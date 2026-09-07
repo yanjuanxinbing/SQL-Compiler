@@ -1,0 +1,13 @@
+// 示例测试文件骨架（后缀为 .example，暂不参与编译）
+//
+// 待你接入测试框架（如 GoogleTest）后，可将本文件重命名为 lexer_test.cpp，
+// 并在 tests/CMakeLists.txt 中注册对应的测试目标。
+//
+// #include "lexer/Lexer.h"
+// #include <gtest/gtest.h>
+//
+// TEST(LexerTest, TokenizesSimpleSelect) {
+//     sqlcompiler::Lexer lexer("SELECT * FROM users;");
+//     auto tokens = lexer.Tokenize();
+//     // TODO: 断言tokens内容符合预期
+// }
