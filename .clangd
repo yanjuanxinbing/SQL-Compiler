@@ -1,0 +1,8 @@
+CompileFlags:
+  Add:
+    - -IC:/Users/23080/Desktop/fun/SQL-Compiler/include
+    - -std=c++17
+  Compiler: clang++
+
+Index:
+  Background: Build
