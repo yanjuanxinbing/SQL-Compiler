@@ -1,241 +1,596 @@
 #include "parser/Parser.h"
 
+#include <stdexcept>
+#include <string>
+
 #include "common/Error.h"
 
 namespace sqlcompiler {
 
-Parser::Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)), current_(0) {
-    // TODO: 如有需要可补充初始化逻辑
-}
+// ================= 构造与基础工具 =================
+
+Parser::Parser(std::vector<Token> tokens)
+    : tokens_(std::move(tokens)), current_(0) {}
 
 StatementPtr Parser::Parse() {
-    // TODO: 调用ParseStatement()解析单条语句，可选地Match(SEMICOLON)吸收结尾分号
-    return nullptr;
+    StatementPtr stmt = ParseStatement();
+    // 吃掉语句结尾的分号（若有）
+    Match(TokenType::SEMICOLON);
+    return stmt;
 }
 
 std::vector<StatementPtr> Parser::ParseAll() {
-    // TODO: 循环调用Parse()直到IsAtEnd()，收集所有语句并返回
-    return {};
+    std::vector<StatementPtr> stmts;
+    while (!IsAtEnd()) {
+        // 跳过可能存在的连续分号
+        while (Match(TokenType::SEMICOLON)) {
+        }
+        if (IsAtEnd()) break;
+        StatementPtr stmt = ParseStatement();
+        if (stmt) {
+            stmts.push_back(std::move(stmt));
+        }
+        // 吃掉分隔分号
+        Match(TokenType::SEMICOLON);
+    }
+    return stmts;
 }
 
-// ================= 基础工具函数 =================
-
 const Token& Parser::CurrentToken() const {
-    // TODO: 返回tokens_[current_]
     return tokens_[current_];
 }
 
 const Token& Parser::PeekToken(int offset) const {
-    // TODO: 返回tokens_[current_ + offset]，注意越界处理（返回EOF Token）
-    return tokens_[current_];
+    if (current_ + offset >= tokens_.size()) {
+        return tokens_.back();  // 越界返回最后一个（通常为 EOF）
+    }
+    return tokens_[current_ + offset];
 }
 
 Token Parser::Advance() {
-    // TODO: 返回当前Token，并将current_前移一位（若未越界）
-    return Token();
+    if (!IsAtEnd()) {
+        ++current_;
+    }
+    return tokens_[current_ - 1];
 }
 
 bool Parser::Check(TokenType type) const {
-    // TODO: 判断CurrentToken().type是否等于type
-    return false;
+    return CurrentToken().type == type;
 }
 
 bool Parser::Match(TokenType type) {
-    // TODO: 若Check(type)为真，则Advance()并返回true，否则返回false
+    if (Check(type)) {
+        Advance();
+        return true;
+    }
     return false;
 }
 
 Token Parser::Expect(TokenType type, const std::string& error_message) {
-    // TODO: 若Check(type)为真则Advance()并返回该Token，
-    // 否则抛出CompilerException(ErrorStage::SYNTAX, error_message, ...)
-    return Token();
+    if (Check(type)) {
+        return Advance();
+    }
+    const Token& cur = CurrentToken();
+    std::string msg = error_message + " (got '" + cur.lexeme + "' at line "
+                      + std::to_string(cur.line) + ", col "
+                      + std::to_string(cur.column) + ")";
+    throw CompilerException(ErrorStage::SYNTAX, msg, cur.line, cur.column);
 }
 
 bool Parser::IsAtEnd() const {
-    // TODO: 判断CurrentToken().type是否为END_OF_FILE
-    return true;
+    return CurrentToken().type == TokenType::END_OF_FILE;
 }
 
 // ================= 语句解析 =================
 
 StatementPtr Parser::ParseStatement() {
-    // TODO: 根据CurrentToken().type分派到具体的Parse*Statement()函数
-    // SELECT / INSERT / UPDATE / DELETE / CREATE / DROP
-    return nullptr;
+    const Token& tok = CurrentToken();
+    switch (tok.type) {
+        case TokenType::KEYWORD_SELECT: return ParseSelectStatement();
+        case TokenType::KEYWORD_INSERT: return ParseInsertStatement();
+        case TokenType::KEYWORD_UPDATE: return ParseUpdateStatement();
+        case TokenType::KEYWORD_DELETE: return ParseDeleteStatement();
+        case TokenType::KEYWORD_CREATE: return ParseCreateTableStatement();
+        case TokenType::KEYWORD_DROP:   return ParseDropTableStatement();
+        default: {
+            std::string msg = "Unexpected token at start of statement: '"
+                              + tok.lexeme + "'";
+            throw CompilerException(ErrorStage::SYNTAX, msg, tok.line, tok.column);
+        }
+    }
 }
 
 StatementPtr Parser::ParseSelectStatement() {
-    // TODO:
-    // 1. Expect(KEYWORD_SELECT)
-    // 2. 可选 DISTINCT
-    // 3. ParseSelectList()
-    // 4. Expect(KEYWORD_FROM) + 表名
-    // 5. ParseJoinClauses()
-    // 6. 可选 ParseWhereClause()
-    // 7. 可选 GROUP BY -> ParseGroupByClause()
-    // 8. 可选 HAVING -> ParseHavingClause()
-    // 9. 可选 ORDER BY -> ParseOrderByClause()
-    // 10. 可选 LIMIT -> ParseLimitClause()
-    return nullptr;
+    auto stmt = std::make_shared<SelectStatement>();
+
+    Expect(TokenType::KEYWORD_SELECT, "Expected SELECT");
+    stmt->is_distinct = Match(TokenType::KEYWORD_DISTINCT);
+
+    stmt->select_list = ParseSelectList();
+
+    Expect(TokenType::KEYWORD_FROM, "Expected FROM");
+    Token table = Expect(TokenType::IDENTIFIER, "Expected table name after FROM");
+    stmt->from_table = table.lexeme;
+
+    stmt->joins = ParseJoinClauses();
+
+    if (Match(TokenType::KEYWORD_WHERE)) {
+        stmt->where_clause = ParseExpression();
+    }
+
+    if (Match(TokenType::KEYWORD_GROUP)) {
+        Expect(TokenType::KEYWORD_BY, "Expected BY after GROUP");
+        stmt->group_by = ParseExpressionList();
+    }
+
+    if (Match(TokenType::KEYWORD_HAVING)) {
+        stmt->having_clause = ParseExpression();
+    }
+
+    if (Match(TokenType::KEYWORD_ORDER)) {
+        Expect(TokenType::KEYWORD_BY, "Expected BY after ORDER");
+        stmt->order_by = ParseOrderByClause();
+    }
+
+    if (Match(TokenType::KEYWORD_LIMIT)) {
+        stmt->limit = ParseLimitClause();
+    }
+
+    return stmt;
 }
 
 StatementPtr Parser::ParseInsertStatement() {
-    // TODO:
-    // 1. Expect(KEYWORD_INSERT) + Expect(KEYWORD_INTO) + 表名
-    // 2. 可选的列名列表 (col1, col2, ...)
-    // 3. Expect(KEYWORD_VALUES)
-    // 4. 一个或多个 (expr, expr, ...) 值列表，逗号分隔
-    return nullptr;
+    auto stmt = std::make_shared<InsertStatement>();
+
+    Expect(TokenType::KEYWORD_INSERT, "Expected INSERT");
+    Expect(TokenType::KEYWORD_INTO, "Expected INTO after INSERT");
+    Token table = Expect(TokenType::IDENTIFIER, "Expected table name after INSERT INTO");
+    stmt->table_name = table.lexeme;
+
+    // 可选列名列表
+    if (Check(TokenType::LEFT_PAREN)) {
+        Advance();
+        // 可能为空: INSERT INTO t () VALUES ... — 我们允许，但要至少有一个
+        if (!Check(TokenType::RIGHT_PAREN)) {
+            Token col = Expect(TokenType::IDENTIFIER, "Expected column name");
+            stmt->columns.push_back(col.lexeme);
+            while (Match(TokenType::COMMA)) {
+                Token c = Expect(TokenType::IDENTIFIER, "Expected column name");
+                stmt->columns.push_back(c.lexeme);
+            }
+        }
+        Expect(TokenType::RIGHT_PAREN, "Expected ')' after column list");
+    }
+
+    Expect(TokenType::KEYWORD_VALUES, "Expected VALUES");
+
+    // 至少一行 (expr, expr, ...)，逗号分隔多行
+    do {
+        Expect(TokenType::LEFT_PAREN, "Expected '(' to start VALUES row");
+        std::vector<ExprPtr> row;
+        // 允许空行 VALUES ()
+        if (!Check(TokenType::RIGHT_PAREN)) {
+            row.push_back(ParseExpression());
+            while (Match(TokenType::COMMA)) {
+                row.push_back(ParseExpression());
+            }
+        }
+        Expect(TokenType::RIGHT_PAREN, "Expected ')' after VALUES row");
+        stmt->values_list.push_back(std::move(row));
+    } while (Match(TokenType::COMMA));
+
+    return stmt;
 }
 
 StatementPtr Parser::ParseUpdateStatement() {
-    // TODO:
-    // 1. Expect(KEYWORD_UPDATE) + 表名
-    // 2. Expect(KEYWORD_SET) + 一个或多个 col = expr，逗号分隔
-    // 3. 可选 ParseWhereClause()
-    return nullptr;
+    auto stmt = std::make_shared<UpdateStatement>();
+
+    Expect(TokenType::KEYWORD_UPDATE, "Expected UPDATE");
+    Token table = Expect(TokenType::IDENTIFIER, "Expected table name after UPDATE");
+    stmt->table_name = table.lexeme;
+
+    Expect(TokenType::KEYWORD_SET, "Expected SET after table name");
+
+    // 至少一个 col = expr，逗号分隔
+    do {
+        Token col = Expect(TokenType::IDENTIFIER,
+                           "Expected column name on left side of assignment");
+        Expect(TokenType::OP_EQUAL, "Expected '=' in assignment");
+        ExprPtr value = ParseExpression();
+        stmt->assignments.emplace_back(col.lexeme, std::move(value));
+    } while (Match(TokenType::COMMA));
+
+    if (Match(TokenType::KEYWORD_WHERE)) {
+        stmt->where_clause = ParseExpression();
+    }
+
+    return stmt;
 }
 
 StatementPtr Parser::ParseDeleteStatement() {
-    // TODO:
-    // 1. Expect(KEYWORD_DELETE) + Expect(KEYWORD_FROM) + 表名
-    // 2. 可选 ParseWhereClause()
-    return nullptr;
+    auto stmt = std::make_shared<DeleteStatement>();
+
+    Expect(TokenType::KEYWORD_DELETE, "Expected DELETE");
+    Expect(TokenType::KEYWORD_FROM, "Expected FROM after DELETE");
+    Token table = Expect(TokenType::IDENTIFIER,
+                         "Expected table name after DELETE FROM");
+    stmt->table_name = table.lexeme;
+
+    if (Match(TokenType::KEYWORD_WHERE)) {
+        stmt->where_clause = ParseExpression();
+    }
+
+    return stmt;
 }
 
 StatementPtr Parser::ParseCreateTableStatement() {
-    // TODO:
-    // 1. Expect(KEYWORD_CREATE) + Expect(KEYWORD_TABLE) + 表名
-    // 2. Expect(LEFT_PAREN) + ParseColumnDefinitions() + Expect(RIGHT_PAREN)
-    return nullptr;
+    auto stmt = std::make_shared<CreateTableStatement>();
+
+    Expect(TokenType::KEYWORD_CREATE, "Expected CREATE");
+    Expect(TokenType::KEYWORD_TABLE, "Expected TABLE after CREATE");
+    Token table = Expect(TokenType::IDENTIFIER,
+                         "Expected table name after CREATE TABLE");
+    stmt->table_name = table.lexeme;
+
+    Expect(TokenType::LEFT_PAREN, "Expected '(' after table name");
+    stmt->columns = ParseColumnDefinitions();
+    Expect(TokenType::RIGHT_PAREN, "Expected ')' after column definitions");
+
+    return stmt;
 }
 
 StatementPtr Parser::ParseDropTableStatement() {
-    // TODO: Expect(KEYWORD_DROP) + Expect(KEYWORD_TABLE) + 表名
-    return nullptr;
+    auto stmt = std::make_shared<DropTableStatement>();
+
+    Expect(TokenType::KEYWORD_DROP, "Expected DROP");
+    Expect(TokenType::KEYWORD_TABLE, "Expected TABLE after DROP");
+    Token table = Expect(TokenType::IDENTIFIER,
+                         "Expected table name after DROP TABLE");
+    stmt->table_name = table.lexeme;
+
+    return stmt;
 }
 
 // ================= 子句解析 =================
 
 std::vector<ExprPtr> Parser::ParseSelectList() {
-    // TODO: 解析逗号分隔的表达式列表（支持 * 通配符），可选AS别名（若需要可扩展AST）
-    return {};
+    std::vector<ExprPtr> list;
+    // SELECT *
+    if (Match(TokenType::OP_STAR)) {
+        // 用一个列名为 "*" 的占位列引用表示全选（AST 中以空 column_name 区分）
+        list.push_back(std::make_shared<ColumnRefExpr>("", "*"));
+        return list;
+    }
+
+    list.push_back(ParseExpression());
+    while (Match(TokenType::COMMA)) {
+        list.push_back(ParseExpression());
+    }
+    return list;
 }
 
 std::vector<JoinClause> Parser::ParseJoinClauses() {
-    // TODO: 循环解析0个或多个JOIN子句，直到不再匹配JOIN相关关键字
-    return {};
-}
+    std::vector<JoinClause> joins;
+    while (true) {
+        JoinType type = JoinType::INNER;
+        bool saw_join_kw = false;
+        if (Match(TokenType::KEYWORD_INNER)) {
+            type = JoinType::INNER;
+            saw_join_kw = true;
+        } else if (Match(TokenType::KEYWORD_LEFT)) {
+            type = JoinType::LEFT;
+            saw_join_kw = true;
+        } else if (Match(TokenType::KEYWORD_RIGHT)) {
+            type = JoinType::RIGHT;
+            saw_join_kw = true;
+        }
+        if (Check(TokenType::KEYWORD_JOIN)) {
+            Advance();
+            saw_join_kw = true;
+        } else if (saw_join_kw) {
+            const Token& cur = CurrentToken();
+            throw CompilerException(ErrorStage::SYNTAX,
+                                    "Expected JOIN keyword",
+                                    cur.line, cur.column);
+        }
+        if (!saw_join_kw) break;
 
-JoinClause Parser::ParseJoinClause() {
-    // TODO:
-    // 1. 解析可选的 INNER/LEFT/RIGHT 关键字确定JoinType
-    // 2. Expect(KEYWORD_JOIN) + 表名
-    // 3. Expect(KEYWORD_ON) + ParseExpression() 作为连接条件
-    return JoinClause();
+        JoinClause jc;
+        jc.join_type = type;
+        Token t = Expect(TokenType::IDENTIFIER, "Expected table name after JOIN");
+        jc.table_name = t.lexeme;
+        Expect(TokenType::KEYWORD_ON, "Expected ON in JOIN clause");
+        jc.on_condition = ParseExpression();
+        joins.push_back(std::move(jc));
+    }
+    return joins;
 }
 
 ExprPtr Parser::ParseWhereClause() {
-    // TODO: Expect(KEYWORD_WHERE) + ParseExpression()
-    return nullptr;
+    Expect(TokenType::KEYWORD_WHERE, "Expected WHERE");
+    return ParseExpression();
 }
 
 std::vector<ExprPtr> Parser::ParseGroupByClause() {
-    // TODO: Expect(KEYWORD_GROUP) + Expect(KEYWORD_BY) + 逗号分隔的表达式列表
-    return {};
+    Expect(TokenType::KEYWORD_GROUP, "Expected GROUP");
+    Expect(TokenType::KEYWORD_BY, "Expected BY after GROUP");
+    return ParseExpressionList();
 }
 
 ExprPtr Parser::ParseHavingClause() {
-    // TODO: Expect(KEYWORD_HAVING) + ParseExpression()
-    return nullptr;
+    Expect(TokenType::KEYWORD_HAVING, "Expected HAVING");
+    return ParseExpression();
 }
 
 std::vector<OrderByItem> Parser::ParseOrderByClause() {
-    // TODO: Expect(KEYWORD_ORDER) + Expect(KEYWORD_BY) +
-    // 逗号分隔的 (表达式 [ASC|DESC]) 列表
-    return {};
+    std::vector<OrderByItem> items;
+    do {
+        OrderByItem item;
+        item.expr = ParseExpression();
+        // ASC / DESC 当前不是独立关键字,按大小写不敏感的 IDENTIFIER 识别
+        if (Check(TokenType::IDENTIFIER)) {
+            const std::string& lex = CurrentToken().lexeme;
+            std::string upper = lex;
+            for (char& c : upper) {
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            }
+            if (upper == "ASC") {
+                Advance();
+                item.ascending = true;
+            } else if (upper == "DESC") {
+                Advance();
+                item.ascending = false;
+            }
+        }
+        items.push_back(std::move(item));
+    } while (Match(TokenType::COMMA));
+    return items;
 }
 
 int Parser::ParseLimitClause() {
-    // TODO: Expect(KEYWORD_LIMIT) + 整数字面量，返回其数值
-    return -1;
+    Token lit = Expect(TokenType::INTEGER_LITERAL,
+                       "Expected integer literal after LIMIT");
+    try {
+        return std::stoi(lit.lexeme);
+    } catch (const std::exception&) {
+        throw CompilerException(ErrorStage::SYNTAX,
+                                "Invalid LIMIT value: " + lit.lexeme,
+                                lit.line, lit.column);
+    }
 }
 
 std::vector<ColumnDefinition> Parser::ParseColumnDefinitions() {
-    // TODO: 循环解析逗号分隔的列定义，直到遇到RIGHT_PAREN
-    return {};
+    std::vector<ColumnDefinition> defs;
+    defs.push_back(ParseColumnDefinition());
+    while (Match(TokenType::COMMA)) {
+        defs.push_back(ParseColumnDefinition());
+    }
+    return defs;
 }
 
 ColumnDefinition Parser::ParseColumnDefinition() {
-    // TODO:
-    // 1. 列名（IDENTIFIER）
-    // 2. 数据类型（KEYWORD_INT / KEYWORD_VARCHAR / KEYWORD_FLOAT 等）
-    // 3. 可选 PRIMARY KEY / NOT NULL 约束
-    return ColumnDefinition();
+    ColumnDefinition def;
+    Token name = Expect(TokenType::IDENTIFIER, "Expected column name");
+    def.column_name = name.lexeme;
+
+    TokenType tt = CurrentToken().type;
+    if (tt == TokenType::KEYWORD_INT) {
+        def.data_type = "INT";
+        Advance();
+    } else if (tt == TokenType::KEYWORD_VARCHAR) {
+        def.data_type = "VARCHAR";
+        Advance();
+        // 可选 VARCHAR(n)
+        if (Match(TokenType::LEFT_PAREN)) {
+            Token len = Expect(TokenType::INTEGER_LITERAL,
+                               "Expected length after VARCHAR(");
+            def.data_type += "(" + len.lexeme + ")";
+            Expect(TokenType::RIGHT_PAREN, "Expected ')' after VARCHAR length");
+        }
+    } else if (tt == TokenType::KEYWORD_FLOAT) {
+        def.data_type = "FLOAT";
+        Advance();
+    } else {
+        const Token& cur = CurrentToken();
+        throw CompilerException(ErrorStage::SYNTAX,
+                                "Expected column data type, got '" + cur.lexeme + "'",
+                                cur.line, cur.column);
+    }
+
+    // 约束：可选 PRIMARY KEY / NOT NULL
+    while (true) {
+        if (Match(TokenType::KEYWORD_PRIMARY)) {
+            Expect(TokenType::KEYWORD_KEY, "Expected KEY after PRIMARY");
+            def.is_primary_key = true;
+        } else if (Match(TokenType::KEYWORD_NOT)) {
+            Expect(TokenType::KEYWORD_NULL, "Expected NULL after NOT");
+            def.is_not_null = true;
+        } else {
+            break;
+        }
+    }
+    return def;
 }
 
-// ================= 表达式解析（递归下降） =================
+// ================= 表达式解析 =================
 
 ExprPtr Parser::ParseExpression() {
-    // TODO: 表达式解析入口，通常等价于ParseOrExpr()
     return ParseOrExpr();
 }
 
 ExprPtr Parser::ParseOrExpr() {
-    // TODO: 解析 ParseAndExpr() (OR ParseAndExpr())*
-    return nullptr;
+    ExprPtr expr = ParseAndExpr();
+    while (Match(TokenType::KEYWORD_OR)) {
+        ExprPtr right = ParseAndExpr();
+        expr = std::make_shared<BinaryExpr>(BinaryOperator::OR, expr, right);
+    }
+    return expr;
 }
 
 ExprPtr Parser::ParseAndExpr() {
-    // TODO: 解析 ParseNotExpr() (AND ParseNotExpr())*
-    return nullptr;
+    ExprPtr expr = ParseNotExpr();
+    while (Match(TokenType::KEYWORD_AND)) {
+        ExprPtr right = ParseNotExpr();
+        expr = std::make_shared<BinaryExpr>(BinaryOperator::AND, expr, right);
+    }
+    return expr;
 }
 
 ExprPtr Parser::ParseNotExpr() {
-    // TODO: 解析可选前缀 NOT，构造UnaryExpr(UnaryOperator::NOT, ...)
-    return nullptr;
+    if (Match(TokenType::KEYWORD_NOT)) {
+        ExprPtr inner = ParseNotExpr();
+        return std::make_shared<UnaryExpr>(UnaryOperator::NOT, inner);
+    }
+    return ParseComparisonExpr();
 }
 
 ExprPtr Parser::ParseComparisonExpr() {
-    // TODO: 解析 ParseAdditiveExpr() ( (=|!=|<>|<|<=|>|>=) ParseAdditiveExpr() )?
-    return nullptr;
+    ExprPtr expr = ParseAdditiveExpr();
+    BinaryOperator op;
+    bool matched = true;
+    switch (CurrentToken().type) {
+        case TokenType::OP_EQUAL:         op = BinaryOperator::EQUAL; break;
+        case TokenType::OP_NOT_EQUAL:     op = BinaryOperator::NOT_EQUAL; break;
+        case TokenType::OP_LESS:          op = BinaryOperator::LESS; break;
+        case TokenType::OP_LESS_EQUAL:    op = BinaryOperator::LESS_EQUAL; break;
+        case TokenType::OP_GREATER:       op = BinaryOperator::GREATER; break;
+        case TokenType::OP_GREATER_EQUAL: op = BinaryOperator::GREATER_EQUAL; break;
+        default: matched = false; break;
+    }
+    if (!matched) return expr;
+    Advance();
+    ExprPtr right = ParseAdditiveExpr();
+    return std::make_shared<BinaryExpr>(op, expr, right);
 }
 
 ExprPtr Parser::ParseAdditiveExpr() {
-    // TODO: 解析 ParseMultiplicativeExpr() ((+|-) ParseMultiplicativeExpr())*
-    return nullptr;
+    ExprPtr expr = ParseMultiplicativeExpr();
+    while (true) {
+        BinaryOperator op;
+        if (Match(TokenType::OP_PLUS)) {
+            op = BinaryOperator::ADD;
+        } else if (Match(TokenType::OP_MINUS)) {
+            op = BinaryOperator::SUB;
+        } else {
+            break;
+        }
+        ExprPtr right = ParseMultiplicativeExpr();
+        expr = std::make_shared<BinaryExpr>(op, expr, right);
+    }
+    return expr;
 }
 
 ExprPtr Parser::ParseMultiplicativeExpr() {
-    // TODO: 解析 ParseUnaryExpr() ((*|/) ParseUnaryExpr())*
-    return nullptr;
+    ExprPtr expr = ParseUnaryExpr();
+    while (true) {
+        BinaryOperator op;
+        if (Match(TokenType::OP_STAR)) {
+            op = BinaryOperator::MUL;
+        } else if (Match(TokenType::OP_SLASH)) {
+            op = BinaryOperator::DIV;
+        } else {
+            break;
+        }
+        ExprPtr right = ParseUnaryExpr();
+        expr = std::make_shared<BinaryExpr>(op, expr, right);
+    }
+    return expr;
 }
 
 ExprPtr Parser::ParseUnaryExpr() {
-    // TODO: 解析可选前缀 '-'，构造UnaryExpr(UnaryOperator::NEGATE, ...)，否则转发到ParsePrimaryExpr()
-    return nullptr;
+    if (Match(TokenType::OP_MINUS)) {
+        ExprPtr inner = ParseUnaryExpr();
+        return std::make_shared<UnaryExpr>(UnaryOperator::NEGATE, inner);
+    }
+    return ParsePrimaryExpr();
 }
 
 ExprPtr Parser::ParsePrimaryExpr() {
-    // TODO: 处理以下情况：
-    // 1. 数字/字符串/NULL 字面量 -> LiteralExpr
-    // 2. 标识符 -> ParseColumnRefOrFunctionCall()
-    // 3. 左括号 '(' 表达式 ')' -> 括号表达式
-    return nullptr;
+    const Token& tok = CurrentToken();
+
+    // 数字字面量
+    if (tok.type == TokenType::INTEGER_LITERAL) {
+        Advance();
+        return std::make_shared<LiteralExpr>(LiteralType::INTEGER, tok.lexeme);
+    }
+    if (tok.type == TokenType::FLOAT_LITERAL) {
+        Advance();
+        return std::make_shared<LiteralExpr>(LiteralType::FLOAT, tok.lexeme);
+    }
+    if (tok.type == TokenType::STRING_LITERAL) {
+        Advance();
+        return std::make_shared<LiteralExpr>(LiteralType::STRING, tok.lexeme);
+    }
+    // NULL / TRUE / FALSE 由关键字 NULL 处理
+    if (tok.type == TokenType::KEYWORD_NULL) {
+        Advance();
+        return std::make_shared<LiteralExpr>(LiteralType::NULL_VALUE, "NULL");
+    }
+
+    // 括号表达式
+    if (Match(TokenType::LEFT_PAREN)) {
+        ExprPtr inner = ParseExpression();
+        Expect(TokenType::RIGHT_PAREN, "Expected ')' after expression");
+        return inner;
+    }
+
+    // 标识符：可能是列引用、限定列、函数调用
+    if (tok.type == TokenType::IDENTIFIER) {
+        return ParseColumnRefOrFunctionCall();
+    }
+
+    // 星号单独出现在表达式上下文：当成 "*" 字面列引用（用于 SELECT * 已在外层处理）
+    if (tok.type == TokenType::OP_STAR) {
+        Advance();
+        return std::make_shared<ColumnRefExpr>("", "*");
+    }
+
+    std::string msg = "Unexpected token in expression: '" + tok.lexeme + "'";
+    throw CompilerException(ErrorStage::SYNTAX, msg, tok.line, tok.column);
 }
 
 std::vector<ExprPtr> Parser::ParseExpressionList() {
-    // TODO: 解析逗号分隔的表达式列表，直到遇到右括号或语句结束
-    return {};
+    std::vector<ExprPtr> list;
+    list.push_back(ParseExpression());
+    while (Match(TokenType::COMMA)) {
+        list.push_back(ParseExpression());
+    }
+    return list;
 }
 
 ExprPtr Parser::ParseColumnRefOrFunctionCall() {
-    // TODO:
-    // 1. 读取第一个标识符
-    // 2. 若紧跟'('，视为函数调用，解析参数列表 -> FunctionCallExpr
-    // 3. 若紧跟'.'，视为 table.column -> ColumnRefExpr
-    // 4. 否则视为不带表名的列引用 -> ColumnRefExpr
-    return nullptr;
+    Token first = Expect(TokenType::IDENTIFIER,
+                         "Expected identifier in expression");
+    const std::string& name = first.lexeme;
+
+    // 函数调用: name( ... )
+    if (Check(TokenType::LEFT_PAREN)) {
+        Advance();
+        std::vector<ExprPtr> args;
+        if (!Check(TokenType::RIGHT_PAREN)) {
+            // 支持 COUNT(*) 之类的写法：直接看到 )
+            if (Check(TokenType::OP_STAR)) {
+                Advance();
+            } else {
+                args.push_back(ParseExpression());
+                while (Match(TokenType::COMMA)) {
+                    args.push_back(ParseExpression());
+                }
+            }
+        }
+        Expect(TokenType::RIGHT_PAREN, "Expected ')' after function arguments");
+        return std::make_shared<FunctionCallExpr>(name, std::move(args));
+    }
+
+    // 限定列引用: name.name
+    if (Match(TokenType::DOT)) {
+        Token col = Expect(TokenType::IDENTIFIER,
+                           "Expected column name after '.'");
+        return std::make_shared<ColumnRefExpr>(name, col.lexeme);
+    }
+
+    // 裸列引用
+    return std::make_shared<ColumnRefExpr>("", name);
 }
 
 }  // namespace sqlcompiler
