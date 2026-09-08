@@ -412,10 +412,11 @@ namespace sqlcompiler
         };
 
         // SQL 关键字大小写不敏感:统一转大写后再查
+        // unsigned char 中转 + static_cast 消除 char 为负值时的 UB,并消除 MSVC C4244 警告
         std::string upper(text);
         for (char &c : upper)
         {
-            c = toupper(c);
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         }
 
         if (auto it = kKeywords.find(upper); it != kKeywords.end())
