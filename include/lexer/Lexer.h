@@ -2,6 +2,8 @@
 
 #include <string>
 #include <vector>
+#include <cctype>
+#include <unordered_map>
 
 #include "lexer/Token.h"
 
