@@ -1,49 +1,121 @@
 #include "semantic/SymbolTable.h"
 
+#include <algorithm>
+#include <cctype>
+
 namespace sqlcompiler {
 
+namespace {
+
+// 把字符串统一转成大写，便于做大小写不敏感的标识符匹配
+std::string ToUpper(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    }
+    return out;
+}
+
+bool EqualsIgnoreCase(const std::string& a, const std::string& b) {
+    return ToUpper(a) == ToUpper(b);
+}
+
+}  // namespace
+
+// ============ TableInfo ============
+
 bool TableInfo::HasColumn(const std::string& column_name) const {
-    // TODO: 遍历columns，判断是否存在同名列（建议忽略大小写）
+    for (const auto& col : columns) {
+        if (EqualsIgnoreCase(col.name, column_name)) {
+            return true;
+        }
+    }
     return false;
 }
 
 const ColumnInfo* TableInfo::GetColumn(const std::string& column_name) const {
-    // TODO: 遍历columns，返回匹配列的指针，找不到返回nullptr
+    for (const auto& col : columns) {
+        if (EqualsIgnoreCase(col.name, column_name)) {
+            return &col;
+        }
+    }
     return nullptr;
 }
 
-SymbolTable::SymbolTable() {
-    // TODO: 如有需要可预置一些内置表/系统表
-}
+// ============ SymbolTable ============
+
+SymbolTable::SymbolTable() = default;
 
 bool SymbolTable::AddTable(const TableInfo& table_info) {
-    // TODO: 若表名已存在则返回false，否则插入tables_并返回true
-    return false;
+    if (table_info.table_name.empty()) {
+        return false;
+    }
+    if (HasTable(table_info.table_name)) {
+        return false;
+    }
+    tables_[table_info.table_name] = table_info;
+    return true;
 }
 
 bool SymbolTable::RemoveTable(const std::string& table_name) {
-    // TODO: 若表存在则从tables_中移除并返回true，否则返回false
-    return false;
+    return tables_.erase(table_name) > 0;
 }
 
 bool SymbolTable::HasTable(const std::string& table_name) const {
-    // TODO: 判断tables_中是否存在该表名
+    if (table_name.empty()) {
+        return false;
+    }
+    // 找到等价表名（大小写不敏感）
+    for (const auto& kv : tables_) {
+        if (EqualsIgnoreCase(kv.first, table_name)) {
+            return true;
+        }
+    }
     return false;
 }
 
 const TableInfo* SymbolTable::GetTable(const std::string& table_name) const {
-    // TODO: 返回对应TableInfo的指针，不存在返回nullptr
+    if (table_name.empty()) {
+        return nullptr;
+    }
+    // 先尝试精确匹配（O(1)），未命中再退回到大小写不敏感扫描
+    auto it = tables_.find(table_name);
+    if (it != tables_.end()) {
+        return &it->second;
+    }
+    for (const auto& kv : tables_) {
+        if (EqualsIgnoreCase(kv.first, table_name)) {
+            return &kv.second;
+        }
+    }
     return nullptr;
 }
 
 bool SymbolTable::AddTableFromCreateStatement(const CreateTableStatement& stmt) {
-    // TODO: 根据CreateTableStatement构造TableInfo，并调用AddTable()注册
-    return false;
+    TableInfo info;
+    info.table_name = stmt.table_name;
+
+    info.columns.reserve(stmt.columns.size());
+    for (const auto& cd : stmt.columns) {
+        ColumnInfo col;
+        col.name = cd.column_name;
+        col.data_type = cd.data_type;
+        col.is_primary_key = cd.is_primary_key;
+        col.is_not_null = cd.is_not_null;
+        info.columns.push_back(std::move(col));
+    }
+    return AddTable(info);
 }
 
 std::vector<std::string> SymbolTable::GetAllTableNames() const {
-    // TODO: 遍历tables_，收集所有表名并返回
-    return {};
+    std::vector<std::string> names;
+    names.reserve(tables_.size());
+    for (const auto& kv : tables_) {
+        names.push_back(kv.first);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
 }
 
 }  // namespace sqlcompiler
