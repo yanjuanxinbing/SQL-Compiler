@@ -1,38 +1,53 @@
 #include "common/Error.h"
 
-namespace sqlcompiler
-{
-    std::string ErrorStageToString(ErrorStage stage)
-    {
-        // TODO: 根据stage返回对应的可读字符串，例如 "Lexical", "Syntax" 等
-        return "";
+#include <sstream>
+
+namespace sqlcompiler {
+
+std::string ErrorStageToString(ErrorStage stage) {
+    switch (stage) {
+        case ErrorStage::LEXICAL:      return "Lexical";
+        case ErrorStage::SYNTAX:       return "Syntax";
+        case ErrorStage::SEMANTIC:     return "Semantic";
+        case ErrorStage::OPTIMIZATION: return "Optimization";
+        case ErrorStage::CODEGEN:      return "CodeGen";
     }
+    return "Unknown";
+}
 
-    CompilerException::CompilerException(ErrorStage stage,
-                                         const std::string &message,
-                                         int line,
-                                         int column)
-        : std::runtime_error(message), stage_(stage), line_(line), column_(column) {}
+CompilerException::CompilerException(ErrorStage stage,
+                                      const std::string& message,
+                                      int line,
+                                      int column)
+    : std::runtime_error(message), stage_(stage), line_(line), column_(column) {
+}
 
-    ErrorStage CompilerException::GetStage() const
-    {
-        return stage_;
+ErrorStage CompilerException::GetStage() const {
+    return stage_;
+}
+
+int CompilerException::GetLine() const {
+    return line_;
+}
+
+int CompilerException::GetColumn() const {
+    return column_;
+}
+
+std::string FormatError(const CompilerException& ex) {
+    std::ostringstream oss;
+    oss << "[" << ErrorStageToString(ex.GetStage()) << "]";
+    int line = ex.GetLine();
+    int col = ex.GetColumn();
+    if (line >= 0) {
+        oss << " line=" << line;
+        if (col >= 0) {
+            oss << ", col=" << col;
+        }
+        oss << ":";
     }
+    oss << " " << ex.what();
+    return oss.str();
+}
 
-    int CompilerException::GetLine() const
-    {
-        return line_;
-    }
-
-    int CompilerException::GetColumn() const
-    {
-        return column_;
-    }
-
-    std::string FormatError(const CompilerException &ex)
-    {
-        // TODO: 组合 阶段 + 行号 + 列号 + 错误信息，生成统一格式的字符串
-        return "";
-    }
-
-} // namespace sqlcompiler
+}  // namespace sqlcompiler

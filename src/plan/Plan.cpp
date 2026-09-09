@@ -1,63 +1,118 @@
 #include "plan/Plan.h"
 
 #include <sstream>
-#include <utility>
 
 namespace sqlcompiler {
 
 namespace {
 
-// 把二元运算符枚举转成可读字符串，仅供 PlanNode 的 ToString 调试输出使用
-std::string BinaryOpToString(BinaryOperator op) {
-    switch (op) {
-        case BinaryOperator::ADD:            return "+";
-        case BinaryOperator::SUB:            return "-";
-        case BinaryOperator::MUL:            return "*";
-        case BinaryOperator::DIV:            return "/";
-        case BinaryOperator::EQUAL:          return "=";
-        case BinaryOperator::NOT_EQUAL:      return "<>";
-        case BinaryOperator::LESS:           return "<";
-        case BinaryOperator::LESS_EQUAL:     return "<=";
-        case BinaryOperator::GREATER:        return ">";
-        case BinaryOperator::GREATER_EQUAL:  return ">=";
-        case BinaryOperator::AND:            return "AND";
-        case BinaryOperator::OR:             return "OR";
-    }
-    return "?";
-}
-
-// 把连接类型转成可读字符串
-std::string JoinTypeToString(JoinType type) {
-    switch (type) {
+const char* JoinTypeName(JoinType t) {
+    switch (t) {
         case JoinType::INNER: return "INNER";
         case JoinType::LEFT:  return "LEFT";
         case JoinType::RIGHT: return "RIGHT";
     }
-    return "UNKNOWN";
+    return "?";
 }
 
-// 把表达式列表拼成 "[expr1, expr2, ...]" 形式
-std::string ExprListToString(const std::vector<ExprPtr>& exprs) {
-    std::ostringstream oss;
-    oss << "[";
-    for (size_t i = 0; i < exprs.size(); ++i) {
-        if (i > 0) oss << ", ";
-        if (exprs[i]) oss << exprs[i]->ToString();
-        else          oss << "<null>";
-    }
-    oss << "]";
-    return oss.str();
+std::string Indent(int depth) {
+    return std::string(static_cast<size_t>(depth) * 2, ' ');
 }
 
-// 把字符串列表拼成 "[s1, s2, ...]" 形式
-std::string StringListToString(const std::vector<std::string>& items) {
+std::string NodeBodyToString(const PlanNode& node, int depth) {
     std::ostringstream oss;
-    oss << "[";
-    for (size_t i = 0; i < items.size(); ++i) {
-        if (i > 0) oss << ", ";
-        oss << items[i];
+    oss << Indent(depth);
+    switch (node.GetType()) {
+        case PlanNodeType::SEQ_SCAN: {
+            auto& n = static_cast<const SeqScanNode&>(node);
+            oss << "SeqScan(" << n.table_name << ")";
+            break;
+        }
+        case PlanNodeType::FILTER: {
+            auto& n = static_cast<const FilterNode&>(node);
+            oss << "Filter(" << (n.predicate ? n.predicate->ToString() : "?") << ")";
+            break;
+        }
+        case PlanNodeType::PROJECT: {
+            auto& n = static_cast<const ProjectNode&>(node);
+            oss << "Project(";
+            for (size_t i = 0; i < n.columns.size(); ++i) {
+                if (i) oss << ", ";
+                oss << (n.columns[i] ? n.columns[i]->ToString() : "?");
+            }
+            oss << ")";
+            break;
+        }
+        case PlanNodeType::JOIN: {
+            auto& n = static_cast<const JoinNode&>(node);
+            oss << "Join(" << JoinTypeName(n.join_type) << ", "
+                << (n.condition ? n.condition->ToString() : "?") << ")";
+            break;
+        }
+        case PlanNodeType::SORT: {
+            auto& n = static_cast<const SortNode&>(node);
+            oss << "Sort(";
+            for (size_t i = 0; i < n.order_items.size(); ++i) {
+                if (i) oss << ", ";
+                oss << (n.order_items[i].expr ? n.order_items[i].expr->ToString() : "?")
+                    << (n.order_items[i].ascending ? " ASC" : " DESC");
+            }
+            oss << ")";
+            break;
+        }
+        case PlanNodeType::LIMIT: {
+            auto& n = static_cast<const LimitNode&>(node);
+            oss << "Limit(" << n.limit_count << ")";
+            break;
+        }
+        case PlanNodeType::AGGREGATE: {
+            auto& n = static_cast<const AggregateNode&>(node);
+            oss << "Aggregate(";
+            oss << "GROUP BY [";
+            for (size_t i = 0; i < n.group_by_exprs.size(); ++i) {
+                if (i) oss << ", ";
+                oss << (n.group_by_exprs[i] ? n.group_by_exprs[i]->ToString() : "?");
+            }
+            oss << "], AGG [";
+            for (size_t i = 0; i < n.aggregate_exprs.size(); ++i) {
+                if (i) oss << ", ";
+                oss << (n.aggregate_exprs[i] ? n.aggregate_exprs[i]->ToString() : "?");
+            }
+            oss << "])";
+            break;
+        }
+        case PlanNodeType::INSERT: {
+            auto& n = static_cast<const InsertNode&>(node);
+            oss << "Insert(" << n.table_name << ", "
+                << n.values_list.size() << " rows)";
+            break;
+        }
+        case PlanNodeType::UPDATE: {
+            auto& n = static_cast<const UpdateNode&>(node);
+            oss << "Update(" << n.table_name << ")";
+            break;
+        }
+        case PlanNodeType::DELETE: {
+            auto& n = static_cast<const DeleteNode&>(node);
+            oss << "Delete(" << n.table_name << ")";
+            break;
+        }
+        case PlanNodeType::CREATE_TABLE: {
+            auto& n = static_cast<const CreateTableNode&>(node);
+            oss << "CreateTable(" << n.table_name << ", "
+                << n.columns.size() << " cols)";
+            break;
+        }
+        case PlanNodeType::DROP_TABLE: {
+            auto& n = static_cast<const DropTableNode&>(node);
+            oss << "DropTable(" << n.table_name << ")";
+            break;
+        }
     }
-    oss << "]";
+    oss << "\n";
+    for (auto& child : node.children) {
+        if (child) oss << NodeBodyToString(*child, depth + 1);
+    }
     return oss.str();
 }
 
@@ -66,7 +121,6 @@ std::string StringListToString(const std::vector<std::string>& items) {
 // ============ SeqScanNode ============
 
 SeqScanNode::SeqScanNode(std::string table_name) : table_name(std::move(table_name)) {
-    // 构造完成即可，无额外初始化
 }
 
 PlanNodeType SeqScanNode::GetType() const {
@@ -74,9 +128,7 @@ PlanNodeType SeqScanNode::GetType() const {
 }
 
 std::string SeqScanNode::ToString() const {
-    std::ostringstream oss;
-    oss << "SeqScan(table=" << table_name << ")";
-    return oss.str();
+    return NodeBodyToString(*this, 0);
 }
 
 // ============ FilterNode ============
@@ -89,12 +141,7 @@ PlanNodeType FilterNode::GetType() const {
 }
 
 std::string FilterNode::ToString() const {
-    std::ostringstream oss;
-    oss << "Filter(predicate=";
-    if (predicate) oss << predicate->ToString();
-    else           oss << "<null>";
-    oss << ")";
-    return oss.str();
+    return NodeBodyToString(*this, 0);
 }
 
 // ============ ProjectNode ============
@@ -107,9 +154,7 @@ PlanNodeType ProjectNode::GetType() const {
 }
 
 std::string ProjectNode::ToString() const {
-    std::ostringstream oss;
-    oss << "Project(columns=" << ExprListToString(columns) << ")";
-    return oss.str();
+    return NodeBodyToString(*this, 0);
 }
 
 // ============ JoinNode ============
@@ -123,13 +168,7 @@ PlanNodeType JoinNode::GetType() const {
 }
 
 std::string JoinNode::ToString() const {
-    std::ostringstream oss;
-    oss << "Join(type=" << JoinTypeToString(join_type)
-        << ", condition=";
-    if (condition) oss << condition->ToString();
-    else           oss << "<null>";
-    oss << ")";
-    return oss.str();
+    return NodeBodyToString(*this, 0);
 }
 
 // ============ SortNode ============
@@ -142,16 +181,7 @@ PlanNodeType SortNode::GetType() const {
 }
 
 std::string SortNode::ToString() const {
-    std::ostringstream oss;
-    oss << "Sort(items=[";
-    for (size_t i = 0; i < order_items.size(); ++i) {
-        if (i > 0) oss << ", ";
-        if (order_items[i].expr) oss << order_items[i].expr->ToString();
-        else                     oss << "<null>";
-        oss << (order_items[i].ascending ? " ASC" : " DESC");
-    }
-    oss << "])";
-    return oss.str();
+    return NodeBodyToString(*this, 0);
 }
 
 // ============ LimitNode ============
@@ -164,17 +194,14 @@ PlanNodeType LimitNode::GetType() const {
 }
 
 std::string LimitNode::ToString() const {
-    std::ostringstream oss;
-    oss << "Limit(count=" << limit_count << ")";
-    return oss.str();
+    return NodeBodyToString(*this, 0);
 }
 
 // ============ AggregateNode ============
 
 AggregateNode::AggregateNode(std::vector<ExprPtr> group_by_exprs,
                               std::vector<ExprPtr> aggregate_exprs)
-    : group_by_exprs(std::move(group_by_exprs)),
-      aggregate_exprs(std::move(aggregate_exprs)) {
+    : group_by_exprs(std::move(group_by_exprs)), aggregate_exprs(std::move(aggregate_exprs)) {
 }
 
 PlanNodeType AggregateNode::GetType() const {
@@ -182,10 +209,7 @@ PlanNodeType AggregateNode::GetType() const {
 }
 
 std::string AggregateNode::ToString() const {
-    std::ostringstream oss;
-    oss << "Aggregate(group_by=" << ExprListToString(group_by_exprs)
-        << ", aggs=" << ExprListToString(aggregate_exprs) << ")";
-    return oss.str();
+    return NodeBodyToString(*this, 0);
 }
 
 // ============ InsertNode ============
@@ -202,11 +226,7 @@ PlanNodeType InsertNode::GetType() const {
 }
 
 std::string InsertNode::ToString() const {
-    std::ostringstream oss;
-    oss << "Insert(table=" << table_name
-        << ", columns=" << StringListToString(columns)
-        << ", rows=" << values_list.size() << ")";
-    return oss.str();
+    return NodeBodyToString(*this, 0);
 }
 
 // ============ UpdateNode ============
@@ -224,19 +244,7 @@ PlanNodeType UpdateNode::GetType() const {
 }
 
 std::string UpdateNode::ToString() const {
-    std::ostringstream oss;
-    oss << "Update(table=" << table_name << ", assignments=[";
-    for (size_t i = 0; i < assignments.size(); ++i) {
-        if (i > 0) oss << ", ";
-        oss << assignments[i].first << "=";
-        if (assignments[i].second) oss << assignments[i].second->ToString();
-        else                       oss << "<null>";
-    }
-    oss << "], predicate=";
-    if (predicate) oss << predicate->ToString();
-    else           oss << "<null>";
-    oss << ")";
-    return oss.str();
+    return NodeBodyToString(*this, 0);
 }
 
 // ============ DeleteNode ============
@@ -250,12 +258,7 @@ PlanNodeType DeleteNode::GetType() const {
 }
 
 std::string DeleteNode::ToString() const {
-    std::ostringstream oss;
-    oss << "Delete(table=" << table_name << ", predicate=";
-    if (predicate) oss << predicate->ToString();
-    else           oss << "<null>";
-    oss << ")";
-    return oss.str();
+    return NodeBodyToString(*this, 0);
 }
 
 // ============ CreateTableNode ============
@@ -269,16 +272,7 @@ PlanNodeType CreateTableNode::GetType() const {
 }
 
 std::string CreateTableNode::ToString() const {
-    std::ostringstream oss;
-    oss << "CreateTable(table=" << table_name << ", columns=[";
-    for (size_t i = 0; i < columns.size(); ++i) {
-        if (i > 0) oss << ", ";
-        oss << columns[i].column_name << " " << columns[i].data_type;
-        if (columns[i].is_primary_key) oss << " PRIMARY KEY";
-        if (columns[i].is_not_null)     oss << " NOT NULL";
-    }
-    oss << "])";
-    return oss.str();
+    return NodeBodyToString(*this, 0);
 }
 
 // ============ DropTableNode ============
@@ -291,9 +285,7 @@ PlanNodeType DropTableNode::GetType() const {
 }
 
 std::string DropTableNode::ToString() const {
-    std::ostringstream oss;
-    oss << "DropTable(table=" << table_name << ")";
-    return oss.str();
+    return NodeBodyToString(*this, 0);
 }
 
 }  // namespace sqlcompiler

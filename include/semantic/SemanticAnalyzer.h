@@ -46,10 +46,6 @@ private:
     bool CheckColumnExists(const std::string& table_name, const std::string& column_name);
     bool CheckExpression(const ExprPtr& expr, const std::string& table_name);
 
-    // 在一组可见表的作用域内检查表达式；SELECT/JOIN/UPDATE/DELETE 都会用到
-    bool CheckExpressionInScope(const ExprPtr& expr,
-                                const std::vector<std::string>& visible_tables);
-
     void AddError(const std::string& message, int line = -1);
 };
 

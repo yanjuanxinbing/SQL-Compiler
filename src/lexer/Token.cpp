@@ -1,140 +1,81 @@
 #include "lexer/Token.h"
 
-namespace sqlcompiler
-{
-    std::string TokenTypeToString(TokenType type)
-    {
-        switch (type)
-        {
-        // ---- 关键字 ----
-        case TokenType::KEYWORD_SELECT:
-            return "SELECT";
-        case TokenType::KEYWORD_FROM:
-            return "FROM";
-        case TokenType::KEYWORD_WHERE:
-            return "WHERE";
-        case TokenType::KEYWORD_INSERT:
-            return "INSERT";
-        case TokenType::KEYWORD_INTO:
-            return "INTO";
-        case TokenType::KEYWORD_VALUES:
-            return "VALUES";
-        case TokenType::KEYWORD_UPDATE:
-            return "UPDATE";
-        case TokenType::KEYWORD_SET:
-            return "SET";
-        case TokenType::KEYWORD_DELETE:
-            return "DELETE";
-        case TokenType::KEYWORD_CREATE:
-            return "CREATE";
-        case TokenType::KEYWORD_TABLE:
-            return "TABLE";
-        case TokenType::KEYWORD_DROP:
-            return "DROP";
-        case TokenType::KEYWORD_AND:
-            return "AND";
-        case TokenType::KEYWORD_OR:
-            return "OR";
-        case TokenType::KEYWORD_NOT:
-            return "NOT";
-        case TokenType::KEYWORD_NULL:
-            return "NULL";
-        case TokenType::KEYWORD_ORDER:
-            return "ORDER";
-        case TokenType::KEYWORD_BY:
-            return "BY";
-        case TokenType::KEYWORD_GROUP:
-            return "GROUP";
-        case TokenType::KEYWORD_HAVING:
-            return "HAVING";
-        case TokenType::KEYWORD_JOIN:
-            return "JOIN";
-        case TokenType::KEYWORD_INNER:
-            return "INNER";
-        case TokenType::KEYWORD_LEFT:
-            return "LEFT";
-        case TokenType::KEYWORD_RIGHT:
-            return "RIGHT";
-        case TokenType::KEYWORD_ON:
-            return "ON";
-        case TokenType::KEYWORD_AS:
-            return "AS";
-        case TokenType::KEYWORD_DISTINCT:
-            return "DISTINCT";
-        case TokenType::KEYWORD_LIMIT:
-            return "LIMIT";
-        case TokenType::KEYWORD_INT:
-            return "INT";
-        case TokenType::KEYWORD_VARCHAR:
-            return "VARCHAR";
-        case TokenType::KEYWORD_FLOAT:
-            return "FLOAT";
-        case TokenType::KEYWORD_PRIMARY:
-            return "PRIMARY";
-        case TokenType::KEYWORD_KEY:
-            return "KEY";
+#include <sstream>
 
-        // ---- 标识符与字面量 ----
-        case TokenType::IDENTIFIER:
-            return "IDENTIFIER";
-        case TokenType::INTEGER_LITERAL:
-            return "INTEGER_LITERAL";
-        case TokenType::FLOAT_LITERAL:
-            return "FLOAT_LITERAL";
-        case TokenType::STRING_LITERAL:
-            return "STRING_LITERAL";
+namespace sqlcompiler {
 
-        // ---- 运算符与符号 ----
-        case TokenType::OP_EQUAL:
-            return "=";
-        case TokenType::OP_NOT_EQUAL:
-            return "!=";
-        case TokenType::OP_LESS:
-            return "<";
-        case TokenType::OP_LESS_EQUAL:
-            return "<=";
-        case TokenType::OP_GREATER:
-            return ">";
-        case TokenType::OP_GREATER_EQUAL:
-            return ">=";
-        case TokenType::OP_PLUS:
-            return "+";
-        case TokenType::OP_MINUS:
-            return "-";
-        case TokenType::OP_STAR:
-            return "*";
-        case TokenType::OP_SLASH:
-            return "/";
-        case TokenType::LEFT_PAREN:
-            return "(";
-        case TokenType::RIGHT_PAREN:
-            return ")";
-        case TokenType::COMMA:
-            return ",";
-        case TokenType::SEMICOLON:
-            return ";";
-        case TokenType::DOT:
-            return ".";
-
-        case TokenType::END_OF_FILE:
-            return "EOF";
-        case TokenType::UNKNOWN:
-            return "UNKNOWN";
-        }
-        // 防御:枚举新增值但忘记在此补 case 时,不会静默返回空串
-        return "<UNKNOWN:" + std::to_string(static_cast<int>(type)) + ">";
+std::string TokenTypeToString(TokenType type) {
+    switch (type) {
+        case TokenType::KEYWORD_SELECT:    return "KEYWORD_SELECT";
+        case TokenType::KEYWORD_FROM:      return "KEYWORD_FROM";
+        case TokenType::KEYWORD_WHERE:     return "KEYWORD_WHERE";
+        case TokenType::KEYWORD_INSERT:    return "KEYWORD_INSERT";
+        case TokenType::KEYWORD_INTO:      return "KEYWORD_INTO";
+        case TokenType::KEYWORD_VALUES:    return "KEYWORD_VALUES";
+        case TokenType::KEYWORD_UPDATE:    return "KEYWORD_UPDATE";
+        case TokenType::KEYWORD_SET:       return "KEYWORD_SET";
+        case TokenType::KEYWORD_DELETE:    return "KEYWORD_DELETE";
+        case TokenType::KEYWORD_CREATE:    return "KEYWORD_CREATE";
+        case TokenType::KEYWORD_TABLE:     return "KEYWORD_TABLE";
+        case TokenType::KEYWORD_DROP:      return "KEYWORD_DROP";
+        case TokenType::KEYWORD_AND:       return "KEYWORD_AND";
+        case TokenType::KEYWORD_OR:        return "KEYWORD_OR";
+        case TokenType::KEYWORD_NOT:       return "KEYWORD_NOT";
+        case TokenType::KEYWORD_NULL:      return "KEYWORD_NULL";
+        case TokenType::KEYWORD_ORDER:     return "KEYWORD_ORDER";
+        case TokenType::KEYWORD_BY:        return "KEYWORD_BY";
+        case TokenType::KEYWORD_GROUP:     return "KEYWORD_GROUP";
+        case TokenType::KEYWORD_HAVING:    return "KEYWORD_HAVING";
+        case TokenType::KEYWORD_JOIN:      return "KEYWORD_JOIN";
+        case TokenType::KEYWORD_INNER:     return "KEYWORD_INNER";
+        case TokenType::KEYWORD_LEFT:      return "KEYWORD_LEFT";
+        case TokenType::KEYWORD_RIGHT:     return "KEYWORD_RIGHT";
+        case TokenType::KEYWORD_ON:        return "KEYWORD_ON";
+        case TokenType::KEYWORD_AS:        return "KEYWORD_AS";
+        case TokenType::KEYWORD_DISTINCT:  return "KEYWORD_DISTINCT";
+        case TokenType::KEYWORD_LIMIT:     return "KEYWORD_LIMIT";
+        case TokenType::KEYWORD_INT:       return "KEYWORD_INT";
+        case TokenType::KEYWORD_VARCHAR:   return "KEYWORD_VARCHAR";
+        case TokenType::KEYWORD_FLOAT:     return "KEYWORD_FLOAT";
+        case TokenType::KEYWORD_PRIMARY:   return "KEYWORD_PRIMARY";
+        case TokenType::KEYWORD_KEY:       return "KEYWORD_KEY";
+        case TokenType::IDENTIFIER:        return "IDENTIFIER";
+        case TokenType::INTEGER_LITERAL:   return "INTEGER_LITERAL";
+        case TokenType::FLOAT_LITERAL:     return "FLOAT_LITERAL";
+        case TokenType::STRING_LITERAL:    return "STRING_LITERAL";
+        case TokenType::OP_EQUAL:          return "OP_EQUAL";
+        case TokenType::OP_NOT_EQUAL:      return "OP_NOT_EQUAL";
+        case TokenType::OP_LESS:           return "OP_LESS";
+        case TokenType::OP_LESS_EQUAL:     return "OP_LESS_EQUAL";
+        case TokenType::OP_GREATER:        return "OP_GREATER";
+        case TokenType::OP_GREATER_EQUAL:  return "OP_GREATER_EQUAL";
+        case TokenType::OP_PLUS:           return "OP_PLUS";
+        case TokenType::OP_MINUS:          return "OP_MINUS";
+        case TokenType::OP_STAR:           return "OP_STAR";
+        case TokenType::OP_SLASH:          return "OP_SLASH";
+        case TokenType::LEFT_PAREN:        return "LEFT_PAREN";
+        case TokenType::RIGHT_PAREN:       return "RIGHT_PAREN";
+        case TokenType::COMMA:             return "COMMA";
+        case TokenType::SEMICOLON:         return "SEMICOLON";
+        case TokenType::DOT:               return "DOT";
+        case TokenType::END_OF_FILE:       return "END_OF_FILE";
+        case TokenType::UNKNOWN:           return "UNKNOWN";
     }
+    return "UNKNOWN";
+}
 
-    Token::Token()
-        : type(TokenType::UNKNOWN), lexeme(""), line(0), column(0) {}
+Token::Token() : type(TokenType::UNKNOWN), lexeme(""), line(0), column(0) {
+}
 
-    Token::Token(TokenType type, const std::string &lexeme, int line, int column)
-        : type(type), lexeme(lexeme), line(line), column(column) {}
+Token::Token(TokenType type, const std::string& lexeme, int line, int column)
+    : type(type), lexeme(lexeme), line(line), column(column) {
+}
 
-    std::string Token::ToString() const
-    {
-        // TODO: 返回形如 "[SELECT, 'select', line=1, col=1]" 的调试字符串
-        return "[" + TokenTypeToString(type) + ", '" + lexeme + "', line=" + std::to_string(line) + ", col=" + std::to_string(column) + "]";
-    }
+std::string Token::ToString() const {
+    std::ostringstream oss;
+    oss << "[" << TokenTypeToString(type) << ", '" << lexeme
+        << "', line=" << line << ", col=" << column << "]";
+    return oss.str();
+}
 
-} // namespace sqlcompiler
+}  // namespace sqlcompiler

@@ -1,0 +1,44 @@
+#include "execution/ProjectExecutor.h"
+
+#include "execution/ExpressionEvaluator.h"
+
+namespace sqlcompiler {
+
+ProjectExecutor::ProjectExecutor(ExecutionContext* context, ExecutorPtr child,
+                                  std::vector<ExprPtr> select_list,
+                                  std::unordered_map<std::string, size_t> column_index_map)
+    : Executor(context),
+      child_(std::move(child)),
+      select_list_(std::move(select_list)),
+      column_index_map_(std::move(column_index_map)) {
+}
+
+void ProjectExecutor::Init() {
+    if (child_) child_->Init();
+}
+
+bool ProjectExecutor::Next(Tuple* tuple) {
+    if (!child_) return false;
+    Tuple in;
+    if (!child_->Next(&in)) return false;
+    if (!tuple) return true;
+    // Handle STAR: pass-through
+    if (select_list_.size() == 1 &&
+        select_list_[0]->GetType() == NodeType::FUNCTION_CALL_EXPR) {
+        auto fc = std::static_pointer_cast<FunctionCallExpr>(select_list_[0]);
+        if (fc->function_name == "*" || fc->function_name == "STAR") {
+            *tuple = in;
+            return true;
+        }
+    }
+    ExpressionEvaluator eval(column_index_map_);
+    std::vector<Value> values;
+    values.reserve(select_list_.size());
+    for (const auto& e : select_list_) {
+        values.push_back(eval.Evaluate(e, in));
+    }
+    *tuple = Tuple(std::move(values));
+    return true;
+}
+
+}  // namespace sqlcompiler
