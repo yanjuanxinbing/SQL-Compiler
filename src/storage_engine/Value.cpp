@@ -43,8 +43,8 @@ double ReadDouble(const char* buf) {
 
 ValueType ValueTypeFromString(const std::string& type_name) {
     std::string u = ToUpper(type_name);
-    if (u == "INT" || u == "INTEGER") return ValueType::INTEGER;
-    if (u == "FLOAT" || u == "DOUBLE") return ValueType::FLOAT;
+    if (u == "INT" || u == "INTEGER" || u == "BIGINT") return ValueType::INTEGER;
+    if (u == "FLOAT" || u == "DOUBLE" || u == "DECIMAL") return ValueType::FLOAT;
     if (u == "VARCHAR" || u == "STRING" || u == "TEXT" || u == "CHAR") return ValueType::VARCHAR;
     return ValueType::NULL_TYPE;
 }

@@ -66,6 +66,7 @@ enum class TokenType {
     OP_MINUS,          // -
     OP_STAR,           // *
     OP_SLASH,          // /
+    OP_CONCAT,         // || 字符串连接
     LEFT_PAREN,        // (
     RIGHT_PAREN,       // )
     COMMA,             // ,

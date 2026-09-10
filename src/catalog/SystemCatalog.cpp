@@ -17,15 +17,25 @@ constexpr const char* kSysTablesKey = "__sys_tables__";
 //   for each column:
 //     uint16 name_len
 //     char[name_len] name
-//     uint8  data_type_id  (0=INT, 1=FLOAT, 2=VARCHAR)
+//     uint8  data_type_id  (0=INT, 1=FLOAT, 2=VARCHAR, 3=BIGINT,
+//                           4=DOUBLE, 5=TEXT, 6=CHAR, 7=STRING)
 //     uint8  flags         (bit0=PRIMARY KEY, bit1=NOT NULL)
 //   uint32 first_page_id
 
 uint8_t DataTypeId(const std::string& s) {
-    if (s == "INT") return 0;
-    if (s == "FLOAT") return 1;
-    if (s == "VARCHAR") return 2;
-    return 3;
+    // 归一化为大写再编码，避免CREATE TABLE中大小写写法不同导致编码失败
+    std::string up;
+    up.reserve(s.size());
+    for (char c : s) up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    if (up == "INT" || up == "INTEGER") return 0;
+    if (up == "FLOAT") return 1;
+    if (up == "VARCHAR") return 2;
+    if (up == "BIGINT") return 3;
+    if (up == "DOUBLE" || up == "DECIMAL") return 4;
+    if (up == "TEXT") return 5;
+    if (up == "CHAR") return 6;
+    if (up == "STRING") return 7;
+    return 8;
 }
 
 const char* DataTypeName(uint8_t id) {
@@ -33,6 +43,11 @@ const char* DataTypeName(uint8_t id) {
         case 0: return "INT";
         case 1: return "FLOAT";
         case 2: return "VARCHAR";
+        case 3: return "BIGINT";
+        case 4: return "DOUBLE";
+        case 5: return "TEXT";
+        case 6: return "CHAR";
+        case 7: return "STRING";
     }
     return "VARCHAR";
 }

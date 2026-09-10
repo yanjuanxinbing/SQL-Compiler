@@ -87,6 +87,7 @@ enum class BinaryOperator {
     SUB,
     MUL,
     DIV,
+    CONCAT,
     EQUAL,
     NOT_EQUAL,
     LESS,

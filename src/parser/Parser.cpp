@@ -553,8 +553,11 @@ ExprPtr Parser::ParseComparisonExpr() {
 
 ExprPtr Parser::ParseAdditiveExpr() {
     ExprPtr left = ParseMultiplicativeExpr();
-    while (Check(TokenType::OP_PLUS) || Check(TokenType::OP_MINUS)) {
-        BinaryOperator op = Check(TokenType::OP_PLUS) ? BinaryOperator::ADD : BinaryOperator::SUB;
+    while (Check(TokenType::OP_PLUS) || Check(TokenType::OP_MINUS) ||
+           Check(TokenType::OP_CONCAT)) {
+        BinaryOperator op = Check(TokenType::OP_PLUS)  ? BinaryOperator::ADD
+                          : Check(TokenType::OP_MINUS) ? BinaryOperator::SUB
+                                                       : BinaryOperator::CONCAT;
         Advance();
         ExprPtr right = ParseMultiplicativeExpr();
         left = std::make_shared<BinaryExpr>(op, left, right);

@@ -128,34 +128,45 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
 Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& tuple) const {
     Value l = Evaluate(expr.left, tuple);
     Value r = Evaluate(expr.right, tuple);
+    // 混合运算时把INTEGER操作数提升为double：
+    // AsFloat()对INTEGER值返回的是内部float_val_（恒为0），直接使用会得到错误结果
+    auto ToDouble = [](const Value& v) -> double {
+        if (v.GetType() == ValueType::INTEGER) return static_cast<double>(v.AsInt());
+        return v.AsFloat();
+    };
     switch (expr.op) {
         case BinaryOperator::ADD: {
             if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
-                return Value::MakeFloat(l.AsFloat() + r.AsFloat());
+                return Value::MakeFloat(ToDouble(l) + ToDouble(r));
             }
             return Value::MakeInt(l.AsInt() + r.AsInt());
         }
         case BinaryOperator::SUB: {
             if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
-                return Value::MakeFloat(l.AsFloat() - r.AsFloat());
+                return Value::MakeFloat(ToDouble(l) - ToDouble(r));
             }
             return Value::MakeInt(l.AsInt() - r.AsInt());
         }
         case BinaryOperator::MUL: {
             if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
-                return Value::MakeFloat(l.AsFloat() * r.AsFloat());
+                return Value::MakeFloat(ToDouble(l) * ToDouble(r));
             }
             return Value::MakeInt(l.AsInt() * r.AsInt());
         }
         case BinaryOperator::DIV: {
             if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
-                double rv = r.AsFloat();
+                double rv = ToDouble(r);
                 if (rv == 0.0) return Value::MakeNull();
-                return Value::MakeFloat(l.AsFloat() / rv);
+                return Value::MakeFloat(ToDouble(l) / rv);
             }
             int32_t rv = r.AsInt();
             if (rv == 0) return Value::MakeNull();
             return Value::MakeInt(l.AsInt() / rv);
+        }
+        case BinaryOperator::CONCAT: {
+            // SQL标准：任一操作数为NULL则结果为NULL；非字符串操作数按其文本形式连接
+            if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            return Value::MakeVarchar(l.ToString() + r.ToString());
         }
         case BinaryOperator::EQUAL: {
             int c = Value::Compare(l, r);

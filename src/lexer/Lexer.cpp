@@ -295,6 +295,10 @@ Token Lexer::ScanOperatorOrSymbol() {
         Advance(); Advance();
         return Token(TokenType::OP_NOT_EQUAL, "<>", start_line, start_col);
     }
+    if (c == '|' && n == '|') {
+        Advance(); Advance();
+        return Token(TokenType::OP_CONCAT, "||", start_line, start_col);
+    }
     Advance();
     switch (c) {
         case '=': return Token(TokenType::OP_EQUAL, "=", start_line, start_col);

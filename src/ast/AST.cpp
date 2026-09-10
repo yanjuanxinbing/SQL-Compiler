@@ -31,6 +31,7 @@ const char* BinaryOpToString(BinaryOperator op) {
         case BinaryOperator::GREATER_EQUAL:  return ">=";
         case BinaryOperator::AND:            return "AND";
         case BinaryOperator::OR:             return "OR";
+        case BinaryOperator::CONCAT:         return "||";
         case BinaryOperator::LIKE:           return "LIKE";
         case BinaryOperator::IN_LIST:        return "IN";
         case BinaryOperator::BETWEEN:        return "BETWEEN";
