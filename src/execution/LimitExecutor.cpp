@@ -17,7 +17,6 @@ void LimitExecutor::Init() {
 bool LimitExecutor::Next(Tuple* tuple) {
     if (!child_) return false;
     if (emitted_ >= limit_count_) return false;
-    // 跳过前 offset 个元组
     while (skipped_ < offset_) {
         Tuple dummy;
         if (!child_->Next(&dummy)) return false;

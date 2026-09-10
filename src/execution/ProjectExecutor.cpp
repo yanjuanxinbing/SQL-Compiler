@@ -20,7 +20,6 @@ void ProjectExecutor::Init() {
 }
 
 bool ProjectExecutor::Next(Tuple* tuple) {
-    // 无 FROM（SELECT 1 / SELECT 'label'）：发射一行常量然后结束
     if (!child_) {
         if (has_emitted_) return false;
         has_emitted_ = true;
@@ -38,7 +37,6 @@ bool ProjectExecutor::Next(Tuple* tuple) {
     Tuple in;
     if (!child_->Next(&in)) return false;
     if (!tuple) return true;
-    // Handle STAR: pass-through
     if (select_list_.size() == 1 &&
         select_list_[0]->GetType() == NodeType::FUNCTION_CALL_EXPR) {
         auto fc = std::static_pointer_cast<FunctionCallExpr>(select_list_[0]);

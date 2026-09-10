@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "parser/Parser.h"
 
 #include "common/Error.h"
@@ -363,17 +364,16 @@ std::vector<OrderByItem> Parser::ParseOrderByClause() {
     do {
         OrderByItem it;
         it.expr = ParseExpression();
-        // ASC / DESC 用作普通标识符；遇到大写的 ASC/DESC 标识符则解释为方向关键字
-        if (CurrentToken().type == TokenType::IDENTIFIER) {
+        // ASC / DESC 既可以是关键字也可以是普通标识符（统一大小写）
+        if (CurrentToken().type == TokenType::KEYWORD_ASC ||
+            CurrentToken().type == TokenType::KEYWORD_DESC) {
+            it.ascending = (CurrentToken().type == TokenType::KEYWORD_ASC);
+            Advance();
+        } else if (CurrentToken().type == TokenType::IDENTIFIER) {
             std::string up = CurrentToken().lexeme;
             for (auto& ch : up) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-            if (up == "ASC") {
-                it.ascending = true;
-                Advance();
-            } else if (up == "DESC") {
-                it.ascending = false;
-                Advance();
-            }
+            if (up == "ASC") { it.ascending = true; Advance(); }
+            else if (up == "DESC") { it.ascending = false; Advance(); }
         }
         items.push_back(it);
     } while (Match(TokenType::COMMA));

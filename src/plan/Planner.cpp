@@ -160,22 +160,22 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
         f->children.push_back(current);
         current = f;
     }
-    // PROJECT
-    auto proj = std::make_shared<ProjectNode>(stmt.select_list, stmt.select_aliases, stmt.is_distinct);
-    if (current) proj->children.push_back(current);
-    current = proj;
-    // ORDER BY
+    // ORDER BY (构建于 Project 之前)
     if (!stmt.order_by.empty()) {
         auto s = std::make_shared<SortNode>(stmt.order_by);
-        s->children.push_back(current);
+        if (current) s->children.push_back(current);
         current = s;
     }
-    // LIMIT
+    // LIMIT (构建于 Project 之前)
     if (stmt.limit >= 0) {
         auto l = std::make_shared<LimitNode>(stmt.limit, stmt.limit_offset);
         l->children.push_back(current);
         current = l;
     }
+    // PROJECT (始终位于最顶层)
+    auto proj = std::make_shared<ProjectNode>(stmt.select_list, stmt.select_aliases, stmt.is_distinct);
+    if (current) proj->children.push_back(current);
+    current = proj;
     return current;
 }
 

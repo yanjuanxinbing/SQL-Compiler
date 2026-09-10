@@ -49,6 +49,7 @@ const std::unordered_map<std::string, TokenType>& KeywordTable() {
         {"IN",       TokenType::KEYWORD_IN},
         {"BETWEEN",  TokenType::KEYWORD_BETWEEN},
         {"ASC",      TokenType::KEYWORD_ASC},
+        {"DESC",     TokenType::KEYWORD_DESC},
         {"IF",       TokenType::KEYWORD_IF},
         {"TRUNCATE", TokenType::KEYWORD_TRUNCATE},
     };

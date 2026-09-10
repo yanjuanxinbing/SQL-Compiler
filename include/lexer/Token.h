@@ -45,6 +45,7 @@ enum class TokenType {
     KEYWORD_IN,
     KEYWORD_BETWEEN,
     KEYWORD_ASC,
+    KEYWORD_DESC,
     KEYWORD_IF,
     KEYWORD_TRUNCATE,
 

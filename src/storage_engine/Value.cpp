@@ -183,9 +183,17 @@ size_t Value::SerializedSize() const {
 }
 
 int Value::Compare(const Value& a, const Value& b) {
+    if (a.IsNull() || b.IsNull()) return 0;
+    // 跨类型数值比较：把 INT 提升为 FLOAT
     if (a.type_ != b.type_) {
-        if (a.IsNull()) return b.IsNull() ? 0 : -1;
-        if (b.IsNull()) return 1;
+        if ((a.type_ == ValueType::INTEGER || a.type_ == ValueType::FLOAT) &&
+            (b.type_ == ValueType::INTEGER || b.type_ == ValueType::FLOAT)) {
+            double av = (a.type_ == ValueType::INTEGER) ? a.AsInt() : a.AsFloat();
+            double bv = (b.type_ == ValueType::INTEGER) ? b.AsInt() : b.AsFloat();
+            if (av < bv) return -1;
+            if (av > bv) return 1;
+            return 0;
+        }
         return 0;
     }
     switch (a.type_) {

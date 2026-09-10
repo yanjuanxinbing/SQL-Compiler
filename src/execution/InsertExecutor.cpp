@@ -7,6 +7,32 @@
 
 namespace sqlcompiler {
 
+namespace {
+
+// 将值强制转换为与列声明一致的类型，避免 INT 字面量被写入 FLOAT 列导致读取错位
+Value CoerceToColumnType(const Value& v, const std::string& col_type) {
+    std::string up;
+    for (char c : col_type) up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    if (up == "INT" || up == "INTEGER" || up == "BIGINT") {
+        if (v.IsNull()) return v;
+        if (v.GetType() == ValueType::INTEGER) return v;
+        if (v.GetType() == ValueType::FLOAT) return Value::MakeInt(static_cast<int32_t>(v.AsFloat()));
+        if (v.GetType() == ValueType::VARCHAR) {
+            try { return Value::MakeInt(static_cast<int32_t>(std::stoi(v.AsVarchar()))); } catch (...) { return Value::MakeInt(0); }
+        }
+    } else if (up == "FLOAT" || up == "DOUBLE" || up == "DECIMAL") {
+        if (v.IsNull()) return v;
+        if (v.GetType() == ValueType::FLOAT) return v;
+        if (v.GetType() == ValueType::INTEGER) return Value::MakeFloat(static_cast<double>(v.AsInt()));
+        if (v.GetType() == ValueType::VARCHAR) {
+            try { return Value::MakeFloat(std::stod(v.AsVarchar())); } catch (...) { return Value::MakeFloat(0.0); }
+        }
+    }
+    return v;
+}
+
+}  // namespace
+
 InsertExecutor::InsertExecutor(ExecutionContext* context, std::string table_name,
                                 std::vector<std::string> columns,
                                 std::vector<std::vector<ExprPtr>> values_list)
@@ -47,7 +73,8 @@ bool InsertExecutor::Next(Tuple* tuple) {
                 "INSERT column count mismatch for " + table_name_);
         }
         for (size_t i = 0; i < row_exprs.size(); ++i) {
-            row_values[i] = eval.Evaluate(row_exprs[i], Tuple());
+            Value v = eval.Evaluate(row_exprs[i], Tuple());
+            row_values[i] = CoerceToColumnType(v, info->columns[i].data_type);
         }
     } else {
         // Place each value into the column index specified by columns_
@@ -57,7 +84,9 @@ bool InsertExecutor::Next(Tuple* tuple) {
                 throw CompilerException(ErrorStage::SEMANTIC,
                     "unknown column: " + columns_[i]);
             }
-            row_values[it->second] = eval.Evaluate(row_exprs[i], Tuple());
+            const auto& target_col = info->columns[it->second];
+            Value v = eval.Evaluate(row_exprs[i], Tuple());
+            row_values[it->second] = CoerceToColumnType(v, target_col.data_type);
         }
     }
 

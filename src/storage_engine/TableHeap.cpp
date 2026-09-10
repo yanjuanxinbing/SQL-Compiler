@@ -1,6 +1,7 @@
 #include "storage_engine/TableHeap.h"
 
 #include <cstring>
+#include <unordered_set>
 
 namespace sqlcompiler {
 
@@ -214,16 +215,22 @@ bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple) {
     }
     int32_t off, len;
     ReadSlot(data, rid.slot_num, off, len);
-    if (IsTombstone(len)) {
+    if (IsTombstone(len) || off < 0 || len < 0 ||
+        off + len > static_cast<int32_t>(PAGE_SIZE)) {
         buffer_pool_manager_->UnpinPage(rid.page_id, false);
         return false;
     }
     std::vector<char> serialized = new_tuple.Serialize();
     int32_t new_len = static_cast<int32_t>(serialized.size());
+    if (new_len == 0) {
+        buffer_pool_manager_->UnpinPage(rid.page_id, false);
+        return false;
+    }
     if (new_len <= len) {
-        if (new_len > 0) {
-            std::memcpy(data + off, serialized.data(), new_len);
+        if (new_len < len) {
+            std::memset(data + off + new_len, 0, len - new_len);
         }
+        std::memcpy(data + off, serialized.data(), new_len);
         WriteSlot(data, rid.slot_num, off, new_len);
         page->SetDirty(true);
         buffer_pool_manager_->UnpinPage(rid.page_id, true);
@@ -238,7 +245,13 @@ bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple) {
 bool TableHeap::FindNextRid(RID current, RID* next) {
     page_id_t pid = current.IsValid() ? current.page_id : first_page_id_;
     int slot_num = current.IsValid() ? current.slot_num + 1 : 0;
-    while (pid != INVALID_PAGE_ID) {
+    // 防止 next_pid 形成循环（数据损坏时保护）
+    std::unordered_set<page_id_t> visited;
+    while (pid != INVALID_PAGE_ID && pid >= 0) {
+        if (!visited.insert(pid).second) {
+            // 已经访问过这个页面，next_pid 形成环
+            return false;
+        }
         Page* page = buffer_pool_manager_->GetPage(pid);
         if (!page) return false;
         char* data = page->GetData();
@@ -258,6 +271,8 @@ bool TableHeap::FindNextRid(RID current, RID* next) {
             ++slot_num;
         }
         buffer_pool_manager_->UnpinPage(pid, false);
+        // next_pid 越界保护
+        if (next_pid < 0) return false;
         pid = next_pid;
         slot_num = 0;
     }
