@@ -99,7 +99,7 @@ const std::string& Value::AsVarchar() const {
     return str_val_;
 }
 
-size_t Value::SerializeTo(char* buf) const {
+size_t Value::SerializeTo(char* buf, ValueType column_type) const {
     switch (type_) {
         case ValueType::INTEGER: {
             WriteInt32(buf, int_val_);
@@ -118,7 +118,14 @@ size_t Value::SerializeTo(char* buf) const {
             return static_cast<size_t>(kVarcharLenBytes + len);
         }
         case ValueType::NULL_TYPE: {
+            // Write a NULL marker whose width matches the column's declared
+            // type so subsequent columns are read at the correct offset.
             WriteInt32(buf, kNullMarker);
+            if (column_type == ValueType::FLOAT) {
+                // Pad with 4 zero bytes so total width is kFloatBytes (8).
+                std::memset(buf + kIntBytes, 0, kIntBytes);
+                return static_cast<size_t>(kFloatBytes);
+            }
             return kIntBytes;
         }
     }
@@ -143,6 +150,15 @@ size_t Value::DeserializeFrom(const char* buf, ValueType type, Value* out) {
             return kIntBytes;
         }
         case ValueType::FLOAT: {
+            // Detect NULL marker (-1) at the start of an 8-byte slot.
+            int32_t marker = ReadInt32(buf);
+            if (marker == kNullMarker) {
+                out->type_ = ValueType::NULL_TYPE;
+                out->int_val_ = 0;
+                out->float_val_ = 0.0;
+                out->str_val_.clear();
+                return static_cast<size_t>(kFloatBytes);
+            }
             out->float_val_ = ReadDouble(buf);
             out->int_val_ = 0;
             out->str_val_.clear();
@@ -172,12 +188,15 @@ size_t Value::DeserializeFrom(const char* buf, ValueType type, Value* out) {
     return 0;
 }
 
-size_t Value::SerializedSize() const {
+size_t Value::SerializedSize(ValueType column_type) const {
     switch (type_) {
         case ValueType::INTEGER:    return static_cast<size_t>(kIntBytes);
         case ValueType::FLOAT:      return static_cast<size_t>(kFloatBytes);
         case ValueType::VARCHAR:    return static_cast<size_t>(kVarcharLenBytes + str_val_.size());
-        case ValueType::NULL_TYPE:  return static_cast<size_t>(kIntBytes);
+        case ValueType::NULL_TYPE:
+            // Match the column's declared width so the slot stays aligned.
+            if (column_type == ValueType::FLOAT) return static_cast<size_t>(kFloatBytes);
+            return static_cast<size_t>(kIntBytes);
     }
     return 0;
 }

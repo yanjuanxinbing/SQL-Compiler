@@ -1,0 +1,32 @@
+-- 25_truncate.sql
+-- TRUNCATE 关键字（KEYWORD_TRUNCATE 已被词法器支持）
+
+CREATE TABLE t(id INT, name VARCHAR, val FLOAT);
+
+INSERT INTO t VALUES (1, 'Alice', 10.0);
+INSERT INTO t VALUES (2, 'Bob',   20.0);
+INSERT INTO t VALUES (3, 'Carl',  30.0);
+
+SELECT * FROM t;
+SELECT COUNT(*) FROM t;
+
+-- 清空数据
+TRUNCATE TABLE t;
+
+SELECT * FROM t;
+SELECT COUNT(*) FROM t;
+
+-- 重建数据
+INSERT INTO t VALUES (10, 'David', 100.0);
+INSERT INTO t VALUES (20, 'Eve',   200.0);
+
+SELECT * FROM t;
+
+-- TRUNCATE 后再次 DROP / 重建
+TRUNCATE TABLE t;
+DROP TABLE t;
+CREATE TABLE t(id INT, name VARCHAR);
+INSERT INTO t VALUES (1, 'new');
+SELECT * FROM t;
+
+exit;

@@ -89,14 +89,15 @@ page_id_t TableHeap::GetFirstPageId() const {
     return first_page_id_;
 }
 
-bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid) {
+bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
+                                 const std::vector<ValueType>& column_types) {
     Page* page = buffer_pool_manager_->GetPage(page_id);
     if (!page) return false;
     char* data = page->GetData();
     int32_t next_pid, slot_count, free_off;
     ReadPageHeader(data, next_pid, slot_count, free_off);
 
-    std::vector<char> serialized = tuple.Serialize();
+    std::vector<char> serialized = tuple.Serialize(column_types);
     int32_t len = static_cast<int32_t>(serialized.size());
 
     // Need room for: new slot entry (kSlotBytes) + record bytes
@@ -121,11 +122,12 @@ bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid) 
     return true;
 }
 
-bool TableHeap::InsertTuple(const Tuple& tuple, RID* rid) {
+bool TableHeap::InsertTuple(const Tuple& tuple, RID* rid,
+                            const std::vector<ValueType>& column_types) {
     page_id_t pid = first_page_id_;
     page_id_t prev_pid = INVALID_PAGE_ID;
     while (pid != INVALID_PAGE_ID) {
-        if (InsertIntoPage(pid, tuple, rid)) {
+        if (InsertIntoPage(pid, tuple, rid, column_types)) {
             return true;
         }
         // Walk to next page in chain
@@ -156,7 +158,7 @@ bool TableHeap::InsertTuple(const Tuple& tuple, RID* rid) {
     } else {
         first_page_id_ = new_pid;
     }
-    return InsertIntoPage(new_pid, tuple, rid);
+    return InsertIntoPage(new_pid, tuple, rid, column_types);
 }
 
 bool TableHeap::GetTuple(const RID& rid, Tuple* tuple,
@@ -202,7 +204,8 @@ bool TableHeap::DeleteTuple(const RID& rid) {
     return true;
 }
 
-bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple) {
+bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple,
+                             const std::vector<ValueType>& column_types) {
     if (!rid.IsValid()) return false;
     Page* page = buffer_pool_manager_->GetPage(rid.page_id);
     if (!page) return false;
@@ -220,7 +223,7 @@ bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple) {
         buffer_pool_manager_->UnpinPage(rid.page_id, false);
         return false;
     }
-    std::vector<char> serialized = new_tuple.Serialize();
+    std::vector<char> serialized = new_tuple.Serialize(column_types);
     int32_t new_len = static_cast<int32_t>(serialized.size());
     if (new_len == 0) {
         buffer_pool_manager_->UnpinPage(rid.page_id, false);
@@ -239,7 +242,7 @@ bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple) {
     buffer_pool_manager_->UnpinPage(rid.page_id, false);
     // Cannot grow in place — delete and reinsert
     DeleteTuple(rid);
-    return InsertTuple(new_tuple, nullptr);
+    return InsertTuple(new_tuple, nullptr, column_types);
 }
 
 bool TableHeap::FindNextRid(RID current, RID* next) {

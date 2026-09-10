@@ -31,7 +31,8 @@ public:
     void SetRid(const RID& rid);
 
     // 序列化为字节数组，供TableHeap写入页面
-    std::vector<char> Serialize() const;
+    // column_types 描述每一列的声明类型，用于为 NULL 值选择匹配的字节宽度
+    std::vector<char> Serialize(const std::vector<ValueType>& column_types) const;
 
     // 根据每一列的类型描述，从字节数组反序列化出一个Tuple
     static Tuple Deserialize(const char* data, const std::vector<ValueType>& column_types);

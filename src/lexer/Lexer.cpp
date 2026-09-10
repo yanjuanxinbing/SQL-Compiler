@@ -187,6 +187,25 @@ Token Lexer::ScanNumber() {
             Advance();
         }
     }
+    // Scientific notation: [e|E][+|-]?digits  (only when there's already a
+    // fractional part OR an integer is immediately followed by e/E+digit,
+    // so that plain identifiers like 'e' or 'e1' are still lexed as IDENTIFIER)
+    if (!IsAtEnd() && (CurrentChar() == 'e' || CurrentChar() == 'E')) {
+        bool has_sign = (PeekChar() == '+' || PeekChar() == '-');
+        size_t after_exp = pos_ + 1 + (has_sign ? 1 : 0);
+        bool exp_has_digit = (after_exp < source_.size() &&
+                              IsDigit(source_[after_exp]));
+        if (is_float || exp_has_digit) {
+            is_float = true;
+            Advance(); // 'e' or 'E'
+            if (!IsAtEnd() && (CurrentChar() == '+' || CurrentChar() == '-')) {
+                Advance();
+            }
+            while (!IsAtEnd() && IsDigit(CurrentChar())) {
+                Advance();
+            }
+        }
+    }
     std::string text = source_.substr(start_pos, pos_ - start_pos);
     TokenType type = is_float ? TokenType::FLOAT_LITERAL : TokenType::INTEGER_LITERAL;
     return Token(type, text, start_line, start_col);

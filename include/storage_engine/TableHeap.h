@@ -30,8 +30,10 @@ public:
 
     // 插入一条记录：从first_page_id开始寻找有足够空闲空间的页，
     // 若都写满则通过buffer_pool_manager_->NewPage()追加新页。
-    // 成功后通过rid返回该记录的位置
-    bool InsertTuple(const Tuple& tuple, RID* rid);
+    // 成功后通过rid返回该记录的位置。
+    // column_types 描述每个字段的声明类型，用于序列化时为 NULL 选择匹配的字节宽度。
+    bool InsertTuple(const Tuple& tuple, RID* rid,
+                     const std::vector<ValueType>& column_types);
 
     // 根据rid读取一条记录，column_types用于反序列化
     bool GetTuple(const RID& rid, Tuple* tuple, const std::vector<ValueType>& column_types);
@@ -41,8 +43,10 @@ public:
     bool DeleteTuple(const RID& rid);
 
     // 根据rid更新一条记录（若新记录变长后仍能放入原slot则原地更新，
-    // 否则可先DeleteTuple旧记录再InsertTuple新记录）
-    bool UpdateTuple(const RID& rid, const Tuple& new_tuple);
+    // 否则可先DeleteTuple旧记录再InsertTuple新记录）。
+    // column_types 同 InsertTuple。
+    bool UpdateTuple(const RID& rid, const Tuple& new_tuple,
+                     const std::vector<ValueType>& column_types);
 
     page_id_t GetFirstPageId() const;
 
@@ -67,7 +71,8 @@ private:
     page_id_t first_page_id_;
 
     // 尝试在给定页内插入记录（写入槽位目录+记录内容），页空间不足返回false
-    bool InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid);
+    bool InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
+                         const std::vector<ValueType>& column_types);
 
     // 定位current之后下一个存在有效（未删除）记录的RID，写入next，
     // 供Iterator::HasNext()/Next()使用；到达堆文件末尾返回false

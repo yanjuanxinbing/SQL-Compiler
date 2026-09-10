@@ -221,7 +221,7 @@ bool SystemCatalog::PersistTableMetadata(const TableInfo& table_info) {
     std::string blob = EncodeTableInfo(table_info, user_pid);
     Tuple t({Value::MakeVarchar(blob)});
     RID rid;
-    return sys_heap->InsertTuple(t, &rid);
+    return sys_heap->InsertTuple(t, &rid, {ValueType::VARCHAR});
 }
 
 TableInfo SystemCatalog::DecodeTableMetadata(const Tuple& tuple) const {

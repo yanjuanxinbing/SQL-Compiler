@@ -18,6 +18,7 @@ set "WORK_DIR=%SCRIPT_DIR%tmp"
 REM ---- Sanity checks -------------------------------------------------
 if not exist "%SQL_DIR%\*.sql" (
     echo [ERROR] No SQL test scripts found in: %SQL_DIR%
+    pause
     exit /b 1
 )
 
@@ -25,6 +26,7 @@ if not exist "%BUILD_DIR%\sqlcompiler.exe" (
     if not exist "%BUILD_DIR%\sqlcompiler" (
         echo [ERROR] sqlcompiler executable not found in: %BUILD_DIR%
         echo         Please build the project first.
+        pause
         exit /b 1
     )
 )
@@ -96,6 +98,10 @@ if !FAILED! gtr 0 (
     echo.
     echo [Failed tests]
     echo !FAILED_TESTS!
+    echo.
+    pause
     endlocal & exit /b 1
 )
+echo.
+pause
 endlocal & exit /b 0

@@ -123,7 +123,14 @@ bool InsertExecutor::Next(Tuple* tuple) {
 
     Tuple t(std::move(row_values));
     RID rid;
-    if (!heap->InsertTuple(t, &rid)) {
+    // Build the column-type vector so serialization can write NULL markers with
+    // the correct width for each declared type (avoids deserializer misalignment).
+    std::vector<ValueType> col_types;
+    col_types.reserve(info->columns.size());
+    for (const auto& c : info->columns) {
+        col_types.push_back(ValueTypeFromString(c.data_type));
+    }
+    if (!heap->InsertTuple(t, &rid, col_types)) {
         throw CompilerException(ErrorStage::SEMANTIC,
             "INSERT failed (no space?)");
     }

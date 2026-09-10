@@ -42,13 +42,24 @@ void Tuple::SetRid(const RID& rid) {
     rid_ = rid;
 }
 
-std::vector<char> Tuple::Serialize() const {
+std::vector<char> Tuple::Serialize(const std::vector<ValueType>& column_types) const {
     std::vector<char> out;
-    for (const auto& v : values_) {
-        size_t sz = v.SerializedSize();
+    size_t n = std::min(values_.size(), column_types.size());
+    for (size_t i = 0; i < n; ++i) {
+        const Value& v = values_[i];
+        ValueType col_ty = column_types[i];
+        size_t sz = v.SerializedSize(col_ty);
         size_t cur = out.size();
         out.resize(cur + sz);
-        v.SerializeTo(out.data() + cur);
+        v.SerializeTo(out.data() + cur, col_ty);
+    }
+    // Trailing values without column metadata fall back to the previous size.
+    for (size_t i = n; i < values_.size(); ++i) {
+        const Value& v = values_[i];
+        size_t sz = v.SerializedSize(ValueType::INTEGER);
+        size_t cur = out.size();
+        out.resize(cur + sz);
+        v.SerializeTo(out.data() + cur, ValueType::INTEGER);
     }
     return out;
 }

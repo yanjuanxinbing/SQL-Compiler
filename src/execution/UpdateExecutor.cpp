@@ -69,7 +69,7 @@ bool UpdateExecutor::Next(Tuple* tuple) {
             new_values[idx] = eval.Evaluate(kv.second, cur);
         }
         Tuple new_t(std::move(new_values));
-        if (table_heap_->UpdateTuple(r, new_t)) {
+        if (table_heap_->UpdateTuple(r, new_t, column_types_)) {
             ++affected;
         }
     }

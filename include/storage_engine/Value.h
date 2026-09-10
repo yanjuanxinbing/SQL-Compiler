@@ -31,14 +31,16 @@ public:
     const std::string& AsVarchar() const;
 
     // 序列化到buf（调用方需保证buf足够大），返回写入的字节数
-    size_t SerializeTo(char* buf) const;
+    // column_type 用于 NULL 值：NULL 在磁盘上占用的字节数应与该列一个非空值的
+    // 序列化字节数一致，避免反序列化时错位读取后续列。
+    size_t SerializeTo(char* buf, ValueType column_type) const;
 
     // 从buf中按给定的目标类型反序列化出一个Value，返回读取的字节数
     static size_t DeserializeFrom(const char* buf, ValueType type, Value* out);
 
     // 计算该类型的值在序列化后固定/最大占用的字节数（VARCHAR为变长，需在实现中约定编码方式，
-    // 如"4字节长度前缀 + 内容"）
-    size_t SerializedSize() const;
+    // 如"4字节长度前缀 + 内容"）。column_type 用于 NULL 值。
+    size_t SerializedSize(ValueType column_type) const;
 
     // 比较两个同类型Value的大小，返回负数/0/正数表示小于/等于/大于
     static int Compare(const Value& a, const Value& b);
