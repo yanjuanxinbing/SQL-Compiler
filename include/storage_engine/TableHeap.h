@@ -48,6 +48,10 @@ public:
     bool UpdateTuple(const RID& rid, const Tuple& new_tuple,
                      const std::vector<ValueType>& column_types);
 
+    // 清空表中的所有记录（保留表结构与首页），供 TRUNCATE TABLE 使用
+    // 释放除首页外的全部溢出页，并把首页重置为空槽位目录
+    void ClearAll();
+
     page_id_t GetFirstPageId() const;
 
     // 顺序扫描迭代器，供SeqScanExecutor使用

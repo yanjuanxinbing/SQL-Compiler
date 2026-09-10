@@ -94,11 +94,11 @@ StatementPtr Parser::ParseStatement() {
         case TokenType::KEYWORD_CREATE: return ParseCreateTableStatement();
         case TokenType::KEYWORD_DROP:   return ParseDropTableStatement();
         case TokenType::KEYWORD_TRUNCATE: {
-            // TRUNCATE TABLE x 等价于 DROP TABLE x（清空表）
+            // TRUNCATE TABLE x：清空表中的所有数据，但保留表结构
             Advance(); // TRUNCATE
             Expect(TokenType::KEYWORD_TABLE, "expected TABLE after TRUNCATE");
             Token t = Expect(TokenType::IDENTIFIER, "expected table name");
-            auto stmt = std::make_shared<DropTableStatement>();
+            auto stmt = std::make_shared<TruncateTableStatement>();
             stmt->table_name = t.lexeme;
             return stmt;
         }

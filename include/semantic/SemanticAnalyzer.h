@@ -40,6 +40,7 @@ private:
     bool AnalyzeDelete(const DeleteStatement& stmt);
     bool AnalyzeCreateTable(const CreateTableStatement& stmt);
     bool AnalyzeDropTable(const DropTableStatement& stmt);
+    bool AnalyzeTruncateTable(const TruncateTableStatement& stmt);
 
     // ---- 通用检查函数 ----
     bool CheckTableExists(const std::string& table_name);

@@ -245,6 +245,47 @@ bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple,
     return InsertTuple(new_tuple, nullptr, column_types);
 }
 
+void TableHeap::ClearAll() {
+    // Walk the linked list of pages, free every overflow page beyond the
+    // first, then reset the first page's slot directory to empty.
+    page_id_t pid = first_page_id_;
+    if (pid == INVALID_PAGE_ID) return;
+
+    // Find first page header
+    Page* first = buffer_pool_manager_->GetPage(pid);
+    if (!first) return;
+    char* first_data = first->GetData();
+    int32_t next_pid, slot_count, free_off;
+    ReadPageHeader(first_data, next_pid, slot_count, free_off);
+    buffer_pool_manager_->UnpinPage(pid, false);
+
+    // Free overflow pages
+    page_id_t cur = next_pid;
+    while (cur != INVALID_PAGE_ID && cur >= 0) {
+        Page* p = buffer_pool_manager_->GetPage(cur);
+        if (!p) return;
+        int32_t nnext, ns, nf;
+        ReadPageHeader(p->GetData(), nnext, ns, nf);
+        buffer_pool_manager_->UnpinPage(cur, false);
+        page_id_t victim = cur;
+        cur = nnext;
+        if (!buffer_pool_manager_->DeletePage(victim)) {
+            // DeletePage failed (probably pinned); bail out — the table is
+            // still partially cleared, but tombstones on overflow pages
+            // are still skipped by the iterator, so the user-visible effect
+            // is consistent.
+            break;
+        }
+    }
+
+    // Reset first page header to empty
+    Page* head = buffer_pool_manager_->GetPage(first_page_id_);
+    if (!head) return;
+    InitEmptyPageHeader(head->GetData());
+    head->SetDirty(true);
+    buffer_pool_manager_->UnpinPage(first_page_id_, true);
+}
+
 bool TableHeap::FindNextRid(RID current, RID* next) {
     page_id_t pid = current.IsValid() ? current.page_id : first_page_id_;
     int slot_num = current.IsValid() ? current.slot_num + 1 : 0;

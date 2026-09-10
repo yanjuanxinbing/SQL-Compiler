@@ -186,6 +186,14 @@ bool SystemCatalog::DropTable(const std::string& table_name) {
     return removed;
 }
 
+bool SystemCatalog::TruncateTable(const std::string& table_name) {
+    if (!symbol_table_.HasTable(table_name)) return false;
+    auto it = table_heaps_.find(table_name);
+    if (it == table_heaps_.end() || !it->second) return false;
+    it->second->ClearAll();
+    return true;
+}
+
 bool SystemCatalog::HasTable(const std::string& table_name) const {
     return symbol_table_.HasTable(table_name);
 }

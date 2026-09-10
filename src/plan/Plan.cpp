@@ -108,6 +108,11 @@ std::string NodeBodyToString(const PlanNode& node, int depth) {
             oss << "DropTable(" << n.table_name << ")";
             break;
         }
+        case PlanNodeType::TRUNCATE_TABLE: {
+            auto& n = static_cast<const TruncateTableNode&>(node);
+            oss << "TruncateTable(" << n.table_name << ")";
+            break;
+        }
     }
     oss << "\n";
     for (auto& child : node.children) {
@@ -290,6 +295,19 @@ PlanNodeType DropTableNode::GetType() const {
 }
 
 std::string DropTableNode::ToString() const {
+    return NodeBodyToString(*this, 0);
+}
+
+// ============ TruncateTableNode ============
+
+TruncateTableNode::TruncateTableNode(std::string table_name) : table_name(std::move(table_name)) {
+}
+
+PlanNodeType TruncateTableNode::GetType() const {
+    return PlanNodeType::TRUNCATE_TABLE;
+}
+
+std::string TruncateTableNode::ToString() const {
     return NodeBodyToString(*this, 0);
 }
 

@@ -38,6 +38,9 @@ public:
     // 删除一张表的元数据记录（对应数据页的回收由调用方结合TableHeap完成）
     bool DropTable(const std::string& table_name);
 
+    // 清空一张表中的所有数据（保留表结构）。表不存在返回false。
+    bool TruncateTable(const std::string& table_name);
+
     bool HasTable(const std::string& table_name) const;
     const TableInfo* GetTable(const std::string& table_name) const;
 

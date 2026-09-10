@@ -115,6 +115,8 @@ PlanNodePtr Planner::CreatePlan(const StatementPtr& statement) {
             return PlanCreateTable(*std::static_pointer_cast<CreateTableStatement>(statement));
         case NodeType::DROP_TABLE_STMT:
             return PlanDropTable(*std::static_pointer_cast<DropTableStatement>(statement));
+        case NodeType::TRUNCATE_TABLE_STMT:
+            return PlanTruncateTable(*std::static_pointer_cast<TruncateTableStatement>(statement));
         default:
             return nullptr;
     }
@@ -197,6 +199,10 @@ PlanNodePtr Planner::PlanCreateTable(const CreateTableStatement& stmt) {
 
 PlanNodePtr Planner::PlanDropTable(const DropTableStatement& stmt) {
     return std::make_shared<DropTableNode>(stmt.table_name);
+}
+
+PlanNodePtr Planner::PlanTruncateTable(const TruncateTableStatement& stmt) {
+    return std::make_shared<TruncateTableNode>(stmt.table_name);
 }
 
 }  // namespace sqlcompiler

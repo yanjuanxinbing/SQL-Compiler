@@ -20,6 +20,7 @@ enum class NodeType {
     DELETE_STMT,
     CREATE_TABLE_STMT,
     DROP_TABLE_STMT,
+    TRUNCATE_TABLE_STMT,
 
     // ---- 表达式 ----
     BINARY_EXPR,
@@ -245,6 +246,17 @@ public:
 class DropTableStatement : public Statement {
 public:
     DropTableStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string table_name;
+};
+
+// TRUNCATE TABLE 语句：清空表中所有数据，但保留表结构
+class TruncateTableStatement : public Statement {
+public:
+    TruncateTableStatement();
 
     NodeType GetType() const override;
     std::string ToString() const override;

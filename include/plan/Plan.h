@@ -21,7 +21,8 @@ enum class PlanNodeType {
     UPDATE,        // 更新
     DELETE,        // 删除
     CREATE_TABLE,  // 建表
-    DROP_TABLE     // 删表
+    DROP_TABLE,    // 删表
+    TRUNCATE_TABLE // 清空表数据（保留表结构）
 };
 
 // 执行计划节点基类，采用树形结构，子节点为输入
@@ -176,6 +177,17 @@ public:
 class DropTableNode : public PlanNode {
 public:
     explicit DropTableNode(std::string table_name);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string table_name;
+};
+
+// 清空表节点
+class TruncateTableNode : public PlanNode {
+public:
+    explicit TruncateTableNode(std::string table_name);
 
     PlanNodeType GetType() const override;
     std::string ToString() const override;

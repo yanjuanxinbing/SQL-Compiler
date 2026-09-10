@@ -316,4 +316,17 @@ std::string DropTableStatement::ToString() const {
     return "DROP TABLE " + table_name;
 }
 
+// ============ TruncateTableStatement ============
+
+TruncateTableStatement::TruncateTableStatement() {
+}
+
+NodeType TruncateTableStatement::GetType() const {
+    return NodeType::TRUNCATE_TABLE_STMT;
+}
+
+std::string TruncateTableStatement::ToString() const {
+    return "TRUNCATE TABLE " + table_name;
+}
+
 }  // namespace sqlcompiler

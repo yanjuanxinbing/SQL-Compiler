@@ -33,6 +33,9 @@ bool SemanticAnalyzer::Analyze(const StatementPtr& statement) {
         case NodeType::DROP_TABLE_STMT:
             ok = AnalyzeDropTable(*std::static_pointer_cast<DropTableStatement>(statement));
             break;
+        case NodeType::TRUNCATE_TABLE_STMT:
+            ok = AnalyzeTruncateTable(*std::static_pointer_cast<TruncateTableStatement>(statement));
+            break;
         default:
             AddError("unsupported statement type");
             ok = false;
@@ -145,6 +148,10 @@ bool SemanticAnalyzer::AnalyzeCreateTable(const CreateTableStatement& stmt) {
 }
 
 bool SemanticAnalyzer::AnalyzeDropTable(const DropTableStatement& stmt) {
+    return CheckTableExists(stmt.table_name);
+}
+
+bool SemanticAnalyzer::AnalyzeTruncateTable(const TruncateTableStatement& stmt) {
     return CheckTableExists(stmt.table_name);
 }
 

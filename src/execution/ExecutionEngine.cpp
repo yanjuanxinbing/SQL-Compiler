@@ -13,6 +13,7 @@
 #include "execution/ProjectExecutor.h"
 #include "execution/SeqScanExecutor.h"
 #include "execution/SortExecutor.h"
+#include "execution/TruncateTableExecutor.h"
 #include "execution/UpdateExecutor.h"
 
 #include <utility>
@@ -257,6 +258,10 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
         case PlanNodeType::DROP_TABLE: {
             auto n = std::static_pointer_cast<DropTableNode>(plan_node);
             return std::make_unique<DropTableExecutor>(context, n->table_name);
+        }
+        case PlanNodeType::TRUNCATE_TABLE: {
+            auto n = std::static_pointer_cast<TruncateTableNode>(plan_node);
+            return std::make_unique<TruncateTableExecutor>(context, n->table_name);
         }
         default:
             throw CompilerException(ErrorStage::CODEGEN,
