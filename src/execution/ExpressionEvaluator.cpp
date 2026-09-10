@@ -1,6 +1,5 @@
 #include "execution/ExpressionEvaluator.h"
 
-#include <cstdio>
 #include <cstdlib>
 
 namespace sqlcompiler {
@@ -105,8 +104,6 @@ Value ExpressionEvaluator::EvaluateLiteral(const LiteralExpr& expr) const {
 
 Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
                                               const Tuple& tuple) const {
-    fprintf(stderr, "[DBG] col=%s, map_size=%zu, val_count=%zu\n",
-            expr.column_name.c_str(), column_index_map_.size(), tuple.ColumnCount());
     auto it = column_index_map_.find(expr.column_name);
     if (it == column_index_map_.end()) {
         // case-insensitive fallback

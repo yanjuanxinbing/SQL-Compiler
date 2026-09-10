@@ -196,8 +196,19 @@ Token Lexer::ScanString() {
     int start_col = column_;
     Advance(); // consume opening '
     std::string buf;
-    while (!IsAtEnd() && CurrentChar() != '\'') {
+    while (!IsAtEnd()) {
         char c = CurrentChar();
+        if (c == '\'') {
+            // SQL 标准双单引号转义 ''
+            if (PeekChar() == '\'') {
+                buf.push_back('\'');
+                Advance();
+                Advance();
+                continue;
+            }
+            // 闭合引号
+            break;
+        }
         if (c == '\\' && PeekChar() != '\0') {
             Advance();
             char esc = CurrentChar();
@@ -211,13 +222,6 @@ Token Lexer::ScanString() {
                 case '0': buf.push_back('\0'); break;
                 default: buf.push_back(esc); break;
             }
-            Advance();
-            continue;
-        }
-        // SQL 标准的双单引号转义 ''
-        if (c == '\'' && PeekChar() == '\'') {
-            buf.push_back('\'');
-            Advance();
             Advance();
             continue;
         }
@@ -308,7 +312,8 @@ Token Lexer::NextToken() {
     if (c == '\'') {
         return ScanString();
     }
-    return ScanOperatorOrSymbol();
+    Token tk = ScanOperatorOrSymbol();
+    return tk;
 }
 
 Token Lexer::PeekToken() {

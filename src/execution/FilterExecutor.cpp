@@ -2,8 +2,6 @@
 
 #include "execution/ExpressionEvaluator.h"
 
-#include <cstdio>
-
 namespace sqlcompiler {
 
 FilterExecutor::FilterExecutor(ExecutionContext* context, ExecutorPtr child, ExprPtr predicate,
@@ -24,7 +22,6 @@ bool FilterExecutor::Next(Tuple* tuple) {
     while (child_->Next(&tmp)) {
         ExpressionEvaluator eval(column_index_map_);
         Value v = eval.Evaluate(predicate_, tmp);
-        fprintf(stderr, "[FLT] res=%d\n", v.IsNull() ? -1 : (int)v.AsInt());
         if (!v.IsNull() && v.AsInt() != 0) {
             if (tuple) *tuple = tmp;
             return true;
