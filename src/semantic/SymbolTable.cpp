@@ -14,6 +14,13 @@ std::string ToUpper(const std::string& s) {
     return out;
 }
 
+std::string ToLower(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    return out;
+}
+
 bool EqualsIgnoreCase(const std::string& a, const std::string& b) {
     return ToUpper(a) == ToUpper(b);
 }
@@ -38,22 +45,24 @@ SymbolTable::SymbolTable() {
 }
 
 bool SymbolTable::AddTable(const TableInfo& table_info) {
-    auto it = tables_.find(table_info.table_name);
-    if (it != tables_.end()) return false;
-    tables_[table_info.table_name] = table_info;
+    std::string key = ToLower(table_info.table_name);
+    if (tables_.find(key) != tables_.end()) return false;
+    TableInfo ti = table_info;
+    ti.table_name = table_info.table_name;
+    tables_[key] = ti;
     return true;
 }
 
 bool SymbolTable::RemoveTable(const std::string& table_name) {
-    return tables_.erase(table_name) > 0;
+    return tables_.erase(ToLower(table_name)) > 0;
 }
 
 bool SymbolTable::HasTable(const std::string& table_name) const {
-    return tables_.find(table_name) != tables_.end();
+    return tables_.find(ToLower(table_name)) != tables_.end();
 }
 
 const TableInfo* SymbolTable::GetTable(const std::string& table_name) const {
-    auto it = tables_.find(table_name);
+    auto it = tables_.find(ToLower(table_name));
     if (it == tables_.end()) return nullptr;
     return &it->second;
 }
@@ -76,7 +85,7 @@ bool SymbolTable::AddTableFromCreateStatement(const CreateTableStatement& stmt) 
 std::vector<std::string> SymbolTable::GetAllTableNames() const {
     std::vector<std::string> names;
     names.reserve(tables_.size());
-    for (const auto& kv : tables_) names.push_back(kv.first);
+    for (const auto& kv : tables_) names.push_back(kv.second.table_name);
     return names;
 }
 

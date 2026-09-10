@@ -120,7 +120,8 @@ std::string NodeBodyToString(const PlanNode& node, int depth) {
 
 // ============ SeqScanNode ============
 
-SeqScanNode::SeqScanNode(std::string table_name) : table_name(std::move(table_name)) {
+SeqScanNode::SeqScanNode(std::string table_name, std::string table_alias)
+    : table_name(std::move(table_name)), table_alias(std::move(table_alias)) {
 }
 
 PlanNodeType SeqScanNode::GetType() const {
@@ -146,7 +147,10 @@ std::string FilterNode::ToString() const {
 
 // ============ ProjectNode ============
 
-ProjectNode::ProjectNode(std::vector<ExprPtr> columns) : columns(std::move(columns)) {
+ProjectNode::ProjectNode(std::vector<ExprPtr> columns,
+                          std::vector<std::string> aliases,
+                          bool is_distinct)
+    : columns(std::move(columns)), aliases(std::move(aliases)), is_distinct(is_distinct) {
 }
 
 PlanNodeType ProjectNode::GetType() const {
@@ -186,7 +190,8 @@ std::string SortNode::ToString() const {
 
 // ============ LimitNode ============
 
-LimitNode::LimitNode(int limit_count) : limit_count(limit_count) {
+LimitNode::LimitNode(int limit_count, int offset)
+    : limit_count(limit_count), offset(offset) {
 }
 
 PlanNodeType LimitNode::GetType() const {

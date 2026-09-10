@@ -40,6 +40,13 @@ enum class TokenType {
     KEYWORD_FLOAT,
     KEYWORD_PRIMARY,
     KEYWORD_KEY,
+    KEYWORD_IS,
+    KEYWORD_LIKE,
+    KEYWORD_IN,
+    KEYWORD_BETWEEN,
+    KEYWORD_ASC,
+    KEYWORD_IF,
+    KEYWORD_TRUNCATE,
 
     // ---- 标识符与字面量 ----
     IDENTIFIER,
@@ -63,6 +70,7 @@ enum class TokenType {
     COMMA,             // ,
     SEMICOLON,         // ;
     DOT,               // .
+    BACKTICK,          // ` 用于中文等特殊标识符
 
     END_OF_FILE,
     UNKNOWN

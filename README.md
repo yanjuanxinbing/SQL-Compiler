@@ -97,9 +97,8 @@ SQL-Compiler/
 │   │
 │   └── db/Database.h               # 门面类：ExecuteSQL(sql) 一站式入口
 │
-├── src/                             # 与include一一对应的实现文件（骨架，全部为TODO）
-│   └── main.cpp                     # CLI入口
-└── tests/                           # 预留测试目录
+└── src/                             # 与include一一对应的实现文件（骨架，全部为TODO）
+    └── main.cpp                     # CLI入口
 ```
 
 ## 模块职责一览

@@ -4,7 +4,6 @@
 
 #include <cctype>
 #include <unordered_map>
-#include <utility>
 
 namespace sqlcompiler {
 
@@ -45,6 +44,13 @@ const std::unordered_map<std::string, TokenType>& KeywordTable() {
         {"FLOAT",    TokenType::KEYWORD_FLOAT},
         {"PRIMARY",  TokenType::KEYWORD_PRIMARY},
         {"KEY",      TokenType::KEYWORD_KEY},
+        {"IS",       TokenType::KEYWORD_IS},
+        {"LIKE",     TokenType::KEYWORD_LIKE},
+        {"IN",       TokenType::KEYWORD_IN},
+        {"BETWEEN",  TokenType::KEYWORD_BETWEEN},
+        {"ASC",      TokenType::KEYWORD_ASC},
+        {"IF",       TokenType::KEYWORD_IF},
+        {"TRUNCATE", TokenType::KEYWORD_TRUNCATE},
     };
     return kKeywords;
 }
@@ -208,6 +214,13 @@ Token Lexer::ScanString() {
             Advance();
             continue;
         }
+        // SQL 标准的双单引号转义 ''
+        if (c == '\'' && PeekChar() == '\'') {
+            buf.push_back('\'');
+            Advance();
+            Advance();
+            continue;
+        }
         buf.push_back(c);
         Advance();
     }
@@ -224,6 +237,23 @@ Token Lexer::ScanOperatorOrSymbol() {
     int start_col = column_;
     char c = CurrentChar();
     char n = PeekChar();
+    // Backtick identifier (for ``...`` 形式的中文等特殊标识符)
+    if (c == '`') {
+        int start_line = line_;
+        int start_col = column_;
+        Advance(); // consume opening `
+        std::string buf;
+        while (!IsAtEnd() && CurrentChar() != '`') {
+            buf.push_back(CurrentChar());
+            Advance();
+        }
+        if (IsAtEnd()) {
+            throw CompilerException(ErrorStage::LEXICAL,
+                "unterminated backtick identifier", start_line, start_col);
+        }
+        Advance(); // consume closing `
+        return Token(TokenType::IDENTIFIER, buf, start_line, start_col);
+    }
     // Two-character operators first
     if (c == '!' && n == '=') {
         Advance(); Advance();

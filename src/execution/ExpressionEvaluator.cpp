@@ -1,5 +1,6 @@
 #include "execution/ExpressionEvaluator.h"
 
+#include <cstdio>
 #include <cstdlib>
 
 namespace sqlcompiler {
@@ -23,6 +24,42 @@ int CompareToInt(const Value& a, const Value& b) {
     if (c < 0) return 1;
     if (c > 0) return 0;
     return 1;  // equal => true
+}
+
+// SQL LIKE pattern matching: '%' matches any sequence, '_' matches one char.
+// Other characters are matched literally. '\' escapes the next character.
+bool MatchLikePattern(const std::string& s, const std::string& p) {
+    size_t i = 0, j = 0;
+    size_t star_i = std::string::npos, star_j = 0;
+    while (i < s.size()) {
+        if (j < p.size() && (p[j] == '_' ||
+            (p[j] == '\\' && j + 1 < p.size() && (p[j + 1] == '_' || p[j + 1] == '%')))) {
+            if (p[j] == '\\') ++j;
+            ++i;
+            ++j;
+        } else if (j < p.size() && p[j] == '%') {
+            star_i = i;
+            star_j = j;
+            ++j;
+        } else if (j < p.size() && p[j] == '\\' && j + 1 < p.size()) {
+            if (p[j + 1] == s[i]) { ++i; j += 2; }
+            else if (star_i != std::string::npos) {
+                i = ++star_i;
+                j = star_j + 1;
+            } else {
+                return false;
+            }
+        } else if (j < p.size() && p[j] == s[i]) {
+            ++i; ++j;
+        } else if (star_i != std::string::npos) {
+            i = ++star_i;
+            j = star_j + 1;
+        } else {
+            return false;
+        }
+    }
+    while (j < p.size() && p[j] == '%') ++j;
+    return j == p.size();
 }
 
 }  // namespace
@@ -68,9 +105,22 @@ Value ExpressionEvaluator::EvaluateLiteral(const LiteralExpr& expr) const {
 
 Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
                                               const Tuple& tuple) const {
+    fprintf(stderr, "[DBG] col=%s, map_size=%zu, val_count=%zu\n",
+            expr.column_name.c_str(), column_index_map_.size(), tuple.ColumnCount());
     auto it = column_index_map_.find(expr.column_name);
     if (it == column_index_map_.end()) {
-        return Value::MakeNull();
+        // case-insensitive fallback
+        std::string lc;
+        for (char c : expr.column_name) lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        for (auto& kv : column_index_map_) {
+            std::string kc;
+            for (char c : kv.first) kc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            if (kc == lc) { it = column_index_map_.find(kv.first); break; }
+        }
+        if (it == column_index_map_.end()) {
+            // fprintf(stderr, "[DBG] NOT FOUND %s\n", expr.column_name.c_str());
+            return Value::MakeNull();
+        }
     }
     if (it->second >= tuple.ColumnCount()) {
         return Value::MakeNull();
@@ -138,6 +188,39 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
             return MakeBool(IsTruthy(l) && IsTruthy(r));
         case BinaryOperator::OR:
             return MakeBool(IsTruthy(l) || IsTruthy(r));
+        case BinaryOperator::IS_NULL:
+            return MakeBool(l.IsNull());
+        case BinaryOperator::IS_NOT_NULL:
+            return MakeBool(!l.IsNull());
+        case BinaryOperator::LIKE: {
+            if (l.GetType() != ValueType::VARCHAR || r.GetType() != ValueType::VARCHAR) {
+                return MakeBool(false);
+            }
+            return MakeBool(MatchLikePattern(l.AsVarchar(), r.AsVarchar()));
+        }
+        case BinaryOperator::IN_LIST: {
+            // right is a FunctionCallExpr("__IN_LIST__", [...values])
+            if (!expr.right || expr.right->GetType() != NodeType::FUNCTION_CALL_EXPR) {
+                return MakeBool(false);
+            }
+            auto fc = std::static_pointer_cast<FunctionCallExpr>(expr.right);
+            for (const auto& v : fc->arguments) {
+                Value vv = Evaluate(v, tuple);
+                if (Value::Compare(l, vv) == 0) return MakeBool(true);
+            }
+            return MakeBool(false);
+        }
+        case BinaryOperator::BETWEEN: {
+            if (!expr.right || expr.right->GetType() != NodeType::FUNCTION_CALL_EXPR) {
+                return MakeBool(false);
+            }
+            auto fc = std::static_pointer_cast<FunctionCallExpr>(expr.right);
+            if (fc->arguments.size() != 2) return MakeBool(false);
+            Value low = Evaluate(fc->arguments[0], tuple);
+            Value high = Evaluate(fc->arguments[1], tuple);
+            return MakeBool(Value::Compare(l, low) >= 0 &&
+                            Value::Compare(l, high) <= 0);
+        }
     }
     return Value::MakeNull();
 }

@@ -61,6 +61,37 @@ bool InsertExecutor::Next(Tuple* tuple) {
         }
     }
 
+    // AUTO_INCREMENT: 首列为 PRIMARY KEY 且未赋值时自动编号
+    if (!info->columns.empty() && info->columns[0].is_primary_key) {
+        size_t idx = 0;
+        bool need_autoinc = row_values[idx].IsNull();
+        if (!need_autoinc && row_values[idx].GetType() == ValueType::INTEGER &&
+            columns_.size() > 0) {
+            // 检查该列是否在 columns_ 中且被赋了值
+            for (const auto& c : columns_) {
+                if (c == info->columns[0].name) { need_autoinc = false; break; }
+            }
+        }
+        if (need_autoinc) {
+            std::vector<ValueType> schema;
+            for (const auto& c : info->columns) {
+                if (c.data_type == "INT" || c.data_type == "INTEGER" || c.data_type == "BIGINT")
+                    schema.push_back(ValueType::INTEGER);
+                else if (c.data_type == "FLOAT" || c.data_type == "DOUBLE" || c.data_type == "DECIMAL")
+                    schema.push_back(ValueType::FLOAT);
+                else
+                    schema.push_back(ValueType::VARCHAR);
+            }
+            auto it = heap->Begin();
+            int count = 0;
+            while (it.HasNext()) {
+                Tuple t = it.Next(schema);
+                if (t.ColumnCount() > 0) ++count;
+            }
+            row_values[idx] = Value::MakeInt(count + 1);
+        }
+    }
+
     Tuple t(std::move(row_values));
     RID rid;
     if (!heap->InsertTuple(t, &rid)) {

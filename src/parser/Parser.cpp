@@ -92,6 +92,15 @@ StatementPtr Parser::ParseStatement() {
         case TokenType::KEYWORD_DELETE: return ParseDeleteStatement();
         case TokenType::KEYWORD_CREATE: return ParseCreateTableStatement();
         case TokenType::KEYWORD_DROP:   return ParseDropTableStatement();
+        case TokenType::KEYWORD_TRUNCATE: {
+            // TRUNCATE TABLE x 等价于 DROP TABLE x（清空表）
+            Advance(); // TRUNCATE
+            Expect(TokenType::KEYWORD_TABLE, "expected TABLE after TRUNCATE");
+            Token t = Expect(TokenType::IDENTIFIER, "expected table name");
+            auto stmt = std::make_shared<DropTableStatement>();
+            stmt->table_name = t.lexeme;
+            return stmt;
+        }
         default: {
             throw CompilerException(ErrorStage::SYNTAX,
                 "unexpected token at start of statement: '" + cur.lexeme + "'",
@@ -106,25 +115,73 @@ StatementPtr Parser::ParseSelectStatement() {
     if (Match(TokenType::KEYWORD_DISTINCT)) {
         stmt->is_distinct = true;
     }
-    stmt->select_list = ParseSelectList();
-    Expect(TokenType::KEYWORD_FROM, "expected FROM");
-    Token table = Expect(TokenType::IDENTIFIER, "expected table name");
-    stmt->from_table = table.lexeme;
-    stmt->joins = ParseJoinClauses();
-    if (Check(TokenType::KEYWORD_WHERE)) {
-        stmt->where_clause = ParseWhereClause();
+    // 解析 select list 并同步收集别名（每个表达式后可有 AS 或隐式别名）
+    stmt->select_list.clear();
+    stmt->select_aliases.clear();
+    auto parse_alias = [&]() -> std::string {
+        std::string alias;
+        if (Match(TokenType::KEYWORD_AS)) {
+            Token a = Expect(TokenType::IDENTIFIER, "expected alias name after AS");
+            alias = a.lexeme;
+        } else if (CurrentToken().type == TokenType::IDENTIFIER &&
+                   !Check(TokenType::KEYWORD_FROM) && !Check(TokenType::KEYWORD_WHERE) &&
+                   !Check(TokenType::KEYWORD_GROUP) && !Check(TokenType::KEYWORD_HAVING) &&
+                   !Check(TokenType::KEYWORD_ORDER) && !Check(TokenType::KEYWORD_LIMIT) &&
+                   !Check(TokenType::COMMA) && !Check(TokenType::SEMICOLON) &&
+                   !Check(TokenType::RIGHT_PAREN) && !Check(TokenType::KEYWORD_INNER) &&
+                   !Check(TokenType::KEYWORD_LEFT) && !Check(TokenType::KEYWORD_RIGHT) &&
+                   !Check(TokenType::KEYWORD_JOIN) && !Check(TokenType::KEYWORD_ON) &&
+                   !Check(TokenType::KEYWORD_AS) && !IsAtEnd()) {
+            alias = CurrentToken().lexeme;
+            Advance();
+        }
+        return alias;
+    };
+        do {
+        ExprPtr e;
+        if (Check(TokenType::OP_STAR)) {
+            Advance();
+            e = std::make_shared<FunctionCallExpr>("*", std::vector<ExprPtr>{});
+        } else {
+            e = ParseExpression();
+        }
+        stmt->select_list.push_back(e);
+        stmt->select_aliases.push_back(parse_alias());
+    } while (Match(TokenType::COMMA));
+    if (Check(TokenType::KEYWORD_FROM)) {
+        Advance();
+        Token table = Expect(TokenType::IDENTIFIER, "expected table name");
+        stmt->from_table = table.lexeme;
+        if (Match(TokenType::KEYWORD_AS)) {
+            Token a = Expect(TokenType::IDENTIFIER, "expected table alias");
+            stmt->from_table_alias = a.lexeme;
+        } else if (CurrentToken().type == TokenType::IDENTIFIER &&
+                   !Check(TokenType::KEYWORD_WHERE) && !Check(TokenType::KEYWORD_INNER) &&
+                   !Check(TokenType::KEYWORD_LEFT) && !Check(TokenType::KEYWORD_RIGHT) &&
+                   !Check(TokenType::KEYWORD_JOIN) && !Check(TokenType::KEYWORD_GROUP) &&
+                   !Check(TokenType::KEYWORD_HAVING) && !Check(TokenType::KEYWORD_ORDER) &&
+                   !Check(TokenType::KEYWORD_LIMIT) &&
+                   !Check(TokenType::SEMICOLON) && !IsAtEnd()) {
+            stmt->from_table_alias = CurrentToken().lexeme;
+            Advance();
+        }
+        stmt->joins = ParseJoinClauses();
     }
-    if (Check(TokenType::KEYWORD_GROUP)) {
-        stmt->group_by = ParseGroupByClause();
-    }
-    if (Check(TokenType::KEYWORD_HAVING)) {
-        stmt->having_clause = ParseHavingClause();
-    }
-    if (Check(TokenType::KEYWORD_ORDER)) {
-        stmt->order_by = ParseOrderByClause();
-    }
+    if (Check(TokenType::KEYWORD_WHERE)) stmt->where_clause = ParseWhereClause();
+    if (Check(TokenType::KEYWORD_GROUP)) stmt->group_by = ParseGroupByClause();
+    if (Check(TokenType::KEYWORD_HAVING)) stmt->having_clause = ParseHavingClause();
+    if (Check(TokenType::KEYWORD_ORDER)) stmt->order_by = ParseOrderByClause();
     if (Check(TokenType::KEYWORD_LIMIT)) {
-        stmt->limit = ParseLimitClause();
+        Advance();
+        Token first = Expect(TokenType::INTEGER_LITERAL, "expected integer after LIMIT");
+        int first_val = std::atoi(first.lexeme.c_str());
+        if (Match(TokenType::COMMA)) {
+            stmt->limit_offset = first_val;
+            Token second = Expect(TokenType::INTEGER_LITERAL, "expected integer after ','");
+            stmt->limit = std::atoi(second.lexeme.c_str());
+        } else {
+            stmt->limit = first_val;
+        }
     }
     return stmt;
 }
@@ -190,6 +247,19 @@ StatementPtr Parser::ParseDeleteStatement() {
 StatementPtr Parser::ParseCreateTableStatement() {
     Expect(TokenType::KEYWORD_CREATE, "expected CREATE");
     Expect(TokenType::KEYWORD_TABLE, "expected TABLE");
+    bool if_not_exists = false;
+    if (Check(TokenType::KEYWORD_IF)) {
+        Advance();
+        Expect(TokenType::KEYWORD_NOT, "expected NOT after IF");
+        // EXISTS 作为普通标识符
+        if (CurrentToken().type == TokenType::IDENTIFIER &&
+            CurrentToken().lexeme == "EXISTS") {
+            Advance();
+        } else {
+            Expect(TokenType::IDENTIFIER, "expected EXISTS after IF NOT");
+        }
+        if_not_exists = true;
+    }
     Token table = Expect(TokenType::IDENTIFIER, "expected table name");
     auto stmt = std::make_shared<CreateTableStatement>();
     stmt->table_name = table.lexeme;
@@ -220,6 +290,11 @@ std::vector<ExprPtr> Parser::ParseSelectList() {
     }
     list.push_back(ParseExpression());
     while (Match(TokenType::COMMA)) {
+        if (Check(TokenType::OP_STAR)) {
+            Advance();
+            list.push_back(std::make_shared<FunctionCallExpr>("*", std::vector<ExprPtr>{}));
+            continue;
+        }
         list.push_back(ParseExpression());
     }
     return list;
@@ -249,6 +324,12 @@ JoinClause Parser::ParseJoinClause() {
     Expect(TokenType::KEYWORD_JOIN, "expected JOIN");
     Token t = Expect(TokenType::IDENTIFIER, "expected joined table name");
     jc.table_name = t.lexeme;
+    // 表可名（user u INNER JOIN)
+    if (CurrentToken().type == TokenType::IDENTIFIER &&
+        !Check(TokenType::KEYWORD_ON)) {
+        jc.table_alias = CurrentToken().lexeme;
+        Advance();
+    }
     Expect(TokenType::KEYWORD_ON, "expected ON");
     jc.on_condition = ParseExpression();
     return jc;
@@ -282,35 +363,7 @@ std::vector<OrderByItem> Parser::ParseOrderByClause() {
     do {
         OrderByItem it;
         it.expr = ParseExpression();
-        if (Match(TokenType::KEYWORD_BY)) {
-            // shouldn't really happen
-        }
-        // ASC / DESC keyword detection: BY is used for ORDER BY grouping, not here.
-        // We treat any trailing ASC/DESC keywords as order direction.
-        items.push_back(it);
-    } while (false); // single pass; multi-ordering can be added later
-    // Note: re-parse properly handling comma-separated and ASC/DESC
-    items.clear();
-    do {
-        OrderByItem it;
-        it.expr = ParseExpression();
-        if (Check(TokenType::KEYWORD_BY)) {
-            // ambiguous - probably means ASC (default), so consume nothing more
-        } else if (Match(TokenType::IDENTIFIER)) {
-            // Not a keyword; treat identifier as... don't decrement. Stop here.
-            // We can't really un-advance. This is a known limitation.
-        }
-        // The original grammar in README supports ASC/DESC keywords but they aren't
-        // TokenType keywords - they're just identifiers. We accept either
-        // a special token-like identifier "ASC"/"DESC" treated as ascending flag.
-        items.push_back(it);
-    } while (false);
-
-    // Best-effort: rewrite using proper ASC/DESC handling with identifier checks.
-    items.clear();
-    do {
-        OrderByItem it;
-        it.expr = ParseExpression();
+        // ASC / DESC 用作普通标识符；遇到大写的 ASC/DESC 标识符则解释为方向关键字
         if (CurrentToken().type == TokenType::IDENTIFIER) {
             std::string up = CurrentToken().lexeme;
             for (auto& ch : up) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
@@ -363,6 +416,21 @@ ColumnDefinition Parser::ParseColumnDefinition() {
         throw CompilerException(ErrorStage::SYNTAX,
             "expected column type", ty.line, ty.column);
     }
+    // 可选类型参数：VARCHAR(N) / CHAR(N) 等
+    if (Match(TokenType::LEFT_PAREN)) {
+        // 吃掉整数后关闭括号
+        if (CurrentToken().type == TokenType::INTEGER_LITERAL) {
+            Advance();
+        }
+        Expect(TokenType::RIGHT_PAREN, "expected ')' after type parameter");
+    }
+    auto skip_auto_inc = [&]() {
+        if (CurrentToken().type == TokenType::IDENTIFIER &&
+            CurrentToken().lexeme == "AUTO_INCREMENT") {
+            Advance();
+        }
+    };
+    skip_auto_inc();
     if (Check(TokenType::KEYWORD_PRIMARY)) {
         Advance();
         Expect(TokenType::KEYWORD_KEY, "expected KEY after PRIMARY");
@@ -373,6 +441,7 @@ ColumnDefinition Parser::ParseColumnDefinition() {
         Expect(TokenType::KEYWORD_NULL, "expected NULL after NOT");
         cd.is_not_null = true;
     }
+    skip_auto_inc();
     return cd;
 }
 
@@ -413,6 +482,58 @@ ExprPtr Parser::ParseNotExpr() {
 ExprPtr Parser::ParseComparisonExpr() {
     ExprPtr left = ParseAdditiveExpr();
     const Token& cur = CurrentToken();
+
+    // IS [NOT] NULL (postfix)
+    if (Check(TokenType::KEYWORD_IS)) {
+        Advance();
+        bool is_not = Check(TokenType::KEYWORD_NOT);
+        if (is_not) Advance();
+        Expect(TokenType::KEYWORD_NULL, "expected NULL after IS [NOT]");
+        return std::make_shared<BinaryExpr>(
+            is_not ? BinaryOperator::IS_NOT_NULL : BinaryOperator::IS_NULL,
+            left, nullptr);
+    }
+
+    // LIKE <pattern>
+    if (Check(TokenType::KEYWORD_LIKE)) {
+        Advance();
+        ExprPtr right = ParseAdditiveExpr();
+        return std::make_shared<BinaryExpr>(BinaryOperator::LIKE, left, right);
+    }
+
+    // IN (val1, val2, ...)
+    if (Check(TokenType::KEYWORD_IN)) {
+        Advance();
+        Expect(TokenType::LEFT_PAREN, "expected '(' after IN");
+        std::vector<ExprPtr> values;
+        if (!Check(TokenType::RIGHT_PAREN)) {
+            values.push_back(ParseExpression());
+            while (Match(TokenType::COMMA)) {
+                values.push_back(ParseExpression());
+            }
+        }
+        Expect(TokenType::RIGHT_PAREN, "expected ')' after IN list");
+        // Encode as BinaryExpr with IN_LIST and a special list operand:
+        // We wrap the values list in a synthetic FunctionCallExpr so the
+        // expression evaluator can iterate over them.
+        auto list_expr = std::make_shared<FunctionCallExpr>("__IN_LIST__", values);
+        return std::make_shared<BinaryExpr>(BinaryOperator::IN_LIST, left, list_expr);
+    }
+
+    // BETWEEN x AND y
+    if (Check(TokenType::KEYWORD_BETWEEN)) {
+        Advance();
+        ExprPtr low = ParseAdditiveExpr();
+        Expect(TokenType::KEYWORD_AND, "expected AND after BETWEEN");
+        ExprPtr high = ParseAdditiveExpr();
+        // Encode BETWEEN as a synthetic BinaryExpr with BETWEEN and high
+        // being the original right operand; low stored as a side info via
+        // a FunctionCallExpr wrapping {low, high}.
+        auto range = std::make_shared<FunctionCallExpr>("__BETWEEN_RANGE__",
+            std::vector<ExprPtr>{low, high});
+        return std::make_shared<BinaryExpr>(BinaryOperator::BETWEEN, left, range);
+    }
+
     BinaryOperator op;
     bool matched = true;
     switch (cur.type) {

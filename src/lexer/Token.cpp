@@ -39,6 +39,11 @@ std::string TokenTypeToString(TokenType type) {
         case TokenType::KEYWORD_FLOAT:     return "KEYWORD_FLOAT";
         case TokenType::KEYWORD_PRIMARY:   return "KEYWORD_PRIMARY";
         case TokenType::KEYWORD_KEY:       return "KEYWORD_KEY";
+        case TokenType::KEYWORD_IS:        return "KEYWORD_IS";
+        case TokenType::KEYWORD_LIKE:      return "KEYWORD_LIKE";
+        case TokenType::KEYWORD_IN:        return "KEYWORD_IN";
+        case TokenType::KEYWORD_BETWEEN:   return "KEYWORD_BETWEEN";
+        case TokenType::KEYWORD_ASC:       return "KEYWORD_ASC";
         case TokenType::IDENTIFIER:        return "IDENTIFIER";
         case TokenType::INTEGER_LITERAL:   return "INTEGER_LITERAL";
         case TokenType::FLOAT_LITERAL:     return "FLOAT_LITERAL";

@@ -35,15 +35,16 @@ public:
 };
 using PlanNodePtr = std::shared_ptr<PlanNode>;
 
-// 全表扫描节点
+// 全表扫描节点：table_alias 用于限定列引用（如 FROM user u -> 列 u.id）
 class SeqScanNode : public PlanNode {
 public:
-    explicit SeqScanNode(std::string table_name);
+    SeqScanNode(std::string table_name, std::string table_alias = "");
 
     PlanNodeType GetType() const override;
     std::string ToString() const override;
 
     std::string table_name;
+    std::string table_alias;
 };
 
 // 过滤节点
@@ -60,12 +61,16 @@ public:
 // 投影节点
 class ProjectNode : public PlanNode {
 public:
-    explicit ProjectNode(std::vector<ExprPtr> columns);
+    ProjectNode(std::vector<ExprPtr> columns,
+                std::vector<std::string> aliases = {},
+                bool is_distinct = false);
 
     PlanNodeType GetType() const override;
     std::string ToString() const override;
 
     std::vector<ExprPtr> columns;
+    std::vector<std::string> aliases;  // 与 columns 平行，可空
+    bool is_distinct;
 };
 
 // 连接节点
@@ -91,15 +96,16 @@ public:
     std::vector<OrderByItem> order_items;
 };
 
-// 限制行数节点
+// 限制行数节点：支持 LIMIT count 或 LIMIT offset, count 两种形式
 class LimitNode : public PlanNode {
 public:
-    explicit LimitNode(int limit_count);
+    LimitNode(int limit_count, int offset = 0);
 
     PlanNodeType GetType() const override;
     std::string ToString() const override;
 
     int limit_count;
+    int offset;
 };
 
 // 聚合节点

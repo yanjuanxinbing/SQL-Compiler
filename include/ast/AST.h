@@ -93,7 +93,12 @@ enum class BinaryOperator {
     GREATER,
     GREATER_EQUAL,
     AND,
-    OR
+    OR,
+    LIKE,
+    IN_LIST,
+    BETWEEN,
+    IS_NULL,
+    IS_NOT_NULL
 };
 
 // 二元表达式，如 a = b / a AND b / a + b
@@ -152,6 +157,7 @@ enum class JoinType { INNER, LEFT, RIGHT };
 struct JoinClause {
     JoinType join_type;
     std::string table_name;
+    std::string table_alias;
     ExprPtr on_condition;
 };
 
@@ -173,13 +179,16 @@ public:
 
     bool is_distinct = false;
     std::vector<ExprPtr> select_list;   // 选择的列/表达式，*表示全部列
+    std::vector<std::string> select_aliases;  // 与 select_list 平行的别名（可能为空）
     std::string from_table;
+    std::string from_table_alias;       // 表别名（FROM t AS a）
     std::vector<JoinClause> joins;
     ExprPtr where_clause;               // 可为空
     std::vector<ExprPtr> group_by;
     ExprPtr having_clause;              // 可为空
     std::vector<OrderByItem> order_by;
     int limit = -1;                     // -1 表示不限制
+    int limit_offset = 0;               // LIMIT offset, count 形式
 };
 
 // INSERT 语句

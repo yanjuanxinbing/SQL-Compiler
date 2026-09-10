@@ -50,15 +50,26 @@ void SemanticAnalyzer::ClearErrors() {
 
 bool SemanticAnalyzer::AnalyzeSelect(const SelectStatement& stmt) {
     bool ok = true;
-    ok &= CheckTableExists(stmt.from_table);
-    for (auto& e : stmt.select_list) ok &= CheckExpression(e, stmt.from_table);
-    if (stmt.where_clause) ok &= CheckExpression(stmt.where_clause, stmt.from_table);
-    for (auto& e : stmt.group_by) ok &= CheckExpression(e, stmt.from_table);
-    if (stmt.having_clause) ok &= CheckExpression(stmt.having_clause, stmt.from_table);
-    for (auto& it : stmt.order_by) ok &= CheckExpression(it.expr, stmt.from_table);
+    if (!stmt.from_table.empty()) {
+        ok &= CheckTableExists(stmt.from_table);
+    }
+
+    // 收集所有真实表名（不含别名），用于 CheckColumnExists 跨表查找
+    std::vector<std::string> real_tables;
+    if (!stmt.from_table.empty()) real_tables.push_back(stmt.from_table);
     for (auto& j : stmt.joins) {
         ok &= CheckTableExists(j.table_name);
-        if (j.on_condition) ok &= CheckExpression(j.on_condition, stmt.from_table);
+        real_tables.push_back(j.table_name);
+    }
+    // 没有 FROM 的查询（如 SELECT 1）：跳过 table/column 检查
+    if (stmt.from_table.empty()) return ok;
+    for (auto& e : stmt.select_list) ok &= CheckExpressionMulti(e, real_tables);
+    if (stmt.where_clause) ok &= CheckExpressionMulti(stmt.where_clause, real_tables);
+    for (auto& e : stmt.group_by) ok &= CheckExpressionMulti(e, real_tables);
+    if (stmt.having_clause) ok &= CheckExpressionMulti(stmt.having_clause, real_tables);
+    for (auto& it : stmt.order_by) ok &= CheckExpressionMulti(it.expr, real_tables);
+    for (auto& j : stmt.joins) {
+        if (j.on_condition) ok &= CheckExpressionMulti(j.on_condition, real_tables);
     }
     return ok;
 }
@@ -119,10 +130,13 @@ bool SemanticAnalyzer::AnalyzeCreateTable(const CreateTableStatement& stmt) {
                 ok = false;
             }
         }
-        // Validate type
-        if (stmt.columns[i].data_type != "INT" &&
-            stmt.columns[i].data_type != "FLOAT" &&
-            stmt.columns[i].data_type != "VARCHAR") {
+        // Validate type (支持 BIGINT/INTEGER/DOUBLE/DECIMAL/CHAR/TEXT/STRING 等全部归一化类型)
+        std::string up;
+        for (char c : stmt.columns[i].data_type)
+            up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        if (up != "INT" && up != "INTEGER" && up != "BIGINT" &&
+            up != "FLOAT" && up != "DOUBLE" && up != "DECIMAL" &&
+            up != "VARCHAR" && up != "CHAR" && up != "TEXT" && up != "STRING") {
             AddError("unsupported column type: " + stmt.columns[i].data_type);
             ok = false;
         }
@@ -142,14 +156,69 @@ bool SemanticAnalyzer::CheckTableExists(const std::string& table_name) {
 
 bool SemanticAnalyzer::CheckColumnExists(const std::string& table_name,
                                           const std::string& column_name) {
-    const TableInfo* info = symbol_table_.GetTable(table_name);
-    if (!info) {
-        AddError("table not found: " + table_name);
+    // table_name may be a comma-separated list of table names (for JOIN).
+    auto check_one = [&](const std::string& t) -> bool {
+        const TableInfo* info = symbol_table_.GetTable(t);
+        if (info && info->HasColumn(column_name)) return true;
+        return false;
+    };
+    if (table_name.find(',') != std::string::npos) {
+        size_t start = 0;
+        while (start < table_name.size()) {
+            size_t end = table_name.find(',', start);
+            std::string t = table_name.substr(start,
+                end == std::string::npos ? std::string::npos : end - start);
+            if (check_one(t)) return true;
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+        AddError("column not found: " + column_name);
         return false;
     }
-    if (info->HasColumn(column_name)) return true;
+    if (check_one(table_name)) return true;
     AddError("column not found: " + table_name + "." + column_name);
     return false;
+}
+
+
+// 跨表列检查（支持表别名）：先按限定列名查指定表；否则在所有真实表中查找
+bool SemanticAnalyzer::CheckExpressionMulti(const ExprPtr& expr,
+                                          const std::vector<std::string>& tables) {
+    if (!expr) return true;
+    switch (expr->GetType()) {
+        case NodeType::LITERAL_EXPR:
+            return true;
+        case NodeType::COLUMN_REF_EXPR: {
+            auto cr = std::static_pointer_cast<ColumnRefExpr>(expr);
+            // 对于限定列（table.col）：如果 cr->table_name 是某个真实表的别名或名字，能在任一表中找到该列即可
+            for (const auto& t : tables) {
+                const TableInfo* info = symbol_table_.GetTable(t);
+                if (info && info->HasColumn(cr->column_name)) return true;
+            }
+            if (cr->table_name.empty()) {
+                AddError("column not found: " + cr->column_name);
+            }
+            // qualified 但表名无法识别：容忍（交由执行器校验）
+            return true;
+        }
+        case NodeType::BINARY_EXPR: {
+            auto be = std::static_pointer_cast<BinaryExpr>(expr);
+            return CheckExpressionMulti(be->left, tables) &&
+                   CheckExpressionMulti(be->right, tables);
+        }
+        case NodeType::UNARY_EXPR: {
+            auto ue = std::static_pointer_cast<UnaryExpr>(expr);
+            return CheckExpressionMulti(ue->operand, tables);
+        }
+        case NodeType::FUNCTION_CALL_EXPR: {
+            auto fc = std::static_pointer_cast<FunctionCallExpr>(expr);
+            bool ok = true;
+            for (auto& a : fc->arguments) ok &= CheckExpressionMulti(a, tables);
+            return ok;
+        }
+        default:
+            return true;
+    }
 }
 
 bool SemanticAnalyzer::CheckExpression(const ExprPtr& expr, const std::string& table_name) {
@@ -160,7 +229,12 @@ bool SemanticAnalyzer::CheckExpression(const ExprPtr& expr, const std::string& t
             return true;
         case NodeType::COLUMN_REF_EXPR: {
             auto cr = std::static_pointer_cast<ColumnRefExpr>(expr);
-            ok &= CheckColumnExists(table_name, cr->column_name);
+            // If the column reference is qualified, verify the specific table.
+            if (!cr->table_name.empty()) {
+                ok &= CheckColumnExists(cr->table_name, cr->column_name);
+            } else {
+                ok &= CheckColumnExists(table_name, cr->column_name);
+            }
             return ok;
         }
         case NodeType::BINARY_EXPR: {

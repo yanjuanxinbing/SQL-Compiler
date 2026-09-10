@@ -45,6 +45,7 @@ private:
     bool CheckTableExists(const std::string& table_name);
     bool CheckColumnExists(const std::string& table_name, const std::string& column_name);
     bool CheckExpression(const ExprPtr& expr, const std::string& table_name);
+    bool CheckExpressionMulti(const ExprPtr& expr, const std::vector<std::string>& tables);
 
     void AddError(const std::string& message, int line = -1);
 };

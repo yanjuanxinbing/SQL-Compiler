@@ -24,6 +24,7 @@ private:
     ExecutorPtr child_;
     std::vector<ExprPtr> select_list_;
     std::unordered_map<std::string, size_t> column_index_map_;
+    bool has_emitted_;
 };
 
 }  // namespace sqlcompiler

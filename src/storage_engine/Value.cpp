@@ -2,8 +2,6 @@
 
 #include <cctype>
 #include <cstring>
-#include <sstream>
-#include <stdexcept>
 
 namespace sqlcompiler {
 
@@ -132,7 +130,14 @@ size_t Value::DeserializeFrom(const char* buf, ValueType type, Value* out) {
     out->type_ = type;
     switch (type) {
         case ValueType::INTEGER: {
-            out->int_val_ = ReadInt32(buf);
+            int32_t v = ReadInt32(buf);
+            if (v == kNullMarker) {
+                // Magic marker: stored as -1 means NULL
+                out->type_ = ValueType::NULL_TYPE;
+                out->int_val_ = 0;
+            } else {
+                out->int_val_ = v;
+            }
             out->float_val_ = 0.0;
             out->str_val_.clear();
             return kIntBytes;
@@ -147,6 +152,9 @@ size_t Value::DeserializeFrom(const char* buf, ValueType type, Value* out) {
             int32_t len = ReadInt32(buf);
             if (len < 0) {
                 out->type_ = ValueType::NULL_TYPE;
+                out->int_val_ = 0;
+                out->float_val_ = 0.0;
+                out->str_val_.clear();
                 return kIntBytes;
             }
             out->str_val_.assign(buf + kVarcharLenBytes, static_cast<size_t>(len));

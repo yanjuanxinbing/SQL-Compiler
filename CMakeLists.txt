@@ -50,7 +50,3 @@ target_include_directories(sqlcompiler_lib PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # 主程序可执行文件
 add_executable(sqlcompiler ${CMAKE_SOURCE_DIR}/src/main.cpp)
 target_link_libraries(sqlcompiler PRIVATE sqlcompiler_lib)
-
-# 预留测试目录（可在实现完成后接入GoogleTest等框架）
-enable_testing()
-add_subdirectory(tests)
