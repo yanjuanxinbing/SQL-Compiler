@@ -91,8 +91,21 @@ StatementPtr Parser::ParseStatement() {
         case TokenType::KEYWORD_INSERT: return ParseInsertStatement();
         case TokenType::KEYWORD_UPDATE: return ParseUpdateStatement();
         case TokenType::KEYWORD_DELETE: return ParseDeleteStatement();
-        case TokenType::KEYWORD_CREATE: return ParseCreateTableStatement();
-        case TokenType::KEYWORD_DROP:   return ParseDropTableStatement();
+        case TokenType::KEYWORD_CREATE: {
+            // CREATE 后面可能是 TABLE 或 [UNIQUE] INDEX，需要前瞻一个 token
+            const Token& next = PeekToken(1);
+            if (next.type == TokenType::KEYWORD_INDEX ||
+                next.type == TokenType::KEYWORD_UNIQUE) {
+                return ParseCreateIndexStatement();
+            }
+            return ParseCreateTableStatement();
+        }
+        case TokenType::KEYWORD_DROP: {
+            if (PeekToken(1).type == TokenType::KEYWORD_INDEX) {
+                return ParseDropIndexStatement();
+            }
+            return ParseDropTableStatement();
+        }
         case TokenType::KEYWORD_TRUNCATE: {
             // TRUNCATE TABLE x：清空表中的所有数据，但保留表结构
             Advance(); // TRUNCATE
@@ -264,8 +277,9 @@ StatementPtr Parser::ParseCreateTableStatement() {
     Token table = Expect(TokenType::IDENTIFIER, "expected table name");
     auto stmt = std::make_shared<CreateTableStatement>();
     stmt->table_name = table.lexeme;
+    stmt->if_not_exists = if_not_exists;
     Expect(TokenType::LEFT_PAREN, "expected '(' after table name");
-    stmt->columns = ParseColumnDefinitions();
+    stmt->columns = ParseColumnDefinitions(*stmt);
     Expect(TokenType::RIGHT_PAREN, "expected ')' after column definitions");
     return stmt;
 }
@@ -273,9 +287,63 @@ StatementPtr Parser::ParseCreateTableStatement() {
 StatementPtr Parser::ParseDropTableStatement() {
     Expect(TokenType::KEYWORD_DROP, "expected DROP");
     Expect(TokenType::KEYWORD_TABLE, "expected TABLE");
+    bool if_exists = false;
+    if (Check(TokenType::KEYWORD_IF)) {
+        Advance();
+        // EXISTS 未列入关键字表，按普通标识符处理（与 CREATE ... IF NOT EXISTS 一致）
+        if (CurrentToken().type == TokenType::IDENTIFIER &&
+            CurrentToken().lexeme == "EXISTS") {
+            Advance();
+        } else {
+            Expect(TokenType::IDENTIFIER, "expected EXISTS after IF");
+        }
+        if_exists = true;
+    }
     Token table = Expect(TokenType::IDENTIFIER, "expected table name");
     auto stmt = std::make_shared<DropTableStatement>();
     stmt->table_name = table.lexeme;
+    stmt->if_exists = if_exists;
+    return stmt;
+}
+
+StatementPtr Parser::ParseCreateIndexStatement() {
+    Expect(TokenType::KEYWORD_CREATE, "expected CREATE");
+    auto stmt = std::make_shared<CreateIndexStatement>();
+    if (Match(TokenType::KEYWORD_UNIQUE)) {
+        stmt->is_unique = true;
+    }
+    Expect(TokenType::KEYWORD_INDEX, "expected INDEX");
+    Token name = Expect(TokenType::IDENTIFIER, "expected index name");
+    stmt->index_name = name.lexeme;
+    Expect(TokenType::KEYWORD_ON, "expected ON after index name");
+    Token table = Expect(TokenType::IDENTIFIER, "expected table name");
+    stmt->table_name = table.lexeme;
+    Expect(TokenType::LEFT_PAREN, "expected '(' before index column list");
+    do {
+        Token col = Expect(TokenType::IDENTIFIER, "expected column name");
+        stmt->key_columns.push_back(col.lexeme);
+    } while (Match(TokenType::COMMA));
+    Expect(TokenType::RIGHT_PAREN, "expected ')' after index column list");
+    return stmt;
+}
+
+StatementPtr Parser::ParseDropIndexStatement() {
+    Expect(TokenType::KEYWORD_DROP, "expected DROP");
+    Expect(TokenType::KEYWORD_INDEX, "expected INDEX");
+    auto stmt = std::make_shared<DropIndexStatement>();
+    if (Check(TokenType::KEYWORD_IF)) {
+        Advance();
+        // EXISTS 未列入关键字表，按普通标识符处理（与 DROP TABLE IF EXISTS 一致）
+        if (CurrentToken().type == TokenType::IDENTIFIER &&
+            CurrentToken().lexeme == "EXISTS") {
+            Advance();
+        } else {
+            Expect(TokenType::IDENTIFIER, "expected EXISTS after IF");
+        }
+        stmt->if_exists = true;
+    }
+    Token name = Expect(TokenType::IDENTIFIER, "expected index name");
+    stmt->index_name = name.lexeme;
     return stmt;
 }
 
@@ -386,11 +454,36 @@ int Parser::ParseLimitClause() {
     return std::atoi(n.lexeme.c_str());
 }
 
-std::vector<ColumnDefinition> Parser::ParseColumnDefinitions() {
+std::vector<ColumnDefinition> Parser::ParseColumnDefinitions(CreateTableStatement& stmt) {
     std::vector<ColumnDefinition> cols;
-    cols.push_back(ParseColumnDefinition());
-    while (Match(TokenType::COMMA)) {
+    auto parse_table_pk = [&]() {
+        // 当前 token 已是 KEYWORD_PRIMARY；语法形式：PRIMARY KEY (col1, col2, ...)
+        Advance();  // PRIMARY
+        Expect(TokenType::KEYWORD_KEY, "expected KEY after PRIMARY");
+        Expect(TokenType::LEFT_PAREN, "expected '(' after PRIMARY KEY");
+        std::vector<std::string> pk_cols;
+        Token c = Expect(TokenType::IDENTIFIER, "expected column name in PRIMARY KEY");
+        pk_cols.push_back(c.lexeme);
+        while (Match(TokenType::COMMA)) {
+            Token cc = Expect(TokenType::IDENTIFIER, "expected column name in PRIMARY KEY");
+            pk_cols.push_back(cc.lexeme);
+        }
+        Expect(TokenType::RIGHT_PAREN, "expected ')' after PRIMARY KEY column list");
+        stmt.primary_keys.push_back(std::move(pk_cols));
+    };
+
+    // First element may be either a column definition or a table-level PK constraint.
+    if (Check(TokenType::KEYWORD_PRIMARY)) {
+        parse_table_pk();
+    } else {
         cols.push_back(ParseColumnDefinition());
+    }
+    while (Match(TokenType::COMMA)) {
+        if (Check(TokenType::KEYWORD_PRIMARY)) {
+            parse_table_pk();
+        } else {
+            cols.push_back(ParseColumnDefinition());
+        }
     }
     return cols;
 }
@@ -418,8 +511,13 @@ ColumnDefinition Parser::ParseColumnDefinition() {
     }
     // 可选类型参数：VARCHAR(N) / CHAR(N) 等
     if (Match(TokenType::LEFT_PAREN)) {
-        // 吃掉整数后关闭括号
+        // 记录长度上限，供 INSERT/UPDATE 时做长度约束校验
         if (CurrentToken().type == TokenType::INTEGER_LITERAL) {
+            try {
+                cd.char_length = static_cast<int32_t>(std::stol(CurrentToken().lexeme));
+            } catch (...) {
+                cd.char_length = -1;
+            }
             Advance();
         }
         Expect(TokenType::RIGHT_PAREN, "expected ')' after type parameter");
@@ -630,9 +728,14 @@ ExprPtr Parser::ParseColumnRefOrFunctionCall() {
     if (Match(TokenType::LEFT_PAREN)) {
         // Function call
         std::vector<ExprPtr> args;
+        bool distinct = false;
         if (!Check(TokenType::RIGHT_PAREN)) {
-            // Handle COUNT(*)
-            if (Check(TokenType::OP_STAR)) {
+            // Handle COUNT(*) — DISTINCT 与 * 互斥
+            if (Check(TokenType::KEYWORD_DISTINCT)) {
+                Advance();
+                distinct = true;
+                args = ParseExpressionList();
+            } else if (Check(TokenType::OP_STAR)) {
                 Advance();
                 args.push_back(std::make_shared<LiteralExpr>(LiteralType::INTEGER, "1"));
             } else {
@@ -640,7 +743,9 @@ ExprPtr Parser::ParseColumnRefOrFunctionCall() {
             }
         }
         Expect(TokenType::RIGHT_PAREN, "expected ')' after function arguments");
-        return std::make_shared<FunctionCallExpr>(first.lexeme, args);
+        auto fc = std::make_shared<FunctionCallExpr>(first.lexeme, args);
+        fc->is_distinct = distinct;
+        return fc;
     }
     if (Match(TokenType::DOT)) {
         // Could be t.column or t.*

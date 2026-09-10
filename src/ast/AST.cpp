@@ -144,6 +144,7 @@ NodeType FunctionCallExpr::GetType() const {
 std::string FunctionCallExpr::ToString() const {
     std::ostringstream oss;
     oss << function_name << "(";
+    if (is_distinct) oss << "DISTINCT ";
     if (function_name == "*" || (arguments.empty() && function_name == "*")) {
         oss << "*";
     } else {
@@ -300,6 +301,15 @@ std::string CreateTableStatement::ToString() const {
         if (columns[i].is_primary_key) oss << " PRIMARY KEY";
         if (columns[i].is_not_null) oss << " NOT NULL";
     }
+    for (const auto& pk : primary_keys) {
+        if (!columns.empty()) oss << ", ";
+        oss << "PRIMARY KEY(";
+        for (size_t i = 0; i < pk.size(); ++i) {
+            if (i > 0) oss << ", ";
+            oss << pk[i];
+        }
+        oss << ")";
+    }
     oss << ")";
     return oss.str();
 }
@@ -315,6 +325,40 @@ NodeType DropTableStatement::GetType() const {
 
 std::string DropTableStatement::ToString() const {
     return "DROP TABLE " + table_name;
+}
+
+// ============ CreateIndexStatement ============
+
+CreateIndexStatement::CreateIndexStatement() {
+}
+
+NodeType CreateIndexStatement::GetType() const {
+    return NodeType::CREATE_INDEX_STMT;
+}
+
+std::string CreateIndexStatement::ToString() const {
+    std::string out = "CREATE ";
+    if (is_unique) out += "UNIQUE ";
+    out += "INDEX " + index_name + " ON " + table_name + "(";
+    for (size_t i = 0; i < key_columns.size(); ++i) {
+        if (i) out += ", ";
+        out += key_columns[i];
+    }
+    out += ")";
+    return out;
+}
+
+// ============ DropIndexStatement ============
+
+DropIndexStatement::DropIndexStatement() {
+}
+
+NodeType DropIndexStatement::GetType() const {
+    return NodeType::DROP_INDEX_STMT;
+}
+
+std::string DropIndexStatement::ToString() const {
+    return std::string("DROP INDEX ") + (if_exists ? "IF EXISTS " : "") + index_name;
 }
 
 // ============ TruncateTableStatement ============

@@ -22,6 +22,8 @@ const std::unordered_map<std::string, TokenType>& KeywordTable() {
         {"DELETE",   TokenType::KEYWORD_DELETE},
         {"CREATE",   TokenType::KEYWORD_CREATE},
         {"TABLE",    TokenType::KEYWORD_TABLE},
+        {"INDEX",    TokenType::KEYWORD_INDEX},
+        {"UNIQUE",   TokenType::KEYWORD_UNIQUE},
         {"DROP",     TokenType::KEYWORD_DROP},
         {"AND",      TokenType::KEYWORD_AND},
         {"OR",       TokenType::KEYWORD_OR},

@@ -1,6 +1,8 @@
 #include "execution/InsertExecutor.h"
 
 #include "common/Error.h"
+#include "execution/ConstraintChecker.h"
+#include "execution/IndexMaintenance.h"
 #include "execution/ExpressionEvaluator.h"
 
 #include <unordered_map>
@@ -125,15 +127,27 @@ bool InsertExecutor::Next(Tuple* tuple) {
     RID rid;
     // Build the column-type vector so serialization can write NULL markers with
     // the correct width for each declared type (avoids deserializer misalignment).
-    std::vector<ValueType> col_types;
-    col_types.reserve(info->columns.size());
-    for (const auto& c : info->columns) {
-        col_types.push_back(ValueTypeFromString(c.data_type));
+    std::vector<ValueType> col_types = BuildColumnTypes(*info);
+    // 列约束校验：必须在写入前完成，违约时抛异常，本条 INSERT 整体不生效。
+    {
+        std::vector<Value> row_snapshot;
+        row_snapshot.reserve(t.ColumnCount());
+        for (size_t i = 0; i < t.ColumnCount(); ++i) {
+            row_snapshot.push_back(t.GetValue(i));
+        }
+        ValidateRowConstraints(context_->GetCatalog(), *info, heap,
+                               row_snapshot, nullptr);
+        // 非主键的唯一索引也必须在写堆之前预检。否则冲突要等到写完堆、
+        // 再写索引时才暴露，那时行已经落表，语句报错却留下了半写状态。
+        CheckUniqueIndexes(context_->GetCatalog(), *info, row_snapshot, nullptr);
     }
     if (!heap->InsertTuple(t, &rid, col_types)) {
         throw CompilerException(ErrorStage::SEMANTIC,
             "INSERT failed (no space?)");
     }
+    // 堆写入成功后同步所有索引。唯一性冲突已在 ValidateRowConstraints 阶段
+    // （通过索引点查）拦下，这里只可能因结构性原因失败。
+    InsertIntoIndexes(context_->GetCatalog(), *info, t.GetValues(), rid);
     ++current_row_;
     if (tuple) {
         *tuple = Tuple({Value::MakeInt(1)});

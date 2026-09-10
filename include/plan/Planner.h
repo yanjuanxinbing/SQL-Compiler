@@ -23,6 +23,8 @@ private:
     PlanNodePtr PlanDelete(const DeleteStatement& stmt);
     PlanNodePtr PlanCreateTable(const CreateTableStatement& stmt);
     PlanNodePtr PlanDropTable(const DropTableStatement& stmt);
+    PlanNodePtr PlanCreateIndex(const CreateIndexStatement& stmt);
+    PlanNodePtr PlanDropIndex(const DropIndexStatement& stmt);
     PlanNodePtr PlanTruncateTable(const TruncateTableStatement& stmt);
 };
 

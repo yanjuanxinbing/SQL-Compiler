@@ -1,6 +1,7 @@
 #include "execution/DeleteExecutor.h"
 
 #include "execution/ExpressionEvaluator.h"
+#include "execution/IndexMaintenance.h"
 
 namespace sqlcompiler {
 
@@ -45,6 +46,13 @@ bool DeleteExecutor::Next(Tuple* tuple) {
             match = !v.IsNull() && v.AsInt() != 0;
         }
         if (match) {
+            // 必须先删索引项再删堆记录：反过来的话，一旦删堆成功而删索引失败，
+            // 索引里就留下指向已释放槽位的 RID，走索引查询会读出幽灵行。
+            const TableInfo* info = context_->GetCatalog()->GetTable(table_name_);
+            if (info != nullptr) {
+                DeleteFromIndexes(context_->GetCatalog(), *info, t.GetValues(),
+                                  t.GetRid());
+            }
             table_heap_->DeleteTuple(t.GetRid());
             ++affected;
         }

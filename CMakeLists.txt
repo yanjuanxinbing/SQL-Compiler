@@ -33,6 +33,9 @@ file(GLOB_RECURSE SQLCOMPILER_LIB_SOURCES
     # ---- 存储引擎（记录/元组 <-> 页的映射） ----
     ${CMAKE_SOURCE_DIR}/src/storage_engine/*.cpp
 
+    # ---- 索引（B+Tree） ----
+    ${CMAKE_SOURCE_DIR}/src/index/*.cpp
+
     # ---- 系统目录（元数据持久化） ----
     ${CMAKE_SOURCE_DIR}/src/catalog/*.cpp
 

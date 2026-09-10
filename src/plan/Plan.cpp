@@ -108,6 +108,21 @@ std::string NodeBodyToString(const PlanNode& node, int depth) {
             oss << "DropTable(" << n.table_name << ")";
             break;
         }
+        case PlanNodeType::CREATE_INDEX: {
+            auto& n = static_cast<const CreateIndexNode&>(node);
+            oss << "CreateIndex(" << n.index_name << " on " << n.table_name << ")";
+            break;
+        }
+        case PlanNodeType::DROP_INDEX: {
+            auto& n = static_cast<const DropIndexNode&>(node);
+            oss << "DropIndex(" << n.index_name << ")";
+            break;
+        }
+        case PlanNodeType::INDEX_SCAN: {
+            auto& n = static_cast<const IndexScanNode&>(node);
+            oss << "IndexScan(" << n.table_name << " using " << n.index_name << ")";
+            break;
+        }
         case PlanNodeType::TRUNCATE_TABLE: {
             auto& n = static_cast<const TruncateTableNode&>(node);
             oss << "TruncateTable(" << n.table_name << ")";
@@ -273,8 +288,11 @@ std::string DeleteNode::ToString() const {
 
 // ============ CreateTableNode ============
 
-CreateTableNode::CreateTableNode(std::string table_name, std::vector<ColumnDefinition> columns)
-    : table_name(std::move(table_name)), columns(std::move(columns)) {
+CreateTableNode::CreateTableNode(std::string table_name, std::vector<ColumnDefinition> columns,
+                                 std::vector<std::vector<std::string>> primary_keys,
+                                 bool if_not_exists)
+    : table_name(std::move(table_name)), columns(std::move(columns)),
+      primary_keys(std::move(primary_keys)), if_not_exists(if_not_exists) {
 }
 
 PlanNodeType CreateTableNode::GetType() const {
@@ -287,7 +305,8 @@ std::string CreateTableNode::ToString() const {
 
 // ============ DropTableNode ============
 
-DropTableNode::DropTableNode(std::string table_name) : table_name(std::move(table_name)) {
+DropTableNode::DropTableNode(std::string table_name, bool if_exists)
+    : table_name(std::move(table_name)), if_exists(if_exists) {
 }
 
 PlanNodeType DropTableNode::GetType() const {
@@ -295,6 +314,53 @@ PlanNodeType DropTableNode::GetType() const {
 }
 
 std::string DropTableNode::ToString() const {
+    return NodeBodyToString(*this, 0);
+}
+
+// ============ IndexScanNode ============
+
+IndexScanNode::IndexScanNode(std::string table_name, std::string index_name,
+                             std::string table_alias)
+    : table_name(std::move(table_name)), index_name(std::move(index_name)),
+      table_alias(std::move(table_alias)) {
+}
+
+PlanNodeType IndexScanNode::GetType() const {
+    return PlanNodeType::INDEX_SCAN;
+}
+
+std::string IndexScanNode::ToString() const {
+    return NodeBodyToString(*this, 0);
+}
+
+// ============ CreateIndexNode ============
+
+CreateIndexNode::CreateIndexNode(std::string index_name, std::string table_name,
+                                 std::vector<std::string> key_columns,
+                                 bool is_unique)
+    : index_name(std::move(index_name)), table_name(std::move(table_name)),
+      key_columns(std::move(key_columns)), is_unique(is_unique) {
+}
+
+PlanNodeType CreateIndexNode::GetType() const {
+    return PlanNodeType::CREATE_INDEX;
+}
+
+std::string CreateIndexNode::ToString() const {
+    return NodeBodyToString(*this, 0);
+}
+
+// ============ DropIndexNode ============
+
+DropIndexNode::DropIndexNode(std::string index_name, bool if_exists)
+    : index_name(std::move(index_name)), if_exists(if_exists) {
+}
+
+PlanNodeType DropIndexNode::GetType() const {
+    return PlanNodeType::DROP_INDEX;
+}
+
+std::string DropIndexNode::ToString() const {
     return NodeBodyToString(*this, 0);
 }
 

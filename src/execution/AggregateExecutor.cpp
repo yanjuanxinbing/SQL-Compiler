@@ -119,9 +119,11 @@ void AggregateExecutor::Init() {
             // Determine the aggregate function and target column
             std::string fname;
             ExprPtr agg_arg;
+            bool is_distinct = false;
             if (expr->GetType() == NodeType::FUNCTION_CALL_EXPR) {
                 auto f = std::static_pointer_cast<FunctionCallExpr>(expr);
                 fname = Upper(f->function_name);
+                is_distinct = f->is_distinct;
                 if (!f->arguments.empty()) {
                     agg_arg = f->arguments[0];
                 }
@@ -135,7 +137,13 @@ void AggregateExecutor::Init() {
             if (fname == "COUNT") {
                 if (fname == "COUNT" && agg_arg) {
                     Value v = eval.Evaluate(agg_arg, t);
-                    if (!v.IsNull()) ++st.count_non_null;
+                    if (!v.IsNull()) {
+                        ++st.count_non_null;
+                        if (is_distinct) {
+                            // COUNT(DISTINCT col)：按值字符串去重
+                            st.distinct_values.insert(v.ToString());
+                        }
+                    }
                 }
                 continue;
             }
@@ -144,6 +152,14 @@ void AggregateExecutor::Init() {
             if (!agg_arg) continue;
             Value v = eval.Evaluate(agg_arg, t);
             if (v.IsNull()) continue;
+
+            // SUM(DISTINCT col) / AVG(DISTINCT col)：只对组内首次出现的值累加
+            if (is_distinct) {
+                if (!st.distinct_values.insert(v.ToString()).second) {
+                    // 已出现过，跳过累加；MIN/MAX 仍按全部值参与
+                }
+            }
+
             st.any_numeric = true;
 
             if (v.GetType() == ValueType::INTEGER) {
@@ -151,7 +167,7 @@ void AggregateExecutor::Init() {
             } else if (v.GetType() == ValueType::FLOAT) {
                 st.sum_float += v.AsFloat();
             }
-            // MIN/MAX
+            // MIN/MAX：所有非 NULL 值都参与（DISTINCT 不影响极值语义）
             if (!st.min_max_init) {
                 st.min_val = v;
                 st.max_val = v;
@@ -183,7 +199,10 @@ Value AggregateExecutor::EvalAggregateExpr(const ExprPtr& expr, const Tuple& sam
         if (f->arguments.empty()) {
             return Value::MakeInt(static_cast<int32_t>(st.count));
         }
-        // COUNT(col): count of non-null values
+        // COUNT(DISTINCT col) 走 distinct 集合大小；其余为非 NULL 计数
+        if (f->is_distinct) {
+            return Value::MakeInt(static_cast<int32_t>(st.distinct_values.size()));
+        }
         return Value::MakeInt(static_cast<int32_t>(st.count_non_null));
     }
     if (!st.any_numeric && fname != "MIN" && fname != "MAX") {

@@ -1,6 +1,5 @@
 #include "semantic/SymbolTable.h"
 
-#include <algorithm>
 #include <cctype>
 
 namespace sqlcompiler {
@@ -26,6 +25,18 @@ bool EqualsIgnoreCase(const std::string& a, const std::string& b) {
 }
 
 }  // namespace
+
+std::vector<std::vector<std::string>> TableInfo::GetPrimaryKeyGroups() const {
+    if (!primary_keys.empty()) return primary_keys;
+    // 兼容路径：元数据里没有分组信息时，按「所有 PK 列构成一个复合组」处理。
+    std::vector<std::string> group;
+    for (const auto& c : columns) {
+        if (c.is_primary_key) group.push_back(c.name);
+    }
+    std::vector<std::vector<std::string>> groups;
+    if (!group.empty()) groups.push_back(std::move(group));
+    return groups;
+}
 
 bool TableInfo::HasColumn(const std::string& column_name) const {
     for (const auto& c : columns) {
@@ -75,9 +86,36 @@ bool SymbolTable::AddTableFromCreateStatement(const CreateTableStatement& stmt) 
         ColumnInfo ci;
         ci.name = cd.column_name;
         ci.data_type = cd.data_type;
+        ci.char_length = cd.char_length;
         ci.is_primary_key = cd.is_primary_key;
         ci.is_not_null = cd.is_not_null;
         info.columns.push_back(std::move(ci));
+    }
+    // 表级 PRIMARY KEY(a, b, ...) 原样保留为一个主键组（复合主键要求组合唯一），
+    // 同时投影到每列的 is_primary_key，便于既有执行路径（如 InsertExecutor 的
+    // 自增逻辑）保持按单列判定的一致性。
+    if (!stmt.primary_keys.empty()) {
+        for (const auto& pk : stmt.primary_keys) {
+            if (pk.empty()) continue;
+            info.primary_keys.push_back(pk);
+            for (const auto& col_name : pk) {
+                for (auto& ci : info.columns) {
+                    if (ci.name == col_name) {
+                        ci.is_primary_key = true;
+                        break;
+                    }
+                }
+            }
+        }
+    } else {
+        // 列内联的 PRIMARY KEY：合并为一个组。若有多列内联标注，按复合主键处理，
+        // 这样既覆盖常见的单列主键，也不会把「多列各自唯一」这种更强的约束强加
+        // 给用户。
+        std::vector<std::string> inline_pk;
+        for (const auto& ci : info.columns) {
+            if (ci.is_primary_key) inline_pk.push_back(ci.name);
+        }
+        if (!inline_pk.empty()) info.primary_keys.push_back(std::move(inline_pk));
     }
     return AddTable(info);
 }

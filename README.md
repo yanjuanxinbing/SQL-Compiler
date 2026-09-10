@@ -146,6 +146,46 @@ SQL-Compiler/
 - `JOIN` / `ORDER BY` / `GROUP BY`：`JoinClause` / `OrderByItem` / `AggregateNode` 已在AST与Plan中建模，但对应的 `JoinExecutor` / `SortExecutor` / `AggregateExecutor` 尚未创建，需要时可参照现有Executor风格自行添加
 - 查询优化（谓词下推等）：`Optimizer::PushDownPredicates()` 已留出接口
 
+## B+Tree 索引
+
+索引是真正的磁盘结构：节点即 4KB 页面，走 `BufferPoolManager`，根页 id 持久化在
+系统目录里，重启后直接可用，无需重建。
+
+**语法**
+
+```sql
+CREATE [UNIQUE] INDEX <name> ON <table>(col1, col2, ...);
+DROP INDEX [IF EXISTS] <name>;
+```
+
+`CREATE TABLE` 时会为每个 `PRIMARY KEY` 组自动建立一棵唯一索引（命名为
+`__pk_<表名>_<组号>`），主键唯一性校验因此是 O(log N) 的索引点查而非全表扫描。
+该索引不允许被 `DROP INDEX` 删除——它是主键约束的实现载体。
+
+**查询优化**：`WHERE` 中形如 `col = c` / `col > c` / `col BETWEEN a AND b` 的谓词，
+若 `col` 上有索引，优化器会把 `Filter -> SeqScan` 改写成 `IndexScan`；无法用索引
+消解的合取项作为残余谓词在回表后再判一次。改写策略刻意保守，任何不确定的形态
+都保持原计划——访问路径改写出错的症状是「查询静默少返回几行」，比崩溃难查得多。
+
+**设计要点**
+
+- 键为 `std::vector<Value>`，复合键按字典序比较，复用 `Value::Compare`。
+- 叶子内按 `(key, rid)` 严格全序。内部节点的分隔键也携带 RID，否则非唯一索引里
+  同一个键跨页时，下降无法判断该走左页还是右页。
+- 插入采用**下降途中预分裂**：进入节点前先保证它装得下，叶子插入永不失败，
+  没有级联分裂，也不需要在页头维护父指针。
+- 根页 id 恒定不变：根分裂时把根内容搬到新页、原根页改写成内部节点，
+  免去「根分裂后回写目录元数据」这条易漏的一致性路径。
+- 页内修改一律「物化 → 修改 → 整页重写」，插入/分裂/删除共用同一套读写函数。
+- 所有页面访问经 `PageGuard`（RAII），禁止裸 `GetPage`/`UnpinPage` 配对。
+
+**已知限制**
+
+- 删除只打墓碑，不做节点合并与再平衡，大量删除后会留下半空节点。
+- 索引键不允许 `NULL`；变长列必须声明有界长度（`VARCHAR(n)`，n ≤ 512）才能建索引。
+- 访问路径改写只用单列索引的最左列，且不处理 `JOIN` 下的扫描。
+- 无 WAL：崩溃一致性依赖「每条语句成功后全量刷盘」，这不是原子的。
+
 ## 测试用例建议（对应题目要求）
 
 ```sql

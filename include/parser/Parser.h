@@ -41,6 +41,8 @@ private:
     StatementPtr ParseDeleteStatement();
     StatementPtr ParseCreateTableStatement();
     StatementPtr ParseDropTableStatement();
+    StatementPtr ParseCreateIndexStatement();
+    StatementPtr ParseDropIndexStatement();
 
     // ---- 子句解析 ----
     std::vector<ExprPtr> ParseSelectList();
@@ -51,7 +53,7 @@ private:
     ExprPtr ParseHavingClause();
     std::vector<OrderByItem> ParseOrderByClause();
     int ParseLimitClause();
-    std::vector<ColumnDefinition> ParseColumnDefinitions();
+    std::vector<ColumnDefinition> ParseColumnDefinitions(CreateTableStatement& stmt);
     ColumnDefinition ParseColumnDefinition();
 
     // ---- 表达式解析（按优先级从低到高分层的递归下降） ----

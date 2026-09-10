@@ -33,6 +33,12 @@ bool SemanticAnalyzer::Analyze(const StatementPtr& statement) {
         case NodeType::DROP_TABLE_STMT:
             ok = AnalyzeDropTable(*std::static_pointer_cast<DropTableStatement>(statement));
             break;
+        case NodeType::CREATE_INDEX_STMT:
+            ok = AnalyzeCreateIndex(*std::static_pointer_cast<CreateIndexStatement>(statement));
+            break;
+        case NodeType::DROP_INDEX_STMT:
+            ok = AnalyzeDropIndex(*std::static_pointer_cast<DropIndexStatement>(statement));
+            break;
         case NodeType::TRUNCATE_TABLE_STMT:
             ok = AnalyzeTruncateTable(*std::static_pointer_cast<TruncateTableStatement>(statement));
             break;
@@ -116,7 +122,7 @@ bool SemanticAnalyzer::AnalyzeDelete(const DeleteStatement& stmt) {
 
 bool SemanticAnalyzer::AnalyzeCreateTable(const CreateTableStatement& stmt) {
     bool ok = true;
-    if (symbol_table_.HasTable(stmt.table_name)) {
+    if (symbol_table_.HasTable(stmt.table_name) && !stmt.if_not_exists) {
         AddError("table already exists: " + stmt.table_name);
         ok = false;
     }
@@ -144,11 +150,53 @@ bool SemanticAnalyzer::AnalyzeCreateTable(const CreateTableStatement& stmt) {
             ok = false;
         }
     }
+    // 表级 PRIMARY KEY(a, b, ...) 引用的列必须存在于列定义中。
+    for (const auto& pk : stmt.primary_keys) {
+        for (const auto& pk_col : pk) {
+            bool found = false;
+            for (const auto& cd : stmt.columns) {
+                if (cd.column_name == pk_col) { found = true; break; }
+            }
+            if (!found) {
+                AddError("PRIMARY KEY references unknown column: " + pk_col);
+                ok = false;
+            }
+        }
+    }
     return ok;
 }
 
 bool SemanticAnalyzer::AnalyzeDropTable(const DropTableStatement& stmt) {
+    // IF EXISTS 时不存在也不算错误，交由执行阶段静默跳过
+    if (stmt.if_exists) return true;
     return CheckTableExists(stmt.table_name);
+}
+
+bool SemanticAnalyzer::AnalyzeCreateIndex(const CreateIndexStatement& stmt) {
+    if (!CheckTableExists(stmt.table_name)) return false;
+    const TableInfo* table = symbol_table_.GetTable(stmt.table_name);
+    if (table == nullptr) return false;
+    if (stmt.key_columns.empty()) {
+        AddError("index must have at least one column");
+        return false;
+    }
+    bool ok = true;
+    for (const auto& col : stmt.key_columns) {
+        if (table->GetColumn(col) == nullptr) {
+            AddError("column not found: " + stmt.table_name + "." + col);
+            ok = false;
+        }
+    }
+    // 列的可索引性（长度上限、非空）留给执行阶段的 SystemCatalog::CreateIndex 统一
+    // 判定，避免同一套规则在两处各写一遍而漂移。
+    return ok;
+}
+
+bool SemanticAnalyzer::AnalyzeDropIndex(const DropIndexStatement& stmt) {
+    // 索引是否存在只有 SystemCatalog 知道（SymbolTable 不持有索引元数据），
+    // 因此存在性检查放在执行阶段。
+    (void)stmt;
+    return true;
 }
 
 bool SemanticAnalyzer::AnalyzeTruncateTable(const TruncateTableStatement& stmt) {

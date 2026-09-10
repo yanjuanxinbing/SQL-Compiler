@@ -1,6 +1,7 @@
 #pragma once
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ast/AST.h"
@@ -40,6 +41,8 @@ private:
         Value   min_val;
         Value   max_val;
         bool    min_max_init = false;
+        // 仅 COUNT(DISTINCT col) / SUM(DISTINCT col) 有效：按组收集到的去重集合。
+        std::unordered_set<std::string> distinct_values;
     };
 
     struct Group {

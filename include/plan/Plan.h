@@ -5,12 +5,14 @@
 #include <vector>
 
 #include "ast/AST.h"
+#include "storage_engine/Value.h"
 
 namespace sqlcompiler {
 
 // 逻辑执行计划节点类型
 enum class PlanNodeType {
     SEQ_SCAN,      // 全表扫描
+    INDEX_SCAN,    // 走 B+Tree 索引的区间扫描（含等值点查）
     FILTER,        // 条件过滤（对应 WHERE / HAVING）
     PROJECT,       // 投影（对应 SELECT 列表）
     JOIN,          // 连接
@@ -22,7 +24,9 @@ enum class PlanNodeType {
     DELETE,        // 删除
     CREATE_TABLE,  // 建表
     DROP_TABLE,    // 删表
-    TRUNCATE_TABLE // 清空表数据（保留表结构）
+    TRUNCATE_TABLE, // 清空表数据（保留表结构）
+    CREATE_INDEX,
+    DROP_INDEX
 };
 
 // 执行计划节点基类，采用树形结构，子节点为输入
@@ -57,6 +61,33 @@ public:
     std::string ToString() const override;
 
     ExprPtr predicate;
+};
+
+// 索引扫描节点：沿 B+Tree 的叶子链扫描 [low_key, high_key] 区间，再用 RID 回表。
+//
+// 边界用 std::vector<Value> 而不是表达式：Optimizer 只在谓词能完全求值成常量时
+// 才改写成索引扫描，把「表达式求值」这件事挡在计划生成阶段之外，执行期就不必
+// 再考虑边界值随行变化的情况。
+class IndexScanNode : public PlanNode {
+public:
+    IndexScanNode(std::string table_name, std::string index_name,
+                  std::string table_alias = "");
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string table_name;
+    std::string index_name;
+    std::string table_alias;
+
+    std::vector<Value> low_key;      // 空表示 -inf
+    std::vector<Value> high_key;     // 空表示 +inf
+    bool low_inclusive = true;
+    bool high_inclusive = true;
+
+    // 无法用索引消解的剩余谓词，回表拿到 Tuple 后再判一次。
+    // 为空表示索引区间已经精确等价于原谓词。
+    ExprPtr residual_predicate;
 };
 
 // 投影节点
@@ -164,24 +195,58 @@ public:
 // 建表节点
 class CreateTableNode : public PlanNode {
 public:
-    CreateTableNode(std::string table_name, std::vector<ColumnDefinition> columns);
+    CreateTableNode(std::string table_name, std::vector<ColumnDefinition> columns,
+                    std::vector<std::vector<std::string>> primary_keys = {},
+                    bool if_not_exists = false);
 
     PlanNodeType GetType() const override;
     std::string ToString() const override;
 
     std::string table_name;
     std::vector<ColumnDefinition> columns;
+    // 表级 PRIMARY KEY(a, b) 的分组信息，需原样传到 Catalog 才能按「组合唯一」校验
+    std::vector<std::vector<std::string>> primary_keys;
+    // CREATE TABLE IF NOT EXISTS 标记
+    bool if_not_exists = false;
 };
 
 // 删表节点
 class DropTableNode : public PlanNode {
 public:
-    explicit DropTableNode(std::string table_name);
+    explicit DropTableNode(std::string table_name, bool if_exists = false);
 
     PlanNodeType GetType() const override;
     std::string ToString() const override;
 
     std::string table_name;
+    bool if_exists = false;
+};
+
+// 建索引节点
+class CreateIndexNode : public PlanNode {
+public:
+    CreateIndexNode(std::string index_name, std::string table_name,
+                    std::vector<std::string> key_columns, bool is_unique);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string index_name;
+    std::string table_name;
+    std::vector<std::string> key_columns;
+    bool is_unique = false;
+};
+
+// 删索引节点
+class DropIndexNode : public PlanNode {
+public:
+    DropIndexNode(std::string index_name, bool if_exists);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string index_name;
+    bool if_exists = false;
 };
 
 // 清空表节点

@@ -1,7 +1,10 @@
 #include "storage_engine/Value.h"
 
+#include <array>
 #include <cctype>
+#include <charconv>
 #include <cstring>
+#include <system_error>
 
 namespace sqlcompiler {
 
@@ -10,6 +13,21 @@ namespace {
 const int32_t kNullMarker = -1;
 const int32_t kIntBytes = 4;
 const int32_t kFloatBytes = 8;
+
+// 以「最短往返」形式格式化浮点数：保证 from_chars(to_chars(x)) == x 的前提下
+// 输出尽可能短的十进制表示。相比 std::to_string 固定 6 位小数（9.99 会被打印成
+// 9.990000），既符合直觉又不丢精度。std::to_chars 不分配内存、不依赖 locale，
+// 比 snprintf/ostringstream 快一个数量级。
+std::string FormatDouble(double v) {
+    std::array<char, 64> buf{};
+    auto res = std::to_chars(buf.data(), buf.data() + buf.size(), v,
+                             std::chars_format::general);
+    if (res.ec != std::errc()) {
+        // 理论上不会发生（缓冲区足够）；退化为固定格式，保证有输出
+        return std::to_string(v);
+    }
+    return std::string(buf.data(), res.ptr);
+}
 const int32_t kVarcharLenBytes = 4;
 
 std::string ToUpper(const std::string& s) {
@@ -239,7 +257,7 @@ std::string Value::ToString() const {
         case ValueType::INTEGER:
             return std::to_string(int_val_);
         case ValueType::FLOAT:
-            return std::to_string(float_val_);
+            return FormatDouble(float_val_);
         case ValueType::VARCHAR:
             return str_val_;
         case ValueType::NULL_TYPE:

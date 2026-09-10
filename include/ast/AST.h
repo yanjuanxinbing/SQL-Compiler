@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -20,6 +21,8 @@ enum class NodeType {
     DELETE_STMT,
     CREATE_TABLE_STMT,
     DROP_TABLE_STMT,
+    CREATE_INDEX_STMT,
+    DROP_INDEX_STMT,
     TRUNCATE_TABLE_STMT,
 
     // ---- 表达式 ----
@@ -130,7 +133,7 @@ public:
     ExprPtr operand;
 };
 
-// 函数调用表达式，如 COUNT(*) / SUM(a)
+// 函数调用表达式，如 COUNT(*) / SUM(a) / COUNT(DISTINCT col)
 class FunctionCallExpr : public Expr {
 public:
     FunctionCallExpr(std::string function_name, std::vector<ExprPtr> arguments);
@@ -140,6 +143,8 @@ public:
 
     std::string function_name;
     std::vector<ExprPtr> arguments;
+    // 仅聚合函数有效：如 COUNT(DISTINCT col) / SUM(DISTINCT col)
+    bool is_distinct = false;
 };
 
 // ============ 辅助结构 ============
@@ -148,6 +153,8 @@ public:
 struct ColumnDefinition {
     std::string column_name;
     std::string data_type;   // INT / VARCHAR / FLOAT 等
+    // 类型参数，如 VARCHAR(50) 中的 50；未显式声明时为 -1（不限长）
+    int32_t char_length = -1;
     bool is_primary_key = false;
     bool is_not_null = false;
 };
@@ -241,6 +248,12 @@ public:
 
     std::string table_name;
     std::vector<ColumnDefinition> columns;
+    // 表级主键约束：每个内层 vector 表示一条 PRIMARY KEY(col, ...) 子句涉及的列名。
+    // 列内 `is_primary_key` 同时会被置位，便于既有执行路径（InsertExecutor/Schema）
+    // 直接基于单列 is_primary_key 做校验/自增。
+    std::vector<std::vector<std::string>> primary_keys;
+    // CREATE TABLE IF NOT EXISTS 标记：true 时若表已存在则静默成功，不报错。
+    bool if_not_exists = false;
 };
 
 // DROP TABLE 语句
@@ -252,6 +265,34 @@ public:
     std::string ToString() const override;
 
     std::string table_name;
+    // DROP TABLE IF EXISTS：表不存在时静默成功，便于幂等脚本
+    bool if_exists = false;
+};
+
+// CREATE [UNIQUE] INDEX <name> ON <table>(col, ...)
+class CreateIndexStatement : public Statement {
+public:
+    CreateIndexStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string index_name;
+    std::string table_name;
+    std::vector<std::string> key_columns;
+    bool is_unique = false;
+};
+
+// DROP INDEX [IF EXISTS] <name>
+class DropIndexStatement : public Statement {
+public:
+    DropIndexStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string index_name;
+    bool if_exists = false;
 };
 
 // TRUNCATE TABLE 语句：清空表中所有数据，但保留表结构

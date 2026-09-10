@@ -4,6 +4,10 @@
 #include <string>
 #include <unordered_map>
 
+#include <vector>
+
+#include "catalog/IndexInfo.h"
+#include "index/BPlusTree.h"
 #include "semantic/SymbolTable.h"
 #include "storage/BufferPoolManager.h"
 #include "storage_engine/TableHeap.h"
@@ -50,20 +54,63 @@ public:
     // 提供内存态元数据视图，供语义分析/计划生成阶段复用（避免与编译器模块重复实现）
     SymbolTable& GetSymbolTable();
 
+    // ---- 索引管理 ----
+    //
+    // 索引元数据存放在另一张系统堆 __sys_indexes__ 中，而不是塞进表元数据 blob。
+    // 理由：CREATE/DROP INDEX 会频繁改写索引元数据，若与表元数据同处一条记录，
+    // 每次建索引都要重写整张表的定义，徒增写放大与损坏风险。
+
+    // 创建索引：校验可建性、建空树、持久化元数据。不做数据回填（由调用方决定）。
+    // 失败时通过 error 返回原因。
+    bool CreateIndex(const IndexInfo& index_info, std::string* error);
+    bool DropIndex(const std::string& index_name);
+    // 把某张表的所有索引重置为空树（TRUNCATE 用）。索引定义保留，内容清空。
+    void ResetIndexesOfTable(const std::string& table_name);
+
+    const IndexInfo* GetIndex(const std::string& index_name) const;
+    BPlusTree* GetIndexTree(const std::string& index_name);
+    // 某张表上的全部索引（含主键索引）
+    std::vector<const IndexInfo*> GetIndexesForTable(const std::string& table_name) const;
+    // 覆盖指定主键列组的唯一索引；没有则返回 nullptr（此时约束校验回退到全表扫描）
+    BPlusTree* GetPrimaryKeyIndexTree(const std::string& table_name,
+                                      const std::vector<std::string>& pk_columns);
+
 private:
     BufferPoolManager* buffer_pool_manager_;
     SymbolTable symbol_table_;  // 内存态元数据缓存
 
     page_id_t sys_tables_first_page_id_;  // 系统目录自身存储表的首页
+    // 索引目录堆的首页。旧版本数据库没有这张堆，此时为 INVALID_PAGE_ID，
+    // 首次 CREATE INDEX 时惰性创建——这样旧库文件仍能正常打开。
+    page_id_t sys_indexes_first_page_id_;
 
     // 各用户表对应的数据堆，key为表名
     std::unordered_map<std::string, std::unique_ptr<TableHeap>> table_heaps_;
+
+    // 索引元数据与对应的 B+Tree，key 为索引名。Catalog 持有所有权，
+    // getter 返回裸指针（与 table_heaps_ 一致的所有权约定）。
+    std::unique_ptr<TableHeap> index_heap_;  // __sys_indexes__ 堆
+    std::unordered_map<std::string, IndexInfo> indexes_;
+    std::unordered_map<std::string, std::unique_ptr<BPlusTree>> index_trees_;
 
     // 将一条表的元数据（表名、列定义列表）编码为记录，追加写入sys_tables堆表
     bool PersistTableMetadata(const TableInfo& table_info);
 
     // 将sys_tables堆表中的一条记录解码为TableInfo
     TableInfo DecodeTableMetadata(const Tuple& tuple) const;
+
+    // ---- 索引目录内部实现 ----
+    // 确保 __sys_indexes__ 堆存在（必要时创建并把首页 id 记入 sys_tables）
+    bool EnsureSysIndexesHeap();
+    bool PersistIndexMetadata(const IndexInfo& index_info);
+    // 从 __sys_indexes__ 删除某条索引元数据
+    void RemoveIndexMetadata(const std::string& index_name);
+    // 从 __sys_indexes__ 重建全部索引元数据与 B+Tree 句柄
+    void LoadIndexesFromDisk();
+    // 打开一棵已持久化的索引树，失败返回 false
+    bool OpenIndexTree(const IndexInfo& index_info);
+    // 删除某张表的全部索引（含 B+Tree 页面回收）
+    void DropIndexesOfTable(const std::string& table_name);
 };
 
 }  // namespace sqlcompiler

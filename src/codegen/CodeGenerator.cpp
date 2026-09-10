@@ -39,6 +39,9 @@ void CodeGenerator::GenerateNode(const PlanNodePtr& node, std::vector<Instructio
     }
     switch (node->GetType()) {
         case PlanNodeType::SEQ_SCAN:     GenerateSeqScan(node, out); break;
+        // 索引扫描沿用全表扫描的伪指令输出：代码生成器只用于展示执行计划，
+        // 不区分访问路径。
+        case PlanNodeType::INDEX_SCAN:   GenerateSeqScan(node, out); break;
         case PlanNodeType::FILTER:       GenerateFilter(node, out); break;
         case PlanNodeType::PROJECT:      GenerateProject(node, out); break;
         case PlanNodeType::JOIN:         GenerateJoin(node, out); break;

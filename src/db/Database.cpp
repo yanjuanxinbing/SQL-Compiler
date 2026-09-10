@@ -41,8 +41,19 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size)
     //    这样做的好处：
     //      - 避免 DiskManager 构造时 open(in|out) 失败后的恢复路径不可控
     //      - 在创建失败时（如权限不足）能给出清晰的错误信息
+    //    注意：必须同时把「存在但为 0 字节 / 不足一页」的文件视为新库。
+    //    否则 LoadFromDisk() 会假定 page 0 是 sys_tables 首页，但该页从未被
+    //    分配；随后的 CREATE TABLE 会把 page 0 分配给用户表，导致用户表堆与
+    //    系统目录堆共用同一页，SELECT 时按错误 schema 反序列化目录元组而崩溃。
     is_new_database_ = !fs::exists(abs_path);
-    if (is_new_database_) {
+    if (!is_new_database_) {
+        std::error_code size_ec;
+        auto sz = fs::file_size(abs_path, size_ec);
+        if (size_ec || sz < PAGE_SIZE) {
+            is_new_database_ = true;
+        }
+    }
+    if (!fs::exists(abs_path)) {
         std::ofstream create(db_file_path_, std::ios::binary | std::ios::trunc);
         if (!create.is_open()) {
             throw std::runtime_error(
@@ -94,9 +105,17 @@ ExecutionResult Database::ExecuteSQL(const std::string& sql) {
         }
         Planner planner(catalog_->GetSymbolTable());
         auto plan = planner.CreatePlan(statement);
-        Optimizer optimizer;
+        Optimizer optimizer(catalog_.get());
         plan = optimizer.Optimize(plan);
-        return execution_engine_->Execute(plan);
+        auto exec_result = execution_engine_->Execute(plan);
+        // 无 WAL/检查点机制时，脏页只在 Shutdown 刷盘；一旦用户 Ctrl+C 或进程
+        // 异常退出，已回报 OK 的 DDL/DML 会丢失，更糟的是磁盘上会留下「已分配
+        // 但内容全零」的页，下次打开时被当成合法页解析。这里在每条语句成功后
+        // 落盘，保证 REPL 看到的 OK 与磁盘状态一致。
+        if (exec_result.success && buffer_pool_manager_) {
+            buffer_pool_manager_->FlushAllPages();
+        }
+        return exec_result;
     } catch (const CompilerException& e) {
         result.success = false;
         result.message = FormatError(e);

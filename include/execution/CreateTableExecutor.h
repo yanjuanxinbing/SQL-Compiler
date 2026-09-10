@@ -13,7 +13,9 @@ namespace sqlcompiler {
 class CreateTableExecutor : public Executor {
 public:
     CreateTableExecutor(ExecutionContext* context, std::string table_name,
-                         std::vector<ColumnDefinition> columns);
+                         std::vector<ColumnDefinition> columns,
+                         std::vector<std::vector<std::string>> primary_keys = {},
+                         bool if_not_exists = false);
 
     void Init() override;
     bool Next(Tuple* tuple) override;  // DDL语句不产出Tuple，恒定返回false
@@ -21,6 +23,8 @@ public:
 private:
     std::string table_name_;
     std::vector<ColumnDefinition> columns_;
+    std::vector<std::vector<std::string>> primary_keys_;
+    bool if_not_exists_;
     bool executed_;
 };
 

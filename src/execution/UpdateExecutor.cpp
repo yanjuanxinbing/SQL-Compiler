@@ -1,5 +1,7 @@
 #include "execution/UpdateExecutor.h"
 
+#include "execution/ConstraintChecker.h"
+#include "execution/IndexMaintenance.h"
 #include "execution/ExpressionEvaluator.h"
 
 #include <unordered_map>
@@ -69,8 +71,36 @@ bool UpdateExecutor::Next(Tuple* tuple) {
             new_values[idx] = eval.Evaluate(kv.second, cur);
         }
         Tuple new_t(std::move(new_values));
+        // 与 INSERT 走同一套约束校验；exclude_rid 传本行自身，避免「主键未改动的
+        // 原地更新」被误判为重复键。
+        {
+            const TableInfo* info = context_->GetCatalog()->GetTable(table_name_);
+            if (info) {
+                std::vector<Value> row_snapshot;
+                row_snapshot.reserve(new_t.ColumnCount());
+                for (size_t i = 0; i < new_t.ColumnCount(); ++i) {
+                    row_snapshot.push_back(new_t.GetValue(i));
+                }
+                ValidateRowConstraints(context_->GetCatalog(), *info,
+                                       table_heap_, row_snapshot, &r);
+                CheckUniqueIndexes(context_->GetCatalog(), *info, row_snapshot, &r);
+            }
+        }
+        // 索引同步：先摘掉旧键，写堆成功后再挂上新键。
+        // 顺序反过来（先插新键）会让唯一索引在「键未变」时自己撞自己。
+        const TableInfo* info = context_->GetCatalog()->GetTable(table_name_);
+        if (info != nullptr) {
+            DeleteFromIndexes(context_->GetCatalog(), *info, cur.GetValues(), r);
+        }
         if (table_heap_->UpdateTuple(r, new_t, column_types_)) {
             ++affected;
+            if (info != nullptr) {
+                InsertIntoIndexes(context_->GetCatalog(), *info,
+                                  new_t.GetValues(), r);
+            }
+        } else if (info != nullptr) {
+            // 写堆失败：把刚摘掉的旧键放回去，避免索引凭空少一条
+            InsertIntoIndexes(context_->GetCatalog(), *info, cur.GetValues(), r);
         }
     }
     if (tuple) *tuple = Tuple({Value::MakeInt(affected)});

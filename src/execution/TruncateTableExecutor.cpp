@@ -14,6 +14,9 @@ void TruncateTableExecutor::Init() {
         throw CompilerException(ErrorStage::SEMANTIC,
             "table not found: " + table_name_);
     }
+    // 表数据被清空，索引里的 RID 全部失效，必须一并重建为空树，
+    // 否则后续查询会沿着悬空 RID 读出垃圾。
+    context_->GetCatalog()->ResetIndexesOfTable(table_name_);
     executed_ = true;
 }
 

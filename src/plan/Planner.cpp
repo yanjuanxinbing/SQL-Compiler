@@ -115,6 +115,10 @@ PlanNodePtr Planner::CreatePlan(const StatementPtr& statement) {
             return PlanCreateTable(*std::static_pointer_cast<CreateTableStatement>(statement));
         case NodeType::DROP_TABLE_STMT:
             return PlanDropTable(*std::static_pointer_cast<DropTableStatement>(statement));
+        case NodeType::CREATE_INDEX_STMT:
+            return PlanCreateIndex(*std::static_pointer_cast<CreateIndexStatement>(statement));
+        case NodeType::DROP_INDEX_STMT:
+            return PlanDropIndex(*std::static_pointer_cast<DropIndexStatement>(statement));
         case NodeType::TRUNCATE_TABLE_STMT:
             return PlanTruncateTable(*std::static_pointer_cast<TruncateTableStatement>(statement));
         default:
@@ -194,11 +198,36 @@ PlanNodePtr Planner::PlanDelete(const DeleteStatement& stmt) {
 }
 
 PlanNodePtr Planner::PlanCreateTable(const CreateTableStatement& stmt) {
-    return std::make_shared<CreateTableNode>(stmt.table_name, stmt.columns);
+    // 将表级 PRIMARY KEY(a, b, ...) 投影到每列 is_primary_key，便于执行器沿用既有单列 PK 路径。
+    std::vector<ColumnDefinition> cols = stmt.columns;
+    if (!stmt.primary_keys.empty()) {
+        for (const auto& pk : stmt.primary_keys) {
+            for (const auto& col_name : pk) {
+                for (auto& cd : cols) {
+                    if (cd.column_name == col_name) {
+                        cd.is_primary_key = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return std::make_shared<CreateTableNode>(stmt.table_name, std::move(cols),
+                                             stmt.primary_keys,
+                                             stmt.if_not_exists);
 }
 
 PlanNodePtr Planner::PlanDropTable(const DropTableStatement& stmt) {
-    return std::make_shared<DropTableNode>(stmt.table_name);
+    return std::make_shared<DropTableNode>(stmt.table_name, stmt.if_exists);
+}
+
+PlanNodePtr Planner::PlanCreateIndex(const CreateIndexStatement& stmt) {
+    return std::make_shared<CreateIndexNode>(stmt.index_name, stmt.table_name,
+                                             stmt.key_columns, stmt.is_unique);
+}
+
+PlanNodePtr Planner::PlanDropIndex(const DropIndexStatement& stmt) {
+    return std::make_shared<DropIndexNode>(stmt.index_name, stmt.if_exists);
 }
 
 PlanNodePtr Planner::PlanTruncateTable(const TruncateTableStatement& stmt) {

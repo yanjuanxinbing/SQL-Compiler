@@ -5,6 +5,9 @@
 #include "execution/CreateTableExecutor.h"
 #include "execution/DeleteExecutor.h"
 #include "execution/DistinctExecutor.h"
+#include "execution/CreateIndexExecutor.h"
+#include "execution/IndexScanExecutor.h"
+#include "execution/DropIndexExecutor.h"
 #include "execution/DropTableExecutor.h"
 #include "execution/FilterExecutor.h"
 #include "execution/InsertExecutor.h"
@@ -27,6 +30,9 @@ std::string FindScanTableName(const PlanNodePtr& node) {
     if (node->GetType() == PlanNodeType::SEQ_SCAN) {
         return std::static_pointer_cast<SeqScanNode>(node)->table_name;
     }
+    if (node->GetType() == PlanNodeType::INDEX_SCAN) {
+        return std::static_pointer_cast<IndexScanNode>(node)->table_name;
+    }
     for (auto& c : node->children) {
         std::string t = FindScanTableName(c);
         if (!t.empty()) return t;
@@ -40,6 +46,9 @@ std::vector<std::string> CollectScanTableNames(const PlanNodePtr& node) {
     if (!node) return names;
     if (node->GetType() == PlanNodeType::SEQ_SCAN) {
         names.push_back(std::static_pointer_cast<SeqScanNode>(node)->table_name);
+    }
+    if (node->GetType() == PlanNodeType::INDEX_SCAN) {
+        names.push_back(std::static_pointer_cast<IndexScanNode>(node)->table_name);
     }
     for (auto& c : node->children) {
         auto sub = CollectScanTableNames(c);
@@ -92,6 +101,7 @@ ExecutionResult ExecutionEngine::Execute(const PlanNodePtr& plan) {
         // Determine if root is a query (any read operator) or DML/DDL
         bool is_query = (plan->GetType() == PlanNodeType::PROJECT ||
                          plan->GetType() == PlanNodeType::SEQ_SCAN ||
+                         plan->GetType() == PlanNodeType::INDEX_SCAN ||
                          plan->GetType() == PlanNodeType::FILTER ||
                          plan->GetType() == PlanNodeType::JOIN ||
                          plan->GetType() == PlanNodeType::SORT ||
@@ -127,6 +137,11 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
         case PlanNodeType::SEQ_SCAN: {
             auto n = std::static_pointer_cast<SeqScanNode>(plan_node);
             return std::make_unique<SeqScanExecutor>(context, n->table_name);
+        }
+        case PlanNodeType::INDEX_SCAN: {
+            auto n = std::static_pointer_cast<IndexScanNode>(plan_node);
+            auto col_map = BuildCombinedColumnIndexMap(context->GetCatalog(), {n->table_name});
+            return std::make_unique<IndexScanExecutor>(context, n, col_map);
         }
         case PlanNodeType::FILTER: {
             auto n = std::static_pointer_cast<FilterNode>(plan_node);
@@ -253,11 +268,24 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
         }
         case PlanNodeType::CREATE_TABLE: {
             auto n = std::static_pointer_cast<CreateTableNode>(plan_node);
-            return std::make_unique<CreateTableExecutor>(context, n->table_name, n->columns);
+            return std::make_unique<CreateTableExecutor>(context, n->table_name,
+                                                          n->columns, n->primary_keys,
+                                                          n->if_not_exists);
         }
         case PlanNodeType::DROP_TABLE: {
             auto n = std::static_pointer_cast<DropTableNode>(plan_node);
-            return std::make_unique<DropTableExecutor>(context, n->table_name);
+            return std::make_unique<DropTableExecutor>(context, n->table_name,
+                                                       n->if_exists);
+        }
+        case PlanNodeType::CREATE_INDEX: {
+            auto n = std::static_pointer_cast<CreateIndexNode>(plan_node);
+            return std::make_unique<CreateIndexExecutor>(
+                context, n->index_name, n->table_name, n->key_columns, n->is_unique);
+        }
+        case PlanNodeType::DROP_INDEX: {
+            auto n = std::static_pointer_cast<DropIndexNode>(plan_node);
+            return std::make_unique<DropIndexExecutor>(context, n->index_name,
+                                                       n->if_exists);
         }
         case PlanNodeType::TRUNCATE_TABLE: {
             auto n = std::static_pointer_cast<TruncateTableNode>(plan_node);
