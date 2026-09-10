@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
     std::cout << "sqlcompiler> " << std::flush;
     while (std::getline(std::cin, line)) {
         sql += line;
-        sql += " ";
+        sql += "\n";
         if (sql.find(';') == std::string::npos) {
             std::cout << "       -> " << std::flush;
             continue;
