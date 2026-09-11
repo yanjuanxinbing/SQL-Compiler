@@ -374,4 +374,178 @@ std::string TruncateTableStatement::ToString() const {
     return "TRUNCATE TABLE " + table_name;
 }
 
+// ============ CaseExprNode ============
+
+CaseExprNode::CaseExprNode() {
+}
+
+NodeType CaseExprNode::GetType() const {
+    return NodeType::CASE_EXPR;
+}
+
+std::string CaseExprNode::ToString() const {
+    std::ostringstream oss;
+    oss << "CASE";
+    if (subject) {
+        oss << " " << subject->ToString();
+    }
+    for (const auto& w : whens) {
+        oss << " WHEN " << (w.when_expr ? w.when_expr->ToString() : "?")
+            << " THEN " << (w.then_expr ? w.then_expr->ToString() : "?");
+    }
+    if (else_expr) {
+        oss << " ELSE " << else_expr->ToString();
+    }
+    oss << " END";
+    return oss.str();
+}
+
+// ============ CastExprNode ============
+
+CastExprNode::CastExprNode(ExprPtr expr, std::string target_type)
+    : expr(std::move(expr)), target_type(std::move(target_type)) {
+}
+
+NodeType CastExprNode::GetType() const {
+    return NodeType::CAST_EXPR;
+}
+
+std::string CastExprNode::ToString() const {
+    std::string inner = expr ? expr->ToString() : "?";
+    return "CAST(" + inner + " AS " + target_type + ")";
+}
+
+// ============ WindowFuncNode ============
+
+WindowFuncNode::WindowFuncNode(std::string function_name,
+                                std::vector<ExprPtr> arguments,
+                                WindowSpec spec,
+                                std::string window_name)
+    : function_name(std::move(function_name)),
+      arguments(std::move(arguments)),
+      spec(std::move(spec)),
+      window_name(std::move(window_name)) {
+}
+
+NodeType WindowFuncNode::GetType() const {
+    return NodeType::WINDOW_FUNC_EXPR;
+}
+
+std::string WindowFuncNode::ToString() const {
+    std::ostringstream oss;
+    oss << function_name << "(";
+    for (size_t i = 0; i < arguments.size(); ++i) {
+        if (i > 0) oss << ", ";
+        oss << (arguments[i] ? arguments[i]->ToString() : "?");
+    }
+    oss << ") OVER ";
+    if (!window_name.empty()) {
+        oss << window_name;
+    } else {
+        oss << "(";
+        if (!spec.partition_by.empty()) {
+            oss << "PARTITION BY ";
+            for (size_t i = 0; i < spec.partition_by.size(); ++i) {
+                if (i > 0) oss << ", ";
+                oss << (spec.partition_by[i] ? spec.partition_by[i]->ToString() : "?");
+            }
+            oss << " ";
+        }
+        if (!spec.order_by.empty()) {
+            oss << "ORDER BY ";
+            for (size_t i = 0; i < spec.order_by.size(); ++i) {
+                if (i > 0) oss << ", ";
+                oss << (spec.order_by[i].expr ? spec.order_by[i].expr->ToString() : "?")
+                    << (spec.order_by[i].ascending ? " ASC" : " DESC");
+            }
+        }
+        oss << ")";
+    }
+    return oss.str();
+}
+
+// ============ SubqueryExprNode ============
+
+SubqueryExprNode::SubqueryExprNode(SubqueryType kind,
+                                    SelectStatementPtr subquery,
+                                    std::string comparison_op,
+                                    ExprPtr outer_expr)
+    : kind(kind),
+      subquery(std::move(subquery)),
+      comparison_op(std::move(comparison_op)),
+      outer_expr(std::move(outer_expr)) {
+}
+
+NodeType SubqueryExprNode::GetType() const {
+    return NodeType::SUBQUERY_EXPR;
+}
+
+std::string SubqueryExprNode::ToString() const {
+    std::ostringstream oss;
+    if (kind == SubqueryType::EXISTS) {
+        oss << "EXISTS(";
+        if (subquery) oss << subquery->ToString();
+        oss << ")";
+    } else if (kind == SubqueryType::IN) {
+        oss << "(" << (outer_expr ? outer_expr->ToString() : "?") << " IN (";
+        if (subquery) oss << subquery->ToString();
+        oss << "))";
+    } else if (kind == SubqueryType::ANY) {
+        oss << "(" << (outer_expr ? outer_expr->ToString() : "?")
+            << " " << comparison_op << " ANY (";
+        if (subquery) oss << subquery->ToString();
+        oss << "))";
+    } else {
+        oss << "(";
+        if (subquery) oss << subquery->ToString();
+        oss << ")";
+    }
+    return oss.str();
+}
+
+// ============ WithClauseStatement ============
+
+WithClauseStatement::WithClauseStatement() {
+}
+
+NodeType WithClauseStatement::GetType() const {
+    return NodeType::WITH_STMT;
+}
+
+std::string WithClauseStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "WITH ";
+    if (is_recursive) oss << "RECURSIVE ";
+    for (size_t i = 0; i < ctes.size(); ++i) {
+        if (i > 0) oss << ", ";
+        oss << ctes[i].cte_name << " AS (";
+        if (ctes[i].cte_query) oss << ctes[i].cte_query->ToString();
+        oss << ")";
+    }
+    if (body) oss << " " << body->ToString();
+    return oss.str();
+}
+
+// ============ SetOperationStatement ============
+
+SetOperationStatement::SetOperationStatement() {
+}
+
+NodeType SetOperationStatement::GetType() const {
+    return NodeType::SET_OP_STMT;
+}
+
+std::string SetOperationStatement::ToString() const {
+    std::ostringstream oss;
+    if (left) oss << left->ToString() << " ";
+    switch (kind) {
+        case Kind::UNION:      oss << "UNION "; break;
+        case Kind::UNION_ALL:  oss << "UNION ALL "; break;
+        case Kind::INTERSECT:  oss << "INTERSECT "; break;
+        case Kind::EXCEPT:     oss << "EXCEPT "; break;
+    }
+    if (right) oss << right->ToString();
+    return oss.str();
+}
+
 }  // namespace sqlcompiler

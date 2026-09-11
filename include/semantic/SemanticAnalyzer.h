@@ -44,11 +44,29 @@ private:
     bool AnalyzeDropIndex(const DropIndexStatement& stmt);
     bool AnalyzeTruncateTable(const TruncateTableStatement& stmt);
 
+    // 内部递归版本：不调用 ClearErrors，便于在嵌套语句（如 SET_OP_STMT）中
+    // 累积所有子树产生的错误。
+    bool AnalyzeInternal(const StatementPtr& statement, bool& ok);
+
     // ---- 通用检查函数 ----
     bool CheckTableExists(const std::string& table_name);
     bool CheckColumnExists(const std::string& table_name, const std::string& column_name);
     bool CheckExpression(const ExprPtr& expr, const std::string& table_name);
-    bool CheckExpressionMulti(const ExprPtr& expr, const std::vector<std::string>& tables);
+
+    // 别名映射：每个 pair 是 (alias_or_name, real_table_name)。用于把限定列
+    // 引用（如 `e.dept_id`）中的别名解析回真实表，以便在「该别名对应的那张表」
+    // 上校验列存在性，避免「跨表找到列就放过」的语义漏检。
+    using TableAliasMap = std::vector<std::pair<std::string, std::string>>;
+
+    bool CheckExpressionMulti(const ExprPtr& expr,
+                              const std::vector<std::string>& tables,
+                              const TableAliasMap& aliases = {});
+    // 与 CheckExpressionMulti 类似，但额外允许 aliases 中的名字解析为列引用。
+    // 用于 ORDER BY / HAVING / 同 SELECT 列表中靠后的项，使 SELECT 别名在这些位置可见。
+    bool CheckExpressionMultiWithAliases(const ExprPtr& expr,
+                                         const std::vector<std::string>& tables,
+                                         const std::vector<std::string>& aliases,
+                                         const TableAliasMap& table_aliases = {});
 
     void AddError(const std::string& message, int line = -1);
 };

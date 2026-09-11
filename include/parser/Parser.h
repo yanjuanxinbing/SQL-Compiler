@@ -35,7 +35,7 @@ private:
 
     // ---- 语句解析 ----
     StatementPtr ParseStatement();
-    StatementPtr ParseSelectStatement();
+    StatementPtr ParseSelectStatement(bool consume_trailers = true);
     StatementPtr ParseInsertStatement();
     StatementPtr ParseUpdateStatement();
     StatementPtr ParseDeleteStatement();
@@ -70,6 +70,34 @@ private:
 
     // 解析 [table.]column 或 table.* 形式的列引用
     ExprPtr ParseColumnRefOrFunctionCall();
+
+    // ---- 27–33 新增语法 ----
+    // 解析 WHERE/HAVING 中可选的前导 NOT（保留以兼容旧调用）
+    // 解析简单 CASE / 搜索式 CASE
+    ExprPtr ParseCaseExpression();
+    // 解析 CAST(expr AS type)
+    ExprPtr ParseCastExpression();
+    // 解析形如 (SELECT ...) / EXISTS (SELECT ...) / ... IN (SELECT ...) / expr op ANY (SELECT ...) 的子查询
+    ExprPtr ParseSubqueryExpression(ExprPtr left_operand, const std::string& comparison_op,
+                                    SubqueryType forced_kind = SubqueryType::SCALAR);
+    // 解析 OVER (...) 或 OVER w
+    WindowSpec ParseOverSpec();
+    // 解析 SELECT 后置的 WINDOW 子句（命名窗口）
+    std::vector<std::pair<std::string, WindowSpec>> ParseWindowClause();
+    // 解析函数调用后的 OVER (...) 子句（若无 OVER 则返回 nullptr）。
+    // 假定 '(' 已经被当前调用方消耗，进入时当前 token 应为 OVER。
+    std::shared_ptr<WindowFuncNode> ParseOverClause(const std::string& func_name,
+                                                     std::vector<ExprPtr>& args);
+    // 解析 SELECT 末尾的 UNION/INTERSECT/EXCEPT 链（左递归式，返回 StatementPtr）
+    StatementPtr ParseSetOperationTail(StatementPtr left);
+    // 解析 WITH ... SELECT（不含 set op tail；set op 由调用者处理）
+    StatementPtr ParseWithClause();
+    // 解析 SELECT 的 FROM 段（含派生表 (SELECT ...) AS alias）
+    void ParseFromClause(SelectStatement& stmt);
+    // 单个 FROM 表项
+    void ParseFromTableRef(SelectStatement& stmt);
+    // 解析 SELECT 语句并自动连接尾部 set-op 链
+    StatementPtr ParseSelectStatementWithSetOps();
 };
 
 }  // namespace sqlcompiler

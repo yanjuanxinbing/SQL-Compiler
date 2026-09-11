@@ -20,7 +20,7 @@ bool FilterExecutor::Next(Tuple* tuple) {
     if (!child_) return false;
     Tuple tmp;
     while (child_->Next(&tmp)) {
-        ExpressionEvaluator eval(column_index_map_);
+        ExpressionEvaluator eval(column_index_map_, context_, nullptr);
         Value v = eval.Evaluate(predicate_, tmp);
         if (!v.IsNull() && v.AsInt() != 0) {
             if (tuple) *tuple = tmp;

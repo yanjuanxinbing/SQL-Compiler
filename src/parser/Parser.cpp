@@ -15,6 +15,7 @@ StatementPtr Parser::Parse() {
     if (IsAtEnd()) return nullptr;
     StatementPtr stmt = ParseStatement();
     if (!stmt) return nullptr;
+    // 顶层 SELECT/WITH 可能跟 UNION/EXCEPT/INTERSECT 链——已经被内部消化
     Match(TokenType::SEMICOLON);
     return stmt;
 }
@@ -86,8 +87,51 @@ bool Parser::IsAtEnd() const {
 
 StatementPtr Parser::ParseStatement() {
     const Token& cur = CurrentToken();
+    // 顶层允许以 '(' 开始的 parenthesized SELECT（如 (SELECT ...) INTERSECT SELECT ...）
+    if (cur.type == TokenType::LEFT_PAREN) {
+        Advance(); // '('
+        StatementPtr inner;
+        if (Check(TokenType::KEYWORD_SELECT)) {
+            inner = ParseSelectStatementWithSetOps();
+        } else if (Check(TokenType::KEYWORD_WITH)) {
+            inner = ParseWithClause();
+        } else {
+            throw CompilerException(ErrorStage::SYNTAX,
+                "expected SELECT inside parenthesized statement");
+        }
+        Expect(TokenType::RIGHT_PAREN, "expected ')' to close parenthesized statement");
+        // 后面可能还有 UNION/INTERSECT/EXCEPT 链
+        if (Check(TokenType::KEYWORD_UNION) ||
+            Check(TokenType::KEYWORD_INTERSECT) ||
+            Check(TokenType::KEYWORD_EXCEPT)) {
+            StatementPtr chain = ParseSetOperationTail(inner);
+            if (chain && chain->GetType() == NodeType::SET_OP_STMT) {
+                auto so = std::static_pointer_cast<SetOperationStatement>(chain);
+                if (Check(TokenType::KEYWORD_ORDER)) {
+                    so->order_by = ParseOrderByClause();
+                }
+                if (Check(TokenType::KEYWORD_LIMIT)) {
+                    Advance();
+                    Token first = Expect(TokenType::INTEGER_LITERAL,
+                                         "expected integer after LIMIT");
+                    int first_val = std::atoi(first.lexeme.c_str());
+                    if (Match(TokenType::COMMA)) {
+                        so->limit_offset = first_val;
+                        Token second = Expect(TokenType::INTEGER_LITERAL,
+                                              "expected integer after ','");
+                        so->limit = std::atoi(second.lexeme.c_str());
+                    } else {
+                        so->limit = first_val;
+                    }
+                }
+            }
+            return chain;
+        }
+        return inner;
+    }
     switch (cur.type) {
-        case TokenType::KEYWORD_SELECT: return ParseSelectStatement();
+        case TokenType::KEYWORD_SELECT: return ParseSelectStatementWithSetOps();
+        case TokenType::KEYWORD_WITH:   return ParseWithClause();
         case TokenType::KEYWORD_INSERT: return ParseInsertStatement();
         case TokenType::KEYWORD_UPDATE: return ParseUpdateStatement();
         case TokenType::KEYWORD_DELETE: return ParseDeleteStatement();
@@ -123,7 +167,7 @@ StatementPtr Parser::ParseStatement() {
     }
 }
 
-StatementPtr Parser::ParseSelectStatement() {
+StatementPtr Parser::ParseSelectStatement(bool consume_trailers) {
     Expect(TokenType::KEYWORD_SELECT, "expected SELECT");
     auto stmt = std::make_shared<SelectStatement>();
     if (Match(TokenType::KEYWORD_DISTINCT)) {
@@ -135,8 +179,19 @@ StatementPtr Parser::ParseSelectStatement() {
     auto parse_alias = [&]() -> std::string {
         std::string alias;
         if (Match(TokenType::KEYWORD_AS)) {
-            Token a = Expect(TokenType::IDENTIFIER, "expected alias name after AS");
-            alias = a.lexeme;
+            // 别名可以是普通标识符，也可以是某些关键字（如 CUME_DIST、COUNT 等被作为列名时）
+            const Token& t = CurrentToken();
+            if (t.type == TokenType::IDENTIFIER) {
+                alias = t.lexeme;
+                Advance();
+            } else if (t.type == TokenType::KEYWORD_CUME_DIST ||
+                       t.type == TokenType::KEYWORD_PERCENT_RANK) {
+                alias = t.lexeme;
+                Advance();
+            } else {
+                Token a = Expect(TokenType::IDENTIFIER, "expected alias name after AS");
+                alias = a.lexeme;
+            }
         } else if (CurrentToken().type == TokenType::IDENTIFIER &&
                    !Check(TokenType::KEYWORD_FROM) && !Check(TokenType::KEYWORD_WHERE) &&
                    !Check(TokenType::KEYWORD_GROUP) && !Check(TokenType::KEYWORD_HAVING) &&
@@ -163,41 +218,143 @@ StatementPtr Parser::ParseSelectStatement() {
         stmt->select_aliases.push_back(parse_alias());
     } while (Match(TokenType::COMMA));
     if (Check(TokenType::KEYWORD_FROM)) {
+        ParseFromClause(*stmt);
+    }
+    if (Check(TokenType::KEYWORD_WHERE)) stmt->where_clause = ParseWhereClause();
+    if (Check(TokenType::KEYWORD_GROUP)) stmt->group_by = ParseGroupByClause();
+    if (Check(TokenType::KEYWORD_HAVING)) stmt->having_clause = ParseHavingClause();
+    // 当 SELECT 作为集合运算的子项被解析时（consume_trailers = false），
+    // ORDER BY / LIMIT / WINDOW 应当上提到集合运算节点上，而不是属于子 SELECT。
+    if (consume_trailers) {
+        if (Check(TokenType::KEYWORD_ORDER)) stmt->order_by = ParseOrderByClause();
+        if (Check(TokenType::KEYWORD_LIMIT)) {
+            Advance();
+            Token first = Expect(TokenType::INTEGER_LITERAL, "expected integer after LIMIT");
+            int first_val = std::atoi(first.lexeme.c_str());
+            if (Match(TokenType::COMMA)) {
+                stmt->limit_offset = first_val;
+                Token second = Expect(TokenType::INTEGER_LITERAL, "expected integer after ','");
+                stmt->limit = std::atoi(second.lexeme.c_str());
+            } else {
+                stmt->limit = first_val;
+            }
+        }
+        // WINDOW 子句（命名窗口）
+        if (Check(TokenType::KEYWORD_WINDOW)) {
+            auto wins = ParseWindowClause();
+            for (auto& w : wins) {
+                stmt->named_windows.push_back({w.first, w.second});
+            }
+        }
+    }
+    return stmt;
+}
+
+StatementPtr Parser::ParseSelectStatementWithSetOps() {
+    StatementPtr left = ParseSelectStatement();
+    if (Check(TokenType::KEYWORD_UNION) ||
+        Check(TokenType::KEYWORD_INTERSECT) ||
+        Check(TokenType::KEYWORD_EXCEPT)) {
+        StatementPtr chain = ParseSetOperationTail(left);
+        // 顶层 ORDER BY / LIMIT 上提到最近的外层集合运算节点上（如果有）。
+        // 由于 ParseSetOperationTail 内的子 SELECT 不消费 ORDER BY/LIMIT，这里
+        // 把它们挂到 SetOperationStatement 上，由 planner 再包 Sort/Limit。
+        if (chain && chain->GetType() == NodeType::SET_OP_STMT) {
+            auto so = std::static_pointer_cast<SetOperationStatement>(chain);
+            if (Check(TokenType::KEYWORD_ORDER)) {
+                so->order_by = ParseOrderByClause();
+            }
+            if (Check(TokenType::KEYWORD_LIMIT)) {
+                Advance();
+                Token first = Expect(TokenType::INTEGER_LITERAL, "expected integer after LIMIT");
+                int first_val = std::atoi(first.lexeme.c_str());
+                if (Match(TokenType::COMMA)) {
+                    so->limit_offset = first_val;
+                    Token second = Expect(TokenType::INTEGER_LITERAL, "expected integer after ','");
+                    so->limit = std::atoi(second.lexeme.c_str());
+                } else {
+                    so->limit = first_val;
+                }
+            }
+        }
+        return chain;
+    }
+    return left;
+}
+
+void Parser::ParseFromClause(SelectStatement& stmt) {
+    Expect(TokenType::KEYWORD_FROM, "expected FROM");
+    // 派生表: (SELECT ...) [AS] alias
+    if (Check(TokenType::LEFT_PAREN)) {
+        Advance(); // '('
+        if (Check(TokenType::KEYWORD_SELECT) || Check(TokenType::KEYWORD_WITH)) {
+            StatementPtr sub = (Check(TokenType::KEYWORD_SELECT))
+                ? ParseSelectStatement() : ParseWithClause();
+            // 处理派生表上的 UNION 链
+            if (Check(TokenType::KEYWORD_UNION) ||
+                Check(TokenType::KEYWORD_INTERSECT) ||
+                Check(TokenType::KEYWORD_EXCEPT)) {
+                sub = ParseSetOperationTail(sub);
+            }
+            Expect(TokenType::RIGHT_PAREN, "expected ')' after derived table subquery");
+            Match(TokenType::KEYWORD_AS);
+            Token alias = Expect(TokenType::IDENTIFIER, "expected derived table alias");
+            stmt.derived_table = std::static_pointer_cast<SelectStatement>(sub);
+            stmt.derived_alias = alias.lexeme;
+            stmt.joins = ParseJoinClauses();
+            return;
+        }
+        throw CompilerException(ErrorStage::SYNTAX,
+            "unsupported parenthesized FROM expression",
+            CurrentToken().line, CurrentToken().column);
+    }
+    Token table = Expect(TokenType::IDENTIFIER, "expected table name");
+    stmt.from_table = table.lexeme;
+    if (Match(TokenType::KEYWORD_AS)) {
+        Token a = Expect(TokenType::IDENTIFIER, "expected table alias");
+        stmt.from_table_alias = a.lexeme;
+    } else if (CurrentToken().type == TokenType::IDENTIFIER &&
+               !Check(TokenType::KEYWORD_WHERE) && !Check(TokenType::KEYWORD_INNER) &&
+               !Check(TokenType::KEYWORD_LEFT) && !Check(TokenType::KEYWORD_RIGHT) &&
+               !Check(TokenType::KEYWORD_JOIN) && !Check(TokenType::KEYWORD_GROUP) &&
+               !Check(TokenType::KEYWORD_HAVING) && !Check(TokenType::KEYWORD_ORDER) &&
+               !Check(TokenType::KEYWORD_LIMIT) && !Check(TokenType::KEYWORD_UNION) &&
+               !Check(TokenType::KEYWORD_INTERSECT) && !Check(TokenType::KEYWORD_EXCEPT) &&
+               !Check(TokenType::KEYWORD_WINDOW) &&
+               !Check(TokenType::SEMICOLON) && !IsAtEnd()) {
+        stmt.from_table_alias = CurrentToken().lexeme;
         Advance();
-        Token table = Expect(TokenType::IDENTIFIER, "expected table name");
-        stmt->from_table = table.lexeme;
+    }
+    // Comma-separated tables in FROM (SQL-92 cross join shorthand):
+    //   FROM t1, t2, t3 ...
+    // Convert each subsequent comma-separated table into an INNER JOIN entry
+    // so they participate in semantic analysis and execution the same way as
+    // explicit JOIN clauses (cartesian product filtered by WHERE).
+    while (Match(TokenType::COMMA)) {
+        Token next = Expect(TokenType::IDENTIFIER, "expected table name after ','");
+        JoinClause jc;
+        jc.join_type = JoinType::INNER;
+        jc.table_name = next.lexeme;
+        // Optional AS or implicit alias for the next table.
         if (Match(TokenType::KEYWORD_AS)) {
             Token a = Expect(TokenType::IDENTIFIER, "expected table alias");
-            stmt->from_table_alias = a.lexeme;
+            jc.table_alias = a.lexeme;
         } else if (CurrentToken().type == TokenType::IDENTIFIER &&
                    !Check(TokenType::KEYWORD_WHERE) && !Check(TokenType::KEYWORD_INNER) &&
                    !Check(TokenType::KEYWORD_LEFT) && !Check(TokenType::KEYWORD_RIGHT) &&
                    !Check(TokenType::KEYWORD_JOIN) && !Check(TokenType::KEYWORD_GROUP) &&
                    !Check(TokenType::KEYWORD_HAVING) && !Check(TokenType::KEYWORD_ORDER) &&
-                   !Check(TokenType::KEYWORD_LIMIT) &&
+                   !Check(TokenType::KEYWORD_LIMIT) && !Check(TokenType::KEYWORD_UNION) &&
+                   !Check(TokenType::KEYWORD_INTERSECT) && !Check(TokenType::KEYWORD_EXCEPT) &&
+                   !Check(TokenType::KEYWORD_WINDOW) && !Check(TokenType::COMMA) &&
                    !Check(TokenType::SEMICOLON) && !IsAtEnd()) {
-            stmt->from_table_alias = CurrentToken().lexeme;
+            jc.table_alias = CurrentToken().lexeme;
             Advance();
         }
-        stmt->joins = ParseJoinClauses();
+        stmt.joins.push_back(std::move(jc));
     }
-    if (Check(TokenType::KEYWORD_WHERE)) stmt->where_clause = ParseWhereClause();
-    if (Check(TokenType::KEYWORD_GROUP)) stmt->group_by = ParseGroupByClause();
-    if (Check(TokenType::KEYWORD_HAVING)) stmt->having_clause = ParseHavingClause();
-    if (Check(TokenType::KEYWORD_ORDER)) stmt->order_by = ParseOrderByClause();
-    if (Check(TokenType::KEYWORD_LIMIT)) {
-        Advance();
-        Token first = Expect(TokenType::INTEGER_LITERAL, "expected integer after LIMIT");
-        int first_val = std::atoi(first.lexeme.c_str());
-        if (Match(TokenType::COMMA)) {
-            stmt->limit_offset = first_val;
-            Token second = Expect(TokenType::INTEGER_LITERAL, "expected integer after ','");
-            stmt->limit = std::atoi(second.lexeme.c_str());
-        } else {
-            stmt->limit = first_val;
-        }
-    }
-    return stmt;
+    auto extra = ParseJoinClauses();
+    for (auto& j : extra) stmt.joins.push_back(std::move(j));
 }
 
 StatementPtr Parser::ParseInsertStatement() {
@@ -265,11 +422,16 @@ StatementPtr Parser::ParseCreateTableStatement() {
     if (Check(TokenType::KEYWORD_IF)) {
         Advance();
         Expect(TokenType::KEYWORD_NOT, "expected NOT after IF");
-        // EXISTS 作为普通标识符
-        if (CurrentToken().type == TokenType::IDENTIFIER &&
-            CurrentToken().lexeme == "EXISTS") {
+        // EXISTS 已被注册为关键字，按关键字处理（同时兼容按标识符传入）
+        bool saw_exists = false;
+        if (Match(TokenType::KEYWORD_EXISTS)) {
+            saw_exists = true;
+        } else if (CurrentToken().type == TokenType::IDENTIFIER &&
+                   CurrentToken().lexeme == "EXISTS") {
             Advance();
-        } else {
+            saw_exists = true;
+        }
+        if (!saw_exists) {
             Expect(TokenType::IDENTIFIER, "expected EXISTS after IF NOT");
         }
         if_not_exists = true;
@@ -290,11 +452,15 @@ StatementPtr Parser::ParseDropTableStatement() {
     bool if_exists = false;
     if (Check(TokenType::KEYWORD_IF)) {
         Advance();
-        // EXISTS 未列入关键字表，按普通标识符处理（与 CREATE ... IF NOT EXISTS 一致）
-        if (CurrentToken().type == TokenType::IDENTIFIER &&
-            CurrentToken().lexeme == "EXISTS") {
+        bool saw_exists = false;
+        if (Match(TokenType::KEYWORD_EXISTS)) {
+            saw_exists = true;
+        } else if (CurrentToken().type == TokenType::IDENTIFIER &&
+                   CurrentToken().lexeme == "EXISTS") {
             Advance();
-        } else {
+            saw_exists = true;
+        }
+        if (!saw_exists) {
             Expect(TokenType::IDENTIFIER, "expected EXISTS after IF");
         }
         if_exists = true;
@@ -333,11 +499,15 @@ StatementPtr Parser::ParseDropIndexStatement() {
     auto stmt = std::make_shared<DropIndexStatement>();
     if (Check(TokenType::KEYWORD_IF)) {
         Advance();
-        // EXISTS 未列入关键字表，按普通标识符处理（与 DROP TABLE IF EXISTS 一致）
-        if (CurrentToken().type == TokenType::IDENTIFIER &&
-            CurrentToken().lexeme == "EXISTS") {
+        bool saw_exists = false;
+        if (Match(TokenType::KEYWORD_EXISTS)) {
+            saw_exists = true;
+        } else if (CurrentToken().type == TokenType::IDENTIFIER &&
+                   CurrentToken().lexeme == "EXISTS") {
             Advance();
-        } else {
+            saw_exists = true;
+        }
+        if (!saw_exists) {
             Expect(TokenType::IDENTIFIER, "expected EXISTS after IF");
         }
         stmt->if_exists = true;
@@ -574,12 +744,40 @@ ExprPtr Parser::ParseNotExpr() {
         ExprPtr operand = ParseNotExpr();
         return std::make_shared<UnaryExpr>(UnaryOperator::NOT, operand);
     }
+    if (Check(TokenType::KEYWORD_EXISTS)) {
+        Advance();
+        Expect(TokenType::LEFT_PAREN, "expected '(' after EXISTS");
+        return ParseSubqueryExpression(nullptr, "", SubqueryType::EXISTS);
+    }
     return ParseComparisonExpr();
 }
 
 ExprPtr Parser::ParseComparisonExpr() {
     ExprPtr left = ParseAdditiveExpr();
     const Token& cur = CurrentToken();
+
+    // NOT IN (SELECT ...) —— 形如 col NOT IN (SELECT ...)
+    if (Check(TokenType::KEYWORD_NOT) && PeekToken(1).type == TokenType::KEYWORD_IN) {
+        Advance(); // consume NOT
+        Advance(); // consume IN
+        Expect(TokenType::LEFT_PAREN, "expected '(' after NOT IN");
+        ExprPtr inner;
+        if (Check(TokenType::KEYWORD_SELECT) || Check(TokenType::KEYWORD_WITH)) {
+            inner = ParseSubqueryExpression(left, "IN");
+        } else {
+            std::vector<ExprPtr> values;
+            if (!Check(TokenType::RIGHT_PAREN)) {
+                values.push_back(ParseExpression());
+                while (Match(TokenType::COMMA)) {
+                    values.push_back(ParseExpression());
+                }
+            }
+            Expect(TokenType::RIGHT_PAREN, "expected ')' after NOT IN list");
+            auto list_expr = std::make_shared<FunctionCallExpr>("__IN_LIST__", values);
+            inner = std::make_shared<BinaryExpr>(BinaryOperator::IN_LIST, left, list_expr);
+        }
+        return std::make_shared<UnaryExpr>(UnaryOperator::NOT, inner);
+    }
 
     // IS [NOT] NULL (postfix)
     if (Check(TokenType::KEYWORD_IS)) {
@@ -599,10 +797,15 @@ ExprPtr Parser::ParseComparisonExpr() {
         return std::make_shared<BinaryExpr>(BinaryOperator::LIKE, left, right);
     }
 
-    // IN (val1, val2, ...)
+    // IN (val1, val2, ...) 或 IN (SELECT ...)
     if (Check(TokenType::KEYWORD_IN)) {
         Advance();
         Expect(TokenType::LEFT_PAREN, "expected '(' after IN");
+        // 子查询形式: IN (SELECT ...)
+        if (Check(TokenType::KEYWORD_SELECT) || Check(TokenType::KEYWORD_WITH)) {
+            // '(' 已经被 Expect 消耗；ParseSubqueryExpression 会消费 SELECT... 并在末尾消费 ')'
+            return ParseSubqueryExpression(left, "IN");
+        }
         std::vector<ExprPtr> values;
         if (!Check(TokenType::RIGHT_PAREN)) {
             values.push_back(ParseExpression());
@@ -618,6 +821,9 @@ ExprPtr Parser::ParseComparisonExpr() {
         return std::make_shared<BinaryExpr>(BinaryOperator::IN_LIST, left, list_expr);
     }
 
+    // ANY (SELECT ...)  —— 形如 expr > ANY (SELECT ...)
+    //   与比较运算符同侧: 解析到比较运算符后再做此检查。
+    //   也支持 expr = ANY (...) / expr > ANY (...) 等。
     // BETWEEN x AND y
     if (Check(TokenType::KEYWORD_BETWEEN)) {
         Advance();
@@ -645,6 +851,23 @@ ExprPtr Parser::ParseComparisonExpr() {
     }
     if (!matched) return left;
     Advance();
+    // expr op ANY (SELECT ...) —— 比较运算符后跟 ANY 子查询
+    if (Check(TokenType::KEYWORD_ANY)) {
+        Advance();
+        Expect(TokenType::LEFT_PAREN, "expected '(' after ANY");
+        std::string op_str;
+        switch (op) {
+            case BinaryOperator::EQUAL:          op_str = "="; break;
+            case BinaryOperator::NOT_EQUAL:      op_str = "<>"; break;
+            case BinaryOperator::LESS:           op_str = "<"; break;
+            case BinaryOperator::LESS_EQUAL:     op_str = "<="; break;
+            case BinaryOperator::GREATER:        op_str = ">"; break;
+            case BinaryOperator::GREATER_EQUAL:  op_str = ">="; break;
+            default: op_str = "="; break;
+        }
+        auto sub = ParseSubqueryExpression(left, op_str);
+        return sub;
+    }
     ExprPtr right = ParseAdditiveExpr();
     return std::make_shared<BinaryExpr>(op, left, right);
 }
@@ -684,7 +907,20 @@ ExprPtr Parser::ParseUnaryExpr() {
 
 ExprPtr Parser::ParsePrimaryExpr() {
     const Token& cur = CurrentToken();
+    if (cur.type == TokenType::KEYWORD_CASE) {
+        return ParseCaseExpression();
+    }
+    if (cur.type == TokenType::KEYWORD_CAST) {
+        return ParseCastExpression();
+    }
     if (cur.type == TokenType::LEFT_PAREN) {
+        // 可能是 (SELECT ...) / (WITH ...) 子查询；也可能是普通括号表达式
+        // 用「左括号后是 SELECT/WITH」判定为子查询
+        const Token& next = PeekToken(1);
+        if (next.type == TokenType::KEYWORD_SELECT || next.type == TokenType::KEYWORD_WITH) {
+            Advance(); // '('
+            return ParseSubqueryExpression(nullptr, "");
+        }
         Advance();
         ExprPtr inner = ParseExpression();
         Expect(TokenType::RIGHT_PAREN, "expected ')' after expression");
@@ -708,6 +944,72 @@ ExprPtr Parser::ParsePrimaryExpr() {
     }
     if (cur.type == TokenType::IDENTIFIER) {
         return ParseColumnRefOrFunctionCall();
+    }
+    // 兼容「关键字形式的函数名」: 例如 COALESCE/NULLIF/UPPER 等。
+    // 这些关键字在 ParseColumnRefOrFunctionCall 中走不到 IDENTIFIER 分支，
+    // 所以在这里识别后转发。带 OVER(...) 的窗口函数也通过同一路径处理。
+    auto is_builtin_function_keyword = [](TokenType t) -> bool {
+        switch (t) {
+            case TokenType::KEYWORD_COALESCE:
+            case TokenType::KEYWORD_NULLIF:
+            case TokenType::KEYWORD_UPPER:
+            case TokenType::KEYWORD_LOWER:
+            case TokenType::KEYWORD_LENGTH:
+            case TokenType::KEYWORD_SUBSTR:
+            case TokenType::KEYWORD_TRIM:
+            case TokenType::KEYWORD_REPLACE:
+            case TokenType::KEYWORD_ROUND:
+            case TokenType::KEYWORD_CEIL:
+            case TokenType::KEYWORD_FLOOR:
+            case TokenType::KEYWORD_ABS:
+            case TokenType::KEYWORD_POWER:
+            case TokenType::KEYWORD_MOD:
+            case TokenType::KEYWORD_YEAR:
+            case TokenType::KEYWORD_MONTH:
+            case TokenType::KEYWORD_DAY:
+            case TokenType::KEYWORD_NOW:
+            case TokenType::KEYWORD_IFNULL:
+            case TokenType::KEYWORD_ROW_NUMBER:
+            case TokenType::KEYWORD_RANK:
+            case TokenType::KEYWORD_DENSE_RANK:
+            case TokenType::KEYWORD_NTILE:
+            case TokenType::KEYWORD_LAG:
+            case TokenType::KEYWORD_LEAD:
+            case TokenType::KEYWORD_FIRST_VALUE:
+            case TokenType::KEYWORD_LAST_VALUE:
+            case TokenType::KEYWORD_PERCENT_RANK:
+            case TokenType::KEYWORD_CUME_DIST:
+                return true;
+            default:
+                return false;
+        }
+    };
+    if (is_builtin_function_keyword(cur.type) && PeekToken(1).type == TokenType::LEFT_PAREN) {
+        std::string name = cur.lexeme;
+        Advance();  // 关键字
+        Match(TokenType::LEFT_PAREN);
+        std::vector<ExprPtr> args;
+        bool distinct = false;
+        if (!Check(TokenType::RIGHT_PAREN)) {
+            if (Check(TokenType::KEYWORD_DISTINCT)) {
+                Advance();
+                distinct = true;
+                args = ParseExpressionList();
+            } else if (Check(TokenType::OP_STAR)) {
+                Advance();
+                args.push_back(std::make_shared<LiteralExpr>(LiteralType::INTEGER, "1"));
+            } else {
+                args = ParseExpressionList();
+            }
+        }
+        Expect(TokenType::RIGHT_PAREN, "expected ')' after function arguments");
+        auto fc = std::make_shared<FunctionCallExpr>(name, args);
+        fc->is_distinct = distinct;
+        // 兼容关键字形式的窗口函数（如 RANK() OVER (...)）
+        if (Check(TokenType::KEYWORD_OVER)) {
+            return ParseOverClause(name, args);
+        }
+        return fc;
     }
     throw CompilerException(ErrorStage::SYNTAX,
         "unexpected token in expression: '" + cur.lexeme + "'",
@@ -745,6 +1047,11 @@ ExprPtr Parser::ParseColumnRefOrFunctionCall() {
         Expect(TokenType::RIGHT_PAREN, "expected ')' after function arguments");
         auto fc = std::make_shared<FunctionCallExpr>(first.lexeme, args);
         fc->is_distinct = distinct;
+        // OVER (...) — 窗口函数
+        if (Check(TokenType::KEYWORD_OVER)) {
+            auto wf = ParseOverClause(first.lexeme, args);
+            return wf;
+        }
         return fc;
     }
     if (Match(TokenType::DOT)) {
@@ -757,6 +1064,380 @@ ExprPtr Parser::ParseColumnRefOrFunctionCall() {
         return std::make_shared<ColumnRefExpr>(first.lexeme, second.lexeme);
     }
     return std::make_shared<ColumnRefExpr>("", first.lexeme);
+}
+
+// ============ 27–33 新增语法：解析函数实现 ============
+
+std::shared_ptr<WindowFuncNode> Parser::ParseOverClause(const std::string& func_name,
+                                                       std::vector<ExprPtr>& args) {
+    Advance(); // OVER
+    auto wf = std::make_shared<WindowFuncNode>(func_name, args, WindowSpec{});
+    if (Check(TokenType::IDENTIFIER)) {
+        // OVER w — 命名窗口引用
+        wf->window_name = CurrentToken().lexeme;
+        Advance();
+    } else {
+        Expect(TokenType::LEFT_PAREN, "expected '(' after OVER");
+        // 解析 [PARTITION BY ...] [ORDER BY ...] [frame]
+        if (Check(TokenType::KEYWORD_PARTITION)) {
+            Advance();
+            Expect(TokenType::KEYWORD_BY, "expected BY after PARTITION");
+            wf->spec.partition_by.push_back(ParseExpression());
+            while (Match(TokenType::COMMA)) {
+                wf->spec.partition_by.push_back(ParseExpression());
+            }
+        }
+        if (Check(TokenType::KEYWORD_ORDER)) {
+            Advance();
+            Expect(TokenType::KEYWORD_BY, "expected BY after ORDER");
+            do {
+                OrderByItem oi;
+                oi.expr = ParseExpression();
+                if (Check(TokenType::KEYWORD_ASC) || Check(TokenType::KEYWORD_DESC)) {
+                    oi.ascending = (CurrentToken().type == TokenType::KEYWORD_ASC);
+                    Advance();
+                }
+                wf->spec.order_by.push_back(oi);
+            } while (Match(TokenType::COMMA));
+        }
+        // frame: ROWS|RANGE BETWEEN ... AND ...
+        if (Check(TokenType::KEYWORD_ROWS) || Check(TokenType::KEYWORD_RANGE)) {
+            wf->spec.frame.is_rows = Check(TokenType::KEYWORD_ROWS);
+            Advance();
+            Expect(TokenType::KEYWORD_BETWEEN, "expected BETWEEN in frame");
+            auto parse_bound = [&](WindowFrame::BoundKind& kind, ExprPtr& expr) {
+                if (Check(TokenType::KEYWORD_UNBOUNDED)) {
+                    Advance();
+                    if (Match(TokenType::KEYWORD_PRECEDING)) kind = WindowFrame::BoundKind::UNBOUNDED_PRECEDING;
+                    else if (Match(TokenType::KEYWORD_FOLLOWING)) kind = WindowFrame::BoundKind::UNBOUNDED_FOLLOWING;
+                    else throw CompilerException(ErrorStage::SYNTAX,
+                        "expected PRECEDING or FOLLOWING after UNBOUNDED");
+                } else if (Check(TokenType::KEYWORD_CURRENT)) {
+                    Advance();
+                    Expect(TokenType::KEYWORD_ROW, "expected ROW after CURRENT");
+                    kind = WindowFrame::BoundKind::CURRENT_ROW;
+                } else {
+                    expr = ParseExpression();
+                    if (Match(TokenType::KEYWORD_PRECEDING)) kind = WindowFrame::BoundKind::EXPR_PRECEDING;
+                    else if (Match(TokenType::KEYWORD_FOLLOWING)) kind = WindowFrame::BoundKind::EXPR_FOLLOWING;
+                    else throw CompilerException(ErrorStage::SYNTAX,
+                        "expected PRECEDING or FOLLOWING after frame bound expression");
+                }
+            };
+            parse_bound(wf->spec.frame.kind1, wf->spec.frame.expr1);
+            Expect(TokenType::KEYWORD_AND, "expected AND in frame");
+            parse_bound(wf->spec.frame.kind2, wf->spec.frame.expr2);
+            wf->spec.has_frame = true;
+        }
+        Expect(TokenType::RIGHT_PAREN, "expected ')' to close OVER (...)");
+    }
+    return wf;
+}
+
+ExprPtr Parser::ParseCastExpression() {
+    // 入口已确认下一个 token 为 KEYWORD_CAST
+    Advance(); // CAST
+    Expect(TokenType::LEFT_PAREN, "expected '(' after CAST");
+    ExprPtr inner = ParseExpression();
+    Expect(TokenType::KEYWORD_AS, "expected AS in CAST");
+    // 类型名可以是关键字 (INT/FLOAT/VARCHAR) 或普通标识符
+    std::string ty_name;
+    const Token& tc = CurrentToken();
+    if (tc.type == TokenType::KEYWORD_INT ||
+        tc.type == TokenType::KEYWORD_FLOAT ||
+        tc.type == TokenType::KEYWORD_VARCHAR) {
+        ty_name = tc.lexeme;
+        Advance();
+    } else if (tc.type == TokenType::IDENTIFIER) {
+        ty_name = tc.lexeme;
+        Advance();
+    } else {
+        throw CompilerException(ErrorStage::SYNTAX,
+            "expected type name after AS", tc.line, tc.column);
+    }
+    auto cast = std::make_shared<CastExprNode>(inner, ty_name);
+    // VARCHAR(N) 可选长度
+    if (Match(TokenType::LEFT_PAREN)) {
+        if (Check(TokenType::INTEGER_LITERAL)) {
+            try {
+                cast->char_length = static_cast<int32_t>(std::stol(CurrentToken().lexeme));
+            } catch (...) {
+                cast->char_length = -1;
+            }
+            Advance();
+        }
+        Expect(TokenType::RIGHT_PAREN, "expected ')' after CAST type parameter");
+    }
+    Expect(TokenType::RIGHT_PAREN, "expected ')' after CAST");
+    return cast;
+}
+
+ExprPtr Parser::ParseCaseExpression() {
+    // 入口已确认下一个 token 为 KEYWORD_CASE
+    Advance(); // CASE
+    auto node = std::make_shared<CaseExprNode>();
+    // 简单 CASE: CASE subject WHEN ...
+    if (!Check(TokenType::KEYWORD_WHEN)) {
+        // 解析 subject（注意 NOT/LIKE/IS 等需要正常表达式路径；这里走 ParseAdditiveExpr）
+        node->subject = ParseAdditiveExpr();
+    }
+    while (Match(TokenType::KEYWORD_WHEN)) {
+        CaseWhen cw;
+        cw.when_expr = ParseExpression();
+        Expect(TokenType::KEYWORD_THEN, "expected THEN in CASE WHEN");
+        cw.then_expr = ParseExpression();
+        node->whens.push_back(std::move(cw));
+    }
+    if (Match(TokenType::KEYWORD_ELSE)) {
+        node->else_expr = ParseExpression();
+    }
+    Expect(TokenType::KEYWORD_END, "expected END to close CASE");
+    return node;
+}
+
+ExprPtr Parser::ParseSubqueryExpression(ExprPtr left_operand,
+                                        const std::string& comparison_op,
+                                        SubqueryType forced_kind) {
+    // 入口：刚消费 '(' 且下一个 token 是 KEYWORD_SELECT / KEYWORD_WITH
+    StatementPtr sub;
+    if (Check(TokenType::KEYWORD_WITH)) {
+        sub = ParseWithClause();
+    } else {
+        sub = ParseSelectStatement();
+    }
+    if (Check(TokenType::KEYWORD_UNION) ||
+        Check(TokenType::KEYWORD_INTERSECT) ||
+        Check(TokenType::KEYWORD_EXCEPT)) {
+        sub = ParseSetOperationTail(sub);
+    }
+    Expect(TokenType::RIGHT_PAREN, "expected ')' after subquery");
+    auto sptr = std::static_pointer_cast<SelectStatement>(sub);
+    if (comparison_op.empty()) {
+        // 形如 (SELECT ...)——标量或 EXISTS。
+        // 调用方显式传入 forced_kind 决定：调用 ParseSubqueryExpression 后立即紧跟
+        // KEYWORD_EXISTS 的路径传 EXISTS；裸 '(SELECT ...)'（如 SELECT 列表）传 SCALAR。
+        SubqueryType kind = forced_kind;
+        if (kind == SubqueryType::EXISTS && left_operand == nullptr) {
+            auto expr = std::make_shared<SubqueryExprNode>(SubqueryType::EXISTS, sptr);
+            return expr;
+        }
+        if (kind == SubqueryType::EXISTS && left_operand != nullptr) {
+            // 罕见路径：EXISTS 出现在二元比较右侧，仍按 EXISTS 处理（保留旧行为）
+            auto expr = std::make_shared<SubqueryExprNode>(SubqueryType::EXISTS, sptr);
+            return expr;
+        }
+        auto expr = std::make_shared<SubqueryExprNode>(SubqueryType::SCALAR, sptr);
+        return expr;
+    }
+    // 形如 expr op ANY (SELECT ...) 或 expr IN (SELECT ...)
+    if (comparison_op == "IN") {
+        auto expr = std::make_shared<SubqueryExprNode>(SubqueryType::IN, sptr,
+                                                        "=", left_operand);
+        return expr;
+    }
+    auto expr = std::make_shared<SubqueryExprNode>(SubqueryType::ANY, sptr,
+                                                    comparison_op, left_operand);
+    return expr;
+}
+
+WindowSpec Parser::ParseOverSpec() {
+    // 仅在调用方处理 OVER 时使用，目前 OVER 的解析嵌在 ParseColumnRefOrFunctionCall
+    // 中；这里保留为占位/重入入口。
+    WindowSpec spec;
+    return spec;
+}
+
+std::vector<std::pair<std::string, WindowSpec>> Parser::ParseWindowClause() {
+    Expect(TokenType::KEYWORD_WINDOW, "expected WINDOW");
+    std::vector<std::pair<std::string, WindowSpec>> wins;
+    do {
+        Token name = Expect(TokenType::IDENTIFIER, "expected window name");
+        Expect(TokenType::KEYWORD_AS, "expected AS after window name");
+        Expect(TokenType::LEFT_PAREN, "expected '(' to begin window spec");
+        WindowSpec spec;
+        if (Check(TokenType::KEYWORD_PARTITION)) {
+            Advance();
+            Expect(TokenType::KEYWORD_BY, "expected BY after PARTITION");
+            spec.partition_by.push_back(ParseExpression());
+            while (Match(TokenType::COMMA)) {
+                spec.partition_by.push_back(ParseExpression());
+            }
+        }
+        if (Check(TokenType::KEYWORD_ORDER)) {
+            Advance();
+            Expect(TokenType::KEYWORD_BY, "expected BY after ORDER");
+            do {
+                OrderByItem oi;
+                oi.expr = ParseExpression();
+                if (Check(TokenType::KEYWORD_ASC) || Check(TokenType::KEYWORD_DESC)) {
+                    oi.ascending = (CurrentToken().type == TokenType::KEYWORD_ASC);
+                    Advance();
+                }
+                spec.order_by.push_back(oi);
+            } while (Match(TokenType::COMMA));
+        }
+        Expect(TokenType::RIGHT_PAREN, "expected ')' to close window spec");
+        wins.push_back({name.lexeme, std::move(spec)});
+    } while (Match(TokenType::COMMA));
+    return wins;
+}
+
+StatementPtr Parser::ParseSetOperationTail(StatementPtr left) {
+    // INTERSECT/EXCEPT/UNION [ALL] chain。约定：先循环匹配高优先级（INTERSECT），
+    // 再循环匹配低优先级（UNION/EXCEPT），等价于 SQL 中 INTERSECT > UNION/EXCEPT 的优先级。
+    // 这里采用左递归形式：先吸收所有 INTERSECT 形成 INTERSECT 链；外层则循环 UNION/EXCEPT。
+    StatementPtr current = left;
+    auto parse_set_op_rhs = [&]() -> StatementPtr {
+        // 支持 (SELECT ...) / (SELECT ... UNION ...) 形式
+        if (Check(TokenType::LEFT_PAREN)) {
+            Advance(); // '('
+            StatementPtr rhs;
+            if (Check(TokenType::KEYWORD_SELECT)) {
+                rhs = ParseSelectStatement(/*consume_trailers=*/false);
+            } else if (Check(TokenType::KEYWORD_WITH)) {
+                rhs = ParseWithClause();
+            } else {
+                throw CompilerException(ErrorStage::SYNTAX,
+                    "expected SELECT inside parenthesized set-op RHS");
+            }
+            if (Check(TokenType::KEYWORD_UNION) ||
+                Check(TokenType::KEYWORD_INTERSECT) ||
+                Check(TokenType::KEYWORD_EXCEPT)) {
+                rhs = ParseSetOperationTail(rhs);
+            }
+            Expect(TokenType::RIGHT_PAREN,
+                "expected ')' after parenthesized set-op RHS");
+            return rhs;
+        }
+        if (Check(TokenType::KEYWORD_SELECT)) {
+            return ParseSelectStatement(/*consume_trailers=*/false);
+        }
+        if (Check(TokenType::KEYWORD_WITH)) {
+            return ParseWithClause();
+        }
+        throw CompilerException(ErrorStage::SYNTAX,
+            "expected SELECT after UNION/INTERSECT/EXCEPT");
+    };
+    // INTERSECT 优先级最高——先把所有 INTERSECT 子句消化
+    while (Check(TokenType::KEYWORD_INTERSECT)) {
+        Advance();
+        StatementPtr rhs = parse_set_op_rhs();
+        if (Check(TokenType::KEYWORD_UNION) ||
+            Check(TokenType::KEYWORD_INTERSECT) ||
+            Check(TokenType::KEYWORD_EXCEPT)) {
+            rhs = ParseSetOperationTail(rhs);
+        }
+        auto sop = std::make_shared<SetOperationStatement>();
+        sop->kind = SetOperationStatement::Kind::INTERSECT;
+        sop->left = current;
+        sop->right = rhs;
+        current = sop;
+    }
+    // UNION / EXCEPT 优先级相同且左结合
+    while (Check(TokenType::KEYWORD_UNION) || Check(TokenType::KEYWORD_EXCEPT)) {
+        if (Check(TokenType::KEYWORD_UNION)) {
+            Advance();
+            bool is_all = Match(TokenType::KEYWORD_ALL);
+            StatementPtr rhs = parse_set_op_rhs();
+            if (Check(TokenType::KEYWORD_UNION) ||
+                Check(TokenType::KEYWORD_INTERSECT) ||
+                Check(TokenType::KEYWORD_EXCEPT)) {
+                rhs = ParseSetOperationTail(rhs);
+            }
+            auto sop = std::make_shared<SetOperationStatement>();
+            sop->kind = is_all ? SetOperationStatement::Kind::UNION_ALL
+                               : SetOperationStatement::Kind::UNION;
+            sop->left = current;
+            sop->right = rhs;
+            current = sop;
+        } else {
+            Advance(); // EXCEPT
+            StatementPtr rhs = parse_set_op_rhs();
+            if (Check(TokenType::KEYWORD_UNION) ||
+                Check(TokenType::KEYWORD_INTERSECT) ||
+                Check(TokenType::KEYWORD_EXCEPT)) {
+                rhs = ParseSetOperationTail(rhs);
+            }
+            auto sop = std::make_shared<SetOperationStatement>();
+            sop->kind = SetOperationStatement::Kind::EXCEPT;
+            sop->left = current;
+            sop->right = rhs;
+            current = sop;
+        }
+    }
+    return current;
+}
+
+StatementPtr Parser::ParseWithClause() {
+    Expect(TokenType::KEYWORD_WITH, "expected WITH");
+    auto with = std::make_shared<WithClauseStatement>();
+    if (Match(TokenType::KEYWORD_RECURSIVE)) {
+        with->is_recursive = true;
+    }
+    do {
+        CteDefinition cte;
+        cte.cte_name = Expect(TokenType::IDENTIFIER, "expected CTE name").lexeme;
+        // 可选列名列表：WITH t(a, b) AS (...)
+        if (Match(TokenType::LEFT_PAREN)) {
+            Token c = Expect(TokenType::IDENTIFIER, "expected column alias");
+            cte.cte_column_aliases.push_back(c.lexeme);
+            while (Match(TokenType::COMMA)) {
+                Token cc = Expect(TokenType::IDENTIFIER, "expected column alias");
+                cte.cte_column_aliases.push_back(cc.lexeme);
+            }
+            Expect(TokenType::RIGHT_PAREN, "expected ')' after CTE column list");
+        }
+        Expect(TokenType::KEYWORD_AS, "expected AS after CTE name");
+        Expect(TokenType::LEFT_PAREN, "expected '(' to start CTE query");
+        StatementPtr body;
+        if (Check(TokenType::KEYWORD_SELECT)) {
+            body = ParseSelectStatement();
+        } else if (Check(TokenType::KEYWORD_WITH)) {
+            body = ParseWithClause();
+        } else {
+            throw CompilerException(ErrorStage::SYNTAX,
+                "expected SELECT inside CTE");
+        }
+        if (Check(TokenType::KEYWORD_UNION) ||
+            Check(TokenType::KEYWORD_INTERSECT) ||
+            Check(TokenType::KEYWORD_EXCEPT)) {
+            body = ParseSetOperationTail(body);
+        }
+        Expect(TokenType::RIGHT_PAREN, "expected ')' to close CTE query");
+        // body 可能是 SelectStatement 或 SetOperationStatement（带 UNION 链）。
+        // 当 CTE 是 WITH RECURSIVE 时，body 若为 UNION ALL 的 SetOp，把它拆为
+        // anchor（左侧 SELECT）放进 cte_query，右侧放进 recursive_part，供
+        // Planner/CteDefineExecutor 走迭代语义。其他集合运算（UNION / INTERSECT /
+        // EXCEPT）的递归不在本期范围内，保留旧行为：cte_query 留空。
+        if (auto sop = std::dynamic_pointer_cast<SetOperationStatement>(body)) {
+            if (with->is_recursive && sop->kind == SetOperationStatement::Kind::UNION_ALL) {
+                if (auto anchor = std::dynamic_pointer_cast<SelectStatement>(sop->left)) {
+                    cte.cte_query = anchor;
+                    cte.recursive_part = sop->right;
+                }
+                // sop->left 不是 SELECT（如 WITH RECURSIVE 的 anchor 又是嵌套 CTE）
+                // 时回退到旧行为：cte_query 留空。
+            }
+            // 非 UNION ALL 的 SetOp 在递归 CTE 中：保持旧行为，cte_query 留空。
+        } else if (auto sel = std::dynamic_pointer_cast<SelectStatement>(body)) {
+            cte.cte_query = sel;
+        }
+        with->ctes.push_back(std::move(cte));
+    } while (Match(TokenType::COMMA));
+    // 主体 SELECT
+    if (Check(TokenType::KEYWORD_SELECT)) {
+        with->body = std::static_pointer_cast<SelectStatement>(ParseSelectStatement());
+    } else {
+        throw CompilerException(ErrorStage::SYNTAX,
+            "expected SELECT after WITH clause");
+    }
+    // 主体后的 set-op 链（如 WITH ... SELECT ... UNION SELECT ...）
+    if (Check(TokenType::KEYWORD_UNION) ||
+        Check(TokenType::KEYWORD_INTERSECT) ||
+        Check(TokenType::KEYWORD_EXCEPT)) {
+        return ParseSetOperationTail(with);
+    }
+    return with;
 }
 
 }  // namespace sqlcompiler

@@ -26,6 +26,18 @@ private:
     PlanNodePtr PlanCreateIndex(const CreateIndexStatement& stmt);
     PlanNodePtr PlanDropIndex(const DropIndexStatement& stmt);
     PlanNodePtr PlanTruncateTable(const TruncateTableStatement& stmt);
+    PlanNodePtr PlanWithClause(const WithClauseStatement& stmt);
+    PlanNodePtr PlanSetOperation(const SetOperationStatement& stmt);
+    // Walk the plan tree and annotate seqScanNodes whose table_name matches a
+    // CTE name so the executor routes them to the CTE materialization.
+    void RewriteCteScans(const PlanNodePtr& root,
+                         const std::vector<std::string>& cte_names);
+    // Recursively traverse an expression tree; for every SubqueryExprNode whose
+    // subquery_plan is null, plan its inner SELECT and assign to subquery_plan.
+    void PlanSubqueriesInExpr(ExprPtr& expr);
+    void PlanSubqueriesInExprList(std::vector<ExprPtr>& list);
+    void PlanSubqueriesInSelect(const SelectStatement& stmt);
+    void PlanSubqueriesInJoin(const JoinClause& j);
 };
 
 }  // namespace sqlcompiler

@@ -75,10 +75,10 @@ bool ValidateIndexableColumns(const TableInfo& table_info,
                             " character limit for index keys");
             }
         }
-        if (!col->is_primary_key && !col->is_not_null) {
-            return fail("cannot index nullable column '" + name +
-                        "': declare it NOT NULL (index keys must be non-null)");
-        }
+        // NULL values are permitted in index keys: standard SQL engines
+        // (PostgreSQL, MySQL/InnoDB, Oracle) all store NULLs as a separate
+        // entry in B-tree indexes. We only restrict variable-length sizes
+        // above; nullability is intentionally not enforced here.
     }
     return true;
 }

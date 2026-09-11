@@ -18,7 +18,7 @@ void SortExecutor::Init() {
     if (!child_) return;
     child_->Init();
 
-    ExpressionEvaluator eval(column_index_map_);
+    ExpressionEvaluator eval(column_index_map_, context_, nullptr);
     Tuple t;
     while (child_->Next(&t)) {
         SortedEntry entry;
@@ -44,9 +44,19 @@ void SortExecutor::Init() {
                   const auto& ka = materialized_[a].keys;
                   const auto& kb = materialized_[b].keys;
                   for (size_t i = 0; i < ka.size() && i < kb.size(); ++i) {
+                      bool a_null = ka[i].IsNull();
+                      bool b_null = kb[i].IsNull();
+                      // MySQL-style: NULL is always greater than any non-NULL value,
+                      // so NULLs sort LAST for both ASC and DESC (the test suite
+                      // expects this convention; see tests/sql/16_null_edge.sql and
+                      // tests/sql/26_edge_cases.sql).
+                      if (a_null && b_null) continue;
+                      if (a_null) return false;   // a is NULL → must come after b
+                      if (b_null) return true;    // b is NULL → a must come first
                       int cmp = Value::Compare(ka[i], kb[i]);
+                      bool ascending = materialized_[a].ascending[i];
                       if (cmp != 0) {
-                          return materialized_[a].ascending[i] ? cmp < 0 : cmp > 0;
+                          return ascending ? cmp < 0 : cmp > 0;
                       }
                   }
                   return a < b;

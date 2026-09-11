@@ -128,6 +128,28 @@ std::string NodeBodyToString(const PlanNode& node, int depth) {
             oss << "TruncateTable(" << n.table_name << ")";
             break;
         }
+        case PlanNodeType::SET_OP: {
+            auto& n = static_cast<const SetOpNode&>(node);
+            const char* kn = "?";
+            switch (n.kind) {
+                case SetOpNode::Kind::UNION: kn = "UNION"; break;
+                case SetOpNode::Kind::UNION_ALL: kn = "UNION ALL"; break;
+                case SetOpNode::Kind::INTERSECT: kn = "INTERSECT"; break;
+                case SetOpNode::Kind::EXCEPT: kn = "EXCEPT"; break;
+            }
+            oss << "SetOp(" << kn << ")";
+            break;
+        }
+        case PlanNodeType::WINDOW: {
+            auto& n = static_cast<const WindowNode&>(node);
+            oss << "Window(";
+            for (size_t i = 0; i < n.select_list.size(); ++i) {
+                if (i) oss << ", ";
+                oss << (n.select_list[i] ? n.select_list[i]->ToString() : "?");
+            }
+            oss << ")";
+            break;
+        }
     }
     oss << "\n";
     for (auto& child : node.children) {
@@ -225,8 +247,11 @@ std::string LimitNode::ToString() const {
 // ============ AggregateNode ============
 
 AggregateNode::AggregateNode(std::vector<ExprPtr> group_by_exprs,
-                              std::vector<ExprPtr> aggregate_exprs)
-    : group_by_exprs(std::move(group_by_exprs)), aggregate_exprs(std::move(aggregate_exprs)) {
+                              std::vector<ExprPtr> aggregate_exprs,
+                              std::vector<std::string> aliases)
+    : group_by_exprs(std::move(group_by_exprs)),
+      aggregate_exprs(std::move(aggregate_exprs)),
+      aliases(std::move(aliases)) {
 }
 
 PlanNodeType AggregateNode::GetType() const {
@@ -374,6 +399,82 @@ PlanNodeType TruncateTableNode::GetType() const {
 }
 
 std::string TruncateTableNode::ToString() const {
+    return NodeBodyToString(*this, 0);
+}
+
+// ============ SetOpNode ============
+
+SetOpNode::SetOpNode(Kind kind) : kind(kind) {
+}
+
+PlanNodeType SetOpNode::GetType() const {
+    return PlanNodeType::SET_OP;
+}
+
+std::string SetOpNode::ToString() const {
+    return NodeBodyToString(*this, 0);
+}
+
+// ============ WindowNode ============
+
+WindowNode::WindowNode(std::vector<ExprPtr> select_list,
+                       std::vector<std::string> aliases,
+                       std::vector<std::pair<std::string, WindowSpec>> named_windows)
+    : select_list(std::move(select_list)),
+      aliases(std::move(aliases)),
+      named_windows(std::move(named_windows)) {
+}
+
+PlanNodeType WindowNode::GetType() const {
+    return PlanNodeType::WINDOW;
+}
+
+std::string WindowNode::ToString() const {
+    return NodeBodyToString(*this, 0);
+}
+
+// ============ SubqueryNode ============
+
+SubqueryNode::SubqueryNode(SubqueryType kind, ExprPtr outer_expr,
+                            std::string comparison_op)
+    : kind(kind),
+      outer_expr(std::move(outer_expr)),
+      comparison_op(std::move(comparison_op)) {
+}
+
+PlanNodeType SubqueryNode::GetType() const {
+    return PlanNodeType::SUBQUERY;
+}
+
+std::string SubqueryNode::ToString() const {
+    return NodeBodyToString(*this, 0);
+}
+
+// ============ CteDefineNode ============
+
+CteDefineNode::CteDefineNode(std::string cte_name, bool is_recursive)
+    : cte_name(std::move(cte_name)), is_recursive(is_recursive) {
+}
+
+PlanNodeType CteDefineNode::GetType() const {
+    return PlanNodeType::CTE_DEFINE;
+}
+
+std::string CteDefineNode::ToString() const {
+    return NodeBodyToString(*this, 0);
+}
+
+// ============ CteBindNode ============
+
+CteBindNode::CteBindNode(std::string cte_name)
+    : cte_name(std::move(cte_name)) {
+}
+
+PlanNodeType CteBindNode::GetType() const {
+    return PlanNodeType::CTE_BIND;
+}
+
+std::string CteBindNode::ToString() const {
     return NodeBodyToString(*this, 0);
 }
 

@@ -32,16 +32,21 @@ public:
     // 执行入口：输入一棵逻辑计划树，返回执行结果
     ExecutionResult Execute(const PlanNodePtr& plan);
 
+    // 在已有的 ExecutionContext 上跑一棵子计划，并把所有结果行返回。
+    // 供子查询 / CTE 物化等需要复用父查询的 CTE 注册表/BufferPool 时使用。
+    ExecutionResult ExecuteSubplan(const PlanNodePtr& plan, ExecutionContext* ctx);
+
+    // 把一棵计划子树转换为 Executor，供 CteDefineNode 等需要在内部再次构造
+    // 子执行器时复用（作为 public 暴露）。
+    ExecutorPtr BuildExecutor(const PlanNodePtr& plan_node, ExecutionContext* context);
+
 private:
     SystemCatalog* catalog_;
-
-    // 递归地将PlanNode树转换为对应的Executor树
-    ExecutorPtr BuildExecutor(const PlanNodePtr& plan_node, ExecutionContext* context);
 
     // 根据表结构构建"列名 -> 下标"的映射，供表达式求值使用
     std::unordered_map<std::string, size_t> BuildColumnIndexMap(const std::string& table_name);
 
-    // 根据select_list推导输出结果集的列名（用于展示SELECT结果）
+    // 根据select_list推导输出结果集列名（用于展示SELECT结果）
     std::vector<std::string> DeriveOutputColumnNames(const PlanNodePtr& plan_node);
 };
 

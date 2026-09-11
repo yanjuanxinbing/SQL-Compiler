@@ -1,10 +1,11 @@
 #include "storage_engine/Value.h"
 
-#include <array>
 #include <cctype>
-#include <charconv>
+#include <cmath>
 #include <cstring>
-#include <system_error>
+#include <iomanip>
+#include <sstream>
+#include <string>
 
 namespace sqlcompiler {
 
@@ -14,19 +15,33 @@ const int32_t kNullMarker = -1;
 const int32_t kIntBytes = 4;
 const int32_t kFloatBytes = 8;
 
-// 以「最短往返」形式格式化浮点数：保证 from_chars(to_chars(x)) == x 的前提下
-// 输出尽可能短的十进制表示。相比 std::to_string 固定 6 位小数（9.99 会被打印成
-// 9.990000），既符合直觉又不丢精度。std::to_chars 不分配内存、不依赖 locale，
-// 比 snprintf/ostringstream 快一个数量级。
+// 以固定 6 位小数 + 修剪尾零的形式输出浮点数，避免
+// `6000 * 1.1 = 6600.000000000001` 这类 IEEE-754 噪声被原样打印。
+// 大值/小值仍保留 fixed 表示，不会出现科学计数法。NaN / Inf 走通用格式。
 std::string FormatDouble(double v) {
-    std::array<char, 64> buf{};
-    auto res = std::to_chars(buf.data(), buf.data() + buf.size(), v,
-                             std::chars_format::general);
-    if (res.ec != std::errc()) {
-        // 理论上不会发生（缓冲区足够）；退化为固定格式，保证有输出
-        return std::to_string(v);
+    if (std::isnan(v)) {
+        return "nan";
     }
-    return std::string(buf.data(), res.ptr);
+    if (std::isinf(v)) {
+        return v < 0 ? "-inf" : "inf";
+    }
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(6) << v;
+    std::string s = oss.str();
+    // 修剪小数部分的尾零和孤立的小数点，例如
+    //   "6600.000000" -> "6600"
+    //   "5500.500000" -> "5500.5"
+    auto dot = s.find('.');
+    if (dot != std::string::npos) {
+        auto last = s.find_last_not_of('0');
+        if (last == dot) {
+            // 小数点后全是 0：去掉小数点
+            s.erase(dot);
+        } else if (last != std::string::npos) {
+            s.erase(last + 1);
+        }
+    }
+    return s;
 }
 const int32_t kVarcharLenBytes = 4;
 

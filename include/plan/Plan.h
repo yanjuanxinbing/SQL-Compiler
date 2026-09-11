@@ -26,7 +26,12 @@ enum class PlanNodeType {
     DROP_TABLE,    // 删表
     TRUNCATE_TABLE, // 清空表数据（保留表结构）
     CREATE_INDEX,
-    DROP_INDEX
+    DROP_INDEX,
+    SET_OP,        // UNION / INTERSECT / EXCEPT
+    WINDOW,        // 窗口函数（OVER ...）—— 桩节点，由后续执行器填充
+    SUBQUERY,      // 子查询：在父算子的表达式中被求值
+    CTE_BIND,      // CTE 绑定：把一个已物化的 CTE 暴露为虚拟表
+    CTE_DEFINE,    // CTE 定义：在执行期物化一份内部子计划并保存到 ExecutionContext
 };
 
 // 执行计划节点基类，采用树形结构，子节点为输入
@@ -143,13 +148,17 @@ public:
 // 聚合节点
 class AggregateNode : public PlanNode {
 public:
-    AggregateNode(std::vector<ExprPtr> group_by_exprs, std::vector<ExprPtr> aggregate_exprs);
+    AggregateNode(std::vector<ExprPtr> group_by_exprs, std::vector<ExprPtr> aggregate_exprs,
+                  std::vector<std::string> aliases = {});
 
     PlanNodeType GetType() const override;
     std::string ToString() const override;
 
     std::vector<ExprPtr> group_by_exprs;
     std::vector<ExprPtr> aggregate_exprs;
+    // 与 aggregate_exprs 平行的别名（来自 SELECT list 的 alias），用于 HAVING/ORDER BY
+    // 通过别名引用对应的聚合输出位置。
+    std::vector<std::string> aliases;
 };
 
 // 插入节点
@@ -258,6 +267,87 @@ public:
     std::string ToString() const override;
 
     std::string table_name;
+};
+
+// 集合运算节点
+class SetOpNode : public PlanNode {
+public:
+    enum class Kind { UNION, UNION_ALL, INTERSECT, EXCEPT };
+    SetOpNode(Kind kind);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    Kind kind;
+};
+
+// 窗口函数节点：消费子算子的全部 Tuple，对 SELECT 列表中的 WindowFuncNode
+// 求值并返回与 Project 相同形状的输出。
+class WindowNode : public PlanNode {
+public:
+    WindowNode(std::vector<ExprPtr> select_list,
+               std::vector<std::string> aliases,
+               std::vector<std::pair<std::string, WindowSpec>> named_windows);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::vector<ExprPtr> select_list;
+    std::vector<std::string> aliases;
+    std::vector<std::pair<std::string, WindowSpec>> named_windows;
+};
+
+// 子查询节点：包装一个内部子计划，使其可在父算子的表达式树中被求值。
+//
+// kind 决定求值语义：
+//   SCALAR  — 返回子计划第一行第一列（如果为空则 NULL）。相关子查询需每行重算。
+//   EXISTS  — 子计划产生 ≥1 行即 TRUE。
+//   IN      — 子计划单列时按 IN 集合判定；否则按行值匹配 outer_expr。
+//   ANY     — outer_expr op ANY(...)：至少一个元素满足 op。
+//
+// outer_expr/comparison_op 仅 IN/ANY 语义使用。
+class SubqueryNode : public PlanNode {
+public:
+    SubqueryNode(SubqueryType kind, ExprPtr outer_expr = nullptr,
+                 std::string comparison_op = "");
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    SubqueryType kind;
+    ExprPtr outer_expr;       // IN/ANY 语义下与子查询结果比较的外部表达式
+    std::string comparison_op; // 仅 ANY：= / < / <= / > / >= / <>
+};
+
+// CTE 定义节点：执行时先把 children[0] 的子计划跑一遍，
+// 把结果存入 ExecutionContext 的 cte_results_[name]。CTE_BIND 节点随后可按名引用。
+class CteDefineNode : public PlanNode {
+public:
+    CteDefineNode(std::string cte_name, bool is_recursive = false);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string cte_name;
+    bool is_recursive;
+    // 递归 CTE 的"非递归部"（anchor）。可选；只有 is_recursive=true 时使用。
+    // 普通 CTE 直接由 cte_plan 提供全部结果。
+    PlanNodePtr anchor_child;
+    // 普通 CTE 的物化计划（由 PlanWithClause 填入）。
+    PlanNodePtr cte_plan;
+};
+
+// CTE 引用节点：把已物化的 CTE 结果作为一张虚拟表逐行发射。
+class CteBindNode : public PlanNode {
+public:
+    explicit CteBindNode(std::string cte_name);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string cte_name;
+    // 物化 CTE 时的列名（用于把结果列按名暴露给外层列引用解析）。
+    std::vector<std::string> column_names;
 };
 
 }  // namespace sqlcompiler

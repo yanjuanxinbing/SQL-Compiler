@@ -12,10 +12,21 @@ namespace sqlcompiler {
 class Expr;
 using ExprPtr = std::shared_ptr<Expr>;
 
+class PlanNode;
+using PlanNodePtr = std::shared_ptr<PlanNode>;
+
+class SelectStatement;
+using SelectStatementPtr = std::shared_ptr<SelectStatement>;
+
+// 窗口规格结构在文件后部定义，但 SelectStatement 内部需要它，
+// 故前置声明。完整定义见下方 "新增表达式节点" 区域。
+struct WindowSpec;
+
 // AST节点类型标识
 enum class NodeType {
     // ---- 语句 ----
     SELECT_STMT,
+    WITH_STMT,
     INSERT_STMT,
     UPDATE_STMT,
     DELETE_STMT,
@@ -31,6 +42,11 @@ enum class NodeType {
     LITERAL_EXPR,
     COLUMN_REF_EXPR,
     FUNCTION_CALL_EXPR,
+    CASE_EXPR,
+    CAST_EXPR,
+    WINDOW_FUNC_EXPR,
+    SUBQUERY_EXPR,
+    SET_OP_STMT,
 };
 
 // ============ 基类 ============
@@ -198,6 +214,11 @@ public:
     std::vector<OrderByItem> order_by;
     int limit = -1;                     // -1 表示不限制
     int limit_offset = 0;               // LIMIT offset, count 形式
+    // 命名窗口（WINDOW 子句）：name → spec
+    std::vector<std::pair<std::string, WindowSpec>> named_windows;
+    // 派生表 FROM (SELECT ...) AS alias：当 derived_table 非空时优先使用。
+    SelectStatementPtr derived_table;
+    std::string derived_alias;
 };
 
 // INSERT 语句
@@ -305,5 +326,155 @@ public:
 
     std::string table_name;
 };
+
+// ============ 新增表达式节点（27–33 测试套件） ============
+
+// CASE WHEN 表达式（同时支持简单 CASE 和搜索式 CASE）
+//   - 简单 CASE：subject 不为空，每个 when_expr 是与 subject 比较的右侧
+//   - 搜索式 CASE：subject 为空，每个 when_expr 是布尔谓词
+struct CaseWhen {
+    ExprPtr when_expr;     // 简单CASE: 被比较值；搜索式CASE: 谓词
+    ExprPtr then_expr;     // THEN 后的结果表达式
+};
+class CaseExprNode : public Expr {
+public:
+    CaseExprNode();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    ExprPtr subject;                       // 可空（搜索式 CASE）
+    std::vector<CaseWhen> whens;
+    ExprPtr else_expr;                     // 可空
+};
+
+// CAST(expr AS type) 表达式
+class CastExprNode : public Expr {
+public:
+    CastExprNode(ExprPtr expr, std::string target_type);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    ExprPtr expr;
+    std::string target_type;   // "INT" / "FLOAT" / "VARCHAR"
+    int32_t char_length = -1;  // VARCHAR(N) 中的 N
+};
+
+// 窗口函数 frame 描述（ROWS BETWEEN ... AND ...）
+struct WindowFrame {
+    enum class BoundKind {
+        UNBOUNDED_PRECEDING,
+        UNBOUNDED_FOLLOWING,
+        EXPR_PRECEDING,
+        EXPR_FOLLOWING,
+        CURRENT_ROW,
+    };
+    BoundKind kind1;
+    ExprPtr expr1;  // 可空
+    BoundKind kind2;
+    ExprPtr expr2;  // 可空
+    // true=ROWS, false=RANGE
+    bool is_rows = true;
+};
+
+// 窗口规格：PARTITION BY / ORDER BY / frame
+struct WindowSpec {
+    std::vector<ExprPtr> partition_by;
+    std::vector<OrderByItem> order_by;
+    bool has_frame = false;
+    WindowFrame frame;
+};
+
+// OVER (...) 节点，承载在函数调用之上：window_func(name(args) OVER spec)
+class WindowFuncNode : public Expr {
+public:
+    WindowFuncNode(std::string function_name,
+                   std::vector<ExprPtr> arguments,
+                   WindowSpec spec,
+                   std::string window_name = "");
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string function_name;
+    std::vector<ExprPtr> arguments;
+    WindowSpec spec;
+    std::string window_name;  // OVER w 引用命名窗口
+};
+
+// 子查询表达式：标量 / IN / EXISTS / ANY
+enum class SubqueryType { SCALAR, EXISTS, IN, ANY };
+class SubqueryExprNode : public Expr {
+public:
+    SubqueryExprNode(SubqueryType kind, SelectStatementPtr subquery,
+                     std::string comparison_op = "",
+                     ExprPtr outer_expr = nullptr);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    SubqueryType kind;
+    SelectStatementPtr subquery;
+    // 仅 ANY/IN 有效：比较运算符（如 ">"、"<"），用于 expr op ANY (SELECT ...)
+    std::string comparison_op;
+    // 仅 ANY/IN 有效：与子查询比较的外部表达式
+    ExprPtr outer_expr;
+    // Planner 在递归下降阶段填充：把 subquery 转成的内部计划。
+    // 求值期 ExpressionEvaluator 看到 subquery_plan 非空时用它直接驱动子查询，
+    // 而无需重新 Parse/Plan 整段子查询。CTE 物化时也会被填充。
+    PlanNodePtr subquery_plan;
+};
+
+// ============ WITH-CTE 与集合运算语句节点 ============
+
+// 单条 CTE 定义
+struct CteDefinition {
+    std::string cte_name;
+    std::vector<std::string> cte_column_aliases;  // 可空：WITH t(a,b) AS (...)
+    SelectStatementPtr cte_query;
+    // 递归 CTE 的"递归部分"。当 CTE 体是 `anchor UNION ALL recursive` 时，
+    // cte_query 承载 anchor（左侧 SELECT），recursive_part 承载递归部分（右侧）。
+    // 当前实现仅支持 UNION ALL 作为连接符；其他集合运算的递归不在范围内。
+    StatementPtr recursive_part;
+};
+
+// 带 WITH 子句的 SELECT（也支持后续 SET OP 链）
+class WithClauseStatement : public Statement {
+public:
+    WithClauseStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    bool is_recursive = false;
+    std::vector<CteDefinition> ctes;
+    SelectStatementPtr body;  // 主 SELECT（含可选的 UNION 链）
+};
+
+// 集合运算：UNION / UNION ALL / INTERSECT / EXCEPT
+class SetOperationStatement : public Statement {
+public:
+    SetOperationStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    enum class Kind { UNION, UNION_ALL, INTERSECT, EXCEPT };
+    Kind kind;
+    StatementPtr left;   // SelectStatement 或 SetOperationStatement
+    StatementPtr right;
+    // 集合运算结果上的顶层 ORDER BY / LIMIT。
+    // 内部 SELECT 上的 ORDER BY / LIMIT 在 SQL 标准里作用于子查询，但本实现的
+    // parser 主动将 ORDER BY / LIMIT 上提到最近的集合运算节点上，因此把它们
+    // 直接挂在这里、planner 再围绕 SetOpNode 加 Sort/Limit 节点即可。
+    std::vector<OrderByItem> order_by;
+    int limit = -1;
+    int limit_offset = 0;
+};
+
+// SELECTStatement 与 INSERT/UPDATE/DELETE 等共享 Statement 基类。
+// 集合运算节点与 WithClause 中需要将 SelectStatement 单独成指针，
+// 故提供强类型别名 SelectStatementPtr（已在文件顶部声明）。
 
 }  // namespace sqlcompiler
