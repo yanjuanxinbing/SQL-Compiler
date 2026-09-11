@@ -92,7 +92,7 @@ ExecutionResult Database::ExecuteSQL(const std::string& sql) {
             result.message = "no statement";
             return result;
         }
-        SemanticAnalyzer analyzer(catalog_->GetSymbolTable());
+        SemanticAnalyzer analyzer(catalog_.get(), catalog_->GetSymbolTable());
         if (!analyzer.Analyze(statement)) {
             std::string msg;
             for (const auto& e : analyzer.GetErrors()) {
@@ -103,7 +103,7 @@ ExecutionResult Database::ExecuteSQL(const std::string& sql) {
             result.message = "semantic error: " + msg;
             return result;
         }
-        Planner planner(catalog_->GetSymbolTable());
+        Planner planner(catalog_.get(), catalog_->GetSymbolTable());
         auto plan = planner.CreatePlan(statement);
         Optimizer optimizer(catalog_.get());
         plan = optimizer.Optimize(plan);

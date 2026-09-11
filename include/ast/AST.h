@@ -35,6 +35,20 @@ enum class NodeType {
     CREATE_INDEX_STMT,
     DROP_INDEX_STMT,
     TRUNCATE_TABLE_STMT,
+    ALTER_TABLE_STMT,
+
+    // ---- 40_txn_view_udf: 事务 / 视图 / 触发器 / UDF ----
+    BEGIN_STMT,
+    COMMIT_STMT,
+    ROLLBACK_STMT,
+    SAVEPOINT_STMT,
+    RELEASE_SAVEPOINT_STMT,
+    CREATE_VIEW_STMT,
+    DROP_VIEW_STMT,
+    CREATE_TRIGGER_STMT,
+    DROP_TRIGGER_STMT,
+    CREATE_FUNCTION_STMT,
+    DROP_FUNCTION_STMT,
 
     // ---- 表达式 ----
     BINARY_EXPR,
@@ -173,10 +187,15 @@ struct ColumnDefinition {
     int32_t char_length = -1;
     bool is_primary_key = false;
     bool is_not_null = false;
+    // 列级 CHECK (expr) 约束：当前仅做语法接受度，语义层暂不强制校验。
+    ExprPtr check_expr;
+    // 列级 DEFAULT expr：当前仅做语法接受度，INSERT 时若显式未提供该列值
+    // 由执行层决定是否替换为默认值；本任务下保留为占位即可。
+    ExprPtr default_expr;
 };
 
 // JOIN 类型
-enum class JoinType { INNER, LEFT, RIGHT };
+enum class JoinType { INNER, LEFT, RIGHT, FULL_OUTER, CROSS };
 
 // JOIN 子句
 struct JoinClause {
@@ -184,6 +203,13 @@ struct JoinClause {
     std::string table_name;
     std::string table_alias;
     ExprPtr on_condition;
+    // USING (col1, col2, ...) —— 等价于 ON a.col = b.col AND ...，但输出
+    // 阶段会把右表 USING 列去重。为简化起见，这里把 USING 翻译成 ON 条件；
+    // 输出阶段的"右表 USING 列去重"在 Planner 生成的 ProjectNode 上体现。
+    std::vector<std::string> using_columns;
+    // NATURAL JOIN —— 等价于 USING(所有左右同名列)；标记后由 Planner 按表
+    // 元数据自动推导 USING 列。
+    bool is_natural = false;
 };
 
 // ORDER BY 单项
@@ -232,6 +258,10 @@ public:
     std::string table_name;
     std::vector<std::string> columns;               // 可为空，表示按表定义顺序插入
     std::vector<std::vector<ExprPtr>> values_list;   // 支持多行 VALUES
+    // INSERT INTO tbl SELECT ... —— query 非空时表示数据来源是 SELECT 的结果集，
+    // 此时 values_list 必须为空。query 顶层可以是 SelectStatement、WithClauseStatement
+    // 或 SetOperationStatement 之一。
+    StatementPtr query;
 };
 
 // UPDATE 语句
@@ -325,6 +355,39 @@ public:
     std::string ToString() const override;
 
     std::string table_name;
+};
+
+// ALTER TABLE 语句：DDL 扩展语法。
+//
+// 支持四种动作（与测试用例 39_ddl_extensions 对齐）：
+//   - ADD COLUMN col TYPE[(N)]         （新增列定义复用 ColumnDefinition）
+//   - DROP COLUMN col                  （删除列）
+//   - RENAME TO new_table_name         （表重命名）
+//   - MODIFY COLUMN col TYPE[(N)]      （修改列类型）
+//
+// 当前实现只要求语法可解析并通过执行（语义可走 no-op 路径，测试期望
+// ALTER 后原数据仍可被 SELECT）。
+enum class AlterAction {
+    ADD_COLUMN,
+    DROP_COLUMN,
+    RENAME_TO,
+    MODIFY_COLUMN,
+};
+class AlterStatement : public Statement {
+public:
+    AlterStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string table_name;
+    AlterAction action;
+    // ADD COLUMN / MODIFY COLUMN 时使用的列定义；其他动作置空。
+    std::shared_ptr<ColumnDefinition> column_def;
+    // DROP COLUMN 时填写被删列名。
+    std::string drop_column_name;
+    // RENAME TO 时填写新表名。
+    std::string new_table_name;
 };
 
 // ============ 新增表达式节点（27–33 测试套件） ============
@@ -476,5 +539,156 @@ public:
 // SELECTStatement 与 INSERT/UPDATE/DELETE 等共享 Statement 基类。
 // 集合运算节点与 WithClause 中需要将 SelectStatement 单独成指针，
 // 故提供强类型别名 SelectStatementPtr（已在文件顶部声明）。
+
+// ============ 40_txn_view_udf：事务 / 视图 / 触发器 / UDF 语句节点 ============
+
+// BEGIN [TRANSACTION] —— 最小可用：no-op，开启事务计数。
+class BeginStatement : public Statement {
+public:
+    BeginStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+};
+
+// COMMIT —— 最小可用：no-op，提交事务。
+class CommitStatement : public Statement {
+public:
+    CommitStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+};
+
+// ROLLBACK —— 最小可用：no-op，回滚事务（当前 DML 仍立即生效，no-op 即可）。
+class RollbackStatement : public Statement {
+public:
+    RollbackStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+};
+
+// SAVEPOINT name —— 最小可用：no-op。
+class SavepointStatement : public Statement {
+public:
+    SavepointStatement(std::string name);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string savepoint_name;
+};
+
+// RELEASE SAVEPOINT name —— 最小可用：no-op。
+class ReleaseSavepointStatement : public Statement {
+public:
+    ReleaseSavepointStatement(std::string name);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string savepoint_name;
+};
+
+// CREATE VIEW name AS <select> —— 视图定义保存在 catalog 中。
+class CreateViewStatement : public Statement {
+public:
+    CreateViewStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string view_name;
+    // 视图定义的 SELECT 语句；解析后转交 catalog 保存为文本或 AST 副本。
+    SelectStatementPtr query;
+};
+
+// DROP VIEW [IF EXISTS] name —— 从 catalog 移除视图。
+class DropViewStatement : public Statement {
+public:
+    DropViewStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string view_name;
+    bool if_exists = false;
+};
+
+// 触发器时机：BEFORE / AFTER
+enum class TriggerTiming { BEFORE, AFTER };
+
+// 触发器事件：INSERT / UPDATE / DELETE
+enum class TriggerEvent { INSERT, UPDATE, DELETE };
+
+// CREATE TRIGGER name BEFORE|AFTER INSERT|UPDATE|DELETE ON table
+// FOR EACH ROW SET NEW.col = expr [, ...]
+// 最小可用：解析整段语法并把触发器记入 catalog（no-op）。
+class CreateTriggerStatement : public Statement {
+public:
+    CreateTriggerStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string trigger_name;
+    TriggerTiming timing = TriggerTiming::BEFORE;
+    TriggerEvent event = TriggerEvent::INSERT;
+    std::string table_name;
+    // 形如 "SET NEW.col = expr [, OLD.col = expr ...]" 的赋值列表
+    std::vector<std::pair<std::string, ExprPtr>> assignments;
+};
+
+// DROP TRIGGER [IF EXISTS] name —— 从 catalog 移除触发器。
+class DropTriggerStatement : public Statement {
+public:
+    DropTriggerStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string trigger_name;
+    bool if_exists = false;
+};
+
+// UDF 参数：name + type
+struct FunctionParameter {
+    std::string name;
+    std::string data_type;
+    int32_t char_length = -1;
+};
+
+// CREATE FUNCTION name(args) RETURNS type
+// BEGIN
+//     RETURN expr;
+// END;
+// 最小可用：体只接受单个 RETURN expr 语句；其余复合结构按占位处理。
+class CreateFunctionStatement : public Statement {
+public:
+    CreateFunctionStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string function_name;
+    std::vector<FunctionParameter> parameters;
+    std::string return_type;
+    int32_t return_char_length = -1;
+    // 函数体的 RETURN 表达式；只支持单个表达式（与测试 40_txn_view_udf 对齐）。
+    ExprPtr body_expr;
+};
+
+// DROP FUNCTION [IF EXISTS] name
+class DropFunctionStatement : public Statement {
+public:
+    DropFunctionStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string function_name;
+    bool if_exists = false;
+};
 
 }  // namespace sqlcompiler

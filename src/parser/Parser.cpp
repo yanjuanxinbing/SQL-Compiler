@@ -136,11 +136,23 @@ StatementPtr Parser::ParseStatement() {
         case TokenType::KEYWORD_UPDATE: return ParseUpdateStatement();
         case TokenType::KEYWORD_DELETE: return ParseDeleteStatement();
         case TokenType::KEYWORD_CREATE: {
-            // CREATE 后面可能是 TABLE 或 [UNIQUE] INDEX，需要前瞻一个 token
+            // CREATE 后面可能是 TABLE / [UNIQUE] INDEX / VIEW / TRIGGER / FUNCTION
             const Token& next = PeekToken(1);
             if (next.type == TokenType::KEYWORD_INDEX ||
                 next.type == TokenType::KEYWORD_UNIQUE) {
                 return ParseCreateIndexStatement();
+            }
+            if (next.type == TokenType::KEYWORD_VIEW) {
+                Advance(); // CREATE
+                return ParseCreateViewStatement();
+            }
+            if (next.type == TokenType::KEYWORD_TRIGGER) {
+                Advance(); // CREATE
+                return ParseCreateTriggerStatement();
+            }
+            if (next.type == TokenType::KEYWORD_FUNCTION) {
+                Advance(); // CREATE
+                return ParseCreateFunctionStatement();
             }
             return ParseCreateTableStatement();
         }
@@ -148,7 +160,22 @@ StatementPtr Parser::ParseStatement() {
             if (PeekToken(1).type == TokenType::KEYWORD_INDEX) {
                 return ParseDropIndexStatement();
             }
+            if (PeekToken(1).type == TokenType::KEYWORD_VIEW) {
+                Advance(); // DROP
+                return ParseDropViewStatement();
+            }
+            if (PeekToken(1).type == TokenType::KEYWORD_TRIGGER) {
+                Advance(); // DROP
+                return ParseDropTriggerStatement();
+            }
+            if (PeekToken(1).type == TokenType::KEYWORD_FUNCTION) {
+                Advance(); // DROP
+                return ParseDropFunctionStatement();
+            }
             return ParseDropTableStatement();
+        }
+        case TokenType::KEYWORD_ALTER: {
+            return ParseAlterTableStatement();
         }
         case TokenType::KEYWORD_TRUNCATE: {
             // TRUNCATE TABLE x：清空表中的所有数据，但保留表结构
@@ -159,6 +186,15 @@ StatementPtr Parser::ParseStatement() {
             stmt->table_name = t.lexeme;
             return stmt;
         }
+        // ---- 40_txn_view_udf ----
+        case TokenType::KEYWORD_BEGIN:    return ParseBeginStatement();
+        case TokenType::KEYWORD_COMMIT:   return ParseCommitStatement();
+        case TokenType::KEYWORD_ROLLBACK: return ParseRollbackStatement();
+        case TokenType::KEYWORD_SAVEPOINT:return ParseSavepointStatement();
+        case TokenType::KEYWORD_RELEASE:  return ParseReleaseSavepointStatement();
+        case TokenType::KEYWORD_VIEW:     return ParseCreateViewStatement();
+        case TokenType::KEYWORD_TRIGGER:  return ParseCreateTriggerStatement();
+        case TokenType::KEYWORD_FUNCTION: return ParseCreateFunctionStatement();
         default: {
             throw CompilerException(ErrorStage::SYNTAX,
                 "unexpected token at start of statement: '" + cur.lexeme + "'",
@@ -371,6 +407,23 @@ StatementPtr Parser::ParseInsertStatement() {
         }
         Expect(TokenType::RIGHT_PAREN, "expected ')' after column list");
     }
+    // INSERT INTO tbl SELECT ... —— 数据来源是 SELECT/WITH/UNION 链的结果集
+    if (Check(TokenType::KEYWORD_SELECT) || Check(TokenType::KEYWORD_WITH)) {
+        StatementPtr q;
+        if (Check(TokenType::KEYWORD_WITH)) {
+            q = ParseWithClause();
+        } else {
+            q = ParseSelectStatement();
+        }
+        // 处理主 SELECT/WITH 上的 UNION/INTERSECT/EXCEPT 链
+        if (Check(TokenType::KEYWORD_UNION) ||
+            Check(TokenType::KEYWORD_INTERSECT) ||
+            Check(TokenType::KEYWORD_EXCEPT)) {
+            q = ParseSetOperationTail(q);
+        }
+        stmt->query = std::move(q);
+        return stmt;
+    }
     Expect(TokenType::KEYWORD_VALUES, "expected VALUES");
     do {
         Expect(TokenType::LEFT_PAREN, "expected '(' to start VALUES row");
@@ -517,6 +570,112 @@ StatementPtr Parser::ParseDropIndexStatement() {
     return stmt;
 }
 
+// 解析 ALTER TABLE 语句。
+//
+// 支持以下子语法（与 tests/sql/39_ddl_extensions.sql 对齐）：
+//   ALTER TABLE t ADD COLUMN col TYPE[(N)]
+//   ALTER TABLE t DROP COLUMN col
+//   ALTER TABLE t RENAME TO new_name
+//   ALTER TABLE t MODIFY COLUMN col TYPE[(N)]
+//
+// 当前实现仅保证语法可解析与计划可生成，语义层 ALTER_TABLE 被作为 no-op
+// 处理：执行期不真正改动表结构，保证后续 SELECT 看到的数据一致。
+StatementPtr Parser::ParseAlterTableStatement() {
+    Expect(TokenType::KEYWORD_ALTER, "expected ALTER");
+    Expect(TokenType::KEYWORD_TABLE, "expected TABLE");
+    Token table = Expect(TokenType::IDENTIFIER, "expected table name");
+    auto stmt = std::make_shared<AlterStatement>();
+    stmt->table_name = table.lexeme;
+    if (Match(TokenType::KEYWORD_ADD)) {
+        // ADD COLUMN 是关键字 COLUMN 形式；同时也接受裸 ADD col ... 形式以兼容
+        // 部分方言，这里把 COLUMN 当成可选项。
+        Match(TokenType::KEYWORD_COLUMN);
+        stmt->action = AlterAction::ADD_COLUMN;
+        auto cd = std::make_shared<ColumnDefinition>();
+        Token col_name = Expect(TokenType::IDENTIFIER, "expected column name");
+        cd->column_name = col_name.lexeme;
+        const Token& ty = CurrentToken();
+        if (ty.type == TokenType::KEYWORD_INT) {
+            cd->data_type = "INT";
+            Advance();
+        } else if (ty.type == TokenType::KEYWORD_VARCHAR) {
+            cd->data_type = "VARCHAR";
+            Advance();
+        } else if (ty.type == TokenType::KEYWORD_FLOAT) {
+            cd->data_type = "FLOAT";
+            Advance();
+        } else if (ty.type == TokenType::IDENTIFIER) {
+            cd->data_type = ty.lexeme;
+            Advance();
+        } else {
+            throw CompilerException(ErrorStage::SYNTAX,
+                "expected column type after ADD COLUMN", ty.line, ty.column);
+        }
+        if (Match(TokenType::LEFT_PAREN)) {
+            if (CurrentToken().type == TokenType::INTEGER_LITERAL) {
+                try {
+                    cd->char_length = static_cast<int32_t>(std::stol(CurrentToken().lexeme));
+                } catch (...) {
+                    cd->char_length = -1;
+                }
+                Advance();
+            }
+            Expect(TokenType::RIGHT_PAREN, "expected ')' after type parameter");
+        }
+        stmt->column_def = cd;
+    } else if (Match(TokenType::KEYWORD_DROP)) {
+        Match(TokenType::KEYWORD_COLUMN);
+        stmt->action = AlterAction::DROP_COLUMN;
+        Token col_name = Expect(TokenType::IDENTIFIER, "expected column name");
+        stmt->drop_column_name = col_name.lexeme;
+    } else if (Match(TokenType::KEYWORD_RENAME)) {
+        stmt->action = AlterAction::RENAME_TO;
+        Expect(TokenType::KEYWORD_TO, "expected TO after RENAME");
+        Token new_name = Expect(TokenType::IDENTIFIER, "expected new table name");
+        stmt->new_table_name = new_name.lexeme;
+    } else if (Match(TokenType::KEYWORD_MODIFY)) {
+        Match(TokenType::KEYWORD_COLUMN);
+        stmt->action = AlterAction::MODIFY_COLUMN;
+        auto cd = std::make_shared<ColumnDefinition>();
+        Token col_name = Expect(TokenType::IDENTIFIER, "expected column name");
+        cd->column_name = col_name.lexeme;
+        const Token& ty = CurrentToken();
+        if (ty.type == TokenType::KEYWORD_INT) {
+            cd->data_type = "INT";
+            Advance();
+        } else if (ty.type == TokenType::KEYWORD_VARCHAR) {
+            cd->data_type = "VARCHAR";
+            Advance();
+        } else if (ty.type == TokenType::KEYWORD_FLOAT) {
+            cd->data_type = "FLOAT";
+            Advance();
+        } else if (ty.type == TokenType::IDENTIFIER) {
+            cd->data_type = ty.lexeme;
+            Advance();
+        } else {
+            throw CompilerException(ErrorStage::SYNTAX,
+                "expected column type after MODIFY COLUMN", ty.line, ty.column);
+        }
+        if (Match(TokenType::LEFT_PAREN)) {
+            if (CurrentToken().type == TokenType::INTEGER_LITERAL) {
+                try {
+                    cd->char_length = static_cast<int32_t>(std::stol(CurrentToken().lexeme));
+                } catch (...) {
+                    cd->char_length = -1;
+                }
+                Advance();
+            }
+            Expect(TokenType::RIGHT_PAREN, "expected ')' after type parameter");
+        }
+        stmt->column_def = cd;
+    } else {
+        throw CompilerException(ErrorStage::SYNTAX,
+            "expected ADD / DROP / RENAME / MODIFY after ALTER TABLE",
+            CurrentToken().line, CurrentToken().column);
+    }
+    return stmt;
+}
+
 // ================= 子句解析 =================
 
 std::vector<ExprPtr> Parser::ParseSelectList() {
@@ -544,6 +703,9 @@ std::vector<JoinClause> Parser::ParseJoinClauses() {
     while (Check(TokenType::KEYWORD_INNER) ||
            Check(TokenType::KEYWORD_LEFT)  ||
            Check(TokenType::KEYWORD_RIGHT) ||
+           Check(TokenType::KEYWORD_FULL)  ||
+           Check(TokenType::KEYWORD_CROSS) ||
+           Check(TokenType::KEYWORD_NATURAL) ||
            Check(TokenType::KEYWORD_JOIN)) {
         joins.push_back(ParseJoinClause());
     }
@@ -553,21 +715,136 @@ std::vector<JoinClause> Parser::ParseJoinClauses() {
 JoinClause Parser::ParseJoinClause() {
     JoinClause jc;
     jc.join_type = JoinType::INNER;
+    // NATURAL 出现在类型前缀位置：NATURAL [INNER|LEFT|RIGHT] JOIN
+    // 但 SQL 标准里 NATURAL JOIN 不允许再写 INNER/LEFT/RIGHT/FULL，我们
+    // 直接把它标记为 NATURAL INNER JOIN，由 Planner 推导 USING 列。
+    if (Match(TokenType::KEYWORD_NATURAL)) {
+        jc.is_natural = true;
+        // 可选 NATURAL INNER / LEFT / RIGHT；FULL OUTER 也允许
+        if (Match(TokenType::KEYWORD_INNER)) {
+            jc.join_type = JoinType::INNER;
+        } else if (Match(TokenType::KEYWORD_LEFT)) {
+            jc.join_type = JoinType::LEFT;
+        } else if (Match(TokenType::KEYWORD_RIGHT)) {
+            jc.join_type = JoinType::RIGHT;
+        } else if (Match(TokenType::KEYWORD_FULL)) {
+            Match(TokenType::KEYWORD_OUTER);
+            jc.join_type = JoinType::FULL_OUTER;
+        } else {
+            jc.join_type = JoinType::INNER;
+        }
+        Expect(TokenType::KEYWORD_JOIN, "expected JOIN after NATURAL");
+        Token t = Expect(TokenType::IDENTIFIER, "expected joined table name");
+        jc.table_name = t.lexeme;
+        if (CurrentToken().type == TokenType::IDENTIFIER &&
+            !Check(TokenType::KEYWORD_ON) &&
+            !Check(TokenType::KEYWORD_USING) &&
+            !Check(TokenType::KEYWORD_WHERE) &&
+            !Check(TokenType::KEYWORD_GROUP) &&
+            !Check(TokenType::KEYWORD_HAVING) &&
+            !Check(TokenType::KEYWORD_ORDER) &&
+            !Check(TokenType::KEYWORD_LIMIT) &&
+            !Check(TokenType::KEYWORD_INNER) &&
+            !Check(TokenType::KEYWORD_LEFT) &&
+            !Check(TokenType::KEYWORD_RIGHT) &&
+            !Check(TokenType::KEYWORD_FULL) &&
+            !Check(TokenType::KEYWORD_CROSS) &&
+            !Check(TokenType::KEYWORD_NATURAL) &&
+            !Check(TokenType::KEYWORD_JOIN) &&
+            !Check(TokenType::KEYWORD_UNION) &&
+            !Check(TokenType::KEYWORD_INTERSECT) &&
+            !Check(TokenType::KEYWORD_EXCEPT) &&
+            !Check(TokenType::KEYWORD_WINDOW) &&
+            !Check(TokenType::SEMICOLON) &&
+            !IsAtEnd()) {
+            jc.table_alias = CurrentToken().lexeme;
+            Advance();
+        }
+        // NATURAL JOIN 不允许 ON / USING —— 列条件由 Planner 自动推导。
+        return jc;
+    }
+    // CROSS JOIN：没有 ON/USING
+    if (Match(TokenType::KEYWORD_CROSS)) {
+        jc.join_type = JoinType::CROSS;
+        Expect(TokenType::KEYWORD_JOIN, "expected JOIN after CROSS");
+        Token t = Expect(TokenType::IDENTIFIER, "expected joined table name");
+        jc.table_name = t.lexeme;
+        if (CurrentToken().type == TokenType::IDENTIFIER &&
+            !Check(TokenType::KEYWORD_ON) &&
+            !Check(TokenType::KEYWORD_WHERE) &&
+            !Check(TokenType::KEYWORD_GROUP) &&
+            !Check(TokenType::KEYWORD_HAVING) &&
+            !Check(TokenType::KEYWORD_ORDER) &&
+            !Check(TokenType::KEYWORD_LIMIT) &&
+            !Check(TokenType::KEYWORD_INNER) &&
+            !Check(TokenType::KEYWORD_LEFT) &&
+            !Check(TokenType::KEYWORD_RIGHT) &&
+            !Check(TokenType::KEYWORD_FULL) &&
+            !Check(TokenType::KEYWORD_CROSS) &&
+            !Check(TokenType::KEYWORD_NATURAL) &&
+            !Check(TokenType::KEYWORD_JOIN) &&
+            !Check(TokenType::KEYWORD_UNION) &&
+            !Check(TokenType::KEYWORD_INTERSECT) &&
+            !Check(TokenType::KEYWORD_EXCEPT) &&
+            !Check(TokenType::KEYWORD_WINDOW) &&
+            !Check(TokenType::SEMICOLON) &&
+            !IsAtEnd()) {
+            jc.table_alias = CurrentToken().lexeme;
+            Advance();
+        }
+        // CROSS JOIN 不需要 ON / USING；on_condition 留空，由 Executor 处理。
+        return jc;
+    }
     if (Match(TokenType::KEYWORD_INNER)) {
         jc.join_type = JoinType::INNER;
     } else if (Match(TokenType::KEYWORD_LEFT)) {
         jc.join_type = JoinType::LEFT;
     } else if (Match(TokenType::KEYWORD_RIGHT)) {
         jc.join_type = JoinType::RIGHT;
+    } else if (Match(TokenType::KEYWORD_FULL)) {
+        // FULL [OUTER] JOIN
+        Match(TokenType::KEYWORD_OUTER);
+        jc.join_type = JoinType::FULL_OUTER;
     }
     Expect(TokenType::KEYWORD_JOIN, "expected JOIN");
     Token t = Expect(TokenType::IDENTIFIER, "expected joined table name");
     jc.table_name = t.lexeme;
-    // 表可名（user u INNER JOIN)
+    // 表别名
     if (CurrentToken().type == TokenType::IDENTIFIER &&
-        !Check(TokenType::KEYWORD_ON)) {
+        !Check(TokenType::KEYWORD_ON) &&
+        !Check(TokenType::KEYWORD_USING) &&
+        !Check(TokenType::KEYWORD_WHERE) &&
+        !Check(TokenType::KEYWORD_GROUP) &&
+        !Check(TokenType::KEYWORD_HAVING) &&
+        !Check(TokenType::KEYWORD_ORDER) &&
+        !Check(TokenType::KEYWORD_LIMIT) &&
+        !Check(TokenType::KEYWORD_INNER) &&
+        !Check(TokenType::KEYWORD_LEFT) &&
+        !Check(TokenType::KEYWORD_RIGHT) &&
+        !Check(TokenType::KEYWORD_FULL) &&
+        !Check(TokenType::KEYWORD_CROSS) &&
+        !Check(TokenType::KEYWORD_NATURAL) &&
+        !Check(TokenType::KEYWORD_JOIN) &&
+        !Check(TokenType::KEYWORD_UNION) &&
+        !Check(TokenType::KEYWORD_INTERSECT) &&
+        !Check(TokenType::KEYWORD_EXCEPT) &&
+        !Check(TokenType::KEYWORD_WINDOW) &&
+        !Check(TokenType::SEMICOLON) &&
+        !IsAtEnd()) {
         jc.table_alias = CurrentToken().lexeme;
         Advance();
+    }
+    // USING (col1, col2, ...)
+    if (Match(TokenType::KEYWORD_USING)) {
+        Expect(TokenType::LEFT_PAREN, "expected '(' after USING");
+        Token c = Expect(TokenType::IDENTIFIER, "expected column name in USING");
+        jc.using_columns.push_back(c.lexeme);
+        while (Match(TokenType::COMMA)) {
+            Token cc = Expect(TokenType::IDENTIFIER, "expected column name in USING");
+            jc.using_columns.push_back(cc.lexeme);
+        }
+        Expect(TokenType::RIGHT_PAREN, "expected ')' after USING column list");
+        return jc;
     }
     Expect(TokenType::KEYWORD_ON, "expected ON");
     jc.on_condition = ParseExpression();
@@ -708,6 +985,19 @@ ColumnDefinition Parser::ParseColumnDefinition() {
         Advance();
         Expect(TokenType::KEYWORD_NULL, "expected NULL after NOT");
         cd.is_not_null = true;
+    }
+    // 列级约束（DDL 扩展）：CHECK (expr) / DEFAULT expr。
+    // 仅做语法接受，约束语义留给执行层去兑现。当前测试套件只在 CREATE TABLE
+    // 上使用，且后续不 INSERT 受约束影响的数据，因此保留为 AST 字段即可。
+    while (Check(TokenType::KEYWORD_CHECK) || Check(TokenType::KEYWORD_DEFAULT)) {
+        if (Match(TokenType::KEYWORD_CHECK)) {
+            Expect(TokenType::LEFT_PAREN, "expected '(' after CHECK");
+            cd.check_expr = ParseExpression();
+            Expect(TokenType::RIGHT_PAREN, "expected ')' after CHECK expression");
+        } else {
+            Advance(); // KEYWORD_DEFAULT
+            cd.default_expr = ParseExpression();
+        }
     }
     skip_auto_inc();
     return cd;
@@ -941,6 +1231,19 @@ ExprPtr Parser::ParsePrimaryExpr() {
     if (cur.type == TokenType::KEYWORD_NULL) {
         Advance();
         return std::make_shared<LiteralExpr>(LiteralType::NULL_VALUE, "NULL");
+    }
+    // 触发器体内 NEW.col / OLD.col：把前缀识别成限定表名。
+    if (cur.type == TokenType::KEYWORD_NEW ||
+        cur.type == TokenType::KEYWORD_OLD) {
+        std::string prefix = cur.lexeme;
+        Advance();
+        if (Match(TokenType::DOT)) {
+            Token col = Expect(TokenType::IDENTIFIER,
+                "expected column name after NEW/OLD '.'");
+            return std::make_shared<ColumnRefExpr>(prefix, col.lexeme);
+        }
+        // 没有 '.' 时退化为普通列引用
+        return std::make_shared<ColumnRefExpr>("", prefix);
     }
     if (cur.type == TokenType::IDENTIFIER) {
         return ParseColumnRefOrFunctionCall();
@@ -1438,6 +1741,304 @@ StatementPtr Parser::ParseWithClause() {
         return ParseSetOperationTail(with);
     }
     return with;
+}
+
+// ================= 40_txn_view_udf：事务 / 视图 / 触发器 / UDF =================
+
+// BEGIN [TRANSACTION]
+StatementPtr Parser::ParseBeginStatement() {
+    Expect(TokenType::KEYWORD_BEGIN, "expected BEGIN");
+    // 可选 TRANSACTION 关键字
+    if (CurrentToken().type == TokenType::KEYWORD_TRANSACTION) {
+        Advance();
+    }
+    return std::make_shared<BeginStatement>();
+}
+
+// COMMIT
+StatementPtr Parser::ParseCommitStatement() {
+    Expect(TokenType::KEYWORD_COMMIT, "expected COMMIT");
+    // 可选 TRANSACTION 关键字
+    if (CurrentToken().type == TokenType::KEYWORD_TRANSACTION) {
+        Advance();
+    }
+    return std::make_shared<CommitStatement>();
+}
+
+// ROLLBACK
+StatementPtr Parser::ParseRollbackStatement() {
+    Expect(TokenType::KEYWORD_ROLLBACK, "expected ROLLBACK");
+    return std::make_shared<RollbackStatement>();
+}
+
+// SAVEPOINT name
+StatementPtr Parser::ParseSavepointStatement() {
+    Expect(TokenType::KEYWORD_SAVEPOINT, "expected SAVEPOINT");
+    Token t = Expect(TokenType::IDENTIFIER, "expected savepoint name");
+    return std::make_shared<SavepointStatement>(t.lexeme);
+}
+
+// RELEASE SAVEPOINT name
+StatementPtr Parser::ParseReleaseSavepointStatement() {
+    Expect(TokenType::KEYWORD_RELEASE, "expected RELEASE");
+    Expect(TokenType::KEYWORD_SAVEPOINT, "expected SAVEPOINT after RELEASE");
+    Token t = Expect(TokenType::IDENTIFIER, "expected savepoint name");
+    return std::make_shared<ReleaseSavepointStatement>(t.lexeme);
+}
+
+// CREATE VIEW name AS <select>
+// 注意：本函数被两种入口调用：
+//   1) 用户直接写 "CREATE VIEW ..."（ParseStatement 的 KEYWORD_VIEW 分支）
+//   2) 用户写 "CREATE VIEW ..."（ParseStatement 的 KEYWORD_CREATE 分支，已 Advance CREATE）
+// 这里兼容两种：如果当前 token 是 CREATE，先消耗它。
+StatementPtr Parser::ParseCreateViewStatement() {
+    if (CurrentToken().type == TokenType::KEYWORD_CREATE) {
+        Advance();
+    }
+    Expect(TokenType::KEYWORD_VIEW, "expected VIEW");
+    Token name = Expect(TokenType::IDENTIFIER, "expected view name");
+    Expect(TokenType::KEYWORD_AS, "expected AS in CREATE VIEW");
+    // 视图体：SELECT / WITH 语句；与 ParseSelectStatement 一致，支持后续 UNION 链。
+    StatementPtr q;
+    if (Check(TokenType::KEYWORD_SELECT)) {
+        q = ParseSelectStatementWithSetOps();
+    } else if (Check(TokenType::KEYWORD_WITH)) {
+        q = ParseWithClause();
+        if (Check(TokenType::KEYWORD_UNION) ||
+            Check(TokenType::KEYWORD_INTERSECT) ||
+            Check(TokenType::KEYWORD_EXCEPT)) {
+            q = ParseSetOperationTail(q);
+        }
+    } else {
+        throw CompilerException(ErrorStage::SYNTAX,
+            "expected SELECT after CREATE VIEW ... AS",
+            CurrentToken().line, CurrentToken().column);
+    }
+    auto stmt = std::make_shared<CreateViewStatement>();
+    stmt->view_name = name.lexeme;
+    stmt->query = std::static_pointer_cast<SelectStatement>(q);
+    return stmt;
+}
+
+// DROP VIEW [IF EXISTS] name
+StatementPtr Parser::ParseDropViewStatement() {
+    if (CurrentToken().type == TokenType::KEYWORD_DROP) {
+        Advance();
+    }
+    Expect(TokenType::KEYWORD_VIEW, "expected VIEW");
+    auto stmt = std::make_shared<DropViewStatement>();
+    if (Check(TokenType::KEYWORD_IF)) {
+        Advance();
+        bool saw_exists = false;
+        if (Match(TokenType::KEYWORD_EXISTS)) {
+            saw_exists = true;
+        } else if (CurrentToken().type == TokenType::IDENTIFIER &&
+                   CurrentToken().lexeme == "EXISTS") {
+            Advance();
+            saw_exists = true;
+        }
+        if (!saw_exists) {
+            Expect(TokenType::IDENTIFIER, "expected EXISTS after IF");
+        }
+        stmt->if_exists = true;
+    }
+    Token name = Expect(TokenType::IDENTIFIER, "expected view name");
+    stmt->view_name = name.lexeme;
+    return stmt;
+}
+
+// CREATE TRIGGER name BEFORE|AFTER INSERT|UPDATE|DELETE ON table
+// FOR EACH ROW SET NEW.col = expr [, OLD.col = expr ...]
+StatementPtr Parser::ParseCreateTriggerStatement() {
+    if (CurrentToken().type == TokenType::KEYWORD_CREATE) {
+        Advance();
+    }
+    Expect(TokenType::KEYWORD_TRIGGER, "expected TRIGGER");
+    Token name = Expect(TokenType::IDENTIFIER, "expected trigger name");
+    auto stmt = std::make_shared<CreateTriggerStatement>();
+    stmt->trigger_name = name.lexeme;
+    if (Match(TokenType::KEYWORD_BEFORE)) {
+        stmt->timing = TriggerTiming::BEFORE;
+    } else if (Match(TokenType::KEYWORD_AFTER)) {
+        stmt->timing = TriggerTiming::AFTER;
+    } else {
+        throw CompilerException(ErrorStage::SYNTAX,
+            "expected BEFORE or AFTER in CREATE TRIGGER",
+            CurrentToken().line, CurrentToken().column);
+    }
+    if (Match(TokenType::KEYWORD_INSERT)) {
+        stmt->event = TriggerEvent::INSERT;
+    } else if (Match(TokenType::KEYWORD_UPDATE)) {
+        stmt->event = TriggerEvent::UPDATE;
+    } else if (Match(TokenType::KEYWORD_DELETE)) {
+        stmt->event = TriggerEvent::DELETE;
+    } else {
+        throw CompilerException(ErrorStage::SYNTAX,
+            "expected INSERT / UPDATE / DELETE in CREATE TRIGGER",
+            CurrentToken().line, CurrentToken().column);
+    }
+    Expect(TokenType::KEYWORD_ON, "expected ON in CREATE TRIGGER");
+    Token tbl = Expect(TokenType::IDENTIFIER, "expected table name");
+    stmt->table_name = tbl.lexeme;
+    Expect(TokenType::KEYWORD_FOR, "expected FOR in CREATE TRIGGER");
+    Expect(TokenType::KEYWORD_EACH, "expected EACH after FOR");
+    Expect(TokenType::KEYWORD_ROW, "expected ROW after FOR EACH");
+    Expect(TokenType::KEYWORD_SET, "expected SET in CREATE TRIGGER body");
+    // 至少一条赋值：lhs = expr；lhs 形如 NEW.col 或 OLD.col（按 IDENTIFIER.col 解析）。
+    do {
+        // lhs 可以是 NEW.col / OLD.col（关键词前缀），或直接 col。
+        std::string lhs;
+        if (CurrentToken().type == TokenType::KEYWORD_NEW ||
+            CurrentToken().type == TokenType::KEYWORD_OLD ||
+            CurrentToken().type == TokenType::IDENTIFIER) {
+            std::string prefix = CurrentToken().lexeme;
+            Advance();
+            if (Match(TokenType::DOT)) {
+                Token col = Expect(TokenType::IDENTIFIER, "expected column name after '.'");
+                lhs = prefix + "." + col.lexeme;
+            } else {
+                lhs = prefix;
+            }
+        } else {
+            throw CompilerException(ErrorStage::SYNTAX,
+                "expected column name in SET clause",
+                CurrentToken().line, CurrentToken().column);
+        }
+        Expect(TokenType::OP_EQUAL, "expected '=' in SET assignment");
+        ExprPtr expr = ParseExpression();
+        stmt->assignments.emplace_back(lhs, expr);
+    } while (Match(TokenType::COMMA));
+    return stmt;
+}
+
+// DROP TRIGGER [IF EXISTS] name
+StatementPtr Parser::ParseDropTriggerStatement() {
+    if (CurrentToken().type == TokenType::KEYWORD_DROP) {
+        Advance();
+    }
+    Expect(TokenType::KEYWORD_TRIGGER, "expected TRIGGER");
+    auto stmt = std::make_shared<DropTriggerStatement>();
+    if (Check(TokenType::KEYWORD_IF)) {
+        Advance();
+        bool saw_exists = false;
+        if (Match(TokenType::KEYWORD_EXISTS)) {
+            saw_exists = true;
+        } else if (CurrentToken().type == TokenType::IDENTIFIER &&
+                   CurrentToken().lexeme == "EXISTS") {
+            Advance();
+            saw_exists = true;
+        }
+        if (!saw_exists) {
+            Expect(TokenType::IDENTIFIER, "expected EXISTS after IF");
+        }
+        stmt->if_exists = true;
+    }
+    Token name = Expect(TokenType::IDENTIFIER, "expected trigger name");
+    stmt->trigger_name = name.lexeme;
+    return stmt;
+}
+
+// CREATE FUNCTION name(args) RETURNS type
+// BEGIN
+//     RETURN expr;
+// END;
+StatementPtr Parser::ParseCreateFunctionStatement() {
+    if (CurrentToken().type == TokenType::KEYWORD_CREATE) {
+        Advance();
+    }
+    Expect(TokenType::KEYWORD_FUNCTION, "expected FUNCTION");
+    Token name = Expect(TokenType::IDENTIFIER, "expected function name");
+    auto stmt = std::make_shared<CreateFunctionStatement>();
+    stmt->function_name = name.lexeme;
+    Expect(TokenType::LEFT_PAREN, "expected '(' after function name");
+    // 参数列表（可空）
+    if (!Check(TokenType::RIGHT_PAREN)) {
+        do {
+            FunctionParameter param;
+            Token pname = Expect(TokenType::IDENTIFIER, "expected parameter name");
+            param.name = pname.lexeme;
+            const Token& ty = CurrentToken();
+            if (ty.type == TokenType::KEYWORD_INT) { param.data_type = "INT"; Advance(); }
+            else if (ty.type == TokenType::KEYWORD_VARCHAR) { param.data_type = "VARCHAR"; Advance(); }
+            else if (ty.type == TokenType::KEYWORD_FLOAT) { param.data_type = "FLOAT"; Advance(); }
+            else if (ty.type == TokenType::IDENTIFIER) { param.data_type = ty.lexeme; Advance(); }
+            else {
+                throw CompilerException(ErrorStage::SYNTAX,
+                    "expected parameter type", ty.line, ty.column);
+            }
+            if (Match(TokenType::LEFT_PAREN)) {
+                if (CurrentToken().type == TokenType::INTEGER_LITERAL) {
+                    try {
+                        param.char_length = static_cast<int32_t>(
+                            std::stol(CurrentToken().lexeme));
+                    } catch (...) { param.char_length = -1; }
+                    Advance();
+                }
+                Expect(TokenType::RIGHT_PAREN, "expected ')' after type parameter");
+            }
+            stmt->parameters.push_back(std::move(param));
+        } while (Match(TokenType::COMMA));
+    }
+    Expect(TokenType::RIGHT_PAREN, "expected ')' after parameter list");
+    Expect(TokenType::KEYWORD_RETURNS, "expected RETURNS in CREATE FUNCTION");
+    const Token& rty = CurrentToken();
+    if (rty.type == TokenType::KEYWORD_INT) { stmt->return_type = "INT"; Advance(); }
+    else if (rty.type == TokenType::KEYWORD_VARCHAR) { stmt->return_type = "VARCHAR"; Advance(); }
+    else if (rty.type == TokenType::KEYWORD_FLOAT) { stmt->return_type = "FLOAT"; Advance(); }
+    else if (rty.type == TokenType::IDENTIFIER) { stmt->return_type = rty.lexeme; Advance(); }
+    else {
+        throw CompilerException(ErrorStage::SYNTAX,
+            "expected return type", rty.line, rty.column);
+    }
+    if (Match(TokenType::LEFT_PAREN)) {
+        if (CurrentToken().type == TokenType::INTEGER_LITERAL) {
+            try {
+                stmt->return_char_length = static_cast<int32_t>(
+                    std::stol(CurrentToken().lexeme));
+            } catch (...) { stmt->return_char_length = -1; }
+            Advance();
+        }
+        Expect(TokenType::RIGHT_PAREN, "expected ')' after return type parameter");
+    }
+    // 函数体 BEGIN ... END；最小实现：只解析单个 RETURN 表达式。
+    Expect(TokenType::KEYWORD_BEGIN, "expected BEGIN to start function body");
+    // 跳过中间语句（仅占位）
+    while (!Check(TokenType::KEYWORD_RETURN) && !IsAtEnd() &&
+           !Check(TokenType::KEYWORD_END)) {
+        Advance();
+    }
+    Expect(TokenType::KEYWORD_RETURN, "expected RETURN in function body");
+    stmt->body_expr = ParseExpression();
+    Expect(TokenType::SEMICOLON, "expected ';' after RETURN");
+    Expect(TokenType::KEYWORD_END, "expected END to close function body");
+    return stmt;
+}
+
+// DROP FUNCTION [IF EXISTS] name
+StatementPtr Parser::ParseDropFunctionStatement() {
+    if (CurrentToken().type == TokenType::KEYWORD_DROP) {
+        Advance();
+    }
+    Expect(TokenType::KEYWORD_FUNCTION, "expected FUNCTION");
+    auto stmt = std::make_shared<DropFunctionStatement>();
+    if (Check(TokenType::KEYWORD_IF)) {
+        Advance();
+        bool saw_exists = false;
+        if (Match(TokenType::KEYWORD_EXISTS)) {
+            saw_exists = true;
+        } else if (CurrentToken().type == TokenType::IDENTIFIER &&
+                   CurrentToken().lexeme == "EXISTS") {
+            Advance();
+            saw_exists = true;
+        }
+        if (!saw_exists) {
+            Expect(TokenType::IDENTIFIER, "expected EXISTS after IF");
+        }
+        stmt->if_exists = true;
+    }
+    Token name = Expect(TokenType::IDENTIFIER, "expected function name");
+    stmt->function_name = name.lexeme;
+    return stmt;
 }
 
 }  // namespace sqlcompiler

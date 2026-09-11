@@ -9,6 +9,8 @@
 
 namespace sqlcompiler {
 
+class SystemCatalog;
+
 // 语义错误描述
 struct SemanticError {
     std::string message;
@@ -18,7 +20,7 @@ struct SemanticError {
 // 语义分析器：在AST上进行表/列存在性检查、类型检查等
 class SemanticAnalyzer {
 public:
-    explicit SemanticAnalyzer(SymbolTable& symbol_table);
+    SemanticAnalyzer(SystemCatalog* catalog, SymbolTable& symbol_table);
 
     // 分析入口，返回是否通过语义检查
     bool Analyze(const StatementPtr& statement);
@@ -30,6 +32,7 @@ public:
     void ClearErrors();
 
 private:
+    SystemCatalog* catalog_ = nullptr;
     SymbolTable& symbol_table_;
     std::vector<SemanticError> errors_;
 
@@ -43,6 +46,7 @@ private:
     bool AnalyzeCreateIndex(const CreateIndexStatement& stmt);
     bool AnalyzeDropIndex(const DropIndexStatement& stmt);
     bool AnalyzeTruncateTable(const TruncateTableStatement& stmt);
+    bool AnalyzeAlterTable(const AlterStatement& stmt);
 
     // 内部递归版本：不调用 ClearErrors，便于在嵌套语句（如 SET_OP_STMT）中
     // 累积所有子树产生的错误。

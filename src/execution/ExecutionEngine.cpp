@@ -2,6 +2,7 @@
 
 #include "common/Error.h"
 #include "execution/AggregateExecutor.h"
+#include "execution/AlterTableExecutor.h"
 #include "execution/CreateTableExecutor.h"
 #include "execution/CteExecutor.h"
 #include "execution/DeleteExecutor.h"
@@ -14,6 +15,7 @@
 #include "execution/InsertExecutor.h"
 #include "execution/JoinExecutor.h"
 #include "execution/LimitExecutor.h"
+#include "execution/NoOpExecutor.h"
 #include "execution/ProjectExecutor.h"
 #include "execution/SeqScanExecutor.h"
 #include "execution/SortExecutor.h"
@@ -322,7 +324,8 @@ ExecutionResult ExecutionEngine::ExecuteSubplan(const PlanNodePtr& plan, Executi
                          plan->GetType() == PlanNodeType::CTE_BIND ||
                          plan->GetType() == PlanNodeType::CTE_DEFINE ||
                          plan->GetType() == PlanNodeType::SET_OP ||
-                         plan->GetType() == PlanNodeType::WINDOW);
+                         plan->GetType() == PlanNodeType::WINDOW ||
+                         plan->GetType() == PlanNodeType::VIEW_DEFINE);
         if (is_query) {
             result.column_names = DeriveOutputColumnNames(plan);
         }
@@ -634,6 +637,11 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
         }
         case PlanNodeType::INSERT: {
             auto n = std::static_pointer_cast<InsertNode>(plan_node);
+            if (n->query_plan) {
+                // INSERT ... SELECT：从子计划取行写入目标表。
+                return std::make_unique<InsertExecutor>(context, n->table_name,
+                                                         n->columns, n->query_plan);
+            }
             return std::make_unique<InsertExecutor>(context, n->table_name, n->columns,
                                                      n->values_list);
         }
@@ -671,6 +679,10 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
         case PlanNodeType::TRUNCATE_TABLE: {
             auto n = std::static_pointer_cast<TruncateTableNode>(plan_node);
             return std::make_unique<TruncateTableExecutor>(context, n->table_name);
+        }
+        case PlanNodeType::ALTER_TABLE: {
+            auto n = std::static_pointer_cast<AlterTableNode>(plan_node);
+            return std::make_unique<AlterTableExecutor>(context, n.get());
         }
         case PlanNodeType::SET_OP: {
             auto n = std::static_pointer_cast<SetOpNode>(plan_node);
@@ -769,6 +781,18 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             }
             return nullptr;
         }
+        // ---- 40_txn_view_udf ----
+        case PlanNodeType::NO_OP:
+            // BEGIN/COMMIT/ROLLBACK/SAVEPOINT/RELEASE 等纯副作用语句。
+            // 这里直接返回一个立即结束的 executor，让 ExecutionEngine 把它当 DDL
+            // 看待（OK 提示）。
+            return std::make_unique<NoOpExecutor>(context);
+        case PlanNodeType::CREATE_VIEW:
+            return std::make_unique<NoOpExecutor>(context);
+        case PlanNodeType::CREATE_TRIGGER:
+            return std::make_unique<NoOpExecutor>(context);
+        case PlanNodeType::CREATE_FUNCTION:
+            return std::make_unique<NoOpExecutor>(context);
         default:
             throw CompilerException(ErrorStage::CODEGEN,
                 "feature not implemented: unsupported plan node");

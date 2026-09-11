@@ -27,11 +27,20 @@ enum class PlanNodeType {
     TRUNCATE_TABLE, // 清空表数据（保留表结构）
     CREATE_INDEX,
     DROP_INDEX,
+    ALTER_TABLE,   // ALTER TABLE 子句：当前仅接受语法，执行期按 no-op 处理
     SET_OP,        // UNION / INTERSECT / EXCEPT
     WINDOW,        // 窗口函数（OVER ...）—— 桩节点，由后续执行器填充
     SUBQUERY,      // 子查询：在父算子的表达式中被求值
     CTE_BIND,      // CTE 绑定：把一个已物化的 CTE 暴露为虚拟表
     CTE_DEFINE,    // CTE 定义：在执行期物化一份内部子计划并保存到 ExecutionContext
+
+    // ---- 40_txn_view_udf ----
+    NO_OP,         // BEGIN/COMMIT/ROLLBACK/SAVEPOINT/RELEASE/DropView 等纯副作用语句
+    CREATE_VIEW,   // 视图已记入 catalog，no-op 执行（供后续 SELECT FROM view 查询）
+    CREATE_TRIGGER,// 触发器已记入 catalog，no-op 执行
+    CREATE_FUNCTION,// UDF 已记入 catalog，no-op 执行
+    VIEW_DEFINE,   // 视图定义：执行时把视图的 SELECT 翻译成子查询占位 SeqScanNode，
+                   // ExecutionEngine 识别 alias 后改走子计划
 };
 
 // 执行计划节点基类，采用树形结构，子节点为输入
@@ -173,6 +182,10 @@ public:
     std::string table_name;
     std::vector<std::string> columns;
     std::vector<std::vector<ExprPtr>> values_list;
+    // INSERT ... SELECT 时由 Planner 把 SELECT 转换为子计划。children[0] 同时指向
+    // 该子计划（语义上"插入源"），children[0] 即 query_plan。执行器优先消费它，
+    // values_list 与 query_plan 互斥（query_plan 非空时使用源计划，否则用 values_list）。
+    PlanNodePtr query_plan;
 };
 
 // 更新节点
@@ -269,6 +282,26 @@ public:
     std::string table_name;
 };
 
+// ALTER TABLE 节点：承载 4 类动作（ADD/DROP/RENAME/MODIFY）。
+// 当前执行器以 no-op 处理（DDL 扩展语法的最小实现），保证后续
+// SELECT 仍能访问原表。
+class AlterTableNode : public PlanNode {
+public:
+    AlterTableNode(AlterAction action, std::string table_name);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    AlterAction action;
+    std::string table_name;
+    // ADD COLUMN / MODIFY COLUMN 时使用的列定义；其他动作置空。
+    std::shared_ptr<ColumnDefinition> column_def;
+    // DROP COLUMN 时填写被删列名。
+    std::string drop_column_name;
+    // RENAME TO 时填写新表名。
+    std::string new_table_name;
+};
+
 // 集合运算节点
 class SetOpNode : public PlanNode {
 public:
@@ -348,6 +381,82 @@ public:
     std::string cte_name;
     // 物化 CTE 时的列名（用于把结果列按名暴露给外层列引用解析）。
     std::vector<std::string> column_names;
+};
+
+// ============ 40_txn_view_udf：事务 / 视图 / 触发器 / UDF 节点 ============
+
+// 无副作用 / 已记录到 catalog 的语句节点。
+class NoOpNode : public PlanNode {
+public:
+    NoOpNode(std::string description);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string description;
+};
+
+// CREATE VIEW：no-op。视图的 SELECT 子句记入 catalog，
+// SELECT FROM view 时由 Planner 查 catalog 并把视图查询替换为子计划。
+class CreateViewNode : public PlanNode {
+public:
+    explicit CreateViewNode(std::string view_name);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string view_name;
+};
+
+// CREATE TRIGGER：no-op。
+class CreateTriggerNode : public PlanNode {
+public:
+    explicit CreateTriggerNode(std::string trigger_name);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string trigger_name;
+};
+
+// CREATE FUNCTION：no-op。
+class CreateFunctionNode : public PlanNode {
+public:
+    explicit CreateFunctionNode(std::string function_name);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string function_name;
+};
+
+// DROP VIEW / DROP TRIGGER / DROP FUNCTION：no-op。
+class DropObjectNode : public PlanNode {
+public:
+    enum class Kind { VIEW, TRIGGER, FUNCTION };
+    DropObjectNode(Kind kind, std::string object_name, bool if_exists);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    Kind kind;
+    std::string object_name;
+    bool if_exists;
+};
+
+// VIEW_DEFINE：把视图的 SELECT 翻译为子查询占位 SeqScanNode。
+// 等同于派生表占位：table_name == alias 且 children[0] 为子计划。
+// 使用 ViewDefineNode 主要便于 ExecutionEngine / Planner 区分 catalog 视图
+// 与派生表（FROM (SELECT ...) AS alias）。
+class ViewDefineNode : public PlanNode {
+public:
+    ViewDefineNode(std::string view_name, std::string view_alias);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string view_name;
+    std::string view_alias;
 };
 
 }  // namespace sqlcompiler

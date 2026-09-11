@@ -1,5 +1,6 @@
 #include "execution/ExpressionEvaluator.h"
 
+#include "catalog/SystemCatalog.h"
 #include "execution/ExecutionEngine.h"
 #include "execution/Executor.h"
 #include "plan/Plan.h"
@@ -759,6 +760,44 @@ Value ExpressionEvaluator::EvaluateFunctionCall(const FunctionCallExpr& expr,
                       tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                       tm.tm_hour, tm.tm_min, tm.tm_sec);
         return Value::MakeVarchar(buf);
+    }
+    // ---- 40_txn_view_udf：UDF 调用 ----
+    // 当内置函数未命中且 ExecutionContext 中存在 catalog 时，尝试按 catalog
+    // 注册的用户自定义函数求值。把实参值代入参数名（同名替换），然后调用
+    // body_expr 求值。注意：UDF 不会修改当前 tuple（无副作用），仅返回值。
+    if (ctx_ != nullptr) {
+        SystemCatalog* catalog = ctx_->GetCatalog();
+        if (catalog != nullptr) {
+            // 大小写不敏感地查 UDF：catalog 内函数名按原大小写存，调用方可能
+            // 写成不同形式。先做一次原大小写匹配，再退化到大小写不敏感扫描。
+            const SystemCatalog::FunctionDefinition* fn =
+                catalog->GetFunction(expr.function_name);
+            if (fn == nullptr) {
+                std::string upper_name;
+                for (char c : expr.function_name)
+                    upper_name.push_back(
+                        static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+                // catalog 内部 keys 直接存 fn 名；HasFunction 接受任意大小写。
+                if (catalog->HasFunction(upper_name)) {
+                    fn = catalog->GetFunction(upper_name);
+                }
+            }
+            if (fn != nullptr && fn->body_expr != nullptr) {
+                if (fn->parameters.size() != expr.arguments.size()) {
+                    return Value::MakeNull();
+                }
+                // 构造一个外层绑定：把每个形参名映射到对应实参的求值结果。
+                std::unordered_map<std::string, Value> udf_bind;
+                for (size_t i = 0; i < expr.arguments.size(); ++i) {
+                    Value v = Evaluate(expr.arguments[i], tuple);
+                    udf_bind[fn->parameters[i].name] = v;
+                }
+                // 用空 column_index_map + udf_bind 作为 outer_bind 求值 body。
+                std::unordered_map<std::string, size_t> empty_cmap;
+                ExpressionEvaluator inner(empty_cmap, ctx_, &udf_bind);
+                return inner.Evaluate(fn->body_expr, tuple);
+            }
+        }
     }
     // 其它函数暂未实现
     return Value::MakeNull();

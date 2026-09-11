@@ -75,6 +75,49 @@ public:
     BPlusTree* GetPrimaryKeyIndexTree(const std::string& table_name,
                                       const std::vector<std::string>& pk_columns);
 
+    // ---- 40_txn_view_udf：视图 / UDF / 触发器注册表 ----
+    //
+    // 视图：CREATE VIEW name AS <select>。我们保存原始 SELECT 语句的 AST 副本，
+    // SELECT FROM view 时由 Semantic/Planner 把它翻译成子计划。
+    // UDF：CREATE FUNCTION name(args) RETURNS type RETURN expr。保存参数列表
+    // 与返回表达式，调用时把参数值代入表达式求值。
+    // 触发器：仅记录存在性，no-op 执行（最小可用实现）。
+    //
+    // 当前实现：仅内存态，不持久化；与 Catalog 的现有内存 SymbolTable 风格一致。
+    // 重新启动数据库时这些对象会丢失——对最小实现足够。
+    struct ViewDefinition {
+        std::string view_name;
+        SelectStatementPtr query;
+    };
+    struct FunctionDefinition {
+        std::string function_name;
+        std::vector<FunctionParameter> parameters;
+        std::string return_type;
+        int32_t return_char_length = -1;
+        ExprPtr body_expr;
+    };
+    struct TriggerDefinition {
+        std::string trigger_name;
+        TriggerTiming timing = TriggerTiming::BEFORE;
+        TriggerEvent event = TriggerEvent::INSERT;
+        std::string table_name;
+        std::vector<std::pair<std::string, ExprPtr>> assignments;
+    };
+
+    bool CreateView(const ViewDefinition& def);
+    bool DropView(const std::string& view_name);
+    bool HasView(const std::string& view_name) const;
+    const ViewDefinition* GetView(const std::string& view_name) const;
+
+    bool CreateFunction(const FunctionDefinition& def);
+    bool DropFunction(const std::string& function_name);
+    bool HasFunction(const std::string& function_name) const;
+    const FunctionDefinition* GetFunction(const std::string& function_name) const;
+
+    bool CreateTrigger(const TriggerDefinition& def);
+    bool DropTrigger(const std::string& trigger_name);
+    bool HasTrigger(const std::string& trigger_name) const;
+
 private:
     BufferPoolManager* buffer_pool_manager_;
     SymbolTable symbol_table_;  // 内存态元数据缓存
@@ -92,6 +135,11 @@ private:
     std::unique_ptr<TableHeap> index_heap_;  // __sys_indexes__ 堆
     std::unordered_map<std::string, IndexInfo> indexes_;
     std::unordered_map<std::string, std::unique_ptr<BPlusTree>> index_trees_;
+
+    // 40_txn_view_udf：视图 / UDF / 触发器字典。
+    std::unordered_map<std::string, ViewDefinition> views_;
+    std::unordered_map<std::string, FunctionDefinition> functions_;
+    std::unordered_map<std::string, TriggerDefinition> triggers_;
 
     // 将一条表的元数据（表名、列定义列表）编码为记录，追加写入sys_tables堆表
     bool PersistTableMetadata(const TableInfo& table_info);

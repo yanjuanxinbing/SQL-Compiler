@@ -579,4 +579,74 @@ BPlusTree* SystemCatalog::GetPrimaryKeyIndexTree(
     return nullptr;
 }
 
+// ============================================================================
+// 40_txn_view_udf：视图 / UDF / 触发器（内存态，最小可用实现）
+// ============================================================================
+
+bool SystemCatalog::CreateView(const ViewDefinition& def) {
+    if (def.view_name.empty()) return false;
+    if (views_.count(def.view_name) != 0) return false;
+    views_[def.view_name] = def;
+    return true;
+}
+
+bool SystemCatalog::DropView(const std::string& view_name) {
+    auto it = views_.find(view_name);
+    if (it == views_.end()) return false;
+    views_.erase(it);
+    return true;
+}
+
+bool SystemCatalog::HasView(const std::string& view_name) const {
+    return views_.find(view_name) != views_.end();
+}
+
+const SystemCatalog::ViewDefinition* SystemCatalog::GetView(
+    const std::string& view_name) const {
+    auto it = views_.find(view_name);
+    return it == views_.end() ? nullptr : &it->second;
+}
+
+bool SystemCatalog::CreateFunction(const FunctionDefinition& def) {
+    if (def.function_name.empty()) return false;
+    if (functions_.count(def.function_name) != 0) return false;
+    functions_[def.function_name] = def;
+    return true;
+}
+
+bool SystemCatalog::DropFunction(const std::string& function_name) {
+    auto it = functions_.find(function_name);
+    if (it == functions_.end()) return false;
+    functions_.erase(it);
+    return true;
+}
+
+bool SystemCatalog::HasFunction(const std::string& function_name) const {
+    return functions_.find(function_name) != functions_.end();
+}
+
+const SystemCatalog::FunctionDefinition* SystemCatalog::GetFunction(
+    const std::string& function_name) const {
+    auto it = functions_.find(function_name);
+    return it == functions_.end() ? nullptr : &it->second;
+}
+
+bool SystemCatalog::CreateTrigger(const TriggerDefinition& def) {
+    if (def.trigger_name.empty()) return false;
+    if (triggers_.count(def.trigger_name) != 0) return false;
+    triggers_[def.trigger_name] = def;
+    return true;
+}
+
+bool SystemCatalog::DropTrigger(const std::string& trigger_name) {
+    auto it = triggers_.find(trigger_name);
+    if (it == triggers_.end()) return false;
+    triggers_.erase(it);
+    return true;
+}
+
+bool SystemCatalog::HasTrigger(const std::string& trigger_name) const {
+    return triggers_.find(trigger_name) != triggers_.end();
+}
+
 }  // namespace sqlcompiler

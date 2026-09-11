@@ -33,6 +33,11 @@ enum class TokenType {
     KEYWORD_INNER,
     KEYWORD_LEFT,
     KEYWORD_RIGHT,
+    KEYWORD_FULL,
+    KEYWORD_OUTER,
+    KEYWORD_CROSS,
+    KEYWORD_NATURAL,
+    KEYWORD_USING,
     KEYWORD_ON,
     KEYWORD_AS,
     KEYWORD_DISTINCT,
@@ -50,6 +55,14 @@ enum class TokenType {
     KEYWORD_DESC,
     KEYWORD_IF,
     KEYWORD_TRUNCATE,
+    KEYWORD_ALTER,
+    KEYWORD_ADD,
+    KEYWORD_RENAME,
+    KEYWORD_MODIFY,
+    KEYWORD_CHECK,
+    KEYWORD_DEFAULT,
+    KEYWORD_TO,
+    KEYWORD_COLUMN,
     KEYWORD_CASE,
     KEYWORD_WHEN,
     KEYWORD_THEN,
@@ -104,6 +117,25 @@ enum class TokenType {
     KEYWORD_DAY,
     KEYWORD_NOW,
     KEYWORD_IFNULL,
+
+    // ---- 40_txn_view_udf: 事务 / 视图 / 触发器 / 用户自定义函数 ----
+    KEYWORD_BEGIN,        // BEGIN [TRANSACTION]
+    KEYWORD_TRANSACTION,
+    KEYWORD_COMMIT,
+    KEYWORD_ROLLBACK,
+    KEYWORD_SAVEPOINT,
+    KEYWORD_RELEASE,
+    KEYWORD_VIEW,
+    KEYWORD_TRIGGER,
+    KEYWORD_FUNCTION,
+    KEYWORD_BEFORE,
+    KEYWORD_AFTER,
+    KEYWORD_FOR,
+    KEYWORD_EACH,
+    KEYWORD_NEW,          // 触发器 NEW.row
+    KEYWORD_OLD,          // 触发器 OLD.row
+    KEYWORD_RETURN,       // UDF 体
+    KEYWORD_RETURNS,      // UDF 返回类型
 
     // ---- 标识符与字面量 ----
     IDENTIFIER,

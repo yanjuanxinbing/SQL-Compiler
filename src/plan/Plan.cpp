@@ -402,6 +402,29 @@ std::string TruncateTableNode::ToString() const {
     return NodeBodyToString(*this, 0);
 }
 
+// ============ AlterTableNode ============
+
+AlterTableNode::AlterTableNode(AlterAction action, std::string table_name)
+    : action(action), table_name(std::move(table_name)) {
+}
+
+PlanNodeType AlterTableNode::GetType() const {
+    return PlanNodeType::ALTER_TABLE;
+}
+
+std::string AlterTableNode::ToString() const {
+    std::ostringstream oss;
+    oss << "AlterTable(" << table_name << ", ";
+    switch (action) {
+        case AlterAction::ADD_COLUMN:    oss << "ADD_COLUMN"; break;
+        case AlterAction::DROP_COLUMN:   oss << "DROP_COLUMN"; break;
+        case AlterAction::RENAME_TO:     oss << "RENAME_TO"; break;
+        case AlterAction::MODIFY_COLUMN: oss << "MODIFY_COLUMN"; break;
+    }
+    oss << ")";
+    return oss.str();
+}
+
 // ============ SetOpNode ============
 
 SetOpNode::SetOpNode(Kind kind) : kind(kind) {
@@ -476,6 +499,65 @@ PlanNodeType CteBindNode::GetType() const {
 
 std::string CteBindNode::ToString() const {
     return NodeBodyToString(*this, 0);
+}
+
+// ============ 40_txn_view_udf：NoOpNode / CreateViewNode / etc ============
+
+NoOpNode::NoOpNode(std::string description) : description(std::move(description)) {
+}
+PlanNodeType NoOpNode::GetType() const { return PlanNodeType::NO_OP; }
+std::string NoOpNode::ToString() const {
+    return "NoOp(" + description + ")\n";
+}
+
+CreateViewNode::CreateViewNode(std::string view_name) : view_name(std::move(view_name)) {
+}
+PlanNodeType CreateViewNode::GetType() const { return PlanNodeType::CREATE_VIEW; }
+std::string CreateViewNode::ToString() const {
+    return "CreateView(" + view_name + ")\n";
+}
+
+CreateTriggerNode::CreateTriggerNode(std::string trigger_name)
+    : trigger_name(std::move(trigger_name)) {
+}
+PlanNodeType CreateTriggerNode::GetType() const { return PlanNodeType::CREATE_TRIGGER; }
+std::string CreateTriggerNode::ToString() const {
+    return "CreateTrigger(" + trigger_name + ")\n";
+}
+
+CreateFunctionNode::CreateFunctionNode(std::string function_name)
+    : function_name(std::move(function_name)) {
+}
+PlanNodeType CreateFunctionNode::GetType() const { return PlanNodeType::CREATE_FUNCTION; }
+std::string CreateFunctionNode::ToString() const {
+    return "CreateFunction(" + function_name + ")\n";
+}
+
+DropObjectNode::DropObjectNode(Kind kind, std::string object_name, bool if_exists)
+    : kind(kind), object_name(std::move(object_name)), if_exists(if_exists) {
+}
+PlanNodeType DropObjectNode::GetType() const { return PlanNodeType::NO_OP; }
+std::string DropObjectNode::ToString() const {
+    const char* kn = "?";
+    switch (kind) {
+        case Kind::VIEW:     kn = "VIEW"; break;
+        case Kind::TRIGGER:  kn = "TRIGGER"; break;
+        case Kind::FUNCTION: kn = "FUNCTION"; break;
+    }
+    std::string out = "Drop";
+    out += kn;
+    out += "(";
+    out += object_name;
+    out += ")\n";
+    return out;
+}
+
+ViewDefineNode::ViewDefineNode(std::string view_name, std::string view_alias)
+    : view_name(std::move(view_name)), view_alias(std::move(view_alias)) {
+}
+PlanNodeType ViewDefineNode::GetType() const { return PlanNodeType::VIEW_DEFINE; }
+std::string ViewDefineNode::ToString() const {
+    return "ViewDefine(" + view_name + " AS " + view_alias + ")\n";
 }
 
 }  // namespace sqlcompiler

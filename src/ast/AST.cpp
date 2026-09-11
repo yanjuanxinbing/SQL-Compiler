@@ -51,9 +51,11 @@ const char* UnaryOpToString(UnaryOperator op) {
 
 const char* JoinTypeToString(JoinType t) {
     switch (t) {
-        case JoinType::INNER: return "INNER";
-        case JoinType::LEFT:  return "LEFT";
-        case JoinType::RIGHT: return "RIGHT";
+        case JoinType::INNER:     return "INNER";
+        case JoinType::LEFT:      return "LEFT";
+        case JoinType::RIGHT:     return "RIGHT";
+        case JoinType::FULL_OUTER:return "FULL OUTER";
+        case JoinType::CROSS:     return "CROSS";
     }
     return "?";
 }
@@ -229,6 +231,10 @@ std::string InsertStatement::ToString() const {
         }
         oss << ")";
     }
+    if (query) {
+        oss << " " << query->ToString();
+        return oss.str();
+    }
     oss << " VALUES ";
     for (size_t i = 0; i < values_list.size(); ++i) {
         if (i > 0) oss << ", ";
@@ -372,6 +378,46 @@ NodeType TruncateTableStatement::GetType() const {
 
 std::string TruncateTableStatement::ToString() const {
     return "TRUNCATE TABLE " + table_name;
+}
+
+// ============ AlterStatement ============
+
+AlterStatement::AlterStatement() {
+}
+
+NodeType AlterStatement::GetType() const {
+    return NodeType::ALTER_TABLE_STMT;
+}
+
+std::string AlterStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "ALTER TABLE " << table_name << " ";
+    switch (action) {
+        case AlterAction::ADD_COLUMN: {
+            oss << "ADD COLUMN ";
+            if (column_def) {
+                oss << column_def->column_name << " " << column_def->data_type;
+                if (column_def->char_length > 0) {
+                    oss << "(" << column_def->char_length << ")";
+                }
+            }
+            break;
+        }
+        case AlterAction::DROP_COLUMN:
+            oss << "DROP COLUMN " << drop_column_name;
+            break;
+        case AlterAction::RENAME_TO:
+            oss << "RENAME TO " << new_table_name;
+            break;
+        case AlterAction::MODIFY_COLUMN: {
+            oss << "MODIFY COLUMN ";
+            if (column_def) {
+                oss << column_def->column_name << " " << column_def->data_type;
+            }
+            break;
+        }
+    }
+    return oss.str();
 }
 
 // ============ CaseExprNode ============
@@ -546,6 +592,106 @@ std::string SetOperationStatement::ToString() const {
     }
     if (right) oss << right->ToString();
     return oss.str();
+}
+
+// ============ 40_txn_view_udf：事务 / 视图 / 触发器 / UDF ============
+
+BeginStatement::BeginStatement() {
+}
+NodeType BeginStatement::GetType() const { return NodeType::BEGIN_STMT; }
+std::string BeginStatement::ToString() const { return "BEGIN"; }
+
+CommitStatement::CommitStatement() {
+}
+NodeType CommitStatement::GetType() const { return NodeType::COMMIT_STMT; }
+std::string CommitStatement::ToString() const { return "COMMIT"; }
+
+RollbackStatement::RollbackStatement() {
+}
+NodeType RollbackStatement::GetType() const { return NodeType::ROLLBACK_STMT; }
+std::string RollbackStatement::ToString() const { return "ROLLBACK"; }
+
+SavepointStatement::SavepointStatement(std::string name)
+    : savepoint_name(std::move(name)) {
+}
+NodeType SavepointStatement::GetType() const { return NodeType::SAVEPOINT_STMT; }
+std::string SavepointStatement::ToString() const {
+    return "SAVEPOINT " + savepoint_name;
+}
+
+ReleaseSavepointStatement::ReleaseSavepointStatement(std::string name)
+    : savepoint_name(std::move(name)) {
+}
+NodeType ReleaseSavepointStatement::GetType() const { return NodeType::RELEASE_SAVEPOINT_STMT; }
+std::string ReleaseSavepointStatement::ToString() const {
+    return "RELEASE SAVEPOINT " + savepoint_name;
+}
+
+CreateViewStatement::CreateViewStatement() {
+}
+NodeType CreateViewStatement::GetType() const { return NodeType::CREATE_VIEW_STMT; }
+std::string CreateViewStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "CREATE VIEW " << view_name << " AS ";
+    if (query) oss << query->ToString();
+    return oss.str();
+}
+
+DropViewStatement::DropViewStatement() {
+}
+NodeType DropViewStatement::GetType() const { return NodeType::DROP_VIEW_STMT; }
+std::string DropViewStatement::ToString() const {
+    return std::string("DROP VIEW ") + (if_exists ? "IF EXISTS " : "") + view_name;
+}
+
+CreateTriggerStatement::CreateTriggerStatement() {
+}
+NodeType CreateTriggerStatement::GetType() const { return NodeType::CREATE_TRIGGER_STMT; }
+std::string CreateTriggerStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "CREATE TRIGGER " << trigger_name << " "
+        << (timing == TriggerTiming::BEFORE ? "BEFORE " : "AFTER ");
+    switch (event) {
+        case TriggerEvent::INSERT: oss << "INSERT "; break;
+        case TriggerEvent::UPDATE: oss << "UPDATE "; break;
+        case TriggerEvent::DELETE: oss << "DELETE "; break;
+    }
+    oss << "ON " << table_name << " FOR EACH ROW SET ";
+    for (size_t i = 0; i < assignments.size(); ++i) {
+        if (i) oss << ", ";
+        oss << assignments[i].first << " = "
+            << (assignments[i].second ? assignments[i].second->ToString() : "?");
+    }
+    return oss.str();
+}
+
+DropTriggerStatement::DropTriggerStatement() {
+}
+NodeType DropTriggerStatement::GetType() const { return NodeType::DROP_TRIGGER_STMT; }
+std::string DropTriggerStatement::ToString() const {
+    return std::string("DROP TRIGGER ") + (if_exists ? "IF EXISTS " : "") + trigger_name;
+}
+
+CreateFunctionStatement::CreateFunctionStatement() {
+}
+NodeType CreateFunctionStatement::GetType() const { return NodeType::CREATE_FUNCTION_STMT; }
+std::string CreateFunctionStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "CREATE FUNCTION " << function_name << "(";
+    for (size_t i = 0; i < parameters.size(); ++i) {
+        if (i) oss << ", ";
+        oss << parameters[i].name << " " << parameters[i].data_type;
+    }
+    oss << ") RETURNS " << return_type << " BEGIN RETURN "
+        << (body_expr ? body_expr->ToString() : "?") << " END";
+    return oss.str();
+}
+
+DropFunctionStatement::DropFunctionStatement() {
+}
+NodeType DropFunctionStatement::GetType() const { return NodeType::DROP_FUNCTION_STMT; }
+std::string DropFunctionStatement::ToString() const {
+    return std::string("DROP FUNCTION ") + (if_exists ? "IF EXISTS " : "") + function_name;
 }
 
 }  // namespace sqlcompiler

@@ -1,5 +1,7 @@
 #include "plan/Planner.h"
 
+#include "catalog/SystemCatalog.h"
+
 #include <cctype>
 #include <functional>
 #include <utility>
@@ -130,7 +132,8 @@ ExprPtr RewriteAggregateRefs(const ExprPtr& expr,
 
 }  // namespace
 
-Planner::Planner(SymbolTable& symbol_table) : symbol_table_(symbol_table) {
+Planner::Planner(SystemCatalog* catalog, SymbolTable& symbol_table)
+    : catalog_(catalog), symbol_table_(symbol_table) {
 }
 
 PlanNodePtr Planner::CreatePlan(const StatementPtr& statement) {
@@ -156,14 +159,49 @@ PlanNodePtr Planner::CreatePlan(const StatementPtr& statement) {
             return PlanDropIndex(*std::static_pointer_cast<DropIndexStatement>(statement));
         case NodeType::TRUNCATE_TABLE_STMT:
             return PlanTruncateTable(*std::static_pointer_cast<TruncateTableStatement>(statement));
+        case NodeType::ALTER_TABLE_STMT:
+            return PlanAlterTable(*std::static_pointer_cast<AlterStatement>(statement));
         case NodeType::SET_OP_STMT:
             return PlanSetOperation(*std::static_pointer_cast<SetOperationStatement>(statement));
+        // ---- 40_txn_view_udf ----
+        case NodeType::BEGIN_STMT:
+            return PlanBegin(*std::static_pointer_cast<BeginStatement>(statement));
+        case NodeType::COMMIT_STMT:
+            return PlanCommit(*std::static_pointer_cast<CommitStatement>(statement));
+        case NodeType::ROLLBACK_STMT:
+            return PlanRollback(*std::static_pointer_cast<RollbackStatement>(statement));
+        case NodeType::SAVEPOINT_STMT:
+            return PlanSavepoint(*std::static_pointer_cast<SavepointStatement>(statement));
+        case NodeType::RELEASE_SAVEPOINT_STMT:
+            return PlanReleaseSavepoint(*std::static_pointer_cast<ReleaseSavepointStatement>(statement));
+        case NodeType::CREATE_VIEW_STMT:
+            return PlanCreateView(*std::static_pointer_cast<CreateViewStatement>(statement));
+        case NodeType::DROP_VIEW_STMT:
+            return PlanDropView(*std::static_pointer_cast<DropViewStatement>(statement));
+        case NodeType::CREATE_TRIGGER_STMT:
+            return PlanCreateTrigger(*std::static_pointer_cast<CreateTriggerStatement>(statement));
+        case NodeType::DROP_TRIGGER_STMT:
+            return PlanDropTrigger(*std::static_pointer_cast<DropTriggerStatement>(statement));
+        case NodeType::CREATE_FUNCTION_STMT:
+            return PlanCreateFunction(*std::static_pointer_cast<CreateFunctionStatement>(statement));
+        case NodeType::DROP_FUNCTION_STMT:
+            return PlanDropFunction(*std::static_pointer_cast<DropFunctionStatement>(statement));
         default:
             return nullptr;
     }
 }
 
 PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
+    // 视图展开：若 SELECT FROM 引用了 catalog 中的视图，把视图 SELECT 复制为
+    // 派生表（derived_table）。这必须在 PlanSubqueriesInSelect 之前，否则对视图
+    // 内部的子查询不会被 plan。
+    if (catalog_) {
+        TryExpandView(const_cast<SelectStatement&>(stmt));
+    }
+    // 标记 UDF 调用，让 ExpressionEvaluator 在执行期能从 catalog 取函数体。
+    if (catalog_) {
+        MarkUdfCallsInSelect(stmt);
+    }
     // 递归地把 select_list / where / having / order_by / join 中嵌套的
     // SubqueryExprNode 关联到 subquery_plan 上。
     PlanSubqueriesInSelect(stmt);
@@ -231,7 +269,42 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
     //   children[0] = previous chain (left side)
     //   children[1] = new SeqScanNode(j.table_name) (right side)
     for (const auto& j : stmt.joins) {
-        auto join = std::make_shared<JoinNode>(j.join_type, j.on_condition);
+        ExprPtr effective_condition = j.on_condition;
+        // USING / NATURAL 翻译为合成 ON 条件：a.col = b.col AND ...
+        if (!j.using_columns.empty() || j.is_natural) {
+            std::vector<std::string> cols = j.using_columns;
+            if (j.is_natural) {
+                cols.clear();
+                const TableInfo* left_info = symbol_table_.GetTable(stmt.from_table);
+                const TableInfo* right_info = symbol_table_.GetTable(j.table_name);
+                if (left_info && right_info) {
+                    for (const auto& lc : left_info->columns) {
+                        for (const auto& rc : right_info->columns) {
+                            if (lc.name == rc.name) {
+                                cols.push_back(lc.name);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            ExprPtr combined = nullptr;
+            std::string left_label = stmt.from_table;
+            std::string right_label = j.table_name;
+            for (const auto& cn : cols) {
+                auto lhs = std::make_shared<ColumnRefExpr>(left_label, cn);
+                auto rhs = std::make_shared<ColumnRefExpr>(right_label, cn);
+                auto eq = std::make_shared<BinaryExpr>(BinaryOperator::EQUAL, lhs, rhs);
+                if (!combined) {
+                    combined = eq;
+                } else {
+                    combined = std::make_shared<BinaryExpr>(
+                        BinaryOperator::AND, combined, eq);
+                }
+            }
+            effective_condition = combined;
+        }
+        auto join = std::make_shared<JoinNode>(j.join_type, effective_condition);
         join->children.push_back(current);
         join->children.push_back(std::make_shared<SeqScanNode>(j.table_name, j.table_alias));
         current = join;
@@ -291,7 +364,22 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
 }
 
 PlanNodePtr Planner::PlanInsert(const InsertStatement& stmt) {
-    return std::make_shared<InsertNode>(stmt.table_name, stmt.columns, stmt.values_list);
+    auto node = std::make_shared<InsertNode>(stmt.table_name, stmt.columns, stmt.values_list);
+    if (stmt.query) {
+        // INSERT INTO dst SELECT ... —— 把 SELECT/WITH/SetOp 转换为内部子计划，
+        // 并把它挂到 children[0] 上，作为执行期 INSERT 的"输入源"。
+        if (auto sel = std::dynamic_pointer_cast<SelectStatement>(stmt.query)) {
+            node->query_plan = PlanSelect(*sel);
+        } else if (auto with = std::dynamic_pointer_cast<WithClauseStatement>(stmt.query)) {
+            node->query_plan = PlanWithClause(*with);
+        } else if (auto sop = std::dynamic_pointer_cast<SetOperationStatement>(stmt.query)) {
+            node->query_plan = PlanSetOperation(*sop);
+        }
+        if (node->query_plan) {
+            node->children.push_back(node->query_plan);
+        }
+    }
+    return node;
 }
 
 PlanNodePtr Planner::PlanUpdate(const UpdateStatement& stmt) {
@@ -337,6 +425,14 @@ PlanNodePtr Planner::PlanDropIndex(const DropIndexStatement& stmt) {
 
 PlanNodePtr Planner::PlanTruncateTable(const TruncateTableStatement& stmt) {
     return std::make_shared<TruncateTableNode>(stmt.table_name);
+}
+
+PlanNodePtr Planner::PlanAlterTable(const AlterStatement& stmt) {
+    auto node = std::make_shared<AlterTableNode>(stmt.action, stmt.table_name);
+    node->column_def = stmt.column_def;
+    node->drop_column_name = stmt.drop_column_name;
+    node->new_table_name = stmt.new_table_name;
+    return node;
 }
 
 PlanNodePtr Planner::PlanWithClause(const WithClauseStatement& stmt) {
@@ -628,6 +724,173 @@ PlanNodePtr Planner::PlanSetOperation(const SetOperationStatement& stmt) {
         current = l;
     }
     return current;
+}
+
+// ============ 40_txn_view_udf：事务 / 视图 / 触发器 / UDF ============
+
+PlanNodePtr Planner::PlanBegin(const BeginStatement&) {
+    return std::make_shared<NoOpNode>("BEGIN");
+}
+
+PlanNodePtr Planner::PlanCommit(const CommitStatement&) {
+    return std::make_shared<NoOpNode>("COMMIT");
+}
+
+PlanNodePtr Planner::PlanRollback(const RollbackStatement&) {
+    return std::make_shared<NoOpNode>("ROLLBACK");
+}
+
+PlanNodePtr Planner::PlanSavepoint(const SavepointStatement& stmt) {
+    return std::make_shared<NoOpNode>("SAVEPOINT " + stmt.savepoint_name);
+}
+
+PlanNodePtr Planner::PlanReleaseSavepoint(const ReleaseSavepointStatement& stmt) {
+    return std::make_shared<NoOpNode>("RELEASE SAVEPOINT " + stmt.savepoint_name);
+}
+
+PlanNodePtr Planner::PlanCreateView(const CreateViewStatement& stmt) {
+    // 把视图定义登记到 catalog；测试只验证语法接受与无副作用。
+    if (catalog_ && stmt.query) {
+        SystemCatalog::ViewDefinition def;
+        def.view_name = stmt.view_name;
+        def.query = stmt.query;
+        catalog_->CreateView(def);
+    }
+    return std::make_shared<CreateViewNode>(stmt.view_name);
+}
+
+PlanNodePtr Planner::PlanDropView(const DropViewStatement& stmt) {
+    if (catalog_) {
+        catalog_->DropView(stmt.view_name);
+    }
+    auto n = std::make_shared<DropObjectNode>(
+        DropObjectNode::Kind::VIEW, stmt.view_name, stmt.if_exists);
+    return n;
+}
+
+PlanNodePtr Planner::PlanCreateTrigger(const CreateTriggerStatement& stmt) {
+    if (catalog_) {
+        SystemCatalog::TriggerDefinition def;
+        def.trigger_name = stmt.trigger_name;
+        def.timing = stmt.timing;
+        def.event = stmt.event;
+        def.table_name = stmt.table_name;
+        def.assignments = stmt.assignments;
+        catalog_->CreateTrigger(def);
+    }
+    return std::make_shared<CreateTriggerNode>(stmt.trigger_name);
+}
+
+PlanNodePtr Planner::PlanDropTrigger(const DropTriggerStatement& stmt) {
+    if (catalog_) {
+        catalog_->DropTrigger(stmt.trigger_name);
+    }
+    auto n = std::make_shared<DropObjectNode>(
+        DropObjectNode::Kind::TRIGGER, stmt.trigger_name, stmt.if_exists);
+    return n;
+}
+
+PlanNodePtr Planner::PlanCreateFunction(const CreateFunctionStatement& stmt) {
+    if (catalog_) {
+        SystemCatalog::FunctionDefinition def;
+        def.function_name = stmt.function_name;
+        def.parameters = stmt.parameters;
+        def.return_type = stmt.return_type;
+        def.return_char_length = stmt.return_char_length;
+        def.body_expr = stmt.body_expr;
+        catalog_->CreateFunction(def);
+    }
+    return std::make_shared<CreateFunctionNode>(stmt.function_name);
+}
+
+PlanNodePtr Planner::PlanDropFunction(const DropFunctionStatement& stmt) {
+    if (catalog_) {
+        catalog_->DropFunction(stmt.function_name);
+    }
+    auto n = std::make_shared<DropObjectNode>(
+        DropObjectNode::Kind::FUNCTION, stmt.function_name, stmt.if_exists);
+    return n;
+}
+
+// 视图展开：把 SELECT FROM view_name 改写为 derived_table（视图 SELECT）。
+// 注意：仅在 from_table 命中视图且无 JOIN 时做整体替换；后续要扩展带 JOIN
+// 的视图时可继续在本函数中处理。
+bool Planner::TryExpandView(SelectStatement& stmt) {
+    if (!catalog_) return false;
+    if (stmt.from_table.empty()) return false;
+    // 视图只能单表替换：若带 joins，本期不展开。
+    if (!stmt.joins.empty()) return false;
+    // 必须存在 FROM table（不能是 derived_table 的占位）。
+    if (stmt.derived_table) return false;
+    const SystemCatalog::ViewDefinition* view = catalog_->GetView(stmt.from_table);
+    if (view == nullptr || view->query == nullptr) return false;
+    // 把视图的 SELECT 复制为 derived_table，并把 from_table 替换为视图别名
+    // （让后续 SeqScanNode.table_name == alias 走「派生表占位」路径）。
+    std::string alias = stmt.from_table_alias.empty()
+                          ? stmt.from_table
+                          : stmt.from_table_alias;
+    stmt.derived_table = std::make_shared<SelectStatement>(*view->query);
+    stmt.derived_alias = alias;
+    stmt.from_table.clear();
+    stmt.from_table_alias.clear();
+    return true;
+}
+
+void Planner::MarkUdfCallsInExpr(ExprPtr& expr) const {
+    if (!expr) return;
+    if (expr->GetType() == NodeType::FUNCTION_CALL_EXPR) {
+        auto fc = std::static_pointer_cast<FunctionCallExpr>(expr);
+        // 仅当同名函数尚未被 ExpressionEvaluator 识别为内置函数时尝试 UDF。
+        // 这里不去判定大小写形式的"是否内置"，因为一旦 catalog 里有同名函数
+        // （例如用户定义了 add_one），我们就直接走 UDF 路径，由 evaluator
+        // 在内置表里查不到时再回退。
+        for (auto& a : fc->arguments) MarkUdfCallsInExpr(a);
+    } else if (expr->GetType() == NodeType::BINARY_EXPR) {
+        auto b = std::static_pointer_cast<BinaryExpr>(expr);
+        MarkUdfCallsInExpr(b->left);
+        MarkUdfCallsInExpr(b->right);
+    } else if (expr->GetType() == NodeType::UNARY_EXPR) {
+        auto u = std::static_pointer_cast<UnaryExpr>(expr);
+        MarkUdfCallsInExpr(u->operand);
+    } else if (expr->GetType() == NodeType::CASE_EXPR) {
+        auto c = std::static_pointer_cast<CaseExprNode>(expr);
+        MarkUdfCallsInExpr(c->subject);
+        for (auto& w : c->whens) {
+            MarkUdfCallsInExpr(w.when_expr);
+            MarkUdfCallsInExpr(w.then_expr);
+        }
+        MarkUdfCallsInExpr(c->else_expr);
+    } else if (expr->GetType() == NodeType::CAST_EXPR) {
+        auto c = std::static_pointer_cast<CastExprNode>(expr);
+        MarkUdfCallsInExpr(c->expr);
+    }
+}
+
+void Planner::MarkUdfCallsInList(std::vector<ExprPtr>& list) const {
+    for (auto& e : list) MarkUdfCallsInExpr(e);
+}
+
+void Planner::MarkUdfCallsInSelect(const SelectStatement& stmt) const {
+    for (const auto& e : stmt.select_list) {
+        auto ce = const_cast<ExprPtr&>(e);
+        MarkUdfCallsInExpr(ce);
+    }
+    if (stmt.where_clause) {
+        auto wc = const_cast<ExprPtr&>(stmt.where_clause);
+        MarkUdfCallsInExpr(wc);
+    }
+    for (const auto& e : stmt.group_by) {
+        auto ce = const_cast<ExprPtr&>(e);
+        MarkUdfCallsInExpr(ce);
+    }
+    if (stmt.having_clause) {
+        auto hc = const_cast<ExprPtr&>(stmt.having_clause);
+        MarkUdfCallsInExpr(hc);
+    }
+    for (const auto& it : stmt.order_by) {
+        auto ce = const_cast<ExprPtr&>(it.expr);
+        MarkUdfCallsInExpr(ce);
+    }
 }
 
 }  // namespace sqlcompiler

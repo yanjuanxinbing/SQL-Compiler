@@ -32,6 +32,7 @@ void JoinExecutor::Init() {
     left_buffer_.clear();
     right_buffer_.clear();
     right_matched_.clear();
+    left_matched_.clear();
     li_ = 0;
     ri_ = 0;
     cur_left_pushed_ = false;
@@ -46,12 +47,32 @@ void JoinExecutor::Init() {
         Tuple t;
         while (right_->Next(&t)) right_buffer_.push_back(t);
     }
-    if (join_type_ == JoinType::RIGHT) {
+    if (join_type_ == JoinType::RIGHT || join_type_ == JoinType::FULL_OUTER) {
         right_matched_.assign(right_buffer_.size(), false);
+    }
+    if (join_type_ == JoinType::FULL_OUTER) {
+        left_matched_.assign(left_buffer_.size(), false);
     }
 }
 
 bool JoinExecutor::Next(Tuple* tuple) {
+    // CROSS JOIN: 直接嵌套循环，无条件。
+    if (join_type_ == JoinType::CROSS) {
+        if (left_buffer_.empty() || right_buffer_.empty()) return false;
+        while (li_ < left_buffer_.size()) {
+            const Tuple& lt = left_buffer_[li_];
+            while (ri_ < right_buffer_.size()) {
+                const Tuple& rt = right_buffer_[ri_];
+                ++ri_;
+                if (tuple) *tuple = Concat(lt, rt);
+                return true;
+            }
+            ++li_;
+            ri_ = 0;
+        }
+        return false;
+    }
+
     ExpressionEvaluator eval(column_index_map_, context_, nullptr);
     while (li_ < left_buffer_.size()) {
         const Tuple& lt = left_buffer_[li_];
@@ -66,17 +87,23 @@ bool JoinExecutor::Next(Tuple* tuple) {
             }
             if (match) {
                 cur_left_pushed_ = true;  // 当前 li_ 已"产出过"——无论是真匹配还是 NULL 补行
-                if (join_type_ == JoinType::RIGHT && ri_ - 1 < right_matched_.size()) {
+                if ((join_type_ == JoinType::RIGHT || join_type_ == JoinType::FULL_OUTER)
+                    && ri_ - 1 < right_matched_.size()) {
                     right_matched_[ri_ - 1] = true;
+                }
+                if (join_type_ == JoinType::FULL_OUTER
+                    && li_ < left_matched_.size()) {
+                    left_matched_[li_] = true;
                 }
                 if (tuple) *tuple = joined;
                 return true;
             }
         }
         // 跑完 inner 循环：当前 li_ 没有再多的 right 可匹配。
-        // LEFT JOIN：若整个 li_ 一次都没成功匹配过（包括当前这次 inner 循环的初轮），
+        // LEFT JOIN / FULL OUTER JOIN：若整个 li_ 一次都没成功匹配过，
         // 补一行 (left, NULL right)；否则说明它至少匹配过，直接前进到下一个 li_。
-        if (join_type_ == JoinType::LEFT && !cur_left_pushed_) {
+        if ((join_type_ == JoinType::LEFT || join_type_ == JoinType::FULL_OUTER)
+            && !cur_left_pushed_) {
             Tuple padded = Concat(lt, NullTuple(right_buffer_.empty() ? 0 :
                                                   right_buffer_[0].ColumnCount()));
             if (tuple) *tuple = padded;
@@ -88,8 +115,8 @@ bool JoinExecutor::Next(Tuple* tuple) {
         cur_left_pushed_ = false;
     }
 
-    // RIGHT JOIN: emit unmatched right tuples with NULL left
-    if (join_type_ == JoinType::RIGHT) {
+    // RIGHT JOIN / FULL OUTER JOIN: emit unmatched right tuples with NULL left
+    if (join_type_ == JoinType::RIGHT || join_type_ == JoinType::FULL_OUTER) {
         for (size_t i = 0; i < right_buffer_.size(); ++i) {
             if (!right_matched_[i]) {
                 size_t left_cols = left_buffer_.empty() ? 0 : left_buffer_[0].ColumnCount();

@@ -43,6 +43,19 @@ private:
     StatementPtr ParseDropTableStatement();
     StatementPtr ParseCreateIndexStatement();
     StatementPtr ParseDropIndexStatement();
+    StatementPtr ParseAlterTableStatement();
+    // ---- 40_txn_view_udf: 事务 / 视图 / 触发器 / UDF ----
+    StatementPtr ParseBeginStatement();
+    StatementPtr ParseCommitStatement();
+    StatementPtr ParseRollbackStatement();
+    StatementPtr ParseSavepointStatement();
+    StatementPtr ParseReleaseSavepointStatement();
+    StatementPtr ParseCreateViewStatement();
+    StatementPtr ParseDropViewStatement();
+    StatementPtr ParseCreateTriggerStatement();
+    StatementPtr ParseDropTriggerStatement();
+    StatementPtr ParseCreateFunctionStatement();
+    StatementPtr ParseDropFunctionStatement();
 
     // ---- 子句解析 ----
     std::vector<ExprPtr> ParseSelectList();

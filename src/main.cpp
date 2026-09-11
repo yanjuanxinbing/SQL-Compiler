@@ -2,6 +2,7 @@
 #include <string>
 #include <algorithm>
 #include <vector>
+#include <cctype>
 
 #include "db/Database.h"
 
@@ -32,13 +33,41 @@ bool IsOnlyCommentsOrWhitespace(const std::string& s) {
 // 判断缓冲区中是否已出现语句结束符 ';'。
 // 必须跳过字符串字面量与行注释，否则 `INSERT ... VALUES ('a;b')` 会被提前截断，
 // 而 `-- 注释里的分号;` 会被误认为语句已完整。
+// 额外规则：在 CREATE FUNCTION/PROCEDURE 类语句的 BEGIN ... END 块内的 ';'
+// 不算语句结束；通过简单扫描文本中的 BEGIN / END 大写关键字计数实现。
 bool HasCompleteStatement(const std::string& s) {
     bool in_string = false;
+    auto extract_word_upper = [](const std::string& s, size_t i) -> std::string {
+        std::string w;
+        while (i < s.size() &&
+               (std::isalpha(static_cast<unsigned char>(s[i])) || s[i] == '_')) {
+            w.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(s[i]))));
+            ++i;
+        }
+        return w;
+    };
+    int begin_depth = 0;
+    // 仅当显式看到 CREATE FUNCTION/PROCEDURE 时才启用 BEGIN...END 计数。
+    // 这样独立的 BEGIN; 事务语句不会被误识别为函数体起点。
+    bool create_fn_seen = false;
+    auto upper_contains = [](const std::string& s, const std::string& needle) -> bool {
+        if (needle.size() > s.size()) return false;
+        for (size_t k = 0; k + needle.size() <= s.size(); ++k) {
+            bool match = true;
+            for (size_t j = 0; j < needle.size(); ++j) {
+                char a = static_cast<char>(std::toupper(
+                    static_cast<unsigned char>(s[k + j])));
+                char b = needle[j];
+                if (a != b) { match = false; break; }
+            }
+            if (match) return true;
+        }
+        return false;
+    };
     for (size_t i = 0; i < s.size(); ++i) {
         char c = s[i];
         if (in_string) {
             if (c == '\'') {
-                // 连续两个单引号是转义的引号，仍在字符串内
                 if (i + 1 < s.size() && s[i + 1] == '\'') { ++i; continue; }
                 in_string = false;
             }
@@ -49,7 +78,33 @@ bool HasCompleteStatement(const std::string& s) {
             while (i < s.size() && s[i] != '\n') ++i;
             continue;
         }
-        if (c == ';') return true;
+        if (std::isalpha(static_cast<unsigned char>(c))) {
+            std::string w = extract_word_upper(s, i);
+            // 检测 "CREATE FUNCTION/PROCEDURE" 触发 BEGIN/END 计数。
+            if (w == "CREATE" && create_fn_seen == false) {
+                // 看后续 token：FUNCTION / PROCEDURE / TRIGGER。
+                size_t j = i + w.size();
+                while (j < s.size() &&
+                       (std::isspace(static_cast<unsigned char>(s[j])))) ++j;
+                std::string next = extract_word_upper(s, j);
+                if (next == "FUNCTION" || next == "PROCEDURE") {
+                    create_fn_seen = true;
+                }
+            }
+            if (create_fn_seen && w == "BEGIN") {
+                ++begin_depth;
+            } else if (create_fn_seen && w == "END") {
+                if (begin_depth > 0) --begin_depth;
+            }
+            i += w.size() - 1;
+            continue;
+        }
+        if (c == ';' && begin_depth == 0) {
+            // 行尾单独的 ';' 之前的整段若包含 CREATE FUNCTION + END（depth 已
+            // 归零），也认作语句完成。否则只信任 depth==0 时退出。
+            (void)upper_contains;
+            return true;
+        }
     }
     return false;
 }

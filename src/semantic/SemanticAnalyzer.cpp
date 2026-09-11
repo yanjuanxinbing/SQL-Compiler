@@ -1,11 +1,14 @@
 #include "semantic/SemanticAnalyzer.h"
 
+#include "catalog/SystemCatalog.h"
+
 #include <functional>
 #include <utility>
 
 namespace sqlcompiler {
 
-SemanticAnalyzer::SemanticAnalyzer(SymbolTable& symbol_table) : symbol_table_(symbol_table) {
+SemanticAnalyzer::SemanticAnalyzer(SystemCatalog* catalog, SymbolTable& symbol_table)
+    : catalog_(catalog), symbol_table_(symbol_table) {
 }
 
 // 内部版本：不调用 ClearErrors，便于在递归（如 SET_OP_STMT）时累积子树的错误。
@@ -43,6 +46,27 @@ bool SemanticAnalyzer::AnalyzeInternal(const StatementPtr& statement, bool& ok) 
             break;
         case NodeType::TRUNCATE_TABLE_STMT:
             ok &= AnalyzeTruncateTable(*std::static_pointer_cast<TruncateTableStatement>(statement));
+            break;
+        case NodeType::ALTER_TABLE_STMT:
+            ok &= AnalyzeAlterTable(*std::static_pointer_cast<AlterStatement>(statement));
+            break;
+        // ---- 40_txn_view_udf：事务 / 视图 / 触发器 / UDF ----
+        // 这些语句当前都按 no-op 通过语义检查：
+        //   - 事务 / 触发器：纯控制流，无表达式求值。
+        //   - 视图：catalog 已经记录 SELECT 子句；调用方会在执行期翻译。
+        //   - UDF：catalog 记录函数体；调用方的表达式树在执行期才解析参数。
+        // 因此本阶段只把它们放进 ok，不再展开进一步检查。
+        case NodeType::BEGIN_STMT:
+        case NodeType::COMMIT_STMT:
+        case NodeType::ROLLBACK_STMT:
+        case NodeType::SAVEPOINT_STMT:
+        case NodeType::RELEASE_SAVEPOINT_STMT:
+        case NodeType::CREATE_VIEW_STMT:
+        case NodeType::DROP_VIEW_STMT:
+        case NodeType::CREATE_TRIGGER_STMT:
+        case NodeType::DROP_TRIGGER_STMT:
+        case NodeType::CREATE_FUNCTION_STMT:
+        case NodeType::DROP_FUNCTION_STMT:
             break;
         case NodeType::SET_OP_STMT: {
             auto so = std::static_pointer_cast<SetOperationStatement>(statement);
@@ -201,7 +225,13 @@ void SemanticAnalyzer::ClearErrors() {
 
 bool SemanticAnalyzer::AnalyzeSelect(const SelectStatement& stmt) {
     bool ok = true;
-    if (!stmt.from_table.empty()) {
+    // 视图：若 from_table 在 catalog 中已注册为视图，跳过表存在性检查；
+    // 否则按正常表检查。视图对应的列下标在执行期由 planner 翻译为子查询。
+    bool from_is_view = false;
+    if (!stmt.from_table.empty() && catalog_ != nullptr) {
+        from_is_view = catalog_->HasView(stmt.from_table);
+    }
+    if (!stmt.from_table.empty() && !from_is_view) {
         ok &= CheckTableExists(stmt.from_table);
     }
 
@@ -219,7 +249,10 @@ bool SemanticAnalyzer::AnalyzeSelect(const SelectStatement& stmt) {
         }
     }
     for (auto& j : stmt.joins) {
-        ok &= CheckTableExists(j.table_name);
+        bool join_is_view = (catalog_ != nullptr) && catalog_->HasView(j.table_name);
+        if (!join_is_view) {
+            ok &= CheckTableExists(j.table_name);
+        }
         real_tables.push_back(j.table_name);
         table_aliases.emplace_back(j.table_name, j.table_name);
         if (!j.table_alias.empty()) {
@@ -251,6 +284,27 @@ bool SemanticAnalyzer::AnalyzeSelect(const SelectStatement& stmt) {
                                                                          all_aliases, table_aliases);
     for (auto& j : stmt.joins) {
         if (j.on_condition) ok &= CheckExpressionMulti(j.on_condition, real_tables, table_aliases);
+        // USING (col1, col2, ...) — 校验每个 USING 列同时存在于左右两表。
+        for (const auto& cn : j.using_columns) {
+            bool in_left = false, in_right = false;
+            const TableInfo* left_info = symbol_table_.GetTable(stmt.from_table);
+            const TableInfo* right_info = symbol_table_.GetTable(j.table_name);
+            if (left_info && left_info->HasColumn(cn)) in_left = true;
+            if (right_info && right_info->HasColumn(cn)) in_right = true;
+            if (!in_left || !in_right) {
+                AddError("USING column '" + cn + "' not found in both tables of JOIN");
+                ok = false;
+            }
+        }
+        // NATURAL JOIN — 左右表至少存在一个公共列；否则按 SQL 标准退化为 CROSS JOIN。
+        if (j.is_natural) {
+            const TableInfo* left_info = symbol_table_.GetTable(stmt.from_table);
+            const TableInfo* right_info = symbol_table_.GetTable(j.table_name);
+            if (!left_info || !right_info) {
+                AddError("NATURAL JOIN: table not found");
+                ok = false;
+            }
+        }
     }
     return ok;
 }
@@ -372,6 +426,13 @@ bool SemanticAnalyzer::AnalyzeDropIndex(const DropIndexStatement& stmt) {
 }
 
 bool SemanticAnalyzer::AnalyzeTruncateTable(const TruncateTableStatement& stmt) {
+    return CheckTableExists(stmt.table_name);
+}
+
+bool SemanticAnalyzer::AnalyzeAlterTable(const AlterStatement& stmt) {
+    // DDL 扩展语法的最小实现：仅校验表存在性。
+    // 真实 schema evolution 校验（列存在 / 类型兼容 / 重命名冲突）不在本期范围内，
+    // 由执行层的 no-op AlterTableExecutor 跳过即可。
     return CheckTableExists(stmt.table_name);
 }
 
