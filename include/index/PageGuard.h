@@ -34,6 +34,11 @@ public:
     page_id_t PageId() const { return page_id_; }
     // 标记该页已修改；析构时会以 is_dirty=true 归还
     void MarkDirty() { dirty_ = true; }
+    // Phase B：把 LSN 转发到底层 Page。仅 WAL 写出器调一次，避免每次都绕回
+    // BufferPool 找帧。
+    void SetPageLsn(uint64_t lsn) {
+        if (page_ != nullptr) page_->SetPageLsn(lsn);
+    }
     // 提前归还（幂等）。析构时不会重复 Unpin。
     void Release();
 

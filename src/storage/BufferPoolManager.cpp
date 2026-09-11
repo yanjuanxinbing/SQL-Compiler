@@ -2,6 +2,7 @@
 
 #include "storage/FIFOReplacer.h"
 #include "storage/LRUReplacer.h"
+#include "txn/LogManager.h"
 
 #include <cstring>
 
@@ -49,6 +50,9 @@ Page* BufferPoolManager::GetPage(page_id_t page_id) {
     pages_[frame_id].SetPageId(page_id);
     pages_[frame_id].SetDirty(false);
     pages_[frame_id].IncPinCount();  // now pin = 1
+    // 重新加载磁盘页后该页的 page_lsn 不可知（磁盘格式不带 LSN），归零。
+    // 后续 redo 会用「page.page_lsn < record.lsn」判定是否重放，安全。
+    pages_[frame_id].SetPageLsn(0);
     page_table_[page_id] = frame_id;
     replacer_->Pin(frame_id);
     ++stats_.miss_count;
@@ -65,6 +69,8 @@ Page* BufferPoolManager::NewPage(page_id_t* page_id) {
     pages_[frame_id].SetPageId(new_pid);
     pages_[frame_id].IncPinCount();  // pin = 1
     pages_[frame_id].SetDirty(false);
+    // ResetMemory 已把 page_lsn_ 置 0；显式再次提醒意图。
+    pages_[frame_id].SetPageLsn(0);
     page_table_[new_pid] = frame_id;
     replacer_->Pin(frame_id);
     if (page_id) *page_id = new_pid;
@@ -90,9 +96,29 @@ bool BufferPoolManager::FlushPage(page_id_t page_id) {
     auto it = page_table_.find(page_id);
     if (it == page_table_.end()) return false;
     int frame_id = it->second;
+    // Phase B：WAL-before-data 规则。
+    // 若该页的 page_lsn 尚未被日志持久化，必须先 LogManager::Flush，
+    // 否则磁盘上的 page 会"领先"日志，导致崩溃后 redo 看不到原始写入。
+    if (log_manager_ != nullptr) {
+        uint64_t page_lsn = pages_[frame_id].GetPageLsn();
+        uint64_t durable = log_manager_->durable_lsn();
+        if (page_lsn > durable) {
+            log_manager_->Flush();
+        }
+    }
     disk_manager_->WritePage(page_id, pages_[frame_id].GetData());
     pages_[frame_id].SetDirty(false);
     return true;
+}
+
+void BufferPoolManager::FlushAllDirtyPages() {
+    // Phase B：仅刷脏页；Lsn-aware 的 FlushPage 保证 WAL 顺序。
+    for (const auto& kv : page_table_) {
+        int frame_id = kv.second;
+        if (pages_[frame_id].IsDirty()) {
+            FlushPage(kv.first);
+        }
+    }
 }
 
 void BufferPoolManager::FlushAllPages() {
@@ -110,6 +136,14 @@ bool BufferPoolManager::DeletePage(page_id_t page_id) {
     int frame_id = it->second;
     if (pages_[frame_id].GetPinCount() > 0) return false;
     if (pages_[frame_id].IsDirty()) {
+        // 同样走 WAL-before-data 规则。
+        if (log_manager_ != nullptr) {
+            uint64_t page_lsn = pages_[frame_id].GetPageLsn();
+            uint64_t durable = log_manager_->durable_lsn();
+            if (page_lsn > durable) {
+                log_manager_->Flush();
+            }
+        }
         disk_manager_->WritePage(page_id, pages_[frame_id].GetData());
     }
     page_table_.erase(it);
@@ -117,6 +151,17 @@ bool BufferPoolManager::DeletePage(page_id_t page_id) {
     free_list_.push_back(frame_id);
     disk_manager_->DeallocatePage(page_id);
     return true;
+}
+
+std::vector<std::pair<page_id_t, uint64_t>> BufferPoolManager::CollectDirtyPages() {
+    std::vector<std::pair<page_id_t, uint64_t>> out;
+    for (const auto& kv : page_table_) {
+        int frame_id = kv.second;
+        if (pages_[frame_id].IsDirty()) {
+            out.emplace_back(kv.first, pages_[frame_id].GetPageLsn());
+        }
+    }
+    return out;
 }
 
 const BufferPoolStats& BufferPoolManager::GetStats() const {
@@ -141,6 +186,14 @@ bool BufferPoolManager::FindFreeFrame(int* frame_id) {
     page_id_t evicted_pid = pages_[victim].GetPageId();
     bool evicted_dirty = pages_[victim].IsDirty();
     if (evicted_dirty) {
+        // Phase B：victim 写出也需尊重 WAL 顺序。
+        if (log_manager_ != nullptr) {
+            uint64_t page_lsn = pages_[victim].GetPageLsn();
+            uint64_t durable = log_manager_->durable_lsn();
+            if (page_lsn > durable) {
+                log_manager_->Flush();
+            }
+        }
         disk_manager_->WritePage(evicted_pid, pages_[victim].GetData());
     }
     page_table_.erase(evicted_pid);

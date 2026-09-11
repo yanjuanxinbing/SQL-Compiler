@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -16,6 +17,13 @@ struct ColumnInfo {
     int32_t char_length = -1;
     bool is_primary_key = false;
     bool is_not_null = false;
+    // 列级 CHECK (expr)：执行期在 INSERT/UPDATE 路径上强制校验；
+    // NULL 求值结果不视为违反约束（SQL 标准三值逻辑）。
+    ExprPtr check_expr;
+    // 列级 DEFAULT expr：当 INSERT 未为该列提供值（或显式 NULL）时，
+    // 由执行层自动填入。允许的字面类型：int / float / string / NULL；
+    // 函数调用、子查询等"非字面表达式"在执行期会抛 "default expression not supported"。
+    ExprPtr default_expr;
 };
 
 // 表元信息

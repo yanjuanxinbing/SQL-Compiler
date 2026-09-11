@@ -2,6 +2,7 @@
 
 #include "common/Error.h"
 #include "index/BPlusTree.h"
+#include "txn/Transaction.h"
 
 #include <unordered_map>
 
@@ -69,34 +70,39 @@ void CheckUniqueIndexes(SystemCatalog* catalog, const TableInfo& table_info,
 }
 
 void InsertIntoIndexes(SystemCatalog* catalog, const TableInfo& table_info,
-                       const std::vector<Value>& row, const RID& rid) {
+                       const std::vector<Value>& row, const RID& rid,
+                       Transaction* txn) {
     if (catalog == nullptr) return;
     for (const IndexInfo* info : catalog->GetIndexesForTable(table_info.table_name)) {
         IndexKey key;
         if (!BuildIndexKeyFromRow(table_info, *info, row, &key)) continue;
         BPlusTree* tree = catalog->GetIndexTree(info->index_name);
         if (tree == nullptr) continue;
+        // Phase A：把 txn 挂到树上，让 Insert 内部的写路径捕获 undo。
+        tree->SetActiveTransaction(txn);
         if (!tree->Insert(key, rid)) {
-            // 唯一性冲突本应在 CheckUniqueIndexes 阶段就被拦下；走到这里说明
-            // 键太长之类的结构性失败，此时堆已写入而索引没写进去，必须报错让
-            // 用户知道，而不是静默留下一个不完整的索引。
+            tree->SetActiveTransaction(nullptr);
             throw CompilerException(
                 ErrorStage::SEMANTIC,
                 "failed to insert into index '" + info->index_name +
                     "': key (" + DescribeKey(*info, key) + ") rejected");
         }
+        tree->SetActiveTransaction(nullptr);
     }
 }
 
 void DeleteFromIndexes(SystemCatalog* catalog, const TableInfo& table_info,
-                       const std::vector<Value>& row, const RID& rid) {
+                       const std::vector<Value>& row, const RID& rid,
+                       Transaction* txn) {
     if (catalog == nullptr) return;
     for (const IndexInfo* info : catalog->GetIndexesForTable(table_info.table_name)) {
         IndexKey key;
         if (!BuildIndexKeyFromRow(table_info, *info, row, &key)) continue;
         BPlusTree* tree = catalog->GetIndexTree(info->index_name);
         if (tree == nullptr) continue;
+        tree->SetActiveTransaction(txn);
         tree->Delete(key, rid);  // 找不到不算错误
+        tree->SetActiveTransaction(nullptr);
     }
 }
 

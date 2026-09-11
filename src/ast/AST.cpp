@@ -13,6 +13,8 @@ const char* LiteralTypeToString(LiteralType t) {
         case LiteralType::STRING:     return "STRING";
         case LiteralType::NULL_VALUE: return "NULL";
         case LiteralType::BOOLEAN:    return "BOOL";
+        case LiteralType::DATE:       return "DATE";
+        case LiteralType::TIMESTAMP:  return "TIMESTAMP";
     }
     return "?";
 }
@@ -37,6 +39,8 @@ const char* BinaryOpToString(BinaryOperator op) {
         case BinaryOperator::BETWEEN:        return "BETWEEN";
         case BinaryOperator::IS_NULL:        return "IS NULL";
         case BinaryOperator::IS_NOT_NULL:    return "IS NOT NULL";
+        case BinaryOperator::INTERVAL_ADD:   return "+";
+        case BinaryOperator::INTERVAL_SUB:   return "-";
     }
     return "?";
 }
@@ -78,6 +82,12 @@ std::string LiteralExpr::ToString() const {
     }
     if (literal_type == LiteralType::NULL_VALUE) {
         return "NULL";
+    }
+    if (literal_type == LiteralType::DATE) {
+        return "DATE '" + value + "'";
+    }
+    if (literal_type == LiteralType::TIMESTAMP) {
+        return "TIMESTAMP '" + value + "'";
     }
     return value;
 }
@@ -233,6 +243,14 @@ std::string InsertStatement::ToString() const {
     }
     if (query) {
         oss << " " << query->ToString();
+        if (has_on_duplicate && !upsert_assignments.empty()) {
+            oss << " ON DUPLICATE KEY UPDATE ";
+            for (size_t i = 0; i < upsert_assignments.size(); ++i) {
+                if (i > 0) oss << ", ";
+                oss << upsert_assignments[i].first << " = "
+                << (upsert_assignments[i].second ? upsert_assignments[i].second->ToString() : "?");
+            }
+        }
         return oss.str();
     }
     oss << " VALUES ";
@@ -244,6 +262,14 @@ std::string InsertStatement::ToString() const {
             oss << (values_list[i][j] ? values_list[i][j]->ToString() : "?");
         }
         oss << ")";
+    }
+    if (has_on_duplicate && !upsert_assignments.empty()) {
+        oss << " ON DUPLICATE KEY UPDATE ";
+        for (size_t i = 0; i < upsert_assignments.size(); ++i) {
+            if (i > 0) oss << ", ";
+            oss << upsert_assignments[i].first << " = "
+                << (upsert_assignments[i].second ? upsert_assignments[i].second->ToString() : "?");
+        }
     }
     return oss.str();
 }
@@ -549,6 +575,56 @@ std::string SubqueryExprNode::ToString() const {
     return oss.str();
 }
 
+// ============ UpsertValuesRefExpr (43_upsert) ============
+
+UpsertValuesRefExpr::UpsertValuesRefExpr(std::string column_name)
+    : column_name(std::move(column_name)) {
+}
+
+NodeType UpsertValuesRefExpr::GetType() const {
+    return NodeType::UPSERT_VALUES_REF_EXPR;
+}
+
+std::string UpsertValuesRefExpr::ToString() const {
+    return "VALUES(" + column_name + ")";
+}
+
+// ============ LikeExprNode (44_pattern_match) ============
+
+LikeExprNode::LikeExprNode(Kind kind,
+                           ExprPtr operand,
+                           ExprPtr pattern,
+                           char escape_char,
+                           bool has_escape)
+    : kind(kind),
+      operand(std::move(operand)),
+      pattern(std::move(pattern)),
+      escape_char(escape_char),
+      has_escape(has_escape) {
+}
+
+NodeType LikeExprNode::GetType() const {
+    return NodeType::LIKE_EXPR;
+}
+
+std::string LikeExprNode::ToString() const {
+    std::ostringstream oss;
+    oss << "("
+        << (operand ? operand->ToString() : "?") << " ";
+    switch (kind) {
+        case Kind::LIKE:   oss << "LIKE";   break;
+        case Kind::ILIKE:  oss << "ILIKE";  break;
+        case Kind::REGEXP: oss << "REGEXP"; break;
+        case Kind::RLIKE:  oss << "RLIKE";  break;
+    }
+    oss << " " << (pattern ? pattern->ToString() : "?");
+    if (has_escape) {
+        oss << " ESCAPE '" << escape_char << "'";
+    }
+    oss << ")";
+    return oss.str();
+}
+
 // ============ WithClauseStatement ============
 
 WithClauseStatement::WithClauseStatement() {
@@ -610,6 +686,12 @@ RollbackStatement::RollbackStatement() {
 }
 NodeType RollbackStatement::GetType() const { return NodeType::ROLLBACK_STMT; }
 std::string RollbackStatement::ToString() const { return "ROLLBACK"; }
+
+RollbackToStatement::RollbackToStatement() = default;
+NodeType RollbackToStatement::GetType() const { return NodeType::ROLLBACK_TO_STMT; }
+std::string RollbackToStatement::ToString() const {
+    return "ROLLBACK TO " + savepoint_name;
+}
 
 SavepointStatement::SavepointStatement(std::string name)
     : savepoint_name(std::move(name)) {
@@ -682,9 +764,80 @@ std::string CreateFunctionStatement::ToString() const {
         if (i) oss << ", ";
         oss << parameters[i].name << " " << parameters[i].data_type;
     }
-    oss << ") RETURNS " << return_type << " BEGIN RETURN "
-        << (body_expr ? body_expr->ToString() : "?") << " END";
+    oss << ") RETURNS " << return_type << " BEGIN";
+    for (const auto& s : body_statements) {
+        if (s) oss << " " << s->ToString() << ";";
+    }
+    oss << " END";
     return oss.str();
+}
+
+// ============ 47_udf_trigger_view: UDF 函数体语句节点 ============
+
+DeclareVarStatement::DeclareVarStatement(std::string var_name, std::string data_type,
+                                         int32_t char_length)
+    : var_name(std::move(var_name)), data_type(std::move(data_type)),
+      char_length(char_length) {
+}
+NodeType DeclareVarStatement::GetType() const { return NodeType::DECLARE_VAR_STMT; }
+std::string DeclareVarStatement::ToString() const {
+    std::string out = "DECLARE " + var_name + " " + data_type;
+    if (char_length > 0) out += "(" + std::to_string(char_length) + ")";
+    return out;
+}
+
+SetVarStatement::SetVarStatement(std::string target, ExprPtr expr)
+    : target(std::move(target)), expr(std::move(expr)) {
+}
+NodeType SetVarStatement::GetType() const { return NodeType::SET_VAR_STMT; }
+std::string SetVarStatement::ToString() const {
+    return "SET " + target + " = " + (expr ? expr->ToString() : "?");
+}
+
+IfStatement::IfStatement() {
+}
+NodeType IfStatement::GetType() const { return NodeType::IF_STMT; }
+std::string IfStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "IF " << (condition ? condition->ToString() : "?") << " THEN";
+    for (const auto& s : then_body) {
+        if (s) oss << " " << s->ToString() << ";";
+    }
+    for (const auto& ec : elseif_clauses) {
+        oss << " ELSEIF " << (ec.condition ? ec.condition->ToString() : "?") << " THEN";
+        for (const auto& s : ec.body) {
+            if (s) oss << " " << s->ToString() << ";";
+        }
+    }
+    if (!else_body.empty()) {
+        oss << " ELSE";
+        for (const auto& s : else_body) {
+            if (s) oss << " " << s->ToString() << ";";
+        }
+    }
+    oss << " END IF";
+    return oss.str();
+}
+
+WhileStatement::WhileStatement() {
+}
+NodeType WhileStatement::GetType() const { return NodeType::WHILE_STMT; }
+std::string WhileStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "WHILE " << (condition ? condition->ToString() : "?") << " DO";
+    for (const auto& s : body) {
+        if (s) oss << " " << s->ToString() << ";";
+    }
+    oss << " END WHILE";
+    return oss.str();
+}
+
+ReturnStatement::ReturnStatement(ExprPtr expr) : expr(std::move(expr)) {
+}
+NodeType ReturnStatement::GetType() const { return NodeType::RETURN_STMT; }
+std::string ReturnStatement::ToString() const {
+    if (expr) return "RETURN " + expr->ToString();
+    return "RETURN";
 }
 
 DropFunctionStatement::DropFunctionStatement() {
@@ -692,6 +845,84 @@ DropFunctionStatement::DropFunctionStatement() {
 NodeType DropFunctionStatement::GetType() const { return NodeType::DROP_FUNCTION_STMT; }
 std::string DropFunctionStatement::ToString() const {
     return std::string("DROP FUNCTION ") + (if_exists ? "IF EXISTS " : "") + function_name;
+}
+
+// ============ 45_datetime：EXTRACT / INTERVAL ============
+
+namespace {
+const char* ExtractFieldName(int field) {
+    // 与 IntervalUnit 对应；用整型值便于不引入对 DateTime.h 的依赖。
+    switch (field) {
+        case 0: return "YEAR";   // IntervalUnit::YEAR
+        case 1: return "MONTH";  // IntervalUnit::MONTH
+        case 2: return "DAY";    // IntervalUnit::DAY
+        case 3: return "HOUR";   // IntervalUnit::HOUR
+        case 4: return "MINUTE"; // IntervalUnit::MINUTE
+        case 5: return "SECOND"; // IntervalUnit::SECOND
+    }
+    return "?";
+}
+}  // namespace
+
+ExtractExprNode::ExtractExprNode(int field, ExprPtr source)
+    : field(field), source(std::move(source)) {
+}
+
+NodeType ExtractExprNode::GetType() const {
+    return NodeType::EXTRACT_EXPR;
+}
+
+std::string ExtractExprNode::ToString() const {
+    std::ostringstream oss;
+    oss << "EXTRACT(" << ExtractFieldName(field) << " FROM "
+        << (source ? source->ToString() : "?") << ")";
+    return oss.str();
+}
+
+IntervalExprNode::IntervalExprNode(int64_t count, int unit)
+    : count(count), unit(unit) {
+}
+
+NodeType IntervalExprNode::GetType() const {
+    return NodeType::INTERVAL_EXPR;
+}
+
+std::string IntervalExprNode::ToString() const {
+    std::ostringstream oss;
+    oss << "INTERVAL " << count << " " << ExtractFieldName(unit);
+    return oss.str();
+}
+
+// ============ 46_meta：EXPLAIN / SHOW ============
+
+ExplainStatement::ExplainStatement() {
+}
+NodeType ExplainStatement::GetType() const {
+    return NodeType::EXPLAIN_STMT;
+}
+std::string ExplainStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "EXPLAIN";
+    if (analyze) oss << " ANALYZE";
+    if (inner) oss << " " << inner->ToString();
+    return oss.str();
+}
+
+ShowStatement::ShowStatement() {
+}
+NodeType ShowStatement::GetType() const {
+    return NodeType::SHOW_STMT;
+}
+std::string ShowStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "SHOW ";
+    switch (kind) {
+        case Kind::TABLES:       oss << "TABLES"; break;
+        case Kind::COLUMNS:      oss << "COLUMNS FROM " << target_table; break;
+        case Kind::INDEX:        oss << "INDEX FROM " << target_table; break;
+        case Kind::CREATE_TABLE: oss << "CREATE TABLE " << target_table; break;
+    }
+    return oss.str();
 }
 
 }  // namespace sqlcompiler

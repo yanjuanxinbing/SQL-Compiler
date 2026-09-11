@@ -41,6 +41,19 @@ enum class PlanNodeType {
     CREATE_FUNCTION,// UDF 已记入 catalog，no-op 执行
     VIEW_DEFINE,   // 视图定义：执行时把视图的 SELECT 翻译成子查询占位 SeqScanNode，
                    // ExecutionEngine 识别 alias 后改走子计划
+    UPSERT,        // 43_upsert: ON DUPLICATE KEY UPDATE —— 主键冲突时改写已有行
+
+    // ---- 48_acid_undo: 事务控制节点 ----
+    BEGIN_TXN,         // BEGIN [TRANSACTION]
+    COMMIT_TXN,        // COMMIT
+    ROLLBACK_TXN,      // ROLLBACK
+    SAVEPOINT,         // SAVEPOINT name
+    ROLLBACK_TO_SP,    // ROLLBACK TO name
+    RELEASE_SP,        // RELEASE SAVEPOINT name
+
+    // ---- 46_meta: 元命令 ----
+    EXPLAIN,       // EXPLAIN [ANALYZE] <statement> —— 把 inner 的计划树打印成文本
+    SHOW,          // SHOW TABLES / SHOW COLUMNS / SHOW INDEX / SHOW CREATE TABLE
 };
 
 // 执行计划节点基类，采用树形结构，子节点为输入
@@ -186,6 +199,27 @@ public:
     // 该子计划（语义上"插入源"），children[0] 即 query_plan。执行器优先消费它，
     // values_list 与 query_plan 互斥（query_plan 非空时使用源计划，否则用 values_list）。
     PlanNodePtr query_plan;
+};
+
+// 43_upsert: ON DUPLICATE KEY UPDATE 节点。
+//
+// 与 InsertNode 共用 values_list / columns（候选数据来自 VALUES），但额外携带
+// upsert_assignments 用于冲突路径上的列改写。当前实现仅 PRIMARY KEY 冲突会触发
+// 改写；UNIQUE INDEX 冲突尚未接入（见 UpsertExecutor 头部说明）。
+class UpsertNode : public PlanNode {
+public:
+    UpsertNode(std::string table_name, std::vector<std::string> columns,
+               std::vector<std::vector<ExprPtr>> values_list,
+               std::vector<std::pair<std::string, ExprPtr>> upsert_assignments);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string table_name;
+    std::vector<std::string> columns;
+    std::vector<std::vector<ExprPtr>> values_list;
+    // col = expr[, ...]；expr 内允许出现 UpsertValuesRefExpr 引用本次候选行的列。
+    std::vector<std::pair<std::string, ExprPtr>> upsert_assignments;
 };
 
 // 更新节点
@@ -457,6 +491,99 @@ public:
 
     std::string view_name;
     std::string view_alias;
+};
+
+// ============ 46_meta: 元命令 ============
+
+// EXPLAIN 节点：把 inner 的计划树渲染成文本。
+//
+// 内层计划由 Planner 把 ExplainStatement.inner 翻译为对应的 PlanNode 后挂在
+// children[0] 上；ExplainExecutor 在 Init() 阶段调用 plan->ToString() 获取
+// 文本，并把它包成一行结果集返回到上层。
+class ExplainNode : public PlanNode {
+public:
+    ExplainNode(bool analyze);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    bool analyze = false;
+};
+
+// ============ 48_acid_undo: 事务控制节点 ============
+
+class BeginTxnNode : public PlanNode {
+public:
+    BeginTxnNode();
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+};
+
+class CommitTxnNode : public PlanNode {
+public:
+    CommitTxnNode();
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+};
+
+class RollbackTxnNode : public PlanNode {
+public:
+    RollbackTxnNode();
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+};
+
+class SavepointNode : public PlanNode {
+public:
+    explicit SavepointNode(std::string name);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string savepoint_name;
+};
+
+class RollbackToSavepointNode : public PlanNode {
+public:
+    explicit RollbackToSavepointNode(std::string name);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string savepoint_name;
+};
+
+class ReleaseSavepointNode : public PlanNode {
+public:
+    explicit ReleaseSavepointNode(std::string name);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string savepoint_name;
+};
+
+// SHOW 节点：kind 决定执行器从 catalog 拉什么数据填充结果集。
+// target_table 仅在 COLUMNS/INDEX/CREATE_TABLE 时使用。
+class ShowNode : public PlanNode {
+public:
+    enum class Kind {
+        TABLES,
+        COLUMNS,
+        INDEX,
+        CREATE_TABLE,
+    };
+
+    ShowNode(Kind kind, std::string target_table);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    Kind kind;
+    std::string target_table;
 };
 
 }  // namespace sqlcompiler

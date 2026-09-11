@@ -3,6 +3,11 @@
 #include <cstring>
 #include <unordered_set>
 
+#include "storage/Page.h"
+#include "txn/LogManager.h"
+#include "txn/LogRecord.h"
+#include "txn/Transaction.h"
+
 namespace sqlcompiler {
 
 namespace {
@@ -134,6 +139,18 @@ bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
         return false;
     }
 
+    // Phase A：写之前抓整页 before-image，给事务的 undo log。
+    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+        active_txn_->AppendUndo(page_id, data, PAGE_SIZE,
+                                "TableHeap::InsertIntoPage");
+    }
+    // Phase B：抓整页 before-image 给 WAL。在写入页面之前记录 BEFORE，让 redo
+    // 能精准重放到本条插入（before 是「该 slot 尚未被填充」的状态）。
+    std::vector<char> before_image;
+    if (log_manager_ != nullptr) {
+        before_image.assign(data, data + PAGE_SIZE);
+    }
+
     int32_t new_off = free_off - len;
     if (len > 0) {
         std::memcpy(data + new_off, serialized.data(), len);
@@ -141,6 +158,22 @@ bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
     WriteSlot(data, slot_count, new_off, len);
     WritePageHeader(data, next_pid, slot_count + 1, new_off);
     page->SetDirty(true);
+
+    // Phase B：写 WAL（UPDATE 记录；before/after 都是 PAGE_SIZE 字节）。
+    if (log_manager_ != nullptr) {
+        LogRecord rec;
+        rec.type_ = LogRecordType::UPDATE;
+        rec.txn_id_ = (active_txn_ != nullptr) ? active_txn_->GetTxnId() : 0;
+        rec.page_id_ = page_id;
+        rec.before_image_ = std::move(before_image);
+        rec.after_image_.assign(data, data + PAGE_SIZE);
+        lsn_t lsn = log_manager_->AppendRecord(std::move(rec));
+        page->SetPageLsn(lsn);
+        // Phase C：回填 in-memory undo 记录的 LSN。
+        if (active_txn_ != nullptr && active_txn_->IsActive()) {
+            active_txn_->SetLastUndoLSN(lsn);
+        }
+    }
     if (rid) {
         rid->page_id = page_id;
         rid->slot_num = slot_count;
@@ -237,8 +270,34 @@ bool TableHeap::DeleteTuple(const RID& rid) {
         buffer_pool_manager_->UnpinPage(rid.page_id, false);
         return false;
     }
+    // Phase A：写之前抓整页 before-image。
+    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+        active_txn_->AppendUndo(rid.page_id, data, PAGE_SIZE,
+                                "TableHeap::DeleteTuple");
+    }
+    // Phase B：抓 before-image 给 WAL。
+    std::vector<char> before_image;
+    if (log_manager_ != nullptr) {
+        before_image.assign(data, data + PAGE_SIZE);
+    }
     WriteSlot(data, rid.slot_num, 0, static_cast<int32_t>(kTombstone));
     page->SetDirty(true);
+
+    // Phase B：写 UPDATE 记录（before = 原 page，after = 带墓碑的 page）。
+    if (log_manager_ != nullptr) {
+        LogRecord rec;
+        rec.type_ = LogRecordType::UPDATE;
+        rec.txn_id_ = (active_txn_ != nullptr) ? active_txn_->GetTxnId() : 0;
+        rec.page_id_ = rid.page_id;
+        rec.before_image_ = std::move(before_image);
+        rec.after_image_.assign(data, data + PAGE_SIZE);
+        lsn_t lsn = log_manager_->AppendRecord(std::move(rec));
+        page->SetPageLsn(lsn);
+        // Phase C：回填 in-memory undo 记录的 LSN。
+        if (active_txn_ != nullptr && active_txn_->IsActive()) {
+            active_txn_->SetLastUndoLSN(lsn);
+        }
+    }
     buffer_pool_manager_->UnpinPage(rid.page_id, true);
     return true;
 }
@@ -268,6 +327,17 @@ bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple,
         buffer_pool_manager_->UnpinPage(rid.page_id, false);
         return false;
     }
+    // Phase A：写之前抓整页 before-image（即使后续走 relocate 路径，
+    // 也会被 DeleteTuple/InsertTuple 各自再抓一份；总 undo 仍能恢复到原始状态）。
+    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+        active_txn_->AppendUndo(rid.page_id, data, PAGE_SIZE,
+                                "TableHeap::UpdateTuple(before)");
+    }
+    // Phase B：抓 before-image 给 WAL。
+    std::vector<char> before_image;
+    if (log_manager_ != nullptr) {
+        before_image.assign(data, data + PAGE_SIZE);
+    }
     if (new_len <= len) {
         if (new_len < len) {
             std::memset(data + off + new_len, 0, len - new_len);
@@ -275,11 +345,28 @@ bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple,
         std::memcpy(data + off, serialized.data(), new_len);
         WriteSlot(data, rid.slot_num, off, new_len);
         page->SetDirty(true);
+
+        // Phase B：写 UPDATE 记录（in-place，before/after 都在同一页）。
+        if (log_manager_ != nullptr) {
+            LogRecord rec;
+            rec.type_ = LogRecordType::UPDATE;
+            rec.txn_id_ = (active_txn_ != nullptr) ? active_txn_->GetTxnId() : 0;
+            rec.page_id_ = rid.page_id;
+            rec.before_image_ = std::move(before_image);
+            rec.after_image_.assign(data, data + PAGE_SIZE);
+            lsn_t lsn = log_manager_->AppendRecord(std::move(rec));
+            page->SetPageLsn(lsn);
+            // Phase C：回填 in-memory undo 记录的 LSN。
+            if (active_txn_ != nullptr && active_txn_->IsActive()) {
+                active_txn_->SetLastUndoLSN(lsn);
+            }
+        }
         buffer_pool_manager_->UnpinPage(rid.page_id, true);
         return true;
     }
     buffer_pool_manager_->UnpinPage(rid.page_id, false);
     // Cannot grow in place — delete and reinsert
+    // 关键：DeleteTuple 和 InsertTuple 各自会写自己的 WAL 记录；这里不再单独追加。
     DeleteTuple(rid);
     return InsertTuple(new_tuple, nullptr, column_types);
 }

@@ -58,6 +58,7 @@ const std::unordered_map<std::string, TokenType>& KeywordTable() {
         {"ASC",      TokenType::KEYWORD_ASC},
         {"DESC",     TokenType::KEYWORD_DESC},
         {"IF",       TokenType::KEYWORD_IF},
+        {"DUPLICATE",TokenType::KEYWORD_DUPLICATE},
         {"TRUNCATE", TokenType::KEYWORD_TRUNCATE},
         {"ALTER",    TokenType::KEYWORD_ALTER},
         {"ADD",      TokenType::KEYWORD_ADD},
@@ -120,6 +121,12 @@ const std::unordered_map<std::string, TokenType>& KeywordTable() {
         {"DAY",      TokenType::KEYWORD_DAY},
         {"NOW",      TokenType::KEYWORD_NOW},
         {"IFNULL",   TokenType::KEYWORD_IFNULL},
+        // 45_datetime: EXTRACT 字段（HOUR/MINUTE/SECOND）也作为关键字注册，
+        // 解析器在 EXTRACT 上下文中识别它们，普通位置仍允许作为标识符使用
+        // （Parser 中通过 Check + PeekToken(1) 判定）。
+        {"HOUR",     TokenType::KEYWORD_HOUR},
+        {"MINUTE",   TokenType::KEYWORD_MINUTE},
+        {"SECOND",   TokenType::KEYWORD_SECOND},
         // 40_txn_view_udf: 事务 / 视图 / 触发器 / UDF 关键字
         {"BEGIN",     TokenType::KEYWORD_BEGIN},
         {"TRANSACTION", TokenType::KEYWORD_TRANSACTION},
@@ -138,6 +145,27 @@ const std::unordered_map<std::string, TokenType>& KeywordTable() {
         {"OLD",       TokenType::KEYWORD_OLD},
         {"RETURN",    TokenType::KEYWORD_RETURN},
         {"RETURNS",   TokenType::KEYWORD_RETURNS},
+        // 47_udf_trigger_view: UDF 体内部使用的语句关键字
+        {"DECLARE",   TokenType::KEYWORD_DECLARE},
+        {"WHILE",     TokenType::KEYWORD_WHILE},
+        {"DO",        TokenType::KEYWORD_DO},
+        {"ELSEIF",    TokenType::KEYWORD_ELSEIF},
+        // 44_pattern_match: 模式匹配扩展关键字
+        {"ILIKE",     TokenType::KEYWORD_ILIKE},
+        {"REGEXP",    TokenType::KEYWORD_REGEXP},
+        {"RLIKE",     TokenType::KEYWORD_RLIKE},
+        {"ESCAPE",    TokenType::KEYWORD_ESCAPE},
+        // 45_datetime: DATE / TIMESTAMP / INTERVAL / EXTRACT
+        {"DATE",      TokenType::KEYWORD_DATE},
+        {"TIMESTAMP", TokenType::KEYWORD_TIMESTAMP},
+        {"INTERVAL",  TokenType::KEYWORD_INTERVAL},
+        {"EXTRACT",   TokenType::KEYWORD_EXTRACT},
+        // 46_meta: 元命令关键字。DESC / INDEX / FROM / CREATE 复用上方已注册项。
+        {"EXPLAIN",   TokenType::KEYWORD_EXPLAIN},
+        {"SHOW",      TokenType::KEYWORD_SHOW},
+        {"DESCRIBE",  TokenType::KEYWORD_DESCRIBE},
+        {"TABLES",    TokenType::KEYWORD_TABLES},
+        {"COLUMNS",   TokenType::KEYWORD_COLUMNS},
     };
     return kKeywords;
 }
@@ -326,7 +354,13 @@ Token Lexer::ScanString() {
                 case '\'': buf.push_back('\''); break;
                 case '"': buf.push_back('"'); break;
                 case '0': buf.push_back('\0'); break;
-                default: buf.push_back(esc); break;
+                // SQL 标准：未识别的 \<char> 保留两个字符 (\ 和原字符)，
+                // 而非像 C 那样丢掉 \。这是为了让 44_pattern_match 的
+                // `LIKE '\%' ESCAPE '\\'` 能正确得到模式 `\%`。
+                default:
+                    buf.push_back('\\');
+                    buf.push_back(esc);
+                    break;
             }
             Advance();
             continue;

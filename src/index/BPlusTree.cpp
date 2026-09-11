@@ -1,6 +1,10 @@
 #include "index/BPlusTree.h"
 
 #include "index/BPlusTreePage.h"
+#include "storage/Page.h"
+#include "txn/LogManager.h"
+#include "txn/LogRecord.h"
+#include "txn/Transaction.h"
 
 #include <algorithm>
 #include <cstring>
@@ -11,6 +15,28 @@ namespace sqlcompiler {
 namespace {
 
 using namespace bptree;
+
+// 写一条 UPDATE 日志记录，并把 page_lsn 设为该记录的 LSN。
+// 仅在 log_manager_ 非空时调用。Phase C：返回 LSN 后顺便回填 txn 最近的
+// undo log 条目的 LSN，让 Rollback 能产出正确的 undo_next_lsn。
+lsn_t EmitPageImageRecord(LogManager* lm, page_id_t pid, const char* before_data,
+                          const char* after_data, Transaction* txn) {
+    LogRecord rec;
+    rec.type_ = LogRecordType::UPDATE;
+    rec.txn_id_ = (txn != nullptr) ? txn->GetTxnId() : 0;
+    rec.page_id_ = pid;
+    if (before_data != nullptr) {
+        rec.before_image_.assign(before_data, before_data + PAGE_SIZE);
+    }
+    if (after_data != nullptr) {
+        rec.after_image_.assign(after_data, after_data + PAGE_SIZE);
+    }
+    lsn_t lsn = lm->AppendRecord(std::move(rec));
+    if (txn != nullptr && txn->IsActive()) {
+        txn->SetLastUndoLSN(lsn);
+    }
+    return lsn;
+}
 
 // ============================================================================
 // 页面读写辅助
@@ -439,6 +465,15 @@ bool BPlusTree::Insert(const IndexKey& key, const RID& rid) {
         InitLeaf(d);
         leaf.MarkDirty();
     }
+    // Phase A：写之前抓叶子整页 before-image。
+    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+        active_txn_->AppendUndo(pid, d, PAGE_SIZE, "BPlusTree::Insert(leaf)");
+    }
+    // Phase B：抓叶子整页 before-image 给 WAL。
+    std::vector<char> leaf_before;
+    if (log_manager_ != nullptr) {
+        leaf_before.assign(d, d + PAGE_SIZE);
+    }
     std::vector<LeafEntry> entries;
     if (!ReadLeafEntries(d, key_schema_, &entries)) return false;
 
@@ -455,6 +490,13 @@ bool BPlusTree::Insert(const IndexKey& key, const RID& rid) {
 
     if (!WriteLeafEntries(d, entries, GetNextLeaf(d), GetPrevLeaf(d))) return false;
     leaf.MarkDirty();
+
+    // Phase B：写 UPDATE 记录（leaf 整页 before/after）。
+    if (log_manager_ != nullptr) {
+        lsn_t lsn = EmitPageImageRecord(log_manager_, pid,
+                                       leaf_before.data(), d, active_txn_);
+        leaf.SetPageLsn(lsn);
+    }
     return true;
 }
 
@@ -466,9 +508,21 @@ bool BPlusTree::SplitChild(page_id_t parent_pid, page_id_t child_pid,
     if (!ReadInternalEntries(parent.Data(), key_schema_, &parent_entries)) return false;
     const page_id_t parent_first_child = GetFirstChild(parent.Data());
 
+    // Phase B：抓 parent 整页 before-image 给 WAL。
+    std::vector<char> parent_before;
+    if (log_manager_ != nullptr) {
+        parent_before.assign(parent.Data(), parent.Data() + PAGE_SIZE);
+    }
+
     PageGuard child = PageGuard::Fetch(bpm_, child_pid);
     if (!child.Valid()) return false;
     char* cd = child.Data();
+
+    // Phase B：抓 child 整页 before-image。
+    std::vector<char> child_before;
+    if (log_manager_ != nullptr) {
+        child_before.assign(cd, cd + PAGE_SIZE);
+    }
 
     PageGuard sib = PageGuard::New(bpm_);
     if (!sib.Valid()) return false;  // 缓冲池耗尽
@@ -523,6 +577,20 @@ bool BPlusTree::SplitChild(page_id_t parent_pid, page_id_t child_pid,
         sep.key_bytes = up.key_bytes;
     }
 
+    // Phase B：先写 child 和 sib 的 UPDATE 记录（两者是新增或修改页面，
+    // sibling 是全新页 before-image 视为全零）。
+    if (log_manager_ != nullptr) {
+        // child 整页 UPDATE
+        lsn_t child_lsn = EmitPageImageRecord(log_manager_, child_pid,
+                                              child_before.data(), cd, active_txn_);
+        child.SetPageLsn(child_lsn);
+        // sib 全新页面：before-image 全零，after 是当前内容。
+        std::vector<char> zero_before(PAGE_SIZE, 0);
+        lsn_t sib_lsn = EmitPageImageRecord(log_manager_, sib_pid,
+                                            zero_before.data(), sib.Data(), active_txn_);
+        sib.SetPageLsn(sib_lsn);
+    }
+
     child.Release();
     sib.Release();
 
@@ -538,6 +606,14 @@ bool BPlusTree::SplitChild(page_id_t parent_pid, page_id_t child_pid,
         return false;
     }
     parent.MarkDirty();
+
+    // Phase B：写 parent 的 UPDATE 记录。
+    if (log_manager_ != nullptr) {
+        lsn_t parent_lsn = EmitPageImageRecord(log_manager_, parent_pid,
+                                               parent_before.data(),
+                                               parent.Data(), active_txn_);
+        parent.SetPageLsn(parent_lsn);
+    }
     (void)reserve;
     return true;
 }
@@ -547,6 +623,13 @@ bool BPlusTree::SplitRoot() {
     if (!root.Valid()) return false;
     char* rd = root.Data();
     const PageType type = GetPageType(rd);
+
+    // Phase B：抓 root 整页 before-image。SplitRoot 之后 root 变成新的内部节点，
+    // before-image 用于回放（万一 redo 时 root 已不是当时状态也能重建）。
+    std::vector<char> root_before;
+    if (log_manager_ != nullptr) {
+        root_before.assign(rd, rd + PAGE_SIZE);
+    }
 
     // 把根的全部内容搬到一个新页，根页本身改写成新的内部节点
     PageGuard moved = PageGuard::New(bpm_);
@@ -606,9 +689,31 @@ bool BPlusTree::SplitRoot() {
         sep.key_bytes = up.key_bytes;
     }
 
+    // Phase B：写 moved 与 sib 的 UPDATE 记录。
+    if (log_manager_ != nullptr) {
+        std::vector<char> zero_before(PAGE_SIZE, 0);
+        // moved 是新分配的页面，但写入前的快照是 root 的拷贝（已被搬过来）；
+        // 这里 before 视为「全零」即可：redo 时 moved 会被 after_image 覆盖。
+        lsn_t moved_lsn = EmitPageImageRecord(log_manager_, moved_pid,
+                                              zero_before.data(), moved.Data(),
+                                              active_txn_);
+        moved.SetPageLsn(moved_lsn);
+        lsn_t sib_lsn = EmitPageImageRecord(log_manager_, sib_pid,
+                                            zero_before.data(), sib.Data(),
+                                            active_txn_);
+        sib.SetPageLsn(sib_lsn);
+    }
+
     std::vector<InternalEntry> root_entries{std::move(sep)};
     if (!WriteInternalEntries(rd, moved_pid, root_entries)) return false;
     root.MarkDirty();
+
+    // Phase B：写 root 的 UPDATE 记录（root 变成新内部节点，before/after 都捕获）。
+    if (log_manager_ != nullptr) {
+        lsn_t root_lsn = EmitPageImageRecord(log_manager_, root_page_id_,
+                                             root_before.data(), rd, active_txn_);
+        root.SetPageLsn(root_lsn);
+    }
     return true;
 }
 
@@ -662,11 +767,28 @@ bool BPlusTree::Delete(const IndexKey& key, const RID& rid) {
         for (size_t i = 0; i < entries.size(); ++i) {
             if (CompareKeyOnly(entries[i].key, key) == 0 &&
                 entries[i].rid == rid) {
+                // Phase A：写之前抓叶子整页 before-image。
+                if (active_txn_ != nullptr && active_txn_->IsActive()) {
+                    active_txn_->AppendUndo(leaf_pid, d, PAGE_SIZE,
+                                            "BPlusTree::Delete(leaf)");
+                }
+                // Phase B：抓叶子 before-image 给 WAL。
+                std::vector<char> leaf_before;
+                if (log_manager_ != nullptr) {
+                    leaf_before.assign(d, d + PAGE_SIZE);
+                }
                 entries.erase(entries.begin() + static_cast<long>(i));
                 if (!WriteLeafEntries(d, entries, GetNextLeaf(d), GetPrevLeaf(d))) {
                     return false;
                 }
                 g.MarkDirty();
+                // Phase B：写 UPDATE 记录。
+                if (log_manager_ != nullptr) {
+                    lsn_t lsn = EmitPageImageRecord(log_manager_, leaf_pid,
+                                                   leaf_before.data(), d,
+                                                   active_txn_);
+                    g.SetPageLsn(lsn);
+                }
                 return true;
             }
         }

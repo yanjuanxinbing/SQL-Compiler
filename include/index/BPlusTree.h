@@ -12,6 +12,10 @@
 
 namespace sqlcompiler {
 
+// Phase A 前向声明。
+class Transaction;
+class LogManager;
+
 // 磁盘 B+Tree：节点即 4KB 页面，全部经 BufferPoolManager 访问。
 //
 // 结构约定：
@@ -55,6 +59,16 @@ public:
     page_id_t GetRootPageId() const { return root_page_id_; }
     bool IsUnique() const { return is_unique_; }
     const std::vector<ValueType>& GetKeySchema() const { return key_schema_; }
+
+    // ---- Phase A：把当前事务挂到树上（写路径把 undo log 写进 txn）----
+    // IndexMaintenance / DML 算子在写索引前调用一次。nullptr 表示隐式
+    // auto-commit，无 undo。PageGuard 与 Transaction 二选一冲突时以本字段为准。
+    void SetActiveTransaction(Transaction* txn) { active_txn_ = txn; }
+    Transaction* GetActiveTransaction() const { return active_txn_; }
+
+    // ---- Phase B：注入 LogManager，写索引时同时落 WAL ----
+    void SetLogManager(LogManager* lm) { log_manager_ = lm; }
+    LogManager* GetLogManager() const { return log_manager_; }
 
     // 范围扫描游标：从 >= 某键的位置开始，沿叶子链顺序推进。
     class Cursor {
@@ -100,6 +114,8 @@ private:
     std::vector<ValueType> key_schema_;
     bool is_unique_;
     page_id_t root_page_id_;
+    Transaction* active_txn_ = nullptr;
+    LogManager* log_manager_ = nullptr;  // Phase B：可选 WAL 写出器
 };
 
 }  // namespace sqlcompiler

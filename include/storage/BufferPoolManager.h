@@ -11,6 +11,9 @@
 
 namespace sqlcompiler {
 
+// 前向声明：避免 BufferPoolManager.h 引入事务模块的 <mutex> 与 LogRecord 头。
+class LogManager;
+
 // 可选的替换策略种类
 enum class ReplacementPolicy { LRU, FIFO };
 
@@ -49,14 +52,31 @@ public:
     // 释放对某页的占用（pin计数减一），is_dirty表示本次使用是否修改了该页
     bool UnpinPage(page_id_t page_id, bool is_dirty);
 
-    // 将指定页强制写回磁盘（无论是否脏页）
+    // 将指定页强制写回磁盘（无论是否脏页）。
+    // Phase B：若 page.page_lsn_ > log.durable_lsn_，必须先 Flush 日志，
+    // 否则磁盘上的 page-image 会「领先」日志，导致重启时 redo 不到原始写入。
+    // 没设置 LogManager 时回退到 Phase A 行为（仅写盘）。
     bool FlushPage(page_id_t page_id);
 
-    // 将缓冲池中所有页写回磁盘
+    // 将缓冲池中所有脏页写回磁盘（不写干净页）。
+    // Phase B：COMMIT 时调用此方法把脏页快速落盘，路径上自动尊重 WAL 规则。
+    // 配合 DiskManager::Sync() 实现 COMMIT 语义。
+    void FlushAllDirtyPages();
+
+    // 将缓冲池中所有页写回磁盘（包括干净页）。Phase A 测试依赖此方法做
+    // 测试收尾清理；保留接口。
     void FlushAllPages();
 
     // 删除一个页：从缓冲池中移除并通过DiskManager回收该page_id
     bool DeletePage(page_id_t page_id);
+
+    // ---- Phase B：注入 LogManager，让 FlushPage 在写盘前尊重 WAL 规则 ----
+    void SetLogManager(LogManager* lm) { log_manager_ = lm; }
+    LogManager* GetLogManager() const { return log_manager_; }
+
+    // 收集当前缓冲池中的脏页（page_id, page_lsn），供 COMMIT 路径强制落盘用。
+    // 返回顺序无定义。
+    std::vector<std::pair<page_id_t, uint64_t>> CollectDirtyPages();
 
     const BufferPoolStats& GetStats() const;
     const std::vector<ReplacementLogEntry>& GetReplacementLog() const;
@@ -72,6 +92,9 @@ private:
 
     BufferPoolStats stats_;
     std::vector<ReplacementLogEntry> replacement_log_;
+
+    // Phase B：可空；非空时 FlushPage / FlushAllDirtyPages 走 LSN 检查。
+    LogManager* log_manager_ = nullptr;
 
     // 找到一个可用帧：优先从free_list_取空闲帧，否则调用replacer_->Victim()淘汰一页；
     // 若淘汰的页为脏页需先写回磁盘。成功返回true并写入frame_id

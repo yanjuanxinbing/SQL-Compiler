@@ -27,8 +27,11 @@ void CreateIndexExecutor::Init() {
     info.key_columns = key_columns_;
     info.is_unique = is_unique_;
 
+    // Phase B：让 catalog 内部 sys_indexes 写入带上当前事务。
+    catalog->SetActiveTransaction(context_->GetTransaction());
     std::string error;
     if (!catalog->CreateIndex(info, &error)) {
+        catalog->SetActiveTransaction(nullptr);
         throw CompilerException(ErrorStage::SEMANTIC, error);
     }
 
@@ -38,6 +41,7 @@ void CreateIndexExecutor::Init() {
     const IndexInfo* created = catalog->GetIndex(index_name_);
     BPlusTree* tree = catalog->GetIndexTree(index_name_);
     if (table == nullptr || heap == nullptr || created == nullptr || tree == nullptr) {
+        catalog->SetActiveTransaction(nullptr);
         return;
     }
 
@@ -51,20 +55,27 @@ void CreateIndexExecutor::Init() {
             // 已有数据里存在 NULL 或缺列，无法建立完整索引。回滚掉刚建的索引，
             // 否则会留下一个「看起来存在但内容不全」的索引——那比没有索引更危险，
             // 因为查询会信任它并漏掉数据。
+            catalog->SetActiveTransaction(context_->GetTransaction());
             catalog->DropIndex(index_name_);
+            catalog->SetActiveTransaction(nullptr);
             throw CompilerException(
                 ErrorStage::SEMANTIC,
                 "cannot build index '" + index_name_ +
                     "': existing rows contain NULL in the indexed columns");
         }
+        // Insert 也走 active_txn_ 路径，但这里是用户表 + 用户索引，回填期间
+        // 索引本身的 WAL 由 catalog->SetActiveTransaction 推过来的 txn 决定。
         if (!tree->Insert(key, t.GetRid())) {
+            catalog->SetActiveTransaction(context_->GetTransaction());
             catalog->DropIndex(index_name_);
+            catalog->SetActiveTransaction(nullptr);
             throw CompilerException(
                 ErrorStage::SEMANTIC,
                 "cannot build unique index '" + index_name_ +
                     "': existing rows contain duplicate keys");
         }
     }
+    catalog->SetActiveTransaction(nullptr);
     executed_ = true;
 }
 

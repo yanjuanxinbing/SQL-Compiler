@@ -49,6 +49,16 @@ private:
     Value EvaluateCase(const CaseExprNode& expr, const Tuple& tuple) const;
     Value EvaluateCast(const CastExprNode& expr, const Tuple& tuple) const;
     Value EvaluateSubquery(const SubqueryExprNode& expr, const Tuple& tuple) const;
+    // 43_upsert: VALUES(col) —— 通过 ExecutionContext 的 upsert_values_bind 取值
+    Value EvaluateUpsertValuesRef(const UpsertValuesRefExpr& expr,
+                                  const Tuple& tuple) const;
+    // 44_pattern_match: LIKE / ILIKE / REGEXP / RLIKE（含可选 ESCAPE 子句）
+    Value EvaluateLike(const LikeExprNode& expr, const Tuple& tuple) const;
+    // 45_datetime: EXTRACT(field FROM source) —— 返回 INT（见实现注释）
+    Value EvaluateExtract(const ExtractExprNode& expr, const Tuple& tuple) const;
+    // 45_datetime: INTERVAL <n> <unit> 节点求值，返回保存计数与单位的
+    // FunctionCallExpr 形式（沿用既有"复合结构用函数节点承载"的风格）。
+    Value EvaluateInterval(const IntervalExprNode& expr, const Tuple& tuple) const;
 };
 
 }  // namespace sqlcompiler

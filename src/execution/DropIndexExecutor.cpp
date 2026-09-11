@@ -1,5 +1,6 @@
 #include "execution/DropIndexExecutor.h"
 
+#include "catalog/SystemCatalog.h"
 #include "common/Error.h"
 
 namespace sqlcompiler {
@@ -21,7 +22,11 @@ void DropIndexExecutor::Init() {
             "cannot drop index '" + index_name_ +
                 "': it backs a PRIMARY KEY constraint");
     }
-    if (!catalog->DropIndex(index_name_) && !if_exists_) {
+    // Phase B：让 catalog 内部 sys_indexes 写入带上当前事务。
+    catalog->SetActiveTransaction(context_->GetTransaction());
+    bool ok = catalog->DropIndex(index_name_);
+    catalog->SetActiveTransaction(nullptr);
+    if (!ok && !if_exists_) {
         throw CompilerException(ErrorStage::SEMANTIC,
                                 "index not found: " + index_name_);
     }

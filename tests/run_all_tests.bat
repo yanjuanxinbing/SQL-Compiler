@@ -89,6 +89,40 @@ for %%f in ("%SQL_DIR%\*.sql") do (
     )
 )
 
+REM ---- Phase B: WAL + crash recovery smoke test (needs 2 phases) ----
+REM Driven by run_acid_recovery.bat: phase1 triggers \crash, phase2 verifies
+REM BEGIN state rolled back, COMMIT persisted. Exit 0 = pass.
+echo.
+echo [ RUN  ] acid_recovery (run_acid_recovery.bat)
+call "%SCRIPT_DIR%run_acid_recovery.bat" > nul 2>&1
+set "ACID_EXITCODE=!errorlevel!"
+if !ACID_EXITCODE! neq 0 goto :acid_recovery_fail
+set /a PASSED = PASSED + 1
+echo  [ OK ]
+goto :acid_recovery_done
+:acid_recovery_fail
+echo  [FAIL] (acid_recovery exit=!ACID_EXITCODE!)
+set /a FAILED = FAILED + 1
+set "FAILED_TESTS=!FAILED_TESTS! 49_acid_recovery!"
+:acid_recovery_done
+
+REM ---- Phase C: CLR chain + mid-rollback crash recovery smoke test ----
+REM Driven by run_acid_clr.bat: phase1 triggers \crash_after_undo_steps,
+REM phase2 verifies redo+undo chain completes remaining undos after crash.
+echo.
+echo [ RUN  ] acid_clr (run_acid_clr.bat)
+call "%SCRIPT_DIR%run_acid_clr.bat" > nul 2>&1
+set "ACID_CLR_EXITCODE=!errorlevel!"
+if !ACID_CLR_EXITCODE! neq 0 goto :acid_clr_fail
+set /a PASSED = PASSED + 1
+echo  [ OK ]
+goto :acid_clr_done
+:acid_clr_fail
+echo  [FAIL] (acid_clr exit=!ACID_CLR_EXITCODE!)
+set /a FAILED = FAILED + 1
+set "FAILED_TESTS=!FAILED_TESTS! 50_undo_clr!"
+:acid_clr_done
+
 echo.
 echo ==========================================
 echo   Summary:  !PASSED! passed,  !FAILED! failed

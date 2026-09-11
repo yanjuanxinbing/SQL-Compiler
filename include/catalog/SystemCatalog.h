@@ -14,6 +14,9 @@
 
 namespace sqlcompiler {
 
+// 前向声明：避免 catalog 头引入 txn/LogManager 完整定义。
+class LogManager;
+
 // 系统目录（System Catalog）：维护数据库的元数据（表名、列名、列类型等）。
 //
 // 要求"系统目录本身作为一张特殊的表进行存储和管理"，因此设计为：
@@ -27,6 +30,16 @@ class SystemCatalog {
 public:
     explicit SystemCatalog(BufferPoolManager* buffer_pool_manager);
     ~SystemCatalog();
+
+    // ---- Phase B：注入 LogManager，让 catalog 持有的 TableHeap / BPlusTree
+    // 也写 WAL。恢复完成后所有 heap 都获得同一 log_manager 引用。
+    void SetLogManager(LogManager* lm);
+
+    // 把当前事务挂到 catalog 持有的所有 TableHeap 与 BPlusTree 上，
+    // 让 sys_tables / sys_indexes 的写路径在 WAL 中记录正确 txn_id。
+    // CreateTableExecutor / CreateIndexExecutor 等 DDL 算子在调用 catalog
+    // 写入前调用一次，写入后置回 nullptr。
+    void SetActiveTransaction(Transaction* txn);
 
     // 全新数据库首次创建时调用：初始化sys_tables自身的存储结构
     void Bootstrap();
@@ -47,6 +60,18 @@ public:
 
     bool HasTable(const std::string& table_name) const;
     const TableInfo* GetTable(const std::string& table_name) const;
+
+    // ---- 46_meta: 内省接口 ----
+    // 列出 catalog 中的所有基本表（不含视图、不含系统目录表 __sys_*）。
+    // 用于 SHOW TABLES。
+    std::vector<std::string> ListAllTables() const;
+    // 表的列信息。SHOW COLUMNS FROM t 直接读取这一副本，避免把 const TableInfo
+    // 引用泄露出去后被外部误改。表不存在时返回空 vector。
+    std::vector<ColumnInfo> GetColumnInfos(const std::string& table_name) const;
+    // 重建 CREATE TABLE 文本：当 catalog 没有保留 create_sql blob 时，
+    // 根据当前 schema 推断一个最贴近原语句的 SQL 字符串。
+    // SHOW CREATE TABLE 使用本接口输出。表不存在时返回空串。
+    std::string BuildCreateTableSQL(const std::string& table_name) const;
 
     // 获取某张表对应的数据存储堆，供执行引擎读写记录；表不存在返回nullptr
     TableHeap* GetTableHeap(const std::string& table_name);
@@ -94,7 +119,9 @@ public:
         std::vector<FunctionParameter> parameters;
         std::string return_type;
         int32_t return_char_length = -1;
-        ExprPtr body_expr;
+        // 函数体：有序语句列表（DECLARE / SET / IF / WHILE / RETURN 等）。
+        // 简单形式可以是单条 RETURN expr，由 UdfExecutor 顺序执行。
+        std::vector<StatementPtr> body_statements;
     };
     struct TriggerDefinition {
         std::string trigger_name;
@@ -108,18 +135,48 @@ public:
     bool DropView(const std::string& view_name);
     bool HasView(const std::string& view_name) const;
     const ViewDefinition* GetView(const std::string& view_name) const;
+    // 返回值同 GetView，但大小写不敏感（UDF 调用大小写差异时的回退路径）。
+    const ViewDefinition* LookupView(const std::string& view_name) const;
 
     bool CreateFunction(const FunctionDefinition& def);
     bool DropFunction(const std::string& function_name);
     bool HasFunction(const std::string& function_name) const;
     const FunctionDefinition* GetFunction(const std::string& function_name) const;
+    // 大小写不敏感的函数查找：UDF 调用方可能使用与 CREATE 时不同的大小写。
+    const FunctionDefinition* LookupFunction(const std::string& name) const;
 
     bool CreateTrigger(const TriggerDefinition& def);
     bool DropTrigger(const std::string& trigger_name);
     bool HasTrigger(const std::string& trigger_name) const;
+    // 列出匹配 (table, timing, event) 的全部触发器，按注册顺序返回。
+    // 触发器内部无序约束，目前任意顺序均可。
+    std::vector<const TriggerDefinition*> LookupTriggers(
+        const std::string& table_name,
+        TriggerTiming timing,
+        TriggerEvent event) const;
+
+    // ---- ALTER TABLE 支撑 ----
+    //
+    // 这些表层变更原语供执行器在 ALTER TABLE 各分支中调用：
+    //   - DropPersistedTableMetadata  删除 sys_tables 中旧记录
+    //   - PersistTableInfo            写入 sys_tables 新记录
+    //   - RenameTableHeapKey          移动 table_heaps_ 的键（重命名用）
+    //   - DropIndexesForTable         失效并清掉该表所有索引（schema 可能变化，
+    //                                 重建/迁移索引超出本任务范围）
+    //   - UpdateTableSchema           一站式封装：把 in-memory 状态更新到新 schema，
+    //                                 并替换 sys_tables 记录。执行器负责行的字节重写。
+    bool DropPersistedTableMetadata(const std::string& table_name);
+    bool PersistTableInfo(const TableInfo& info);
+    bool RenameTableHeapKey(const std::string& old_name, const std::string& new_name);
+    void DropIndexesForTable(const std::string& table_name);
+    // 应用 schema 变更到目录内存态（含表名变更与索引清理），但不重写 TableHeap 的
+    // 行字节——这一部分由 AlterTableExecutor 负责，因其需要新/旧 column_types 映射。
+    // new_info.table_name 必须与 old_name 相同除非是 RENAME TO。
+    bool UpdateTableSchema(const std::string& old_name, const TableInfo& new_info);
 
 private:
     BufferPoolManager* buffer_pool_manager_;
+    LogManager* log_manager_ = nullptr;  // Phase B：可选 WAL 写出器
     SymbolTable symbol_table_;  // 内存态元数据缓存
 
     page_id_t sys_tables_first_page_id_;  // 系统目录自身存储表的首页

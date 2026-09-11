@@ -89,6 +89,10 @@ bool SymbolTable::AddTableFromCreateStatement(const CreateTableStatement& stmt) 
         ci.char_length = cd.char_length;
         ci.is_primary_key = cd.is_primary_key;
         ci.is_not_null = cd.is_not_null;
+        // 把 AST 上的 CHECK / DEFAULT 表达式接到目录侧，让执行层在写入时
+        // 校验 / 替换默认。两者均为可空，未声明时此指针为空。
+        ci.check_expr = cd.check_expr;
+        ci.default_expr = cd.default_expr;
         info.columns.push_back(std::move(ci));
     }
     // 表级 PRIMARY KEY(a, b, ...) 原样保留为一个主键组（复合主键要求组合唯一），

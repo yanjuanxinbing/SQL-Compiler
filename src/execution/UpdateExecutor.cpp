@@ -82,25 +82,30 @@ bool UpdateExecutor::Next(Tuple* tuple) {
                     row_snapshot.push_back(new_t.GetValue(i));
                 }
                 ValidateRowConstraints(context_->GetCatalog(), *info,
-                                       table_heap_, row_snapshot, &r);
+                                       table_heap_, row_snapshot, &r, context_);
                 CheckUniqueIndexes(context_->GetCatalog(), *info, row_snapshot, &r);
             }
         }
         // 索引同步：先摘掉旧键，写堆成功后再挂上新键。
         // 顺序反过来（先插新键）会让唯一索引在「键未变」时自己撞自己。
         const TableInfo* info = context_->GetCatalog()->GetTable(table_name_);
+        Transaction* txn = context_->GetTransaction();
         if (info != nullptr) {
-            DeleteFromIndexes(context_->GetCatalog(), *info, cur.GetValues(), r);
+            DeleteFromIndexes(context_->GetCatalog(), *info, cur.GetValues(), r, txn);
         }
-        if (table_heap_->UpdateTuple(r, new_t, column_types_)) {
+        // Phase A：把当前事务挂到堆上，让 UpdateTuple 抓 undo。
+        table_heap_->SetActiveTransaction(txn);
+        bool ok = table_heap_->UpdateTuple(r, new_t, column_types_);
+        table_heap_->SetActiveTransaction(nullptr);
+        if (ok) {
             ++affected;
             if (info != nullptr) {
                 InsertIntoIndexes(context_->GetCatalog(), *info,
-                                  new_t.GetValues(), r);
+                                  new_t.GetValues(), r, txn);
             }
         } else if (info != nullptr) {
             // 写堆失败：把刚摘掉的旧键放回去，避免索引凭空少一条
-            InsertIntoIndexes(context_->GetCatalog(), *info, cur.GetValues(), r);
+            InsertIntoIndexes(context_->GetCatalog(), *info, cur.GetValues(), r, txn);
         }
     }
     if (tuple) *tuple = Tuple({Value::MakeInt(affected)});

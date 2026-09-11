@@ -78,7 +78,11 @@ ValueType ValueTypeFromString(const std::string& type_name) {
     std::string u = ToUpper(type_name);
     if (u == "INT" || u == "INTEGER" || u == "BIGINT") return ValueType::INTEGER;
     if (u == "FLOAT" || u == "DOUBLE" || u == "DECIMAL") return ValueType::FLOAT;
-    if (u == "VARCHAR" || u == "STRING" || u == "TEXT" || u == "CHAR") return ValueType::VARCHAR;
+    // 45_datetime: DATE / TIMESTAMP 持久化为 VARCHAR（按 YYYY-MM-DD 或
+    // YYYY-MM-DD HH:MM:SS 文本），运行时按 VARCHAR 处理，比较 / 算术在
+    // ExpressionEvaluator 的 ExtractField / ApplyInterval 路径上完成。
+    if (u == "VARCHAR" || u == "STRING" || u == "TEXT" || u == "CHAR" ||
+        u == "DATE" || u == "TIMESTAMP") return ValueType::VARCHAR;
     return ValueType::NULL_TYPE;
 }
 

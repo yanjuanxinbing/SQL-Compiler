@@ -37,12 +37,16 @@ private:
     PlanNodePtr PlanRollback(const RollbackStatement& stmt);
     PlanNodePtr PlanSavepoint(const SavepointStatement& stmt);
     PlanNodePtr PlanReleaseSavepoint(const ReleaseSavepointStatement& stmt);
+    PlanNodePtr PlanRollbackTo(const RollbackToStatement& stmt);
     PlanNodePtr PlanCreateView(const CreateViewStatement& stmt);
     PlanNodePtr PlanDropView(const DropViewStatement& stmt);
     PlanNodePtr PlanCreateTrigger(const CreateTriggerStatement& stmt);
     PlanNodePtr PlanDropTrigger(const DropTriggerStatement& stmt);
     PlanNodePtr PlanCreateFunction(const CreateFunctionStatement& stmt);
     PlanNodePtr PlanDropFunction(const DropFunctionStatement& stmt);
+    // ---- 46_meta ----
+    PlanNodePtr PlanExplain(const ExplainStatement& stmt);
+    PlanNodePtr PlanShow(const ShowStatement& stmt);
     // Walk the plan tree and annotate seqScanNodes whose table_name matches a
     // CTE name so the executor routes them to the CTE materialization.
     void RewriteCteScans(const PlanNodePtr& root,

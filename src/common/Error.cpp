@@ -11,6 +11,7 @@ std::string ErrorStageToString(ErrorStage stage) {
         case ErrorStage::SEMANTIC:     return "Semantic";
         case ErrorStage::OPTIMIZATION: return "Optimization";
         case ErrorStage::CODEGEN:      return "CodeGen";
+        case ErrorStage::RUNTIME:      return "Runtime";
     }
     return "Unknown";
 }
@@ -36,17 +37,22 @@ int CompilerException::GetColumn() const {
 
 std::string FormatError(const CompilerException& ex) {
     std::ostringstream oss;
-    oss << "[" << ErrorStageToString(ex.GetStage()) << "]";
-    int line = ex.GetLine();
-    int col = ex.GetColumn();
-    if (line >= 0) {
-        oss << " line=" << line;
-        if (col >= 0) {
-            oss << ", col=" << col;
+    // RUNTIME 阶段的错误（44_pattern_match: REGEXP 模式非法）跳过阶段
+    // 前缀，让用户直接看到业务文案。
+    if (ex.GetStage() != ErrorStage::RUNTIME) {
+        oss << "[" << ErrorStageToString(ex.GetStage()) << "]";
+        int line = ex.GetLine();
+        int col = ex.GetColumn();
+        if (line >= 0) {
+            oss << " line=" << line;
+            if (col >= 0) {
+                oss << ", col=" << col;
+            }
+            oss << ":";
         }
-        oss << ":";
+        oss << " ";
     }
-    oss << " " << ex.what();
+    oss << ex.what();
     return oss.str();
 }
 

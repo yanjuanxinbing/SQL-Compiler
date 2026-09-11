@@ -1,13 +1,35 @@
 #include "execution/ConstraintChecker.h"
 
 #include "common/Error.h"
+#include "execution/ExpressionEvaluator.h"
 #include "index/BPlusTree.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <string>
 #include <unordered_map>
 
 #include "index/IndexKey.h"
+
+// ============================================================================
+// CHECK / DEFAULT 执行期语义说明（也覆盖以下哪些情况尚未覆盖）
+// ----------------------------------------------------------------------------
+// 已强制：
+//   - 列级 CHECK (expr)  在 INSERT/UPDATE 写入路径上被求值；求值结果为 FALSE
+//     时抛 "check constraint violated: <table>.<col> (<expr>)"；NULL 不视作
+//     违反约束（SQL 标准三值逻辑）。
+//   - DEFAULT 仅支持字面量（INT/FLOAT/STRING/NULL），由 InsertExecutor 在
+//     写入前替换。函数调用 / 子查询 / 复杂表达式会在执行期抛
+//     "default expression not supported"。
+//
+// 未强制（下一阶段可考虑）：
+//   - 跨行的 CHECK（如 COUNT(*) >= 0 之类聚合形式）未强制；当前 CHECK 仅作
+//     用在单行上下文，跨行一致性留给后续工作。
+//   - 表级 CHECK：parser 当前不解析独立的 CREATE TABLE 级 CHECK（仅解析列级
+//     CHECK），因此 catalog 也不会收到表级 CHECK 表达式；本路径不依赖它。
+//   - DEFAULT 与 CHECK 之间的相互引用：解析阶段无循环依赖检测，但 AST 上
+//     不会出现递归，因此运行期也不会无限递归。
+// ============================================================================
 
 namespace sqlcompiler {
 
@@ -26,6 +48,22 @@ size_t Utf8Length(const std::string& s) {
 
 bool IsStringType(ValueType t) { return t == ValueType::VARCHAR; }
 
+// SQL 标准三值逻辑：CHECK 求值为 NULL（UNKNOWN）不视作违反约束；
+// 只有确定为 FALSE 时才拒绝写入。TRUE 与 NULL 都视为"通过"。
+//
+// 反例：`score >= 0 AND score <= 100` 在 score = NULL 时
+//   - `NULL >= 0`  = UNKNOWN (NULL)
+//   - `NULL <= 100`= UNKNOWN (NULL)
+//   - `UNKNOWN AND UNKNOWN` = UNKNOWN (NULL)
+// 因此整体 NULL，CHECK 不应触发。
+bool CheckExpressionFails(const Value& v) {
+    if (v.IsNull()) return false;  // UNKNOWN 不是 FALSE，CHECK 通过
+    if (v.GetType() == ValueType::INTEGER) return v.AsInt() == 0;
+    if (v.GetType() == ValueType::FLOAT) return v.AsFloat() == 0.0;
+    if (v.GetType() == ValueType::VARCHAR) return v.AsVarchar().empty();
+    return false;
+}
+
 }  // namespace
 
 std::vector<ValueType> BuildColumnTypes(const TableInfo& table_info) {
@@ -39,7 +77,8 @@ std::vector<ValueType> BuildColumnTypes(const TableInfo& table_info) {
 
 void ValidateRowConstraints(SystemCatalog* catalog, const TableInfo& table_info,
                             TableHeap* heap, const std::vector<Value>& row,
-                            const RID* exclude_rid) {
+                            const RID* exclude_rid,
+                            ExecutionContext* ctx) {
     const auto& cols = table_info.columns;
     if (row.size() != cols.size()) return;  // 列数不符由调用方负责报错
 
@@ -76,7 +115,32 @@ void ValidateRowConstraints(SystemCatalog* catalog, const TableInfo& table_info,
         }
     }
 
-    // ---- 3) PRIMARY KEY 唯一性 ----
+    // ---- 3) 列级 CHECK (expr) ----
+    // 慢路径过滤：没有任何列挂 CHECK 时直接跳过，避免每行都构造 evaluator。
+    if (std::any_of(cols.begin(), cols.end(),
+                    [](const ColumnInfo& c) { return c.check_expr != nullptr; })) {
+        std::unordered_map<std::string, size_t> cmap;
+        cmap.reserve(cols.size());
+        for (size_t i = 0; i < cols.size(); ++i) cmap[cols[i].name] = i;
+        // CHECK 是只读，把当前行的 value 列表直接交给 Tuple 即可。Tuple 仅
+        // 持有引用计数安全的 Value，无后续修改。
+        Tuple check_tuple(row);
+        ExpressionEvaluator eval(cmap, ctx, nullptr);
+        for (size_t i = 0; i < cols.size(); ++i) {
+            if (!cols[i].check_expr) continue;
+            Value v = eval.Evaluate(cols[i].check_expr, check_tuple);
+            // SQL 标准：NULL 不视作违反约束；只有确定 FALSE 才拒绝。
+            if (CheckExpressionFails(v)) {
+                throw CompilerException(
+                    ErrorStage::SEMANTIC,
+                    "check constraint violated: " + table_info.table_name + "." +
+                        cols[i].name + " (" +
+                        cols[i].check_expr->ToString() + ")");
+            }
+        }
+    }
+
+    // ---- 4) PRIMARY KEY 唯一性 ----
     auto groups = table_info.GetPrimaryKeyGroups();
     if (groups.empty()) return;
 

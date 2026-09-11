@@ -1,8 +1,11 @@
 #include "execution/ExpressionEvaluator.h"
 
 #include "catalog/SystemCatalog.h"
+#include "common/DateTime.h"
+#include "common/Error.h"
 #include "execution/ExecutionEngine.h"
 #include "execution/Executor.h"
+#include "execution/UdfExecutor.h"
 #include "plan/Plan.h"
 
 #include <algorithm>
@@ -14,6 +17,8 @@
 #include <ctime>
 #include <functional>
 #include <memory>
+#include <regex>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -44,6 +49,20 @@ bool IsFalse(const Value& v) {
     if (v.IsNull()) return false;
     return !IsTruthy(v);
 }
+
+// =============================================================================
+// 模式匹配支持面（44_pattern_match）
+//   - SQL 标准 LIKE   : '%' 任意序列、'_' 单字符；默认以 '\\' 作为转义字符，
+//                       也可通过 LikeExprNode 的 has_escape/escape_char 自定义。
+//   - ILIKE           : 同 LIKE，但先对输入和模式做 ASCII 大小写折叠再匹配。
+//   - REGEXP / RLIKE  : POSIX ERE 风格的正则子串匹配（默认不锚定 ^/$）；
+//                       模式按 <regex> 在每行即时编译（pattern 表达式非字面量
+//                       时无法预编译，统一在运行时编译一次以保持简单）。
+//   - 错误处理        : REGEXP 模式非法时抛出 RuntimeError，
+//                       文案为 "Error: invalid regex pattern: <reason>"。
+// 旧 `BinaryOperator::LIKE` 路径复用 MatchLikePattern（保留 '\\' 默认转义），
+// 行为对 00–43 测试零变更。新运算符和 ESCAPE 子句全部走 LikeExprNode。
+// =============================================================================
 
 // SQL LIKE pattern matching: '%' matches any sequence, '_' matches one char.
 // Other characters are matched literally. '\' escapes the next character.
@@ -79,6 +98,52 @@ bool MatchLikePattern(const std::string& s, const std::string& p) {
     }
     while (j < p.size() && p[j] == '%') ++j;
     return j == p.size();
+}
+
+// 可配置转义字符的 LIKE 匹配：'esc' 取消紧随字符的特殊含义（包括其自身）。
+// 算法与 MatchLikePattern 等价的二维回溯，但把 '\\' 换成 esc，便于 ILIKE
+// 在大小写折叠后直接复用。
+bool MatchLikePatternEscaped(const std::string& s, const std::string& p, char esc) {
+    size_t i = 0, j = 0;
+    size_t star_i = std::string::npos, star_j = 0;
+    while (i < s.size()) {
+        if (j < p.size() && p[j] == '_') {
+            ++i; ++j;
+        } else if (j < p.size() && p[j] == '%') {
+            star_i = i;
+            star_j = j;
+            ++j;
+        } else if (j < p.size() && p[j] == esc && j + 1 < p.size()) {
+            // 转义：把后一个字符当字面量匹配。
+            if (p[j + 1] == s[i]) { ++i; j += 2; }
+            else if (star_i != std::string::npos) {
+                i = ++star_i;
+                j = star_j + 1;
+            } else {
+                return false;
+            }
+        } else if (j < p.size() && p[j] == s[i]) {
+            ++i; ++j;
+        } else if (star_i != std::string::npos) {
+            i = ++star_i;
+            j = star_j + 1;
+        } else {
+            return false;
+        }
+    }
+    while (j < p.size() && p[j] == '%') ++j;
+    return j == p.size();
+}
+
+// ASCII 小写折叠（仅 A-Z）。
+std::string AsciiLower(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        out.push_back(c);
+    }
+    return out;
 }
 
 // 函数名规范化：大小写不敏感
@@ -234,6 +299,23 @@ Value ExpressionEvaluator::Evaluate(const ExprPtr& expr, const Tuple& tuple) con
             return EvaluateCast(*static_cast<const CastExprNode*>(expr.get()), tuple);
         case NodeType::SUBQUERY_EXPR:
             return EvaluateSubquery(*static_cast<const SubqueryExprNode*>(expr.get()), tuple);
+        case NodeType::UPSERT_VALUES_REF_EXPR:
+            // 43_upsert: ON DUPLICATE KEY UPDATE 的赋值右侧出现的 VALUES(col)。
+            // 该值在 UpsertExecutor 里通过 ExecutionContext 推入，本 evaluator 仅
+            // 负责按列名取出。不在该上下文中时返回 NULL（语义层会报错）。
+            return EvaluateUpsertValuesRef(*static_cast<const UpsertValuesRefExpr*>(expr.get()),
+                                           tuple);
+        case NodeType::LIKE_EXPR:
+            // 44_pattern_match: LIKE / ILIKE / REGEXP / RLIKE + 可选 ESCAPE。
+            return EvaluateLike(*static_cast<const LikeExprNode*>(expr.get()), tuple);
+        case NodeType::EXTRACT_EXPR:
+            // 45_datetime: EXTRACT(field FROM source)
+            return EvaluateExtract(*static_cast<const ExtractExprNode*>(expr.get()), tuple);
+        case NodeType::INTERVAL_EXPR:
+            // 45_datetime: INTERVAL <n> <unit> —— 单独出现没有意义；
+            // 这里返回一个零值（NULL）。正常路径上 INTERVAL 总是作为
+            // INTERVAL_ADD / INTERVAL_SUB 的右操作数被消费。
+            return EvaluateInterval(*static_cast<const IntervalExprNode*>(expr.get()), tuple);
         default:
             return Value::MakeNull();
     }
@@ -251,6 +333,12 @@ Value ExpressionEvaluator::EvaluateLiteral(const LiteralExpr& expr) const {
             return Value::MakeNull();
         case LiteralType::BOOLEAN:
             return MakeBool(expr.value != "0" && expr.value != "false" && expr.value != "FALSE");
+        // 45_datetime: DATE / TIMESTAMP 字面量按文本持久化（YYYY-MM-DD /
+        // YYYY-MM-DD HH:MM:SS）；运行期仍然作为 VARCHAR 流转，ExtractField
+        // / ApplyInterval 在需要时按字符串解释。
+        case LiteralType::DATE:
+        case LiteralType::TIMESTAMP:
+            return Value::MakeVarchar(expr.value);
     }
     return Value::MakeNull();
 }
@@ -347,8 +435,17 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
 }
 
 Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& tuple) const {
+    // 45_datetime: INTERVAL_ADD / INTERVAL_SUB 的右操作数是 IntervalExprNode，
+    // 不需要对它求值（数据在 AST 节点上），而是直接用节点本身。
     Value l = Evaluate(expr.left, tuple);
-    Value r = Evaluate(expr.right, tuple);
+    Value r = Value::MakeNull();
+    bool right_is_interval = (expr.op == BinaryOperator::INTERVAL_ADD ||
+                              expr.op == BinaryOperator::INTERVAL_SUB) &&
+                              expr.right &&
+                              expr.right->GetType() == NodeType::INTERVAL_EXPR;
+    if (!right_is_interval) {
+        r = Evaluate(expr.right, tuple);
+    }
     // 混合运算时把INTEGER操作数提升为double：
     // AsFloat()对INTEGER值返回的是内部float_val_（恒为0），直接使用会得到错误结果
     auto ToDouble = [](const Value& v) -> double {
@@ -441,6 +538,36 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
             return MakeBool(l.IsNull());
         case BinaryOperator::IS_NOT_NULL:
             return MakeBool(!l.IsNull());
+        // 45_datetime: <date_or_ts> ± INTERVAL <n> <unit>
+        // 左侧求值为日期/时间字符串（DATE/TIMESTAMP 列或字面量），右侧是
+        // IntervalExprNode 节点。语义见 include/common/DateTime.h 顶部注释。
+        case BinaryOperator::INTERVAL_ADD:
+        case BinaryOperator::INTERVAL_SUB: {
+            if (l.IsNull()) return Value::MakeNull();
+            if (!expr.right || expr.right->GetType() != NodeType::INTERVAL_EXPR) {
+                return Value::MakeNull();
+            }
+            auto ie = std::static_pointer_cast<IntervalExprNode>(expr.right);
+            int64_t base_epoch = 0;
+            if (!ParseDateTime(l.ToString(), &base_epoch)) return Value::MakeNull();
+            int sign = (expr.op == BinaryOperator::INTERVAL_ADD) ? 1 : -1;
+            int64_t new_epoch = 0;
+            if (!ApplyInterval(base_epoch, ie->count,
+                               static_cast<IntervalUnit>(ie->unit),
+                               sign, &new_epoch)) {
+                return Value::MakeNull();
+            }
+            // 输出格式：若原值只到日（10 字符且无时间分量），输出 DATE 形式；
+            // 否则输出 TIMESTAMP 形式。判断方式：原值长度 == 10 表示 YYYY-MM-DD。
+            if (l.GetType() == ValueType::VARCHAR &&
+                l.AsVarchar().size() == 10 &&
+                l.AsVarchar().find(' ') == std::string::npos &&
+                l.AsVarchar().find('T') == std::string::npos &&
+                l.AsVarchar().find(':') == std::string::npos) {
+                return Value::MakeVarchar(FormatDate(new_epoch));
+            }
+            return Value::MakeVarchar(FormatDateTime(new_epoch));
+        }
         case BinaryOperator::LIKE: {
             // LIKE 任一边为 NULL 则 UNKNOWN
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
@@ -764,38 +891,24 @@ Value ExpressionEvaluator::EvaluateFunctionCall(const FunctionCallExpr& expr,
     // ---- 40_txn_view_udf：UDF 调用 ----
     // 当内置函数未命中且 ExecutionContext 中存在 catalog 时，尝试按 catalog
     // 注册的用户自定义函数求值。把实参值代入参数名（同名替换），然后调用
-    // body_expr 求值。注意：UDF 不会修改当前 tuple（无副作用），仅返回值。
+    // UdfExecutor 走 body_statements（顺序解释 DECLARE/SET/IF/WHILE/RETURN）。
     if (ctx_ != nullptr) {
         SystemCatalog* catalog = ctx_->GetCatalog();
         if (catalog != nullptr) {
-            // 大小写不敏感地查 UDF：catalog 内函数名按原大小写存，调用方可能
-            // 写成不同形式。先做一次原大小写匹配，再退化到大小写不敏感扫描。
             const SystemCatalog::FunctionDefinition* fn =
-                catalog->GetFunction(expr.function_name);
-            if (fn == nullptr) {
-                std::string upper_name;
-                for (char c : expr.function_name)
-                    upper_name.push_back(
-                        static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-                // catalog 内部 keys 直接存 fn 名；HasFunction 接受任意大小写。
-                if (catalog->HasFunction(upper_name)) {
-                    fn = catalog->GetFunction(upper_name);
-                }
-            }
-            if (fn != nullptr && fn->body_expr != nullptr) {
+                catalog->LookupFunction(expr.function_name);
+            if (fn != nullptr) {
                 if (fn->parameters.size() != expr.arguments.size()) {
                     return Value::MakeNull();
                 }
-                // 构造一个外层绑定：把每个形参名映射到对应实参的求值结果。
-                std::unordered_map<std::string, Value> udf_bind;
+                // 构造实参绑定：每个形参名 → 对应实参表达式在当前行上的求值结果。
+                std::unordered_map<std::string, Value> arg_bind;
                 for (size_t i = 0; i < expr.arguments.size(); ++i) {
                     Value v = Evaluate(expr.arguments[i], tuple);
-                    udf_bind[fn->parameters[i].name] = v;
+                    arg_bind[fn->parameters[i].name] = v;
                 }
-                // 用空 column_index_map + udf_bind 作为 outer_bind 求值 body。
-                std::unordered_map<std::string, size_t> empty_cmap;
-                ExpressionEvaluator inner(empty_cmap, ctx_, &udf_bind);
-                return inner.Evaluate(fn->body_expr, tuple);
+                UdfExecutor udf(catalog, ctx_, *fn, std::move(arg_bind));
+                return udf.Run();
             }
         }
     }
@@ -1091,6 +1204,107 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
             return Value::MakeInt(0);
         }
     }
+    return Value::MakeNull();
+}
+
+// 43_upsert: VALUES(col) —— 通过 ExecutionContext 上的 upsert_values_bind 取值。
+// 不在 upsert 上下文时返回 NULL（语义层应保证 VALUES(col) 不出现在其它语境）。
+Value ExpressionEvaluator::EvaluateUpsertValuesRef(const UpsertValuesRefExpr& expr,
+                                                   const Tuple& tuple) const {
+    if (!ctx_) return Value::MakeNull();
+    const auto* bind = ctx_->GetUpsertValuesBind();
+    if (!bind) return Value::MakeNull();
+    auto it = bind->find(expr.column_name);
+    if (it == bind->end()) return Value::MakeNull();
+    return it->second;
+}
+
+// 44_pattern_match: 统一处理 LIKE / ILIKE / REGEXP / RLIKE（含可选 ESCAPE）。
+//
+// 设计取舍：
+//   - LIKE / ILIKE：使用本文件的 MatchLikePatternEscaped（按 escape_char
+//     转义）。ILIKE 在匹配前对两侧做 ASCII 小写折叠；REGEXP 不受 escape_char
+//     影响（C++ <regex> 自身支持 '\' 转义）。
+//   - REGEXP / RLIKE：pattern 通常是字面量，但在通用 AST 上无法保证；统一
+//     在运行时每行编译一次 std::regex（regex::ECMAScript + 关闭 implicit
+//     锚定符合 POSIX ERE 的语义）。失败时抛 RuntimeError，文案
+//     `Error: invalid regex pattern: <what()>` 满足测试期望。
+Value ExpressionEvaluator::EvaluateLike(const LikeExprNode& expr,
+                                        const Tuple& tuple) const {
+    Value l = Evaluate(expr.operand, tuple);
+    Value r = Evaluate(expr.pattern, tuple);
+    if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+
+    auto as_str = [](const Value& v) -> std::string {
+        if (v.GetType() == ValueType::VARCHAR) return v.AsVarchar();
+        // 非 VARCHAR 一律按其 ToString() 形式参与匹配，避免隐式 NULL。
+        return v.ToString();
+    };
+
+    std::string s = as_str(l);
+    std::string p = as_str(r);
+    char esc = expr.has_escape ? expr.escape_char : '\\';
+
+    switch (expr.kind) {
+        case LikeExprNode::Kind::LIKE:
+            return MakeBool(MatchLikePatternEscaped(s, p, esc));
+        case LikeExprNode::Kind::ILIKE:
+            return MakeBool(MatchLikePatternEscaped(AsciiLower(s),
+                                                    AsciiLower(p),
+                                                    esc));
+        case LikeExprNode::Kind::REGEXP:
+        case LikeExprNode::Kind::RLIKE: {
+            // ECMAScript + 非显式 '^' 锚定 → 子串匹配；POSIX ERE 的 '^'/'$'
+            // 在 ECMAScript 下同样按位置断言，因此 metacharacter 要求可达成。
+            try {
+                std::regex re(p, std::regex::ECMAScript | std::regex::optimize);
+                return MakeBool(std::regex_search(s, re));
+            } catch (const std::regex_error& e) {
+                // FormatError 对 RUNTIME 阶段跳过 "[Runtime]" 前缀，main.cpp
+                // 再补 "Error: "。最终输出为 "Error: invalid regex pattern: <what()>"。
+                throw CompilerException(ErrorStage::RUNTIME,
+                    std::string("invalid regex pattern: ") + e.what());
+            }
+        }
+    }
+    return Value::MakeNull();
+}
+
+// 45_datetime: EXTRACT(field FROM source)
+//
+//   1) 求值 source → VARCHAR（按 YYYY-MM-DD / YYYY-MM-DD HH:MM:SS 解释）
+//   2) ParseDateTime 把 source 转为 epoch 秒
+//   3) ExtractDateTimeParts 取目标字段；YEAR/MONTH/DAY/HOUR/MINUTE/SECOND
+//      均为 INT。SECOND 字段按规范可返回 FLOAT 保留小数秒；本实现简化
+//      为 INT，仅返回秒（无小数部分）。
+Value ExpressionEvaluator::EvaluateExtract(const ExtractExprNode& expr,
+                                           const Tuple& tuple) const {
+    if (!expr.source) return Value::MakeNull();
+    Value v = Evaluate(expr.source, tuple);
+    if (v.IsNull()) return Value::MakeNull();
+    int64_t epoch = 0;
+    if (!ParseDateTime(v.ToString(), &epoch)) return Value::MakeNull();
+    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+    ExtractDateTimeParts(epoch, &y, &mo, &d, &h, &mi, &s);
+    switch (static_cast<IntervalUnit>(expr.field)) {
+        case IntervalUnit::YEAR:   return Value::MakeInt(y);
+        case IntervalUnit::MONTH:  return Value::MakeInt(mo);
+        case IntervalUnit::DAY:    return Value::MakeInt(d);
+        case IntervalUnit::HOUR:   return Value::MakeInt(h);
+        case IntervalUnit::MINUTE: return Value::MakeInt(mi);
+        case IntervalUnit::SECOND: return Value::MakeInt(s);
+    }
+    return Value::MakeNull();
+}
+
+// 45_datetime: INTERVAL <n> <unit> 单独求值。
+//
+// 单独出现没有语义（用户应当用 `<date> + INTERVAL ...`），但执行器可能
+// 在某些边界场景（如类型推断 / ShowPlan）调用它。这里返回 NULL。
+Value ExpressionEvaluator::EvaluateInterval(const IntervalExprNode& expr,
+                                            const Tuple& tuple) const {
+    (void)tuple;
+    (void)expr;
     return Value::MakeNull();
 }
 

@@ -56,6 +56,9 @@ private:
     StatementPtr ParseDropTriggerStatement();
     StatementPtr ParseCreateFunctionStatement();
     StatementPtr ParseDropFunctionStatement();
+    // ---- 46_meta: 元命令 ----
+    StatementPtr ParseExplainStatement();
+    StatementPtr ParseShowStatement();
 
     // ---- 子句解析 ----
     std::vector<ExprPtr> ParseSelectList();
@@ -81,6 +84,17 @@ private:
     ExprPtr ParsePrimaryExpr();
     std::vector<ExprPtr> ParseExpressionList();
 
+    // ---- 47_udf_trigger_view: UDF 函数体语句 ----
+    // 解析一条语句（用于 BEGIN ... END 块内部）。可识别：
+    //   RETURN [expr];
+    //   DECLARE name TYPE;
+    //   SET name = expr;  （name 可为 "NEW.col" / "OLD.col"）
+    //   IF cond THEN stmts [ELSEIF ...] [ELSE ...] END IF;
+    //   WHILE cond DO stmts END WHILE;
+    StatementPtr ParseFunctionBodyStatement();
+    // 解析一段语句列表直到遇到 end_token 为止（不含 end_token）。
+    std::vector<StatementPtr> ParseFunctionBodyUntil(TokenType end_token);
+
     // 解析 [table.]column 或 table.* 形式的列引用
     ExprPtr ParseColumnRefOrFunctionCall();
 
@@ -90,6 +104,14 @@ private:
     ExprPtr ParseCaseExpression();
     // 解析 CAST(expr AS type)
     ExprPtr ParseCastExpression();
+    // 45_datetime: 解析 EXTRACT(field FROM source)
+    ExprPtr ParseExtractExpression();
+    // 45_datetime: 解析 INTERVAL <n> <unit>（调用前已消耗 INTERVAL 关键字）
+    ExprPtr ParseIntervalExpression();
+    // 解析 ON DUPLICATE KEY UPDATE 末尾的 SET 子句：
+    //   col = expr [, col = expr ...]
+    // expr 中可出现 VALUES(col) 形式（在 ParsePrimaryExpr 中处理）。
+    std::vector<std::pair<std::string, ExprPtr>> ParseUpsertAssignments();
     // 解析形如 (SELECT ...) / EXISTS (SELECT ...) / ... IN (SELECT ...) / expr op ANY (SELECT ...) 的子查询
     ExprPtr ParseSubqueryExpression(ExprPtr left_operand, const std::string& comparison_op,
                                     SubqueryType forced_kind = SubqueryType::SCALAR);

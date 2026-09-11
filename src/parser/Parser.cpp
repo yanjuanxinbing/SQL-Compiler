@@ -1,6 +1,7 @@
 #include <cstdio>
 #include "parser/Parser.h"
 
+#include "common/DateTime.h"
 #include "common/Error.h"
 
 #include <cstdlib>
@@ -128,6 +129,24 @@ StatementPtr Parser::ParseStatement() {
             return chain;
         }
         return inner;
+    }
+    // ---- 46_meta: EXPLAIN 是语句前缀，先识别 ----
+    if (cur.type == TokenType::KEYWORD_EXPLAIN) {
+        return ParseExplainStatement();
+    }
+    // ---- 46_meta: SHOW 是独立语句 ----
+    if (cur.type == TokenType::KEYWORD_SHOW) {
+        return ParseShowStatement();
+    }
+    // ---- 46_meta: DESCRIBE / DESC 等价于 SHOW COLUMNS FROM table ----
+    if (cur.type == TokenType::KEYWORD_DESCRIBE ||
+        cur.type == TokenType::KEYWORD_DESC) {
+        Advance(); // DESCRIBE / DESC
+        Token t = Expect(TokenType::IDENTIFIER, "expected table name after DESCRIBE/DESC");
+        auto stmt = std::make_shared<ShowStatement>();
+        stmt->kind = ShowStatement::Kind::COLUMNS;
+        stmt->target_table = t.lexeme;
+        return stmt;
     }
     switch (cur.type) {
         case TokenType::KEYWORD_SELECT: return ParseSelectStatementWithSetOps();
@@ -435,7 +454,32 @@ StatementPtr Parser::ParseInsertStatement() {
         Expect(TokenType::RIGHT_PAREN, "expected ')' after VALUES row");
         stmt->values_list.push_back(std::move(row));
     } while (Match(TokenType::COMMA));
+    // ---- 43_upsert: 可选 ON DUPLICATE KEY UPDATE ----
+    // MySQL 风格 upsert。仅当本 INSERT 由 VALUES 提供数据时才有意义（query 路径
+    // 暂不支持）。语义：见 include/ast/AST.h 中 InsertStatement 的注释。
+    if (Check(TokenType::KEYWORD_ON)) {
+        Advance();
+        Expect(TokenType::KEYWORD_DUPLICATE, "expected DUPLICATE after ON");
+        Expect(TokenType::KEYWORD_KEY, "expected KEY after DUPLICATE");
+        Expect(TokenType::KEYWORD_UPDATE, "expected UPDATE after ON DUPLICATE KEY");
+        stmt->has_on_duplicate = true;
+        stmt->upsert_assignments = ParseUpsertAssignments();
+    }
     return stmt;
+}
+
+// 解析 ON DUPLICATE KEY UPDATE 末尾的 SET 子句：
+//   col = expr [, col = expr ...]
+// expr 中可出现 VALUES(col) 形式（在 ParsePrimaryExpr 中处理）。
+std::vector<std::pair<std::string, ExprPtr>> Parser::ParseUpsertAssignments() {
+    std::vector<std::pair<std::string, ExprPtr>> assigns;
+    do {
+        Token col = Expect(TokenType::IDENTIFIER, "expected column name in ON DUPLICATE KEY UPDATE");
+        Expect(TokenType::OP_EQUAL, "expected '=' in upsert assignment");
+        ExprPtr expr = ParseExpression();
+        assigns.push_back({col.lexeme, std::move(expr)});
+    } while (Match(TokenType::COMMA));
+    return assigns;
 }
 
 StatementPtr Parser::ParseUpdateStatement() {
@@ -586,6 +630,18 @@ StatementPtr Parser::ParseAlterTableStatement() {
     Token table = Expect(TokenType::IDENTIFIER, "expected table name");
     auto stmt = std::make_shared<AlterStatement>();
     stmt->table_name = table.lexeme;
+    auto parse_column_type = [](const Token& ty, ColumnDefinition* cd) {
+        if (ty.type == TokenType::KEYWORD_INT)       { cd->data_type = "INT";       }
+        else if (ty.type == TokenType::KEYWORD_VARCHAR)  { cd->data_type = "VARCHAR";  }
+        else if (ty.type == TokenType::KEYWORD_FLOAT)    { cd->data_type = "FLOAT";    }
+        else if (ty.type == TokenType::KEYWORD_DATE)     { cd->data_type = "DATE";     }
+        else if (ty.type == TokenType::KEYWORD_TIMESTAMP){ cd->data_type = "TIMESTAMP";}
+        else if (ty.type == TokenType::IDENTIFIER)       { cd->data_type = ty.lexeme;  }
+        else {
+            throw CompilerException(ErrorStage::SYNTAX,
+                "expected column type", ty.line, ty.column);
+        }
+    };
     if (Match(TokenType::KEYWORD_ADD)) {
         // ADD COLUMN 是关键字 COLUMN 形式；同时也接受裸 ADD col ... 形式以兼容
         // 部分方言，这里把 COLUMN 当成可选项。
@@ -595,22 +651,8 @@ StatementPtr Parser::ParseAlterTableStatement() {
         Token col_name = Expect(TokenType::IDENTIFIER, "expected column name");
         cd->column_name = col_name.lexeme;
         const Token& ty = CurrentToken();
-        if (ty.type == TokenType::KEYWORD_INT) {
-            cd->data_type = "INT";
-            Advance();
-        } else if (ty.type == TokenType::KEYWORD_VARCHAR) {
-            cd->data_type = "VARCHAR";
-            Advance();
-        } else if (ty.type == TokenType::KEYWORD_FLOAT) {
-            cd->data_type = "FLOAT";
-            Advance();
-        } else if (ty.type == TokenType::IDENTIFIER) {
-            cd->data_type = ty.lexeme;
-            Advance();
-        } else {
-            throw CompilerException(ErrorStage::SYNTAX,
-                "expected column type after ADD COLUMN", ty.line, ty.column);
-        }
+        parse_column_type(ty, cd.get());
+        Advance();
         if (Match(TokenType::LEFT_PAREN)) {
             if (CurrentToken().type == TokenType::INTEGER_LITERAL) {
                 try {
@@ -640,22 +682,8 @@ StatementPtr Parser::ParseAlterTableStatement() {
         Token col_name = Expect(TokenType::IDENTIFIER, "expected column name");
         cd->column_name = col_name.lexeme;
         const Token& ty = CurrentToken();
-        if (ty.type == TokenType::KEYWORD_INT) {
-            cd->data_type = "INT";
-            Advance();
-        } else if (ty.type == TokenType::KEYWORD_VARCHAR) {
-            cd->data_type = "VARCHAR";
-            Advance();
-        } else if (ty.type == TokenType::KEYWORD_FLOAT) {
-            cd->data_type = "FLOAT";
-            Advance();
-        } else if (ty.type == TokenType::IDENTIFIER) {
-            cd->data_type = ty.lexeme;
-            Advance();
-        } else {
-            throw CompilerException(ErrorStage::SYNTAX,
-                "expected column type after MODIFY COLUMN", ty.line, ty.column);
-        }
+        parse_column_type(ty, cd.get());
+        Advance();
         if (Match(TokenType::LEFT_PAREN)) {
             if (CurrentToken().type == TokenType::INTEGER_LITERAL) {
                 try {
@@ -949,6 +977,14 @@ ColumnDefinition Parser::ParseColumnDefinition() {
     } else if (ty.type == TokenType::KEYWORD_FLOAT) {
         cd.data_type = "FLOAT";
         Advance();
+    } else if (ty.type == TokenType::KEYWORD_DATE) {
+        // 45_datetime: DATE 'YYYY-MM-DD'
+        cd.data_type = "DATE";
+        Advance();
+    } else if (ty.type == TokenType::KEYWORD_TIMESTAMP) {
+        // 45_datetime: TIMESTAMP 'YYYY-MM-DD HH:MM:SS'
+        cd.data_type = "TIMESTAMP";
+        Advance();
     } else if (ty.type == TokenType::IDENTIFIER) {
         cd.data_type = ty.lexeme;
         Advance();
@@ -1080,11 +1116,43 @@ ExprPtr Parser::ParseComparisonExpr() {
             left, nullptr);
     }
 
-    // LIKE <pattern>
-    if (Check(TokenType::KEYWORD_LIKE)) {
+    // LIKE <pattern> [ESCAPE 'x']  —— 旧路径仅在没有 ESCAPE 子句时使用，
+    // 走 BinaryExpr + BinaryOperator::LIKE（默认 '\' 转义）；当显式带
+    // ESCAPE 子句或使用 ILIKE / REGEXP / RLIKE 时，构建 LikeExprNode。
+    if (Check(TokenType::KEYWORD_LIKE) || Check(TokenType::KEYWORD_ILIKE) ||
+        Check(TokenType::KEYWORD_REGEXP) || Check(TokenType::KEYWORD_RLIKE)) {
+        LikeExprNode::Kind kind;
+        switch (CurrentToken().type) {
+            case TokenType::KEYWORD_LIKE:   kind = LikeExprNode::Kind::LIKE;   break;
+            case TokenType::KEYWORD_ILIKE:  kind = LikeExprNode::Kind::ILIKE;  break;
+            case TokenType::KEYWORD_REGEXP: kind = LikeExprNode::Kind::REGEXP; break;
+            case TokenType::KEYWORD_RLIKE:  kind = LikeExprNode::Kind::RLIKE;  break;
+            default:                        kind = LikeExprNode::Kind::LIKE;   break;
+        }
         Advance();
-        ExprPtr right = ParseAdditiveExpr();
-        return std::make_shared<BinaryExpr>(BinaryOperator::LIKE, left, right);
+        ExprPtr pattern = ParseAdditiveExpr();
+        // 可选 ESCAPE 'x' 子句：仅对 LIKE/ILIKE 真正生效；REGEXP/RLIKE 接受
+        // 但忽略（节点上 has_escape 保持 false），保持语法宽容。
+        char esc = '\\';
+        bool has_esc = false;
+        if (Check(TokenType::KEYWORD_ESCAPE)) {
+            Advance();
+            const Token& lit = Expect(TokenType::STRING_LITERAL,
+                "parse error: ESCAPE must be a single character");
+            if (lit.lexeme.size() != 1) {
+                throw CompilerException(ErrorStage::SYNTAX,
+                    "parse error: ESCAPE must be a single character",
+                    lit.line, lit.column);
+            }
+            esc = lit.lexeme[0];
+            has_esc = true;
+        }
+        if (kind == LikeExprNode::Kind::LIKE && !has_esc) {
+            // 旧路径：没有显式 ESCAPE 时复用 BinaryExpr(LIKE) 以保持原
+            // MatchLikePattern 默认 '\' 转义行为，避免触碰既有测试。
+            return std::make_shared<BinaryExpr>(BinaryOperator::LIKE, left, pattern);
+        }
+        return std::make_shared<LikeExprNode>(kind, left, pattern, esc, has_esc);
     }
 
     // IN (val1, val2, ...) 或 IN (SELECT ...)
@@ -1166,6 +1234,22 @@ ExprPtr Parser::ParseAdditiveExpr() {
     ExprPtr left = ParseMultiplicativeExpr();
     while (Check(TokenType::OP_PLUS) || Check(TokenType::OP_MINUS) ||
            Check(TokenType::OP_CONCAT)) {
+        // 45_datetime: <date_or_ts> ± INTERVAL <n> <unit>
+        // 在看到 +/- 之后若紧跟 INTERVAL 关键字，则把右侧整体解析为
+        // IntervalExprNode 并构造 INTERVAL_ADD / INTERVAL_SUB 二元表达式。
+        // 保留原有"右侧走 ParseMultiplicativeExpr"分支以保证普通算术不受影响。
+        if ((Check(TokenType::OP_PLUS) || Check(TokenType::OP_MINUS)) &&
+            PeekToken(1).type == TokenType::KEYWORD_INTERVAL) {
+            TokenType op_tok = CurrentToken().type;
+            Advance();  // '+' / '-'
+            Advance();  // INTERVAL
+            ExprPtr interval_expr = ParseIntervalExpression();
+            BinaryOperator op = (op_tok == TokenType::OP_PLUS)
+                                    ? BinaryOperator::INTERVAL_ADD
+                                    : BinaryOperator::INTERVAL_SUB;
+            left = std::make_shared<BinaryExpr>(op, left, interval_expr);
+            continue;
+        }
         BinaryOperator op = Check(TokenType::OP_PLUS)  ? BinaryOperator::ADD
                           : Check(TokenType::OP_MINUS) ? BinaryOperator::SUB
                                                        : BinaryOperator::CONCAT;
@@ -1197,6 +1281,34 @@ ExprPtr Parser::ParseUnaryExpr() {
 
 ExprPtr Parser::ParsePrimaryExpr() {
     const Token& cur = CurrentToken();
+    // 45_datetime: DATE 'YYYY-MM-DD'
+    if (cur.type == TokenType::KEYWORD_DATE) {
+        Advance();  // DATE
+        Token lit = Expect(TokenType::STRING_LITERAL,
+                           "expected string literal after DATE");
+        return std::make_shared<LiteralExpr>(LiteralType::DATE, lit.lexeme);
+    }
+    // 45_datetime: TIMESTAMP 'YYYY-MM-DD HH:MM:SS'
+    if (cur.type == TokenType::KEYWORD_TIMESTAMP) {
+        Advance();  // TIMESTAMP
+        Token lit = Expect(TokenType::STRING_LITERAL,
+                           "expected string literal after TIMESTAMP");
+        return std::make_shared<LiteralExpr>(LiteralType::TIMESTAMP, lit.lexeme);
+    }
+    // 45_datetime: EXTRACT(field FROM source)
+    if (cur.type == TokenType::KEYWORD_EXTRACT) {
+        return ParseExtractExpression();
+    }
+    // 43_upsert: VALUES(col) —— 仅在 ON DUPLICATE KEY UPDATE 的赋值右侧出现。
+    // 解析后语义层会校验「VALUES 引用只能出现在 Upsert 上下文」。当前位置必须在
+    // KEYWORD_VALUES 关键字 + LEFT_PAREN + 列名 + RIGHT_PAREN 形式。
+    if (cur.type == TokenType::KEYWORD_VALUES) {
+        Advance();
+        Expect(TokenType::LEFT_PAREN, "expected '(' after VALUES");
+        Token col = Expect(TokenType::IDENTIFIER, "expected column name in VALUES()");
+        Expect(TokenType::RIGHT_PAREN, "expected ')' after VALUES(column)");
+        return std::make_shared<UpsertValuesRefExpr>(col.lexeme);
+    }
     if (cur.type == TokenType::KEYWORD_CASE) {
         return ParseCaseExpression();
     }
@@ -1743,6 +1855,103 @@ StatementPtr Parser::ParseWithClause() {
     return with;
 }
 
+// ================= 45_datetime：DATE/TIMESTAMP/INTERVAL/EXTRACT =================
+
+// EXTRACT(field FROM source)
+//
+//   field ∈ { YEAR, MONTH, DAY, HOUR, MINUTE, SECOND }
+//   source 是任意可解析为日期/时间字符串的表达式（列、VARCHAR 字面量等）。
+//
+// 进入此函数时当前 token 必为 KEYWORD_EXTRACT。
+ExprPtr Parser::ParseExtractExpression() {
+    Advance();  // EXTRACT
+    Expect(TokenType::LEFT_PAREN, "expected '(' after EXTRACT");
+    IntervalUnit unit;
+    const Token& ftok = CurrentToken();
+    bool matched = false;
+    switch (ftok.type) {
+        case TokenType::KEYWORD_YEAR:   unit = IntervalUnit::YEAR;   matched = true; break;
+        case TokenType::KEYWORD_MONTH:  unit = IntervalUnit::MONTH;  matched = true; break;
+        case TokenType::KEYWORD_DAY:    unit = IntervalUnit::DAY;    matched = true; break;
+        case TokenType::KEYWORD_HOUR:   unit = IntervalUnit::HOUR;   matched = true; break;
+        case TokenType::KEYWORD_MINUTE: unit = IntervalUnit::MINUTE; matched = true; break;
+        case TokenType::KEYWORD_SECOND: unit = IntervalUnit::SECOND; matched = true; break;
+        default: break;
+    }
+    if (!matched) {
+        throw CompilerException(ErrorStage::SYNTAX,
+            std::string("expected YEAR/MONTH/DAY/HOUR/MINUTE/SECOND in EXTRACT (got '")
+            + ftok.lexeme + "')",
+            ftok.line, ftok.column);
+    }
+    Advance();  // field keyword
+    Expect(TokenType::KEYWORD_FROM, "expected FROM in EXTRACT");
+    ExprPtr source = ParseExpression();
+    Expect(TokenType::RIGHT_PAREN, "expected ')' after EXTRACT source");
+    return std::make_shared<ExtractExprNode>(static_cast<int>(unit), source);
+}
+
+// INTERVAL <n> <unit>
+//
+//   n 可以是 INTEGER_LITERAL 或 STRING_LITERAL（数字串）。
+//   unit ∈ { YEAR, MONTH, DAY, HOUR, MINUTE, SECOND }。
+//
+// 进入此函数时 INTERVAL 已被调用方消费。
+ExprPtr Parser::ParseIntervalExpression() {
+    int64_t count = 0;
+    const Token& nt = CurrentToken();
+    if (nt.type == TokenType::INTEGER_LITERAL) {
+        count = static_cast<int64_t>(std::atoll(nt.lexeme.c_str()));
+        Advance();
+    } else if (nt.type == TokenType::STRING_LITERAL) {
+        try {
+            count = static_cast<int64_t>(std::atoll(nt.lexeme.c_str()));
+        } catch (...) {
+            count = 0;
+        }
+        Advance();
+    } else if (nt.type == TokenType::OP_MINUS) {
+        // 允许 `-` 前缀（罕见）：仅用于让负数 INTERVAL 与 SUB 算符正确组合。
+        Advance();
+        const Token& next = CurrentToken();
+        int64_t v = 0;
+        if (next.type == TokenType::INTEGER_LITERAL) {
+            v = static_cast<int64_t>(std::atoll(next.lexeme.c_str()));
+        } else if (next.type == TokenType::STRING_LITERAL) {
+            v = static_cast<int64_t>(std::atoll(next.lexeme.c_str()));
+        } else {
+            throw CompilerException(ErrorStage::SYNTAX,
+                "expected number after INTERVAL -", next.line, next.column);
+        }
+        count = -v;
+        Advance();
+    } else {
+        throw CompilerException(ErrorStage::SYNTAX,
+            "expected number after INTERVAL (got '" + nt.lexeme + "')",
+            nt.line, nt.column);
+    }
+    IntervalUnit unit;
+    const Token& ut = CurrentToken();
+    bool matched = false;
+    switch (ut.type) {
+        case TokenType::KEYWORD_YEAR:   unit = IntervalUnit::YEAR;   matched = true; break;
+        case TokenType::KEYWORD_MONTH:  unit = IntervalUnit::MONTH;  matched = true; break;
+        case TokenType::KEYWORD_DAY:    unit = IntervalUnit::DAY;    matched = true; break;
+        case TokenType::KEYWORD_HOUR:   unit = IntervalUnit::HOUR;   matched = true; break;
+        case TokenType::KEYWORD_MINUTE: unit = IntervalUnit::MINUTE; matched = true; break;
+        case TokenType::KEYWORD_SECOND: unit = IntervalUnit::SECOND; matched = true; break;
+        default: break;
+    }
+    if (!matched) {
+        throw CompilerException(ErrorStage::SYNTAX,
+            std::string("expected YEAR/MONTH/DAY/HOUR/MINUTE/SECOND after INTERVAL count (got '")
+            + ut.lexeme + "')",
+            ut.line, ut.column);
+    }
+    Advance();  // unit
+    return std::make_shared<IntervalExprNode>(count, static_cast<int>(unit));
+}
+
 // ================= 40_txn_view_udf：事务 / 视图 / 触发器 / UDF =================
 
 // BEGIN [TRANSACTION]
@@ -1765,9 +1974,16 @@ StatementPtr Parser::ParseCommitStatement() {
     return std::make_shared<CommitStatement>();
 }
 
-// ROLLBACK
+// ROLLBACK [TO name]
 StatementPtr Parser::ParseRollbackStatement() {
     Expect(TokenType::KEYWORD_ROLLBACK, "expected ROLLBACK");
+    // 可选 TO name —— 若有则升级为 ROLLBACK TO 语句。
+    if (Match(TokenType::KEYWORD_TO)) {
+        Token t = Expect(TokenType::IDENTIFIER, "expected savepoint name");
+        auto stmt = std::make_shared<RollbackToStatement>();
+        stmt->savepoint_name = t.lexeme;
+        return stmt;
+    }
     return std::make_shared<RollbackStatement>();
 }
 
@@ -1940,8 +2156,12 @@ StatementPtr Parser::ParseDropTriggerStatement() {
 
 // CREATE FUNCTION name(args) RETURNS type
 // BEGIN
-//     RETURN expr;
+//     <stmts...>
 // END;
+//
+// 函数体是有序语句集合，由 ParseFunctionBodyStatement 反复调用直到 KEYWORD_END。
+// 每条语句末尾必须有 ';'（main.cpp 的 HasCompleteStatement 已经知道 BEGIN/END 块内的
+// ';' 不算语句终止，因此这里在 BEGIN...END 内仍然逐条 StatementPtr 解析）。
 StatementPtr Parser::ParseCreateFunctionStatement() {
     if (CurrentToken().type == TokenType::KEYWORD_CREATE) {
         Advance();
@@ -2000,18 +2220,170 @@ StatementPtr Parser::ParseCreateFunctionStatement() {
         }
         Expect(TokenType::RIGHT_PAREN, "expected ')' after return type parameter");
     }
-    // 函数体 BEGIN ... END；最小实现：只解析单个 RETURN 表达式。
+    // 函数体 BEGIN ... END。允许体为空（无语句，但要求至少一条 RETURN 由语义层
+    // 强制）。每条语句以 ';' 结尾，分号缺失会抛语法错。
     Expect(TokenType::KEYWORD_BEGIN, "expected BEGIN to start function body");
-    // 跳过中间语句（仅占位）
-    while (!Check(TokenType::KEYWORD_RETURN) && !IsAtEnd() &&
-           !Check(TokenType::KEYWORD_END)) {
-        Advance();
-    }
-    Expect(TokenType::KEYWORD_RETURN, "expected RETURN in function body");
-    stmt->body_expr = ParseExpression();
-    Expect(TokenType::SEMICOLON, "expected ';' after RETURN");
+    stmt->body_statements = ParseFunctionBodyUntil(TokenType::KEYWORD_END);
     Expect(TokenType::KEYWORD_END, "expected END to close function body");
     return stmt;
+}
+
+// 解析一段语句直到遇到 end_token（不含 end_token 本身）。
+// 这是 BEGIN...END / IF...END IF / WHILE...END WHILE 块共用的"序列解析器"。
+//
+// 块内允许出现空语句 / 多余的分号（例如 IF 体内 `RETURN 'positive';;` 或
+// 嵌套 END 后残留的 `;`）。每次迭代开头先把连续 '; ' 都吃掉，再看是否到达
+// end_token；若到达则退出；否则解析一条语句。
+std::vector<StatementPtr> Parser::ParseFunctionBodyUntil(TokenType end_token) {
+    std::vector<StatementPtr> stmts;
+    while (!IsAtEnd()) {
+        // 跳过块内的空语句（连续分号）
+        while (Match(TokenType::SEMICOLON)) {}
+        if (IsAtEnd() || Check(end_token)) break;
+        // END 关键字必须留给外层结束块；块内不允许裸 "END" 语句
+        if (Check(TokenType::KEYWORD_END)) {
+            const Token& cur = CurrentToken();
+            throw CompilerException(ErrorStage::SYNTAX,
+                "unexpected END inside function body", cur.line, cur.column);
+        }
+        StatementPtr s = ParseFunctionBodyStatement();
+        if (s) stmts.push_back(std::move(s));
+    }
+    return stmts;
+}
+
+// 解析 UDF 函数体内的一条语句：
+//   RETURN [expr];
+//   DECLARE name TYPE;
+//   SET name = expr;     （lhs 可为 NEW.col / OLD.col）
+//   IF cond THEN stmts [ELSEIF cond THEN stmts]... [ELSE stmts] END IF;
+//   WHILE cond DO stmts END WHILE;
+//
+// 每条语句以 ';' 结尾（位于 ParseStatement 的入口，';' 已被 Parse() 顶层消耗，
+// 但函数体内仍要每条手动消费，避免误切到下一条顶层 SQL）。
+StatementPtr Parser::ParseFunctionBodyStatement() {
+    const Token& cur = CurrentToken();
+    if (cur.type == TokenType::KEYWORD_RETURN) {
+        Advance();  // RETURN
+        ExprPtr ret_expr = nullptr;
+        if (!Check(TokenType::SEMICOLON) && !IsAtEnd()) {
+            ret_expr = ParseExpression();
+        }
+        Match(TokenType::SEMICOLON);
+        return std::make_shared<ReturnStatement>(ret_expr);
+    }
+    if (cur.type == TokenType::KEYWORD_DECLARE) {
+        Advance();  // DECLARE
+        Token vname = Expect(TokenType::IDENTIFIER, "expected variable name after DECLARE");
+        const Token& ty = CurrentToken();
+        std::string data_type;
+        int32_t char_length = -1;
+        if (ty.type == TokenType::KEYWORD_INT) { data_type = "INT"; Advance(); }
+        else if (ty.type == TokenType::KEYWORD_VARCHAR) { data_type = "VARCHAR"; Advance(); }
+        else if (ty.type == TokenType::KEYWORD_FLOAT) { data_type = "FLOAT"; Advance(); }
+        else {
+            const Token& bad = CurrentToken();
+            throw CompilerException(ErrorStage::SYNTAX,
+                "DECLARE supports only INT / FLOAT / VARCHAR types",
+                bad.line, bad.column);
+        }
+        if (Match(TokenType::LEFT_PAREN)) {
+            if (CurrentToken().type == TokenType::INTEGER_LITERAL) {
+                try {
+                    char_length = static_cast<int32_t>(std::stol(CurrentToken().lexeme));
+                } catch (...) { char_length = -1; }
+                Advance();
+            }
+            Expect(TokenType::RIGHT_PAREN, "expected ')' after type parameter");
+        }
+        Match(TokenType::SEMICOLON);
+        return std::make_shared<DeclareVarStatement>(vname.lexeme, data_type, char_length);
+    }
+    if (cur.type == TokenType::KEYWORD_SET) {
+        Advance();  // SET
+        // 解析 lhs：可能是 name / NEW.col / OLD.col。
+        std::string target;
+        if (CurrentToken().type == TokenType::KEYWORD_NEW ||
+            CurrentToken().type == TokenType::KEYWORD_OLD ||
+            CurrentToken().type == TokenType::IDENTIFIER) {
+            std::string prefix = CurrentToken().lexeme;
+            Advance();
+            if (Match(TokenType::DOT)) {
+                Token col = Expect(TokenType::IDENTIFIER,
+                    "expected column name after NEW/OLD '.'");
+                target = prefix + "." + col.lexeme;
+            } else {
+                target = prefix;
+            }
+        } else {
+            const Token& bad = CurrentToken();
+            throw CompilerException(ErrorStage::SYNTAX,
+                "expected variable name after SET",
+                bad.line, bad.column);
+        }
+        Expect(TokenType::OP_EQUAL, "expected '=' in SET assignment");
+        ExprPtr rhs = ParseExpression();
+        Match(TokenType::SEMICOLON);
+        return std::make_shared<SetVarStatement>(target, rhs);
+    }
+    if (cur.type == TokenType::KEYWORD_IF) {
+        Advance();  // IF
+        ExprPtr cond = ParseExpression();
+        Expect(TokenType::KEYWORD_THEN, "expected THEN in IF");
+        auto stmt = std::make_shared<IfStatement>();
+        stmt->condition = cond;
+        // THEN 体：解析直到 ELSE / ELSEIF / END。
+        auto parse_branch_until = [&](TokenType t1, TokenType t2, TokenType t3) {
+            std::vector<StatementPtr> out;
+            while (!IsAtEnd()) {
+                // 跳过空语句（连续分号）
+                while (Match(TokenType::SEMICOLON)) {}
+                if (IsAtEnd()) break;
+                if (Check(t1) || Check(t2) || Check(t3)) break;
+                if (Check(TokenType::KEYWORD_END)) {
+                    const Token& cur2 = CurrentToken();
+                    throw CompilerException(ErrorStage::SYNTAX,
+                        "unexpected END inside IF branch", cur2.line, cur2.column);
+                }
+                StatementPtr s = ParseFunctionBodyStatement();
+                if (s) out.push_back(std::move(s));
+            }
+            return out;
+        };
+        stmt->then_body = parse_branch_until(
+            TokenType::KEYWORD_ELSEIF, TokenType::KEYWORD_ELSE, TokenType::KEYWORD_END);
+        // 循环消费 ELSEIF
+        while (Match(TokenType::KEYWORD_ELSEIF)) {
+            IfStatement::ElseIfClause ec;
+            ec.condition = ParseExpression();
+            Expect(TokenType::KEYWORD_THEN, "expected THEN in ELSEIF");
+            ec.body = parse_branch_until(
+                TokenType::KEYWORD_ELSEIF, TokenType::KEYWORD_ELSE, TokenType::KEYWORD_END);
+            stmt->elseif_clauses.push_back(std::move(ec));
+        }
+        if (Match(TokenType::KEYWORD_ELSE)) {
+            stmt->else_body = parse_branch_until(
+                TokenType::KEYWORD_END, TokenType::KEYWORD_END, TokenType::KEYWORD_END);
+        }
+        Expect(TokenType::KEYWORD_END, "expected END to close IF");
+        Expect(TokenType::KEYWORD_IF, "expected IF after END in IF statement");
+        return stmt;
+    }
+    if (cur.type == TokenType::KEYWORD_WHILE) {
+        Advance();  // WHILE
+        ExprPtr cond = ParseExpression();
+        Expect(TokenType::KEYWORD_DO, "expected DO in WHILE");
+        auto stmt = std::make_shared<WhileStatement>();
+        stmt->condition = cond;
+        stmt->body = ParseFunctionBodyUntil(TokenType::KEYWORD_END);
+        Expect(TokenType::KEYWORD_END, "expected END to close WHILE");
+        Expect(TokenType::KEYWORD_WHILE, "expected WHILE after END in WHILE statement");
+        return stmt;
+    }
+    const Token& bad = CurrentToken();
+    throw CompilerException(ErrorStage::SYNTAX,
+        "unexpected token in function body: '" + bad.lexeme + "'",
+        bad.line, bad.column);
 }
 
 // DROP FUNCTION [IF EXISTS] name
@@ -2039,6 +2411,78 @@ StatementPtr Parser::ParseDropFunctionStatement() {
     Token name = Expect(TokenType::IDENTIFIER, "expected function name");
     stmt->function_name = name.lexeme;
     return stmt;
+}
+
+// ============ 46_meta: EXPLAIN / SHOW ============
+
+// EXPLAIN [ANALYZE] <statement>
+//
+// EXPLAIN 是语句前缀：识别后消耗可选 ANALYZE，再把当前 token 重新抛回
+// ParseStatement() 递归解析。递归调用会跳过任何 EXPLAIN/SHOW/DESCRIBE 前缀
+// 顶层分支（因为它们的当前 token 已经不是这些关键字），最终命中 SELECT /
+// INSERT / DDL 等真实语句类型。analyze 当前仅记录；执行期若见 analyze==true
+// 则打印 "EXPLAIN ANALYZE not supported" 而不输出计划树。
+StatementPtr Parser::ParseExplainStatement() {
+    Expect(TokenType::KEYWORD_EXPLAIN, "expected EXPLAIN");
+    auto stmt = std::make_shared<ExplainStatement>();
+    // 可选 ANALYZE：ANALYZE 在本词法器未注册为关键字，lexer 会将其识别为
+    // 普通 IDENTIFIER。这里兼容两种情况：先把 ANALYZE 当作标识符匹配。
+    if (CurrentToken().type == TokenType::IDENTIFIER &&
+        CurrentToken().lexeme == "ANALYZE") {
+        Advance();
+        stmt->analyze = true;
+    }
+    // 解析内部语句。这里递归调用 ParseStatement() 而不是直接拼装：保持与
+    // 顶层语句调度完全一致的优先级（含 WITH/SET OP/CTE/INSERT ... SELECT 等）。
+    if (IsAtEnd()) {
+        throw CompilerException(ErrorStage::SYNTAX,
+            "expected statement after EXPLAIN");
+    }
+    stmt->inner = ParseStatement();
+    if (!stmt->inner) {
+        throw CompilerException(ErrorStage::SYNTAX,
+            "expected statement after EXPLAIN");
+    }
+    return stmt;
+}
+
+// SHOW TABLES | SHOW COLUMNS FROM t | SHOW INDEX FROM t | SHOW CREATE TABLE t
+//
+// 仅这 4 种子命令形式；其他 SHOW 形式（SHOW DATABASES 等）按语法错误处理。
+// 注意：本任务的 EXPLAIN 不覆盖 SHOW，SHOW 不内嵌任何子语句。
+StatementPtr Parser::ParseShowStatement() {
+    Expect(TokenType::KEYWORD_SHOW, "expected SHOW");
+    auto stmt = std::make_shared<ShowStatement>();
+    if (Match(TokenType::KEYWORD_TABLES)) {
+        stmt->kind = ShowStatement::Kind::TABLES;
+        return stmt;
+    }
+    if (Match(TokenType::KEYWORD_COLUMNS)) {
+        Expect(TokenType::KEYWORD_FROM, "expected FROM after SHOW COLUMNS");
+        Token t = Expect(TokenType::IDENTIFIER, "expected table name after FROM");
+        stmt->kind = ShowStatement::Kind::COLUMNS;
+        stmt->target_table = t.lexeme;
+        return stmt;
+    }
+    if (Match(TokenType::KEYWORD_INDEX)) {
+        Expect(TokenType::KEYWORD_FROM, "expected FROM after SHOW INDEX");
+        Token t = Expect(TokenType::IDENTIFIER, "expected table name after FROM");
+        stmt->kind = ShowStatement::Kind::INDEX;
+        stmt->target_table = t.lexeme;
+        return stmt;
+    }
+    if (Check(TokenType::KEYWORD_CREATE) &&
+        PeekToken(1).type == TokenType::KEYWORD_TABLE) {
+        Advance(); // CREATE
+        Advance(); // TABLE
+        Token t = Expect(TokenType::IDENTIFIER, "expected table name after SHOW CREATE TABLE");
+        stmt->kind = ShowStatement::Kind::CREATE_TABLE;
+        stmt->target_table = t.lexeme;
+        return stmt;
+    }
+    throw CompilerException(ErrorStage::SYNTAX,
+        "unsupported SHOW form; expected TABLES, COLUMNS FROM tbl, "
+        "INDEX FROM tbl, or CREATE TABLE tbl");
 }
 
 }  // namespace sqlcompiler

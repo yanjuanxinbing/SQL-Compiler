@@ -72,13 +72,24 @@ void DiskManager::ReadPage(page_id_t page_id, char* data) {
     }
 }
 
-void DiskManager::WritePage(page_id_t page_id, const char* data) {
+void DiskManager::WritePage(page_id_t page_id, const char* data, bool force) {
     std::lock_guard<std::mutex> lock(db_io_latch_);
     EnsureFileCapacity(page_id);
     long long offset = static_cast<long long>(page_id) * PAGE_SIZE;
     db_io_.seekp(offset);
     db_io_.write(data, PAGE_SIZE);
     db_io_.flush();
+    // Phase B：COMMIT 路径调用 force=true，把 dirty page 强制刷到磁盘；
+    // 默认 false 保留 Phase A 行为以减少同步开销。
+    if (force) {
+        db_io_.sync();  // std::fstream::sync 调用 OS fsync
+    }
+}
+
+void DiskManager::Sync() {
+    std::lock_guard<std::mutex> lock(db_io_latch_);
+    db_io_.flush();
+    db_io_.sync();  // 调用 OS fsync/FlushFileBuffers
 }
 
 int DiskManager::GetNumPages() const {

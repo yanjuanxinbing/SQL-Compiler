@@ -44,6 +44,9 @@ file(GLOB_RECURSE SQLCOMPILER_LIB_SOURCES
 
     # ---- 数据库总入口（门面类） ----
     ${CMAKE_SOURCE_DIR}/src/db/*.cpp
+
+    # ---- 事务子系统（Phase A：内存 undo log；Phase B：WAL + 恢复） ----
+    ${CMAKE_SOURCE_DIR}/src/txn/*.cpp
 )
 
 # 编译为静态库，方便主程序与未来的测试共同链接

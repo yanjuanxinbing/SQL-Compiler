@@ -1,6 +1,7 @@
 #include "execution/CreateTableExecutor.h"
 
 #include "catalog/IndexInfo.h"
+#include "catalog/SystemCatalog.h"
 #include "common/Error.h"
 
 namespace sqlcompiler {
@@ -26,6 +27,10 @@ void CreateTableExecutor::Init() {
         ci.char_length = cd.char_length;
         ci.is_primary_key = cd.is_primary_key;
         ci.is_not_null = cd.is_not_null;
+        // 把 AST 上的 CHECK / DEFAULT 表达式搬到 ColumnInfo；执行期在
+        // INSERT / UPDATE 路径上兑现这两类约束。两者可空：未声明时为 nullptr。
+        ci.check_expr = cd.check_expr;
+        ci.default_expr = cd.default_expr;
         info.columns.push_back(std::move(ci));
     }
     // 主键分组：表级 PRIMARY KEY(a, b) 必须按「组合唯一」校验，因此分组信息要
@@ -38,8 +43,13 @@ void CreateTableExecutor::Init() {
         }
         if (!inline_pk.empty()) info.primary_keys.push_back(std::move(inline_pk));
     }
-    if (!context_->GetCatalog()->CreateTable(info)) {
+    SystemCatalog* cat = context_->GetCatalog();
+    // Phase B：让 catalog 的内部写路径（sys_tables / sys_indexes）也带上当前
+    // 事务，让 WAL 记录里 txn_id 与 DML 一致。
+    cat->SetActiveTransaction(context_->GetTransaction());
+    if (!cat->CreateTable(info)) {
         // CREATE TABLE IF NOT EXISTS：表已存在则静默成功，不抛错。
+        cat->SetActiveTransaction(nullptr);
         if (!if_not_exists_) {
             throw CompilerException(ErrorStage::SEMANTIC,
                 "table already exists: " + table_name_);
@@ -60,8 +70,9 @@ void CreateTableExecutor::Init() {
         idx.key_columns = info.primary_keys[g];
         idx.is_unique = true;
         std::string ignored_error;
-        context_->GetCatalog()->CreateIndex(idx, &ignored_error);
+        cat->CreateIndex(idx, &ignored_error);
     }
+    cat->SetActiveTransaction(nullptr);
     executed_ = true;
 }
 

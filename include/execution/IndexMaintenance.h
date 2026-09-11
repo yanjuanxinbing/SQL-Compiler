@@ -8,6 +8,7 @@
 #include "index/IndexKey.h"
 #include "storage_engine/Tuple.h"
 #include "storage_engine/Value.h"
+#include "txn/Transaction.h"
 
 namespace sqlcompiler {
 
@@ -34,13 +35,16 @@ void CheckUniqueIndexes(SystemCatalog* catalog, const TableInfo& table_info,
                         const std::vector<Value>& row, const RID* exclude_rid);
 
 // 把一行写入该表的全部索引。任一索引写入失败抛异常。
+// Phase A：txn 非空时把当前事务挂到每棵 B+Tree 上，让写路径抓 undo。
 void InsertIntoIndexes(SystemCatalog* catalog, const TableInfo& table_info,
-                       const std::vector<Value>& row, const RID& rid);
+                       const std::vector<Value>& row, const RID& rid,
+                       Transaction* txn = nullptr);
 
 // 从该表的全部索引中删除一行对应的索引项。
 // 索引项不存在不视为错误：删除路径要尽量幂等，否则一次失配会让后续 DELETE 全部
 // 报错，反而把可恢复的局面变成不可用。
 void DeleteFromIndexes(SystemCatalog* catalog, const TableInfo& table_info,
-                       const std::vector<Value>& row, const RID& rid);
+                       const std::vector<Value>& row, const RID& rid,
+                       Transaction* txn = nullptr);
 
 }  // namespace sqlcompiler

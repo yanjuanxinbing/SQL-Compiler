@@ -170,6 +170,8 @@ PlanNodePtr Planner::CreatePlan(const StatementPtr& statement) {
             return PlanCommit(*std::static_pointer_cast<CommitStatement>(statement));
         case NodeType::ROLLBACK_STMT:
             return PlanRollback(*std::static_pointer_cast<RollbackStatement>(statement));
+        case NodeType::ROLLBACK_TO_STMT:
+            return PlanRollbackTo(*std::static_pointer_cast<RollbackToStatement>(statement));
         case NodeType::SAVEPOINT_STMT:
             return PlanSavepoint(*std::static_pointer_cast<SavepointStatement>(statement));
         case NodeType::RELEASE_SAVEPOINT_STMT:
@@ -186,6 +188,11 @@ PlanNodePtr Planner::CreatePlan(const StatementPtr& statement) {
             return PlanCreateFunction(*std::static_pointer_cast<CreateFunctionStatement>(statement));
         case NodeType::DROP_FUNCTION_STMT:
             return PlanDropFunction(*std::static_pointer_cast<DropFunctionStatement>(statement));
+        // ---- 46_meta ----
+        case NodeType::EXPLAIN_STMT:
+            return PlanExplain(*std::static_pointer_cast<ExplainStatement>(statement));
+        case NodeType::SHOW_STMT:
+            return PlanShow(*std::static_pointer_cast<ShowStatement>(statement));
         default:
             return nullptr;
     }
@@ -364,6 +371,13 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
 }
 
 PlanNodePtr Planner::PlanInsert(const InsertStatement& stmt) {
+    // 43_upsert: ON DUPLICATE KEY UPDATE 路径走 UpsertNode，由 UpsertExecutor 处理。
+    // 注意：目前仅支持 VALUES 数据源（query 非空时无候选行，无法直接构造冲突行）。
+    if (stmt.has_on_duplicate) {
+        return std::make_shared<UpsertNode>(stmt.table_name, stmt.columns,
+                                            stmt.values_list,
+                                            stmt.upsert_assignments);
+    }
     auto node = std::make_shared<InsertNode>(stmt.table_name, stmt.columns, stmt.values_list);
     if (stmt.query) {
         // INSERT INTO dst SELECT ... —— 把 SELECT/WITH/SetOp 转换为内部子计划，
@@ -726,26 +740,38 @@ PlanNodePtr Planner::PlanSetOperation(const SetOperationStatement& stmt) {
     return current;
 }
 
-// ============ 40_txn_view_udf：事务 / 视图 / 触发器 / UDF ============
+// ============ 48_acid_undo：事务控制节点 ============
+//
+// Phase A 把原 no-op 节点替换为带语义的计划节点，由 TransactionExecutor
+// 转发到 TransactionManager。Phase B/C/D 不在此处改动。
 
 PlanNodePtr Planner::PlanBegin(const BeginStatement&) {
-    return std::make_shared<NoOpNode>("BEGIN");
+    return std::make_shared<BeginTxnNode>();
 }
 
 PlanNodePtr Planner::PlanCommit(const CommitStatement&) {
-    return std::make_shared<NoOpNode>("COMMIT");
+    return std::make_shared<CommitTxnNode>();
 }
 
 PlanNodePtr Planner::PlanRollback(const RollbackStatement&) {
-    return std::make_shared<NoOpNode>("ROLLBACK");
+    return std::make_shared<RollbackTxnNode>();
 }
 
 PlanNodePtr Planner::PlanSavepoint(const SavepointStatement& stmt) {
-    return std::make_shared<NoOpNode>("SAVEPOINT " + stmt.savepoint_name);
+    return std::make_shared<SavepointNode>(stmt.savepoint_name);
 }
 
 PlanNodePtr Planner::PlanReleaseSavepoint(const ReleaseSavepointStatement& stmt) {
-    return std::make_shared<NoOpNode>("RELEASE SAVEPOINT " + stmt.savepoint_name);
+    // 解析器已支持 ROLLBACK TO name，但 Planner 还没有 PlanRollbackTo 入口——
+    // 这里保留兼容性：原 RELEASE SAVEPOINT 仍走 ReleaseSavepointNode。
+    // Phase A 测试覆盖了 SAVEPOINT / ROLLBACK TO sp，由 BeginTxnNode/Rollback
+    // 路径合流；单独的 ROLLBACK TO 仅在 48_acid_undo 测试里需要，先支持之。
+    return std::make_shared<ReleaseSavepointNode>(stmt.savepoint_name);
+}
+
+// 新增：PlanRollbackTo —— 由 parser 检测 "ROLLBACK TO" 关键字后调用。
+PlanNodePtr Planner::PlanRollbackTo(const RollbackToStatement& stmt) {
+    return std::make_shared<RollbackToSavepointNode>(stmt.savepoint_name);
 }
 
 PlanNodePtr Planner::PlanCreateView(const CreateViewStatement& stmt) {
@@ -797,7 +823,7 @@ PlanNodePtr Planner::PlanCreateFunction(const CreateFunctionStatement& stmt) {
         def.parameters = stmt.parameters;
         def.return_type = stmt.return_type;
         def.return_char_length = stmt.return_char_length;
-        def.body_expr = stmt.body_expr;
+        def.body_statements = stmt.body_statements;
         catalog_->CreateFunction(def);
     }
     return std::make_shared<CreateFunctionNode>(stmt.function_name);
@@ -812,6 +838,43 @@ PlanNodePtr Planner::PlanDropFunction(const DropFunctionStatement& stmt) {
     return n;
 }
 
+// ============ 46_meta: EXPLAIN / SHOW ============
+
+// EXPLAIN [ANALYZE] <stmt>
+//
+// 把 inner 语句先走一遍 Planner（递归 CreatePlan）拿到计划子树，再包成
+// ExplainNode。把 inner 计划挂到 children[0]，让 ExplainExecutor 在 Init 阶段
+// 可以直接用 inner->ToString() 拿到计划文本。
+//
+// 注意：我们不在这里执行 inner；inner 是 EXPLAIN 时本就不该真正跑（任务文档
+// 要求「不执行，只展示计划」）。
+PlanNodePtr Planner::PlanExplain(const ExplainStatement& stmt) {
+    auto node = std::make_shared<ExplainNode>(stmt.analyze);
+    if (stmt.inner) {
+        PlanNodePtr inner_plan = CreatePlan(stmt.inner);
+        if (inner_plan) {
+            // 执行器按 children[0] 拿 inner 计划即可，不进入常规调度。
+            node->children.push_back(inner_plan);
+        }
+    }
+    return node;
+}
+
+// SHOW TABLES / SHOW COLUMNS / SHOW INDEX / SHOW CREATE TABLE
+//
+// 纯元数据查询；执行器不依赖 children，直接读 catalog。target_table 在
+// TABLES 形式下为空。
+PlanNodePtr Planner::PlanShow(const ShowStatement& stmt) {
+    ShowNode::Kind kind = ShowNode::Kind::TABLES;
+    switch (stmt.kind) {
+        case ShowStatement::Kind::TABLES:       kind = ShowNode::Kind::TABLES; break;
+        case ShowStatement::Kind::COLUMNS:      kind = ShowNode::Kind::COLUMNS; break;
+        case ShowStatement::Kind::INDEX:        kind = ShowNode::Kind::INDEX; break;
+        case ShowStatement::Kind::CREATE_TABLE: kind = ShowNode::Kind::CREATE_TABLE; break;
+    }
+    return std::make_shared<ShowNode>(kind, stmt.target_table);
+}
+
 // 视图展开：把 SELECT FROM view_name 改写为 derived_table（视图 SELECT）。
 // 注意：仅在 from_table 命中视图且无 JOIN 时做整体替换；后续要扩展带 JOIN
 // 的视图时可继续在本函数中处理。
@@ -822,7 +885,7 @@ bool Planner::TryExpandView(SelectStatement& stmt) {
     if (!stmt.joins.empty()) return false;
     // 必须存在 FROM table（不能是 derived_table 的占位）。
     if (stmt.derived_table) return false;
-    const SystemCatalog::ViewDefinition* view = catalog_->GetView(stmt.from_table);
+    const SystemCatalog::ViewDefinition* view = catalog_->LookupView(stmt.from_table);
     if (view == nullptr || view->query == nullptr) return false;
     // 把视图的 SELECT 复制为 derived_table，并把 from_table 替换为视图别名
     // （让后续 SeqScanNode.table_name == alias 走「派生表占位」路径）。

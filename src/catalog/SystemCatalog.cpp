@@ -1,10 +1,58 @@
 #include "catalog/SystemCatalog.h"
 
+#include "lexer/Lexer.h"
+#include "parser/Parser.h"
+#include "txn/LogManager.h"
+
+#include <algorithm>
 #include <cstring>
+#include <sstream>
 
 namespace sqlcompiler {
 
 namespace {
+
+// 把落盘的 CHECK / DEFAULT 文本重新解析为 AST。失败时返回 nullptr 并让
+// 调用方静默继续 —— CHECK/DEFAULT 是"约束增强"，缺失不应阻塞表被打开。
+// 抛异常的代价是下次启动后所有用户都拿不到这张表，这与"约束可选"的语义
+// 不符。
+ExprPtr ReParseExprOrNull(const std::string& text) {
+    if (text.empty()) return nullptr;
+    try {
+        Lexer lexer(text);
+        std::vector<Token> tokens = lexer.Tokenize();
+        // 兜底追加一个 END_OF_FILE 防止某些路径上 Tokenize 未自动收尾
+        if (tokens.empty() || tokens.back().type != TokenType::END_OF_FILE) {
+            tokens.emplace_back(TokenType::END_OF_FILE, "", 0, 0);
+        }
+        Parser parser(std::move(tokens));
+        StatementPtr stmt = parser.Parse();
+        if (!stmt) return nullptr;
+        // 我们落盘的内容来自 Expr::ToString()，不属于完整语句；但 Parser 入口
+        // 是 ParseStatement()。这里退而求其次：尝试解析为 SELECT 表达式别名，
+        // 拿到 AST 中的第一个 Expr。
+        //
+        // 实际策略：再起一次"只解析表达式"路径 —— 借助 Parser 的内部入口
+        // ParseExpression()。但 ParseExpression 是 private，因此这里临时走
+        // 一条 hack：把表达式包成 "SELECT <expr>" 走 ParseSelectStatement，
+        // 然后从 SelectStatement 的 select_list 取第一个元素。
+        std::string wrapped = "SELECT " + text;
+        Lexer l2(wrapped);
+        std::vector<Token> t2 = l2.Tokenize();
+        if (t2.empty() || t2.back().type != TokenType::END_OF_FILE) {
+            t2.emplace_back(TokenType::END_OF_FILE, "", 0, 0);
+        }
+        Parser p2(std::move(t2));
+        StatementPtr s2 = p2.Parse();
+        if (!s2) return nullptr;
+        if (s2->GetType() != NodeType::SELECT_STMT) return nullptr;
+        auto* sel = static_cast<SelectStatement*>(s2.get());
+        if (sel->select_list.empty()) return nullptr;
+        return sel->select_list[0];
+    } catch (...) {
+        return nullptr;
+    }
+}
 
 constexpr const char* kSysTablesKey = "__sys_tables__";
 // 索引目录堆。它的首页 id 以一条特殊记录（表名为该常量、零列）存放在
@@ -24,11 +72,19 @@ constexpr const char* kSysIndexesKey = "__sys_indexes__";
 //                           4=DOUBLE, 5=TEXT, 6=CHAR, 7=STRING)
 //     uint8  flags         (bit0=PRIMARY KEY, bit1=NOT NULL)
 //     uint16 char_length + 1  (0 表示未声明长度；即 VARCHAR(50) 存 51)
+//     uint16 check_expr_text_len (0 表示无 CHECK)
+//     char[check_expr_text_len]  check_expr_text   （AST ToString 的可重新解析文本）
+//     uint16 default_expr_text_len (0 表示无 DEFAULT)
+//     char[default_expr_text_len]  default_expr_text
 //   uint16 num_pk_groups
 //   for each pk group:
 //     uint16 num_cols_in_group
 //     for each col: uint16 name_len + char[name_len]
 //   uint32 first_page_id
+//
+// 备注：CHECK / DEFAULT 这里只存「可重新解析的文本」，落盘只多 ~ 几十字节，
+// 但保留了完整的语义信息；启动时 DecodeTableMetadata 用 Parser 把文本解析
+// 回 AST 接到 ColumnInfo.check_expr / default_expr。
 
 uint8_t DataTypeId(const std::string& s) {
     // 归一化为大写再编码，避免CREATE TABLE中大小写写法不同导致编码失败
@@ -43,6 +99,11 @@ uint8_t DataTypeId(const std::string& s) {
     if (up == "TEXT") return 5;
     if (up == "CHAR") return 6;
     if (up == "STRING") return 7;
+    // 45_datetime: DATE / TIMESTAMP 持久化为 VARCHAR（按 YYYY-MM-DD 或
+    // YYYY-MM-DD HH:MM:SS 文本格式），但保留独立 DataTypeId 以便未来切到
+    // 原生二进制布局时无需再次迁移 schema；wire 格式上额外 ID 不影响旧库。
+    if (up == "DATE") return 8;
+    if (up == "TIMESTAMP") return 9;
     return 8;
 }
 
@@ -56,6 +117,8 @@ const char* DataTypeName(uint8_t id) {
         case 5: return "TEXT";
         case 6: return "CHAR";
         case 7: return "STRING";
+        case 8: return "DATE";
+        case 9: return "TIMESTAMP";
     }
     return "VARCHAR";
 }
@@ -116,6 +179,16 @@ std::string EncodeTableInfo(const TableInfo& info, page_id_t first_page_id) {
                                ? static_cast<uint16_t>(c.char_length + 1)
                                : 0;
         WriteU16(buf, enc_len);
+        // CHECK / DEFAULT 表达式：以 AST->ToString() 的可重新解析文本落盘。
+        // 空文本表示未声明；旧版数据库写出的 blob 没有这两段，ReadU16 会读到 0。
+        std::string check_text;
+        if (c.check_expr) check_text = c.check_expr->ToString();
+        WriteU16(buf, static_cast<uint16_t>(check_text.size()));
+        if (!check_text.empty()) buf.append(check_text);
+        std::string default_text;
+        if (c.default_expr) default_text = c.default_expr->ToString();
+        WriteU16(buf, static_cast<uint16_t>(default_text.size()));
+        if (!default_text.empty()) buf.append(default_text);
     }
     WriteU16(buf, static_cast<uint16_t>(info.primary_keys.size()));
     for (const auto& group : info.primary_keys) {
@@ -200,6 +273,38 @@ SystemCatalog::SystemCatalog(BufferPoolManager* buffer_pool_manager)
       sys_indexes_first_page_id_(INVALID_PAGE_ID) {
 }
 
+void SystemCatalog::SetLogManager(LogManager* lm) {
+    log_manager_ = lm;
+    // 把 LogManager 注入到 catalog 已经持有的所有 TableHeap / BPlusTree。
+    // 注：BPlusTree 的 log_manager 是写在 BPlusTree::SetLogManager 上的——
+    // 这里不直接访问私有字段，但通过 public 接口完成。
+    for (auto& kv : table_heaps_) {
+        if (kv.second) kv.second->SetLogManager(lm);
+    }
+    for (auto& kv : index_trees_) {
+        if (kv.second) kv.second->SetLogManager(lm);
+    }
+    if (index_heap_) index_heap_->SetLogManager(lm);
+}
+
+// ---- Phase B helper：把 catalog 持有的所有 heap/tree 在创建/打开之后立即
+// 绑定 log_manager（针对 Bootstrap / LoadFromDisk 之后又新建 heap 的场景）。
+// 直接调用 SetLogManager(lm) 即可（它已经会遍历全部已存在的成员）。
+// 该函数是 SetLogManager 的同义别名，让调用点的语义更明确。
+namespace { void BindWalToAllCatalogMembers(SystemCatalog*, LogManager*) {} }
+
+void SystemCatalog::SetActiveTransaction(Transaction* txn) {
+    // 推到所有 catalog 自有的 TableHeap 与 BPlusTree，让 sys_tables 与
+    // sys_indexes 的写路径正确记录 WAL。
+    for (auto& kv : table_heaps_) {
+        if (kv.second) kv.second->SetActiveTransaction(txn);
+    }
+    for (auto& kv : index_trees_) {
+        if (kv.second) kv.second->SetActiveTransaction(txn);
+    }
+    if (index_heap_) index_heap_->SetActiveTransaction(txn);
+}
+
 SystemCatalog::~SystemCatalog() {
 }
 
@@ -268,6 +373,7 @@ bool SystemCatalog::CreateTable(const TableInfo& table_info) {
     if (!symbol_table_.AddTable(table_info)) return false;
     TableHeap* heap = TableHeap::Create(buffer_pool_manager_);
     if (!heap) return false;
+    if (log_manager_ != nullptr) heap->SetLogManager(log_manager_);
     page_id_t user_pid = heap->GetFirstPageId();
     table_heaps_[table_info.table_name].reset(heap);
     return PersistTableMetadata(table_info);
@@ -309,6 +415,75 @@ bool SystemCatalog::HasTable(const std::string& table_name) const {
 
 const TableInfo* SystemCatalog::GetTable(const std::string& table_name) const {
     return symbol_table_.GetTable(table_name);
+}
+
+std::vector<std::string> SystemCatalog::ListAllTables() const {
+    // SymbolTable::GetAllTableNames() 已返回所有表名；这里过滤掉 __sys_tables__
+    // 与 __sys_indexes__ 两条系统目录条目，避免被 SHOW TABLES 当作用户表展示。
+    std::vector<std::string> names = symbol_table_.GetAllTableNames();
+    std::vector<std::string> out;
+    out.reserve(names.size());
+    for (auto& n : names) {
+        if (n == kSysTablesKey || n == kSysIndexesKey) continue;
+        out.push_back(std::move(n));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::vector<ColumnInfo> SystemCatalog::GetColumnInfos(
+    const std::string& table_name) const {
+    std::vector<ColumnInfo> out;
+    const TableInfo* info = symbol_table_.GetTable(table_name);
+    if (!info) return out;
+    out.reserve(info->columns.size());
+    for (const auto& c : info->columns) {
+        out.push_back(c);  // 浅拷贝：包含 check_expr/default_expr 的 shared_ptr
+    }
+    return out;
+}
+
+std::string SystemCatalog::BuildCreateTableSQL(
+    const std::string& table_name) const {
+    const TableInfo* info = symbol_table_.GetTable(table_name);
+    if (!info) return "";
+    std::ostringstream oss;
+    oss << "CREATE TABLE " << info->table_name << " (";
+    bool first = true;
+    for (const auto& c : info->columns) {
+        if (!first) oss << ", ";
+        first = false;
+        oss << c.name << " " << c.data_type;
+        if (c.data_type == "VARCHAR" || c.data_type == "CHAR") {
+            if (c.char_length > 0) oss << "(" << c.char_length << ")";
+        }
+        if (c.is_primary_key) oss << " PRIMARY KEY";
+        if (c.is_not_null) oss << " NOT NULL";
+        if (c.default_expr) oss << " DEFAULT " << c.default_expr->ToString();
+        if (c.check_expr) oss << " CHECK (" << c.check_expr->ToString() << ")";
+    }
+    // 复合主键：以表级 PRIMARY KEY(...) 形式追加（与 parser 输出一致）。
+    for (const auto& group : info->primary_keys) {
+        if (group.empty()) continue;
+        // 跳过"已被列内 is_primary_key 标记过的单列主键"。
+        if (group.size() == 1) {
+            bool found = false;
+            for (const auto& c : info->columns) {
+                if (c.name == group[0] && c.is_primary_key) { found = true; break; }
+            }
+            if (found) continue;
+        }
+        if (!first) oss << ", ";
+        first = false;
+        oss << "PRIMARY KEY(";
+        for (size_t i = 0; i < group.size(); ++i) {
+            if (i) oss << ", ";
+            oss << group[i];
+        }
+        oss << ")";
+    }
+    oss << ")";
+    return oss.str();
 }
 
 TableHeap* SystemCatalog::GetTableHeap(const std::string& table_name) {
@@ -369,6 +544,44 @@ TableInfo SystemCatalog::DecodeTableMetadata(const Tuple& tuple) const {
         if (p + 2 > end) { info.table_name.clear(); return info; }
         uint16_t enc_len = ReadU16(p);
         ci.char_length = (enc_len == 0) ? -1 : static_cast<int32_t>(enc_len) - 1;
+        // ---- CHECK / DEFAULT 表达式文本（旧库可能没有这两段，做长度探测）----
+        // 探测方法：剩余字节至少要能容纳两个 uint16 长度字段；否则视为
+        // 旧版编码、CHECK/DEFAULT 留空。
+        if (p + 4 > end) {
+            // 旧版 blob：本列无 CHECK/DEFAULT 段
+            ci.check_expr = nullptr;
+            ci.default_expr = nullptr;
+        } else {
+            uint16_t check_len = ReadU16(p);
+            std::string check_text;
+            if (check_len > 0) {
+                if (p + check_len > end) {
+                    info.table_name.clear();
+                    return info;
+                }
+                check_text.assign(p, check_len);
+                p += check_len;
+            }
+            if (p + 2 > end) {
+                // 编码被截断：保守回退
+                info.table_name.clear();
+                return info;
+            }
+            uint16_t default_len = ReadU16(p);
+            std::string default_text;
+            if (default_len > 0) {
+                if (p + default_len > end) {
+                    info.table_name.clear();
+                    return info;
+                }
+                default_text.assign(p, default_len);
+                p += default_len;
+            }
+            // 把文本重新解析为 AST；解析失败时静默退化为 nullptr（CHECK/DEFAULT
+            // 是约束增强，不阻塞表加载）
+            ci.check_expr = ReParseExprOrNull(check_text);
+            ci.default_expr = ReParseExprOrNull(default_text);
+        }
         info.columns.push_back(std::move(ci));
     }
     // 主键分组
@@ -401,12 +614,16 @@ bool SystemCatalog::EnsureSysIndexesHeap() {
     if (sys_indexes_first_page_id_ != INVALID_PAGE_ID) {
         index_heap_.reset(
             TableHeap::Open(buffer_pool_manager_, sys_indexes_first_page_id_));
+        if (index_heap_ != nullptr && log_manager_ != nullptr) {
+            index_heap_->SetLogManager(log_manager_);
+        }
         return index_heap_ != nullptr;
     }
     // 惰性创建：旧版本数据库里没有索引目录堆，首次用到时才建，
     // 这样旧库文件不需要迁移也能打开。
     TableHeap* heap = TableHeap::Create(buffer_pool_manager_);
     if (heap == nullptr) return false;
+    if (log_manager_ != nullptr) heap->SetLogManager(log_manager_);
     index_heap_.reset(heap);
     sys_indexes_first_page_id_ = heap->GetFirstPageId();
 
@@ -449,6 +666,7 @@ void SystemCatalog::LoadIndexesFromDisk() {
     index_heap_.reset(
         TableHeap::Open(buffer_pool_manager_, sys_indexes_first_page_id_));
     if (index_heap_ == nullptr) return;
+    if (log_manager_ != nullptr) index_heap_->SetLogManager(log_manager_);
 
     const std::vector<ValueType> schema = {ValueType::VARCHAR};
     auto iter = index_heap_->Begin();
@@ -471,6 +689,7 @@ bool SystemCatalog::OpenIndexTree(const IndexInfo& index_info) {
     auto tree = BPlusTree::Open(buffer_pool_manager_, index_info.key_types,
                                 index_info.is_unique, index_info.root_page_id);
     if (tree == nullptr) return false;
+    if (log_manager_ != nullptr) tree->SetLogManager(log_manager_);
     index_trees_[index_info.index_name] = std::move(tree);
     return true;
 }
@@ -499,6 +718,7 @@ bool SystemCatalog::CreateIndex(const IndexInfo& index_info, std::string* error)
     auto tree = BPlusTree::Create(buffer_pool_manager_, info.key_types,
                                   info.is_unique);
     if (tree == nullptr) return fail("failed to allocate index root page");
+    if (log_manager_ != nullptr) tree->SetLogManager(log_manager_);
     info.root_page_id = tree->GetRootPageId();
 
     if (!PersistIndexMetadata(info)) {
@@ -532,6 +752,7 @@ void SystemCatalog::ResetIndexesOfTable(const std::string& table_name) {
         auto tree = BPlusTree::Create(buffer_pool_manager_, info.key_types,
                                       info.is_unique);
         if (tree == nullptr) continue;
+        if (log_manager_ != nullptr) tree->SetLogManager(log_manager_);
         info.root_page_id = tree->GetRootPageId();
         index_trees_[info.index_name] = std::move(tree);
         // 根页变了，元数据要跟着落盘
@@ -607,6 +828,22 @@ const SystemCatalog::ViewDefinition* SystemCatalog::GetView(
     return it == views_.end() ? nullptr : &it->second;
 }
 
+const SystemCatalog::ViewDefinition* SystemCatalog::LookupView(
+    const std::string& view_name) const {
+    // 大小写不敏感的回退：UDF / view 调用方可能使用与 CREATE 时不同的大小写。
+    auto it = views_.find(view_name);
+    if (it != views_.end()) return &it->second;
+    std::string upper;
+    upper.reserve(view_name.size());
+    for (char c : view_name) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    for (const auto& kv : views_) {
+        std::string k = kv.first;
+        for (char& c : k) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (k == upper) return &kv.second;
+    }
+    return nullptr;
+}
+
 bool SystemCatalog::CreateFunction(const FunctionDefinition& def) {
     if (def.function_name.empty()) return false;
     if (functions_.count(def.function_name) != 0) return false;
@@ -631,6 +868,21 @@ const SystemCatalog::FunctionDefinition* SystemCatalog::GetFunction(
     return it == functions_.end() ? nullptr : &it->second;
 }
 
+const SystemCatalog::FunctionDefinition* SystemCatalog::LookupFunction(
+    const std::string& name) const {
+    auto it = functions_.find(name);
+    if (it != functions_.end()) return &it->second;
+    std::string upper;
+    upper.reserve(name.size());
+    for (char c : name) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    for (const auto& kv : functions_) {
+        std::string k = kv.first;
+        for (char& c : k) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (k == upper) return &kv.second;
+    }
+    return nullptr;
+}
+
 bool SystemCatalog::CreateTrigger(const TriggerDefinition& def) {
     if (def.trigger_name.empty()) return false;
     if (triggers_.count(def.trigger_name) != 0) return false;
@@ -647,6 +899,91 @@ bool SystemCatalog::DropTrigger(const std::string& trigger_name) {
 
 bool SystemCatalog::HasTrigger(const std::string& trigger_name) const {
     return triggers_.find(trigger_name) != triggers_.end();
+}
+
+std::vector<const SystemCatalog::TriggerDefinition*>
+SystemCatalog::LookupTriggers(const std::string& table_name,
+                              TriggerTiming timing,
+                              TriggerEvent event) const {
+    std::vector<const TriggerDefinition*> out;
+    for (const auto& kv : triggers_) {
+        const TriggerDefinition& d = kv.second;
+        if (d.table_name != table_name) continue;
+        if (d.timing != timing) continue;
+        if (d.event != event) continue;
+        out.push_back(&d);
+    }
+    return out;
+}
+
+// ============================================================================
+// ALTER TABLE 支撑
+// ============================================================================
+
+bool SystemCatalog::DropPersistedTableMetadata(const std::string& table_name) {
+    TableHeap* sys_heap = table_heaps_[kSysTablesKey].get();
+    if (!sys_heap) return false;
+    const std::vector<ValueType> schema = {ValueType::VARCHAR};
+    auto iter = sys_heap->Begin();
+    while (iter.HasNext()) {
+        Tuple t = iter.Next(schema);
+        if (t.ColumnCount() == 0) continue;
+        TableInfo info = DecodeTableMetadata(t);
+        if (info.table_name == table_name) {
+            sys_heap->DeleteTuple(t.GetRid());
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SystemCatalog::PersistTableInfo(const TableInfo& info) {
+    return PersistTableMetadata(info);
+}
+
+bool SystemCatalog::RenameTableHeapKey(const std::string& old_name,
+                                       const std::string& new_name) {
+    if (old_name == new_name) return true;
+    auto it = table_heaps_.find(old_name);
+    if (it == table_heaps_.end()) return false;
+    if (table_heaps_.find(new_name) != table_heaps_.end()) return false;
+    // 系统目录自身与索引目录堆用特殊键名，绝不能被重命名覆盖。
+    if (old_name == kSysTablesKey || new_name == kSysTablesKey ||
+        old_name == kSysIndexesKey || new_name == kSysIndexesKey) {
+        return false;
+    }
+    std::unique_ptr<TableHeap> heap = std::move(it->second);
+    table_heaps_.erase(it);
+    table_heaps_[new_name] = std::move(heap);
+    return true;
+}
+
+void SystemCatalog::DropIndexesForTable(const std::string& table_name) {
+    DropIndexesOfTable(table_name);
+}
+
+bool SystemCatalog::UpdateTableSchema(const std::string& old_name,
+                                      const TableInfo& new_info) {
+    if (!symbol_table_.HasTable(old_name)) return false;
+    // 先失效索引：schema/列名变化后旧索引可能引用不存在的列。
+    DropIndexesForTable(old_name);
+    // 元数据：先删旧记录，再写新记录，避免遗留。
+    DropPersistedTableMetadata(old_name);
+    if (old_name != new_info.table_name) {
+        // RENAME: 移动 TableHeap 句柄。
+        if (!RenameTableHeapKey(old_name, new_info.table_name)) return false;
+    }
+    // 内存态：用新 schema 覆盖。SymbolTable 是基于 lowercase key 的 hash map，
+    // 不能原地改值（const TableInfo* 暴露），只能 Remove + Add。
+    symbol_table_.RemoveTable(old_name);
+    if (!symbol_table_.AddTable(new_info)) {
+        // 极端情况：symbol_table_ 内部冲突——继续执行会让状态不一致，
+        // 因此直接报错并返回 false，让上层决定回滚策略。
+        return false;
+    }
+    // 落盘新元数据。注意：必须在 RenameTableHeapKey 之后调用，因为 PersistTableMetadata
+    // 通过 table_heaps_[info.table_name] 查找首页 id。
+    return PersistTableInfo(new_info);
 }
 
 }  // namespace sqlcompiler

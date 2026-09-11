@@ -12,6 +12,8 @@
 
 namespace sqlcompiler {
 
+class TransactionManager;
+
 // 执行结果：
 //   - 查询类语句（SELECT）：success/column_names/rows 有效
 //   - DML/DDL语句（INSERT/UPDATE/DELETE/CREATE TABLE/DROP TABLE）：
@@ -27,7 +29,8 @@ struct ExecutionResult {
 // 转换为算子树（Executor Tree）并以火山模型驱动其运行，产出最终结果
 class ExecutionEngine {
 public:
-    explicit ExecutionEngine(SystemCatalog* catalog);
+    explicit ExecutionEngine(SystemCatalog* catalog,
+                             TransactionManager* txn_manager = nullptr);
 
     // 执行入口：输入一棵逻辑计划树，返回执行结果
     ExecutionResult Execute(const PlanNodePtr& plan);
@@ -40,8 +43,12 @@ public:
     // 子执行器时复用（作为 public 暴露）。
     ExecutorPtr BuildExecutor(const PlanNodePtr& plan_node, ExecutionContext* context);
 
+    // ---- Phase A ----
+    TransactionManager* GetTransactionManager() const { return txn_manager_; }
+
 private:
     SystemCatalog* catalog_;
+    TransactionManager* txn_manager_;
 
     // 根据表结构构建"列名 -> 下标"的映射，供表达式求值使用
     std::unordered_map<std::string, size_t> BuildColumnIndexMap(const std::string& table_name);

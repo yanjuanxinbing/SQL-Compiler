@@ -59,6 +59,7 @@ bool SemanticAnalyzer::AnalyzeInternal(const StatementPtr& statement, bool& ok) 
         case NodeType::BEGIN_STMT:
         case NodeType::COMMIT_STMT:
         case NodeType::ROLLBACK_STMT:
+        case NodeType::ROLLBACK_TO_STMT:
         case NodeType::SAVEPOINT_STMT:
         case NodeType::RELEASE_SAVEPOINT_STMT:
         case NodeType::CREATE_VIEW_STMT:
@@ -68,6 +69,27 @@ bool SemanticAnalyzer::AnalyzeInternal(const StatementPtr& statement, bool& ok) 
         case NodeType::CREATE_FUNCTION_STMT:
         case NodeType::DROP_FUNCTION_STMT:
             break;
+        // ---- 46_meta: EXPLAIN / SHOW ----
+        // EXPLAIN：递归分析 inner，错误一并累积到 ok。
+        // SHOW：仅在 TABLES 时无需 catalog 校验；COLUMNS/INDEX/CREATE_TABLE
+        //       时校验 target_table 是否存在。
+        case NodeType::EXPLAIN_STMT: {
+            auto ex = std::static_pointer_cast<ExplainStatement>(statement);
+            if (ex->inner) ok &= AnalyzeInternal(ex->inner, ok);
+            break;
+        }
+        case NodeType::SHOW_STMT: {
+            auto sh = std::static_pointer_cast<ShowStatement>(statement);
+            if (sh->kind == ShowStatement::Kind::COLUMNS ||
+                sh->kind == ShowStatement::Kind::INDEX ||
+                sh->kind == ShowStatement::Kind::CREATE_TABLE) {
+                if (!CheckTableExists(sh->target_table)) {
+                    AddError("table not found: " + sh->target_table);
+                    ok = false;
+                }
+            }
+            break;
+        }
         case NodeType::SET_OP_STMT: {
             auto so = std::static_pointer_cast<SetOperationStatement>(statement);
             // 列数与类型兼容性：左右两侧 SELECT 列表需有相同数量的列。
@@ -327,6 +349,27 @@ bool SemanticAnalyzer::AnalyzeInsert(const InsertStatement& stmt) {
             ok = false;
         }
     }
+    // 43_upsert: ON DUPLICATE KEY UPDATE 仅在 VALUES 路径下合法；
+    // INSERT ... SELECT 不支持（候选行不可枚举）。
+    if (stmt.has_on_duplicate) {
+        if (stmt.query) {
+            AddError("ON DUPLICATE KEY UPDATE is not supported with INSERT ... SELECT");
+            ok = false;
+        }
+        if (stmt.upsert_assignments.empty()) {
+            AddError("ON DUPLICATE KEY UPDATE requires at least one assignment");
+            ok = false;
+        }
+        // 校验每个被赋值的列存在于目标表中；表达式 CheckExpressionMulti 允许
+        // 引用目标表的列 + 解析 VALUES(col)。
+        std::vector<std::pair<std::string, ExprPtr>> valid_assigns;
+        for (const auto& kv : stmt.upsert_assignments) {
+            ok &= CheckColumnExists(stmt.table_name, kv.first);
+            // 表达式里允许 ColumnRefExpr（目标表现有列）+ UpsertValuesRefExpr
+            // （VALUES(col)）+ 其它表达式；统一交给 CheckExpression 校验。
+            ok &= CheckExpression(kv.second, stmt.table_name);
+        }
+    }
     return ok;
 }
 
@@ -371,7 +414,8 @@ bool SemanticAnalyzer::AnalyzeCreateTable(const CreateTableStatement& stmt) {
             up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
         if (up != "INT" && up != "INTEGER" && up != "BIGINT" &&
             up != "FLOAT" && up != "DOUBLE" && up != "DECIMAL" &&
-            up != "VARCHAR" && up != "CHAR" && up != "TEXT" && up != "STRING") {
+            up != "VARCHAR" && up != "CHAR" && up != "TEXT" && up != "STRING" &&
+            up != "DATE" && up != "TIMESTAMP") {
             AddError("unsupported column type: " + stmt.columns[i].data_type);
             ok = false;
         }
@@ -430,10 +474,57 @@ bool SemanticAnalyzer::AnalyzeTruncateTable(const TruncateTableStatement& stmt) 
 }
 
 bool SemanticAnalyzer::AnalyzeAlterTable(const AlterStatement& stmt) {
-    // DDL 扩展语法的最小实现：仅校验表存在性。
-    // 真实 schema evolution 校验（列存在 / 类型兼容 / 重命名冲突）不在本期范围内，
-    // 由执行层的 no-op AlterTableExecutor 跳过即可。
-    return CheckTableExists(stmt.table_name);
+    // ALTER TABLE 现在由 AlterTableExecutor 真正改写 schema，因此语义层
+    // 必须做完整校验，避免「错误参数也能 ALTER 成功」导致目录与数据脱节。
+    if (!CheckTableExists(stmt.table_name)) return false;
+    const TableInfo* info = symbol_table_.GetTable(stmt.table_name);
+    if (!info) return false;  // CheckTableExists 已报错。
+    switch (stmt.action) {
+        case AlterAction::ADD_COLUMN: {
+            const auto& cd = stmt.column_def;
+            if (!cd || cd->column_name.empty()) {
+                AddError("ALTER TABLE ADD COLUMN requires a column name");
+                return false;
+            }
+            if (info->HasColumn(cd->column_name)) {
+                AddError("column already exists: " + cd->column_name);
+                return false;
+            }
+            return true;
+        }
+        case AlterAction::DROP_COLUMN: {
+            if (!info->HasColumn(stmt.drop_column_name)) {
+                AddError("column not found: " + stmt.drop_column_name);
+                return false;
+            }
+            return true;
+        }
+        case AlterAction::RENAME_TO: {
+            if (stmt.new_table_name.empty()) {
+                AddError("ALTER TABLE RENAME TO requires a new table name");
+                return false;
+            }
+            if (stmt.new_table_name == stmt.table_name) return true;
+            if (symbol_table_.HasTable(stmt.new_table_name)) {
+                AddError("table already exists: " + stmt.new_table_name);
+                return false;
+            }
+            return true;
+        }
+        case AlterAction::MODIFY_COLUMN: {
+            const auto& cd = stmt.column_def;
+            if (!cd || cd->column_name.empty()) {
+                AddError("ALTER TABLE MODIFY COLUMN requires a column name");
+                return false;
+            }
+            if (!info->HasColumn(cd->column_name)) {
+                AddError("column not found: " + cd->column_name);
+                return false;
+            }
+            return true;
+        }
+    }
+    return true;
 }
 
 bool SemanticAnalyzer::CheckTableExists(const std::string& table_name) {
@@ -522,6 +613,13 @@ bool SemanticAnalyzer::CheckExpressionMulti(const ExprPtr& expr,
             for (auto& a : fc->arguments) ok &= CheckExpressionMulti(a, tables, table_aliases);
             return ok;
         }
+        case NodeType::LIKE_EXPR: {
+            // 44_pattern_match: LIKE / ILIKE / REGEXP / RLIKE 仅校验
+            // 左/右子表达式中的列引用，模式串为字面量无需检查。
+            auto le = std::static_pointer_cast<LikeExprNode>(expr);
+            return CheckExpressionMulti(le->operand, tables, table_aliases) &&
+                   CheckExpressionMulti(le->pattern, tables, table_aliases);
+        }
         default:
             return true;
     }
@@ -582,6 +680,11 @@ bool SemanticAnalyzer::CheckExpressionMultiWithAliases(const ExprPtr& expr,
             bool ok = true;
             for (auto& a : fc->arguments) ok &= CheckExpressionMultiWithAliases(a, tables, aliases, table_aliases);
             return ok;
+        }
+        case NodeType::LIKE_EXPR: {
+            auto le = std::static_pointer_cast<LikeExprNode>(expr);
+            return CheckExpressionMultiWithAliases(le->operand, tables, aliases, table_aliases) &&
+                   CheckExpressionMultiWithAliases(le->pattern, tables, aliases, table_aliases);
         }
         default:
             return true;

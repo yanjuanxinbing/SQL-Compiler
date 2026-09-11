@@ -54,6 +54,7 @@ enum class TokenType {
     KEYWORD_ASC,
     KEYWORD_DESC,
     KEYWORD_IF,
+    KEYWORD_DUPLICATE,  // 43_upsert: ON DUPLICATE KEY UPDATE
     KEYWORD_TRUNCATE,
     KEYWORD_ALTER,
     KEYWORD_ADD,
@@ -117,6 +118,9 @@ enum class TokenType {
     KEYWORD_DAY,
     KEYWORD_NOW,
     KEYWORD_IFNULL,
+    KEYWORD_HOUR,
+    KEYWORD_MINUTE,
+    KEYWORD_SECOND,
 
     // ---- 40_txn_view_udf: 事务 / 视图 / 触发器 / 用户自定义函数 ----
     KEYWORD_BEGIN,        // BEGIN [TRANSACTION]
@@ -136,6 +140,32 @@ enum class TokenType {
     KEYWORD_OLD,          // 触发器 OLD.row
     KEYWORD_RETURN,       // UDF 体
     KEYWORD_RETURNS,      // UDF 返回类型
+    KEYWORD_DECLARE,      // 47_udf_trigger_view: UDF 体内声明局部变量
+    KEYWORD_WHILE,        // 47_udf_trigger_view: UDF 体内 while 循环
+    KEYWORD_DO,           // 47_udf_trigger_view: WHILE cond DO ...
+    KEYWORD_ELSEIF,       // 47_udf_trigger_view: UDF 体内 ELSEIF 分支
+
+    // ---- 44_pattern_match: 模式匹配扩展 ----
+    KEYWORD_ILIKE,        // ILIKE — PostgreSQL 大小写不敏感 LIKE
+    KEYWORD_REGEXP,       // REGEXP — MySQL 风格 POSIX ERE 子串匹配
+    KEYWORD_RLIKE,        // RLIKE — REGEXP 的同义别名
+    KEYWORD_ESCAPE,       // ESCAPE — LIKE / ILIKE 的转义字符指定符
+
+    // ---- 45_datetime: DATE / TIMESTAMP / INTERVAL / EXTRACT ----
+    KEYWORD_DATE,         // DATE — DATE 'YYYY-MM-DD'
+    KEYWORD_TIMESTAMP,    // TIMESTAMP 'YYYY-MM-DD HH:MM:SS'
+    KEYWORD_INTERVAL,     // INTERVAL n unit
+    KEYWORD_EXTRACT,      // EXTRACT(field FROM source)
+    // HOUR / MINUTE / SECOND 同时作为 EXTRACT 字段；
+    // YEAR / MONTH / DAY 已在上方 KEYWORD_YEAR/MONTH/DAY 定义。
+
+    // ---- 46_meta: 元命令（EXPLAIN / SHOW / DESCRIBE / DESC） ----
+    KEYWORD_EXPLAIN,      // EXPLAIN <statement>
+    KEYWORD_SHOW,         // SHOW TABLES / SHOW COLUMNS / SHOW INDEX / SHOW CREATE TABLE
+    KEYWORD_DESCRIBE,     // DESCRIBE <table>
+    // DESC / INDEX 复用上方的 KEYWORD_DESC / KEYWORD_INDEX（已存在）。
+    KEYWORD_TABLES,       // SHOW TABLES
+    KEYWORD_COLUMNS,      // SHOW COLUMNS FROM <table>
 
     // ---- 标识符与字面量 ----
     IDENTIFIER,

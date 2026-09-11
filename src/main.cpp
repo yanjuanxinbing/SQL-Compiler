@@ -94,6 +94,17 @@ bool HasCompleteStatement(const std::string& s) {
             if (create_fn_seen && w == "BEGIN") {
                 ++begin_depth;
             } else if (create_fn_seen && w == "END") {
+                // END IF / END WHILE 是 IF / WHILE 块的结束，不是函数体的 END。
+                // 看到 END 后看下一个非空白关键字：若是 IF / WHILE，则跳过。
+                size_t j = i + w.size();
+                while (j < s.size() &&
+                       (std::isspace(static_cast<unsigned char>(s[j])))) ++j;
+                std::string next = extract_word_upper(s, j);
+                if (next == "IF" || next == "WHILE") {
+                    // 跳过整个 next 词，避免下一次循环再处理它
+                    i += w.size() + (j - (i + w.size())) + next.size() - 1;
+                    continue;
+                }
                 if (begin_depth > 0) --begin_depth;
             }
             i += w.size() - 1;

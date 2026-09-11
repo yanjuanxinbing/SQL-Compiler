@@ -297,6 +297,28 @@ std::string UpdateNode::ToString() const {
     return NodeBodyToString(*this, 0);
 }
 
+// ============ UpsertNode (43_upsert) ============
+
+UpsertNode::UpsertNode(std::string table_name, std::vector<std::string> columns,
+                       std::vector<std::vector<ExprPtr>> values_list,
+                       std::vector<std::pair<std::string, ExprPtr>> upsert_assignments)
+    : table_name(std::move(table_name)),
+      columns(std::move(columns)),
+      values_list(std::move(values_list)),
+      upsert_assignments(std::move(upsert_assignments)) {
+}
+
+PlanNodeType UpsertNode::GetType() const {
+    return PlanNodeType::UPSERT;
+}
+
+std::string UpsertNode::ToString() const {
+    std::ostringstream oss;
+    oss << "Upsert(" << table_name << ", "
+        << values_list.size() << " rows, " << upsert_assignments.size() << " assigns)\n";
+    return oss.str();
+}
+
 // ============ DeleteNode ============
 
 DeleteNode::DeleteNode(std::string table_name, ExprPtr predicate)
@@ -558,6 +580,72 @@ ViewDefineNode::ViewDefineNode(std::string view_name, std::string view_alias)
 PlanNodeType ViewDefineNode::GetType() const { return PlanNodeType::VIEW_DEFINE; }
 std::string ViewDefineNode::ToString() const {
     return "ViewDefine(" + view_name + " AS " + view_alias + ")\n";
+}
+
+// ============ 46_meta: EXPLAIN / SHOW ============
+
+ExplainNode::ExplainNode(bool analyze) : analyze(analyze) {
+}
+PlanNodeType ExplainNode::GetType() const { return PlanNodeType::EXPLAIN; }
+std::string ExplainNode::ToString() const {
+    std::ostringstream oss;
+    oss << "Explain(";
+    if (analyze) oss << "ANALYZE ";
+    oss << "inner plan)\n";
+    return oss.str();
+}
+
+ShowNode::ShowNode(Kind kind, std::string target_table)
+    : kind(kind), target_table(std::move(target_table)) {
+}
+PlanNodeType ShowNode::GetType() const { return PlanNodeType::SHOW; }
+std::string ShowNode::ToString() const {
+    std::ostringstream oss;
+    oss << "Show(";
+    switch (kind) {
+        case Kind::TABLES:       oss << "TABLES"; break;
+        case Kind::COLUMNS:      oss << "COLUMNS FROM " << target_table; break;
+        case Kind::INDEX:        oss << "INDEX FROM " << target_table; break;
+        case Kind::CREATE_TABLE: oss << "CREATE TABLE " << target_table; break;
+    }
+    oss << ")\n";
+    return oss.str();
+}
+
+// ============ 48_acid_undo: 事务控制节点 ============
+
+BeginTxnNode::BeginTxnNode() = default;
+PlanNodeType BeginTxnNode::GetType() const { return PlanNodeType::BEGIN_TXN; }
+std::string BeginTxnNode::ToString() const { return "BeginTxn()\n"; }
+
+CommitTxnNode::CommitTxnNode() = default;
+PlanNodeType CommitTxnNode::GetType() const { return PlanNodeType::COMMIT_TXN; }
+std::string CommitTxnNode::ToString() const { return "CommitTxn()\n"; }
+
+RollbackTxnNode::RollbackTxnNode() = default;
+PlanNodeType RollbackTxnNode::GetType() const { return PlanNodeType::ROLLBACK_TXN; }
+std::string RollbackTxnNode::ToString() const { return "RollbackTxn()\n"; }
+
+SavepointNode::SavepointNode(std::string name) : savepoint_name(std::move(name)) {}
+PlanNodeType SavepointNode::GetType() const { return PlanNodeType::SAVEPOINT; }
+std::string SavepointNode::ToString() const {
+    return "Savepoint(" + savepoint_name + ")\n";
+}
+
+RollbackToSavepointNode::RollbackToSavepointNode(std::string name)
+    : savepoint_name(std::move(name)) {}
+PlanNodeType RollbackToSavepointNode::GetType() const {
+    return PlanNodeType::ROLLBACK_TO_SP;
+}
+std::string RollbackToSavepointNode::ToString() const {
+    return "RollbackToSavepoint(" + savepoint_name + ")\n";
+}
+
+ReleaseSavepointNode::ReleaseSavepointNode(std::string name)
+    : savepoint_name(std::move(name)) {}
+PlanNodeType ReleaseSavepointNode::GetType() const { return PlanNodeType::RELEASE_SP; }
+std::string ReleaseSavepointNode::ToString() const {
+    return "ReleaseSavepoint(" + savepoint_name + ")\n";
 }
 
 }  // namespace sqlcompiler

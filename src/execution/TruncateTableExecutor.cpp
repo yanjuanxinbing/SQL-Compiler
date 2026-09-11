@@ -1,5 +1,6 @@
 #include "execution/TruncateTableExecutor.h"
 
+#include "catalog/SystemCatalog.h"
 #include "common/Error.h"
 
 namespace sqlcompiler {
@@ -10,13 +11,20 @@ TruncateTableExecutor::TruncateTableExecutor(ExecutionContext* context, std::str
 
 void TruncateTableExecutor::Init() {
     if (executed_) return;
-    if (!context_->GetCatalog()->TruncateTable(table_name_)) {
+    SystemCatalog* cat = context_->GetCatalog();
+    // Phase B：让 catalog / 内部 sys_tables 写入带上当前事务。
+    cat->SetActiveTransaction(context_->GetTransaction());
+    bool ok = cat->TruncateTable(table_name_);
+    if (ok) {
+        // 表数据被清空，索引里的 RID 全部失效，必须一并重建为空树，
+        // 否则后续查询会沿着悬空 RID 读出垃圾。
+        cat->ResetIndexesOfTable(table_name_);
+    }
+    cat->SetActiveTransaction(nullptr);
+    if (!ok) {
         throw CompilerException(ErrorStage::SEMANTIC,
             "table not found: " + table_name_);
     }
-    // 表数据被清空，索引里的 RID 全部失效，必须一并重建为空树，
-    // 否则后续查询会沿着悬空 RID 读出垃圾。
-    context_->GetCatalog()->ResetIndexesOfTable(table_name_);
     executed_ = true;
 }
 

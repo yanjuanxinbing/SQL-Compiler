@@ -8,6 +8,7 @@
 #include "execution/DeleteExecutor.h"
 #include "execution/DistinctExecutor.h"
 #include "execution/CreateIndexExecutor.h"
+#include "execution/ExplainExecutor.h"
 #include "execution/IndexScanExecutor.h"
 #include "execution/DropIndexExecutor.h"
 #include "execution/DropTableExecutor.h"
@@ -18,12 +19,16 @@
 #include "execution/NoOpExecutor.h"
 #include "execution/ProjectExecutor.h"
 #include "execution/SeqScanExecutor.h"
+#include "execution/ShowExecutor.h"
 #include "execution/SortExecutor.h"
 #include "execution/SetOpExecutor.h"
 #include "execution/SubqueryExecutor.h"
+#include "execution/TransactionExecutor.h"
 #include "execution/TruncateTableExecutor.h"
 #include "execution/UpdateExecutor.h"
+#include "execution/UpsertExecutor.h"
 #include "execution/WindowExecutor.h"
+#include "txn/TransactionManager.h"
 
 #include <functional>
 #include <utility>
@@ -291,11 +296,18 @@ std::unordered_map<std::string, size_t> BuildCombinedColumnIndexMapWithDerived(
 
 }  // namespace
 
-ExecutionEngine::ExecutionEngine(SystemCatalog* catalog) : catalog_(catalog) {
+ExecutionEngine::ExecutionEngine(SystemCatalog* catalog, TransactionManager* txn_manager)
+    : catalog_(catalog), txn_manager_(txn_manager) {
 }
 
 ExecutionResult ExecutionEngine::Execute(const PlanNodePtr& plan) {
-    ExecutionContext ctx(catalog_);
+    ExecutionContext ctx(catalog_, txn_manager_);
+    // Phase A：让新 ctx 自动挂上当前事务，使 DML 算子的写路径抓到正确的 undo。
+    // BEGIN/COMMIT/ROLLBACK/SAVEPOINT 等事务控制语句本身也通过此 ctx
+    // 看到当前 txn。
+    if (txn_manager_ != nullptr) {
+        ctx.SetTransaction(txn_manager_->GetCurrentTransaction());
+    }
     return ExecuteSubplan(plan, &ctx);
 }
 
@@ -325,7 +337,10 @@ ExecutionResult ExecutionEngine::ExecuteSubplan(const PlanNodePtr& plan, Executi
                          plan->GetType() == PlanNodeType::CTE_DEFINE ||
                          plan->GetType() == PlanNodeType::SET_OP ||
                          plan->GetType() == PlanNodeType::WINDOW ||
-                         plan->GetType() == PlanNodeType::VIEW_DEFINE);
+                         plan->GetType() == PlanNodeType::VIEW_DEFINE ||
+                         // 46_meta：EXPLAIN / SHOW 也是"返回结果集"的查询
+                         plan->GetType() == PlanNodeType::EXPLAIN ||
+                         plan->GetType() == PlanNodeType::SHOW);
         if (is_query) {
             result.column_names = DeriveOutputColumnNames(plan);
         }
@@ -645,6 +660,12 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             return std::make_unique<InsertExecutor>(context, n->table_name, n->columns,
                                                      n->values_list);
         }
+        case PlanNodeType::UPSERT: {
+            auto n = std::static_pointer_cast<UpsertNode>(plan_node);
+            return std::make_unique<UpsertExecutor>(context, n->table_name,
+                                                    n->columns, n->values_list,
+                                                    n->upsert_assignments);
+        }
         case PlanNodeType::UPDATE: {
             auto n = std::static_pointer_cast<UpdateNode>(plan_node);
             return std::make_unique<UpdateExecutor>(context, n->table_name, n->assignments,
@@ -787,12 +808,40 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             // 这里直接返回一个立即结束的 executor，让 ExecutionEngine 把它当 DDL
             // 看待（OK 提示）。
             return std::make_unique<NoOpExecutor>(context);
+        // ---- 48_acid_undo: 事务控制节点 ----
+        case PlanNodeType::BEGIN_TXN:
+            return std::make_unique<BeginExecutor>(context);
+        case PlanNodeType::COMMIT_TXN:
+            return std::make_unique<CommitExecutor>(context);
+        case PlanNodeType::ROLLBACK_TXN:
+            return std::make_unique<RollbackExecutor>(context);
+        case PlanNodeType::SAVEPOINT: {
+            auto n = std::static_pointer_cast<SavepointNode>(plan_node);
+            return std::make_unique<SavepointExecutor>(context, n->savepoint_name);
+        }
+        case PlanNodeType::ROLLBACK_TO_SP: {
+            auto n = std::static_pointer_cast<RollbackToSavepointNode>(plan_node);
+            return std::make_unique<RollbackToSavepointExecutor>(context, n->savepoint_name);
+        }
+        case PlanNodeType::RELEASE_SP: {
+            auto n = std::static_pointer_cast<ReleaseSavepointNode>(plan_node);
+            return std::make_unique<ReleaseSavepointExecutor>(context, n->savepoint_name);
+        }
         case PlanNodeType::CREATE_VIEW:
             return std::make_unique<NoOpExecutor>(context);
         case PlanNodeType::CREATE_TRIGGER:
             return std::make_unique<NoOpExecutor>(context);
         case PlanNodeType::CREATE_FUNCTION:
             return std::make_unique<NoOpExecutor>(context);
+        // ---- 46_meta ----
+        case PlanNodeType::EXPLAIN: {
+            auto n = std::static_pointer_cast<ExplainNode>(plan_node);
+            return std::make_unique<ExplainExecutor>(context, n.get());
+        }
+        case PlanNodeType::SHOW: {
+            auto n = std::static_pointer_cast<ShowNode>(plan_node);
+            return std::make_unique<ShowExecutor>(context, n.get());
+        }
         default:
             throw CompilerException(ErrorStage::CODEGEN,
                 "feature not implemented: unsupported plan node");
@@ -814,6 +863,30 @@ std::unordered_map<std::string, size_t> ExecutionEngine::BuildColumnIndexMap(
 std::vector<std::string> ExecutionEngine::DeriveOutputColumnNames(const PlanNodePtr& plan_node) {
     std::vector<std::string> names;
     if (!plan_node) return names;
+    // ---- 46_meta: EXPLAIN 始终输出单列 "plan" ----
+    if (plan_node->GetType() == PlanNodeType::EXPLAIN) {
+        names.push_back("plan");
+        return names;
+    }
+    // ---- 46_meta: SHOW 的列名直接由 kind/target_table 决定 ----
+    if (plan_node->GetType() == PlanNodeType::SHOW) {
+        auto sn = std::static_pointer_cast<ShowNode>(plan_node);
+        switch (sn->kind) {
+            case ShowNode::Kind::TABLES:
+                names.push_back("name");
+                break;
+            case ShowNode::Kind::COLUMNS:
+                names = {"name", "type", "nullable", "default", "primary_key", "check_expr"};
+                break;
+            case ShowNode::Kind::INDEX:
+                names = {"name", "table", "column", "unique"};
+                break;
+            case ShowNode::Kind::CREATE_TABLE:
+                names.push_back("sql");
+                break;
+        }
+        return names;
+    }
     // Walk through Sort/Limit/SET_OP wrappers to find the underlying Project (or Aggregate)
     PlanNodePtr p = plan_node;
     while (p && (p->GetType() == PlanNodeType::SORT ||

@@ -12,6 +12,11 @@
 
 namespace sqlcompiler {
 
+// Phase A 前向声明：完整定义在 txn/Transaction.h / TransactionManager.h。
+// 各算子只持有指针，避免在 Executor.h 引入事务模块的 <vector> 依赖。
+class Transaction;
+class TransactionManager;
+
 // 单条物化的 CTE：执行 CTE_DEFINE 节点时把 children[0] 的子计划跑完，
 // 把所有结果行收集在这里。后续同一次查询执行中任何 CteBindNode 都直接
 // 从这里读取，不必重新执行子计划。
@@ -23,9 +28,14 @@ struct CteMaterialization {
 // 执行上下文：贯穿整个查询执行过程，向各算子提供目录与存储访问入口
 class ExecutionContext {
 public:
-    explicit ExecutionContext(SystemCatalog* catalog);
+    explicit ExecutionContext(SystemCatalog* catalog,
+                             TransactionManager* txn_manager = nullptr);
 
     SystemCatalog* GetCatalog() const;
+
+    // ---- Phase A：事务管理 ----
+    TransactionManager* GetTransactionManager() const { return txn_manager_; }
+    void SetTransactionManager(TransactionManager* mgr) { txn_manager_ = mgr; }
 
     // CTE 注册表：CTE_DEFINE 节点负责写入，CteBind 节点负责读取。
     // 同一次 Execute 调用内对相同 cte_name 只允许写一次（递归 CTE 多次追加）。
@@ -58,6 +68,24 @@ public:
         return inner_tables_;
     }
 
+    // 43_upsert: ON DUPLICATE KEY UPDATE 的赋值右侧可能出现 VALUES(col) 形式
+    // 引用「本次候选行」的列值。该绑定由 UpsertExecutor 在评估冲突路径上的
+    // assignments 时推入；ExpressionEvaluator 看到 UpsertValuesRefExpr 时
+    // 据此查找列名对应的候选行值。nullptr 表示当前不在 upsert 上下文中。
+    void SetUpsertValuesBind(const std::unordered_map<std::string, Value>* bind) {
+        upsert_values_bind_ = bind;
+    }
+    const std::unordered_map<std::string, Value>* GetUpsertValuesBind() const {
+        return upsert_values_bind_;
+    }
+
+    // ---- Phase A：当前事务 ----
+    // nullptr 表示当前没有显式事务（隐式 auto-commit）；DML 算子据此判断
+    // 是否要把写入记录到事务的 undo log 中。TransactionExecutor 负责
+    // BEGIN/COMMIT/ROLLBACK 时机的设置。
+    void SetTransaction(Transaction* txn) { txn_ = txn; }
+    Transaction* GetTransaction() const { return txn_; }
+
 private:
     SystemCatalog* catalog_;
     std::unordered_map<std::string, CteMaterialization> cte_results_;
@@ -68,6 +96,12 @@ private:
     const std::unordered_map<std::string, Value>* outer_bind_ = nullptr;
     // 当前子查询的内层表名集合（含别名）。
     const std::unordered_set<std::string>* inner_tables_ = nullptr;
+    // 43_upsert: ON DUPLICATE KEY UPDATE 中 VALUES(col) 的候选行绑定。
+    const std::unordered_map<std::string, Value>* upsert_values_bind_ = nullptr;
+    // Phase A：当前事务（nullptr = 隐式 auto-commit）。
+    Transaction* txn_ = nullptr;
+    // Phase A：所属事务管理器（由 ExecutionEngine 在构造 ctx 时注入）。
+    TransactionManager* txn_manager_ = nullptr;
 };
 
 // 执行算子基类，采用火山模型（Volcano / Iterator Model）：

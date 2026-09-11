@@ -1,8 +1,12 @@
 #include "execution/Executor.h"
 
+#include "txn/TransactionManager.h"
+
 namespace sqlcompiler {
 
-ExecutionContext::ExecutionContext(SystemCatalog* catalog) : catalog_(catalog) {
+ExecutionContext::ExecutionContext(SystemCatalog* catalog,
+                                   TransactionManager* txn_manager)
+    : catalog_(catalog), txn_manager_(txn_manager) {
 }
 
 SystemCatalog* ExecutionContext::GetCatalog() const {
