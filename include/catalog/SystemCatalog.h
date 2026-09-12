@@ -11,6 +11,7 @@
 #include "index/BPlusTree.h"
 #include "semantic/SymbolTable.h"
 #include "storage/BufferPoolManager.h"
+#include "storage/StorageAccess.h"
 #include "storage_engine/TableHeap.h"
 
 namespace sqlcompiler {
@@ -27,9 +28,12 @@ class LogManager;
 //     由Bootstrap()负责在数据库初始化时创建）。
 //   - 数据库启动时通过LoadFromDisk()把sys_tables堆表中的记录反序列化，
 //     重建内存态的SymbolTable与各表的TableHeap句柄。
+//
+// 存储接入：构造时接受 StorageAccess*（统一的存储门面）。BPlusTree 等需要
+// 直接持有 BufferPoolManager 的模块从 storage_ 取 BPM 引用。
 class SystemCatalog {
 public:
-    explicit SystemCatalog(BufferPoolManager* buffer_pool_manager);
+    explicit SystemCatalog(StorageAccess* storage);
     ~SystemCatalog();
 
     // ---- Phase B：注入 LogManager，让 catalog 持有的 TableHeap / BPlusTree
@@ -285,6 +289,11 @@ public:
         const std::string& parent_table) const;
 
 private:
+    // 主存句柄：统一存储门面。TableHeap 等高层组件走 storage_；
+    // BPlusTree / PageGuard 等需要直接持有 BPM 的低层组件通过
+    // storage_->GetBufferPoolManager() 拿到 buffer_pool_manager_。
+    StorageAccess* storage_;
+    // 由 storage_ 在构造期一次性取得，供 BPlusTree 等继续使用。
     BufferPoolManager* buffer_pool_manager_;
     LogManager* log_manager_ = nullptr;  // Phase B：可选 WAL 写出器
     SymbolTable symbol_table_;  // 内存态元数据缓存

@@ -6,7 +6,9 @@
 #include "execution/ExecutionEngine.h"
 #include "execution/Executor.h"
 #include "execution/UdfExecutor.h"
+#include "optimizer/Optimizer.h"
 #include "plan/Plan.h"
+#include "plan/Planner.h"
 
 #include <algorithm>
 #include <cctype>
@@ -550,6 +552,16 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
         if (proc_locals_) {
             auto pl = proc_locals_->find(expr.column_name);
             if (pl != proc_locals_->end()) return pl->second;
+        }
+        // 71_proc_out_params：会话变量 @var 回退。column_name 以 '@' 开头时
+        // 视为 session variable；去掉前缀后到 ctx_->GetSessionVar() 查值。
+        // MySQL/MariaDB 语义：未设置的 @var 视为 NULL（已由 GetSessionVar
+        // 默认行为覆盖）。
+        if (!expr.column_name.empty() && expr.column_name.front() == '@' &&
+            ctx_ != nullptr) {
+            std::string sv_name(expr.column_name.begin() + 1,
+                                expr.column_name.end());
+            return ctx_->GetSessionVar(sv_name);
         }
         return Value::MakeNull();
     }
@@ -1278,8 +1290,24 @@ std::unordered_map<std::string, Value> BuildOuterBind(
 
 Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
                                             const Tuple& tuple) const {
-    if (!expr.subquery_plan) return Value::MakeNull();
     if (!ctx_) return Value::MakeNull();
+    // 71_proc_out_params：procedure 体内 SET var = (SELECT ...) / 表达式中的
+    // 子查询未经过顶层 Planner 路径，AST 上的 subquery_plan 字段为空。
+    // 在此按需 plan：复用 ctx 的 catalog + symbol_table，得到 PlanNodePtr
+    // 后照常驱动子计划。Planner/Optimizer 不修改 AST，所以不需要写回 subquery_plan。
+    PlanNodePtr plan = expr.subquery_plan;
+    if (!plan && expr.subquery) {
+        Planner planner(ctx_->GetCatalog(), ctx_->GetCatalog()->GetSymbolTable());
+        std::shared_ptr<Statement> stmt_alias(
+            const_cast<SelectStatement*>(expr.subquery.get()),
+            [](Statement*){});
+        plan = planner.CreatePlan(stmt_alias);
+        if (plan) {
+            Optimizer opt(ctx_->GetCatalog());
+            plan = opt.Optimize(std::move(plan));
+        }
+    }
+    if (!plan) return Value::MakeNull();
 
     // === 相关子查询：把当前外层行的列值推到 ExecutionContext，再跑子计划 ===
     // 跑完后恢复旧的 outer_bind，避免影响同语句后续无关的 evaluator。
@@ -1289,6 +1317,15 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
     const std::unordered_set<std::string>* saved_inner = ctx_->GetInnerTables();
     std::unique_ptr<std::unordered_set<std::string>> owned_inner_tables;
     const std::unordered_set<std::string>* use_inner = nullptr;
+    // 71_proc_out_params：procedure 体内部的子查询需要看到 frame.locals（如
+    // `WHERE val > threshold`），外层元组通常是空、列下标 cmap 也是空，
+    // BuildOuterBind 提不出任何键。本分支把父 evaluator 的 outer_bind（通常
+    // 是 UdfExecutor::frame.locals）整体塞到 ctx_->outer_bind，使子查询内部
+    // 的 evaluator 通过 EvaluateColumnRef 的 outer_bind 回退路径找到这些键。
+    if (outer_bind_ != nullptr) {
+        use_bind = outer_bind_;
+        ctx_->SetOuterBind(use_bind);
+    }
     if (expr.subquery && IsSubqueryCorrelated(*expr.subquery)) {
         // 合并子查询 AST 中所有相关位置的外层列引用：select_list / where /
         // having / order_by / join.on 都可能引用外层。把每处 expr 喂给 BuildOuterBind，
@@ -1307,6 +1344,8 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
             for (auto& kv : sub_bind) owned_bind[kv.first] = kv.second;
         }
         if (!owned_bind.empty()) {
+            // 真实相关子查询：用 owned_bind（外层元组列）覆盖父 outer_bind
+            // （procedure locals），否则相关列被 procedure locals 误命中。
             use_bind = &owned_bind;
             ctx_->SetOuterBind(use_bind);
         }
@@ -1318,7 +1357,7 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
         ctx_->SetInnerTables(use_inner);
     }
 
-    auto rows = RunPlanToCompletion(ctx_, expr.subquery_plan);
+    auto rows = RunPlanToCompletion(ctx_, plan);
     if (use_bind) ctx_->SetOuterBind(saved_bind);
     if (use_inner) ctx_->SetInnerTables(saved_inner);
 

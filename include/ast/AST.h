@@ -119,6 +119,14 @@ public:
     virtual ~Node() = default;
     virtual NodeType GetType() const = 0;
     virtual std::string ToString() const = 0;
+
+    // 源码位置（Spec 1.3 要求语义错误携带 stage + line + column）。
+    // 由 Parser 在节点构造时通过 Token::line / Token::column 填入；
+    // -1 表示「来源未携带位置信息」（例如由执行期内部构造的临时节点）。
+    // 所有继承自 Node / Statement / Expr 的具体节点都通过基类共享这两个字段，
+    // 避免在数十种节点类上重复定义。
+    int line = -1;
+    int column = -1;
 };
 using NodePtr = std::shared_ptr<Node>;
 
@@ -1398,6 +1406,8 @@ public:
     std::string ToString() const override;
 
     bool analyze = false;
+    // format ∈ { "TEXT", "JSON", "SEXPR" }。默认 TEXT 与原行为一致。
+    std::string format = "TEXT";
     StatementPtr inner;
 };
 

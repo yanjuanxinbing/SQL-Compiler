@@ -2,14 +2,10 @@
 
 #include "catalog/SystemCatalog.h"
 #include "common/Error.h"
-#include "execution/CreateTableExecutor.h"
 #include "execution/ExecutionEngine.h"
-#include "execution/InsertExecutor.h"
-#include "execution/TruncateTableExecutor.h"
 #include "storage_engine/TableHeap.h"
 
-#include <cstring>
-#include <unordered_map>
+#include <cctype>
 #include <vector>
 
 namespace sqlcompiler {
@@ -25,48 +21,16 @@ ExecutorPtr BuildChildExecutor(ExecutionContext* ctx,
     return engine.BuildExecutor(plan, ctx);
 }
 
-// 推断 SELECT 子计划输出列的类型（用来建 backing table）。
-// V1 简化：先把子计划跑一遍"探针"获取首行的 ValueType；空集时回退为 VARCHAR。
-std::vector<ColumnDefinition> InferColumns(ExecutorPtr& child) {
-    std::vector<ColumnDefinition> cols;
-    if (!child) return cols;
-    child->Init();
-    Tuple first;
-    if (!child->Next(&first)) {
-        // 空结果集时无法推断列类型；用 single VARCHAR 占位列。
-        ColumnDefinition c;
-        c.column_name = "col0";
-        c.data_type = "VARCHAR";
-        cols.push_back(c);
-        return cols;
-    }
-    for (size_t i = 0; i < first.ColumnCount(); ++i) {
-        ColumnDefinition c;
-        c.column_name = "col" + std::to_string(i);
-        const Value& v = first.GetValue(i);
-        switch (v.GetType()) {
-            case ValueType::INTEGER:
-                c.data_type = "INT";
-                break;
-            case ValueType::FLOAT:
-                c.data_type = "FLOAT";
-                break;
-            case ValueType::VARCHAR:
-            default:
-                c.data_type = "VARCHAR";
-                c.char_length = 255;
-                break;
-        }
-        cols.push_back(c);
-    }
-    return cols;
-}
-
 // 把子计划的全部行写入 backing table。失败抛错。
+//
+// schema 必须是 catalog 中 backing table 的列类型顺序（来自
+// CreateMaterializedViewNode::columns），不能直接用 child tuple 的运行时
+// 类型 —— 否则空表 MV 拿不到任何一行时无法启动。
 void BulkInsertIntoTable(ExecutionContext* ctx,
                          const std::string& table_name,
                          const std::vector<ColumnDefinition>& cols,
                          ExecutorPtr& child) {
+    (void)cols;
     if (!ctx || !child) return;
     TableHeap* heap = ctx->GetCatalog()->GetTableHeap(table_name);
     if (!heap) {
@@ -104,7 +68,44 @@ void BulkInsertIntoTable(ExecutionContext* ctx,
         }
         heap->SetActiveTransaction(nullptr);
     }
-    (void)cols;
+}
+
+// 比较两组 ColumnDefinition 是否「列名 + 类型」一一对应。
+// 注意：忽略 char_length 的差异 —— 同一 VARCHAR(50) 与 VARCHAR(255) 视为同一
+// 类型；只在「用户实际换列」时报 drift，避免误伤。
+bool ColumnsMatch(const std::vector<ColumnDefinition>& a,
+                  const std::vector<ColumnDefinition>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].column_name != b[i].column_name) return false;
+        // 大小写不敏感比较类型字符串（与 ValueTypeFromString 一致）。
+        std::string ua = a[i].data_type;
+        std::string ub = b[i].data_type;
+        for (auto& c : ua) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        for (auto& c : ub) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (ua != ub) return false;
+    }
+    return true;
+}
+
+// 格式化「schema drift」错误信息，附带旧 vs 新列差异，便于用户排查。
+std::string FormatDriftMessage(const std::string& view_name,
+                               const std::vector<ColumnDefinition>& old_cols,
+                               const std::vector<ColumnDefinition>& new_cols) {
+    std::string out = "schema drift detected for materialized view '" +
+                      view_name + "':\n  existing columns: [";
+    for (size_t i = 0; i < old_cols.size(); ++i) {
+        if (i) out += ", ";
+        out += old_cols[i].column_name + ":" + old_cols[i].data_type;
+    }
+    out += "]\n  refreshed columns: [";
+    for (size_t i = 0; i < new_cols.size(); ++i) {
+        if (i) out += ", ";
+        out += new_cols[i].column_name + ":" + new_cols[i].data_type;
+    }
+    out += "]\n  hint: DROP MATERIALIZED VIEW " + view_name +
+           " then CREATE MATERIALIZED VIEW ... AS ... to apply the new schema.";
+    return out;
 }
 
 }  // namespace
@@ -117,9 +118,13 @@ MaterializedViewExecutor::MaterializedViewExecutor(ExecutionContext* context,
         if (kind_ == Kind::CREATE) {
             auto* n = static_cast<const CreateMaterializedViewNode*>(plan_node_);
             view_name_ = n->view_name;
+            // Planner 通过 InferSelectOutputSchema 静态产出输出 schema —— 不依赖
+            // 执行期求值，因此空表 MV 也能正确建表。
+            cols_ = n->columns;
         } else {
             auto* n = static_cast<const AlterMaterializedViewNode*>(plan_node_);
             view_name_ = n->view_name;
+            cols_ = n->columns;
         }
     }
 }
@@ -145,10 +150,18 @@ void MaterializedViewExecutor::Init() {
     }
 
     if (kind_ == Kind::CREATE) {
-        // 推断 SELECT 输出列类型并建 backing table
-        auto cols = InferColumns(child);
+        // Planner 已经把输出列定型写到 node->columns；若 Planner 漏写（极少见，
+        // 比如 SELECT 子句根本不存在），用兜底的单 VARCHAR 列以保留向后兼容。
+        std::vector<ColumnDefinition> cols = cols_;
+        if (cols.empty()) {
+            ColumnDefinition c;
+            c.column_name = "col0";
+            c.data_type = "VARCHAR";
+            c.char_length = 255;
+            cols.push_back(c);
+        }
         std::string backing = SystemCatalog::MaterializedViewBackingTable(view_name_);
-        // 如果已存在则跳过（IF NOT EXISTS）
+        // 如果已存在则跳过（IF NOT EXISTS）。
         if (!catalog->HasTable(backing)) {
             TableInfo info;
             info.table_name = backing;
@@ -183,13 +196,23 @@ void MaterializedViewExecutor::Init() {
         // 物化数据
         BulkInsertIntoTable(context_, backing, cols, child);
     } else {
-        // REFRESH：truncate + 重新执行 SELECT
+        // REFRESH：truncate + 重新执行 SELECT。
+        //   1) Schema drift 检查：把 planner 重新推断出的 columns 与 catalog 中
+        //      已存的 MaterializedViewInfo.columns 对比；不一致则报错，让用户
+        //      drop + create（与 PostgreSQL 行为一致）。
+        const SystemCatalog::MaterializedViewInfo* info =
+            catalog->GetMaterializedView(view_name_);
+        if (info != nullptr && !info->columns.empty() && !cols_.empty() &&
+            !ColumnsMatch(info->columns, cols_)) {
+            throw CompilerException(ErrorStage::SEMANTIC,
+                FormatDriftMessage(view_name_, info->columns, cols_));
+        }
         std::string backing = SystemCatalog::MaterializedViewBackingTable(view_name_);
         if (catalog->HasTable(backing)) {
             catalog->TruncateTable(backing);
         }
-        // 重新推断列（schema 假定不变；V1 简化）
-        BulkInsertIntoTable(context_, backing, {}, child);
+        // 重新物化（schema 不变，由 drift 检查保证）。
+        BulkInsertIntoTable(context_, backing, cols_, child);
     }
 }
 

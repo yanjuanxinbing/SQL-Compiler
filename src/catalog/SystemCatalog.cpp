@@ -346,8 +346,9 @@ IndexInfo DecodeIndexInfo(const std::string& blob) {
 
 }  // namespace
 
-SystemCatalog::SystemCatalog(BufferPoolManager* buffer_pool_manager)
-    : buffer_pool_manager_(buffer_pool_manager),
+SystemCatalog::SystemCatalog(StorageAccess* storage)
+    : storage_(storage),
+      buffer_pool_manager_(storage ? storage->GetBufferPoolManager() : nullptr),
       sys_tables_first_page_id_(INVALID_PAGE_ID),
       sys_indexes_first_page_id_(INVALID_PAGE_ID),
       sys_triggers_first_page_id_(INVALID_PAGE_ID) {
@@ -407,7 +408,7 @@ void SystemCatalog::Bootstrap() {
     auto it = table_heaps_.find(kSysTablesKey);
     if (it == table_heaps_.end() && sys_tables_first_page_id_ != INVALID_PAGE_ID) {
         table_heaps_[kSysTablesKey].reset(
-            TableHeap::Open(buffer_pool_manager_, sys_tables_first_page_id_));
+            TableHeap::Open(storage_, sys_tables_first_page_id_));
     }
 }
 
@@ -416,7 +417,7 @@ void SystemCatalog::LoadFromDisk() {
         sys_tables_first_page_id_ = 0;
     }
     table_heaps_[kSysTablesKey].reset(
-        TableHeap::Open(buffer_pool_manager_, sys_tables_first_page_id_));
+        TableHeap::Open(storage_, sys_tables_first_page_id_));
     TableHeap* sys_heap = table_heaps_[kSysTablesKey].get();
     if (!sys_heap) return;
 
@@ -447,7 +448,7 @@ void SystemCatalog::LoadFromDisk() {
         symbol_table_.AddTable(info);
         if (user_pid >= 0) {
             table_heaps_[info.table_name].reset(
-                TableHeap::Open(buffer_pool_manager_, user_pid));
+                TableHeap::Open(storage_, user_pid));
         }
     }
     LoadIndexesFromDisk();
@@ -457,7 +458,7 @@ void SystemCatalog::LoadFromDisk() {
 bool SystemCatalog::CreateTable(const TableInfo& table_info) {
     if (symbol_table_.HasTable(table_info.table_name)) return false;
     if (!symbol_table_.AddTable(table_info)) return false;
-    TableHeap* heap = TableHeap::Create(buffer_pool_manager_);
+    TableHeap* heap = TableHeap::Create(storage_);
     if (!heap) return false;
     if (log_manager_ != nullptr) heap->SetLogManager(log_manager_);
     page_id_t user_pid = heap->GetFirstPageId();
@@ -520,6 +521,24 @@ std::vector<std::string> SystemCatalog::ListAllTables() const {
 std::vector<ColumnInfo> SystemCatalog::GetColumnInfos(
     const std::string& table_name) const {
     std::vector<ColumnInfo> out;
+    // 60_view_trigger: 物化视图优先 —— SHOW COLUMNS / DESCRIBE 直接以 MV 名
+    // 触发时，列出 catalog 中已存的 MV.columns（这些列由 Planner 在
+    // CREATE MATERIALIZED VIEW 时通过 InferSelectOutputSchema 静态定型）。
+    const MaterializedViewInfo* mv = LookupMaterializedView(table_name);
+    if (mv != nullptr) {
+        out.reserve(mv->columns.size());
+        for (const auto& c : mv->columns) {
+            ColumnInfo ci;
+            ci.name = c.column_name;
+            ci.data_type = c.data_type;
+            ci.char_length = c.char_length;
+            ci.is_primary_key = c.is_primary_key;
+            ci.is_not_null = c.is_not_null;
+            ci.is_unique = c.is_unique;
+            out.push_back(std::move(ci));
+        }
+        return out;
+    }
     const TableInfo* info = symbol_table_.GetTable(table_name);
     if (!info) return out;
     out.reserve(info->columns.size());
@@ -636,7 +655,7 @@ bool SystemCatalog::PersistTableMetadata(const TableInfo& table_info) {
     if (!sys_heap) {
         if (sys_tables_first_page_id_ == INVALID_PAGE_ID) return false;
         table_heaps_[kSysTablesKey].reset(
-            TableHeap::Open(buffer_pool_manager_, sys_tables_first_page_id_));
+            TableHeap::Open(storage_, sys_tables_first_page_id_));
         sys_heap = table_heaps_[kSysTablesKey].get();
         if (!sys_heap) return false;
     }
@@ -798,7 +817,7 @@ bool SystemCatalog::EnsureSysIndexesHeap() {
     if (index_heap_ != nullptr) return true;
     if (sys_indexes_first_page_id_ != INVALID_PAGE_ID) {
         index_heap_.reset(
-            TableHeap::Open(buffer_pool_manager_, sys_indexes_first_page_id_));
+            TableHeap::Open(storage_, sys_indexes_first_page_id_));
         if (index_heap_ != nullptr && log_manager_ != nullptr) {
             index_heap_->SetLogManager(log_manager_);
         }
@@ -806,7 +825,7 @@ bool SystemCatalog::EnsureSysIndexesHeap() {
     }
     // 惰性创建：旧版本数据库里没有索引目录堆，首次用到时才建，
     // 这样旧库文件不需要迁移也能打开。
-    TableHeap* heap = TableHeap::Create(buffer_pool_manager_);
+    TableHeap* heap = TableHeap::Create(storage_);
     if (heap == nullptr) return false;
     if (log_manager_ != nullptr) heap->SetLogManager(log_manager_);
     index_heap_.reset(heap);
@@ -849,7 +868,7 @@ void SystemCatalog::RemoveIndexMetadata(const std::string& index_name) {
 void SystemCatalog::LoadIndexesFromDisk() {
     if (sys_indexes_first_page_id_ == INVALID_PAGE_ID) return;  // 旧库：无索引
     index_heap_.reset(
-        TableHeap::Open(buffer_pool_manager_, sys_indexes_first_page_id_));
+        TableHeap::Open(storage_, sys_indexes_first_page_id_));
     if (index_heap_ == nullptr) return;
     if (log_manager_ != nullptr) index_heap_->SetLogManager(log_manager_);
 
@@ -1431,7 +1450,7 @@ bool SystemCatalog::EnsureSysTriggersHeap() {
     if (sys_triggers_first_page_id_ != INVALID_PAGE_ID && trigger_heap_) {
         return true;
     }
-    TableHeap* heap = TableHeap::Create(buffer_pool_manager_);
+    TableHeap* heap = TableHeap::Create(storage_);
     if (!heap) return false;
     if (log_manager_ != nullptr) heap->SetLogManager(log_manager_);
     trigger_heap_.reset(heap);
@@ -1479,7 +1498,7 @@ bool SystemCatalog::PersistTriggerMetadata(const TriggerDefinition& def) {
 void SystemCatalog::RemoveTriggerMetadata(const std::string& trigger_name) {
     if (sys_triggers_first_page_id_ == INVALID_PAGE_ID) return;
     if (!trigger_heap_) {
-        trigger_heap_.reset(TableHeap::Open(buffer_pool_manager_,
+        trigger_heap_.reset(TableHeap::Open(storage_,
                                              sys_triggers_first_page_id_));
     }
     if (!trigger_heap_) return;
@@ -1502,7 +1521,7 @@ void SystemCatalog::RemoveTriggerMetadata(const std::string& trigger_name) {
 void SystemCatalog::LoadTriggersFromDisk() {
     if (sys_triggers_first_page_id_ == INVALID_PAGE_ID) return;
     if (!trigger_heap_) {
-        trigger_heap_.reset(TableHeap::Open(buffer_pool_manager_,
+        trigger_heap_.reset(TableHeap::Open(storage_,
                                              sys_triggers_first_page_id_));
     }
     if (!trigger_heap_) return;

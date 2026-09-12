@@ -16,6 +16,9 @@ namespace sqlcompiler {
 // 各算子只持有指针，避免在 Executor.h 引入事务模块的 <vector> 依赖。
 class Transaction;
 class TransactionManager;
+// Spec 2.3 前向声明：完整定义在 storage/StorageAccess.h，避免在 Executor.h 引入
+// 整个存储门面头文件；算子按需在 .cpp 中 include。
+class StorageAccess;
 
 // 单条物化的 CTE：执行 CTE_DEFINE 节点时把 children[0] 的子计划跑完，
 // 把所有结果行收集在这里。后续同一次查询执行中任何 CteBindNode 都直接
@@ -97,6 +100,13 @@ public:
     void SetTransaction(Transaction* txn) { txn_ = txn; }
     Transaction* GetTransaction() const { return txn_; }
 
+    // ---- Spec 2.3：统一的存储访问门面 ----
+    // 由 ExecutionEngine 在 Execute() 创建 ctx 时挂上；算子可调用
+    // ctx.GetStorage()->GetPage(...) 访问 BPM，绕过对 BufferPoolManager 的直接
+    // 依赖。nullptr 表示当前 ctx 没有关联到 StorageAccess（极少发生在测试场景）。
+    void SetStorage(StorageAccess* storage) { storage_ = storage; }
+    StorageAccess* GetStorage() const { return storage_; }
+
     // ---- 59_procs (Category 8)：OUT 参数返回值表 ----
     //
     // CALL name(...) 执行后，procedure 的 OUT / INOUT 参数被回写到本字典
@@ -126,16 +136,20 @@ public:
     // 60_view_trigger (Category 9): AFTER 触发器 / STATEMENT 级触发器共享的会话状态。
     // - session_log_：AFTER 触发器把"会话变量"以 name → value 的形式写入；
     //   后续 SQL 可以通过 SET @var = ... 等路径回读。V1 主要用于记录 AFTER 副作用。
+    //   71_proc_out_params 后改为非所有权指针，指向 Database 持有的同一张表；
+    //   这样 CALL/SELECT @var / SET @var 跨 ExecuteSQL 调用都能看到对方的写入。
     // - statement_fired_：STATEMENT 级触发器避免在每行重复执行的标记。
     //   InsertExecutor / UpdateExecutor / DeleteExecutor 入口处清空，
     //   TriggerExecutor::FireAfter 在已 fire 时直接返回。
-    void SetSessionVar(const std::string& name, Value v) {
-        session_log_[name] = std::move(v);
+    void SetSessionVars(std::unordered_map<std::string, Value>* vars) {
+        session_log_ = vars;
     }
-    Value GetSessionVar(const std::string& name) const;
-    const std::unordered_map<std::string, Value>& GetSessionLog() const {
+    std::unordered_map<std::string, Value>* GetSessionVars() const {
         return session_log_;
     }
+    void SetSessionVar(const std::string& name, Value v);
+    Value GetSessionVar(const std::string& name) const;
+    const std::unordered_map<std::string, Value>& GetSessionLog() const;
     bool MarkStatementFired(const std::string& key) {
         return !statement_fired_.insert(key).second;  // true 表示已 fire 过
     }
@@ -160,12 +174,17 @@ private:
     Transaction* txn_ = nullptr;
     // Phase A：所属事务管理器（由 ExecutionEngine 在构造 ctx 时注入）。
     TransactionManager* txn_manager_ = nullptr;
+    // Spec 2.3：统一的存储访问门面（非所有权裸指针）。
+    StorageAccess* storage_ = nullptr;
     // 59_procs (Category 8): CALL 返回的 OUT / INOUT 参数值。
     std::unordered_map<std::string, Value> out_args_;
     // 59_procs (Category 8): procedure 当前局部变量绑定。
     const std::unordered_map<std::string, Value>* proc_locals_ = nullptr;
     // 60_view_trigger (Category 9): AFTER 触发器会话变量 + 语句级 fire 标记。
-    std::unordered_map<std::string, Value> session_log_;
+    // 71_proc_out_params：session_log_ 由"本地上 map"改为"非所有权指针"，
+    // 由 ExecutionEngine::Execute 把 Database::session_vars_ 注入到 ctx 上；
+    // SetSessionVar / GetSessionVar 通过该指针读写，跨 ExecuteSQL 调用持久。
+    std::unordered_map<std::string, Value>* session_log_ = nullptr;
     std::unordered_set<std::string> statement_fired_;
 };
 

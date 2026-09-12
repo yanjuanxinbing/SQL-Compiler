@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "execution/Executor.h"
 #include "plan/Plan.h"
@@ -41,6 +42,12 @@ private:
     Kind kind_;
     std::string view_name_;
     const PlanNode* plan_node_;  // CREATE / ALTER 节点；children[0] 是 SELECT 子计划
+    // 由 Planner 通过 InferSelectOutputSchema 静态计算出的输出列定义。
+    // - CREATE 路径：直接用作 backing table 的列定义。
+    // - REFRESH 路径：与 catalog 中已存的 MaterializedViewInfo.columns 对比，
+    //   不一致时报「schema drift detected」错误（V1 行为与 PostgreSQL 一致：
+    //   schema 变更需要 DROP + CREATE）。
+    std::vector<ColumnDefinition> cols_;
     bool done_ = false;
 };
 

@@ -1039,7 +1039,8 @@ PlanNodePtr Planner::PlanCreateView(const CreateViewStatement& stmt) {
 // 60_view_trigger (Category 9): CREATE MATERIALIZED VIEW
 //
 // V1 实施策略：
-//   - 把 SELECT 的输出列定型为 ColumnDefinition（通过 DeriveOutputColumns 走子计划）。
+//   - 把 SELECT 的输出列定型为 ColumnDefinition（通过 InferSelectOutputSchema，
+//     不依赖执行期求值 —— 即使源表为空也能正确产出 schema）。
 //   - catalog 内注册 MaterializedViewInfo（backing_table = "__mv_<name>"）。
 //   - 立即执行 SELECT 并把结果集通过 CreateMaterializedViewExecutor 写入 backing table。
 //
@@ -1047,12 +1048,16 @@ PlanNodePtr Planner::PlanCreateView(const CreateViewStatement& stmt) {
 // 不在 Planner 阶段跑子计划（planner 阶段不应产生副作用）。
 PlanNodePtr Planner::PlanCreateMaterializedView(const MaterializedViewStatement& stmt) {
     // 先递归 plan 出子计划，用于在执行器阶段读取定型列。
+    std::vector<ColumnDefinition> output_columns;
     if (stmt.query) {
         SelectStatement& mutable_query = const_cast<SelectStatement&>(*stmt.query);
         PlanSelect(mutable_query);
+        // 类型推断：基于 SelectStatement AST 与当前 symbol_table 静态产出
+        // 输出 schema（与 planner 已收集到的列类型 / UDF / 视图展开兼容）。
+        output_columns = InferSelectOutputSchema(mutable_query, symbol_table_);
     }
     auto node = std::make_shared<CreateMaterializedViewNode>(
-        stmt.view_name, std::vector<ColumnDefinition>{}, stmt.if_not_exists);
+        stmt.view_name, output_columns, stmt.if_not_exists);
     if (stmt.query) {
         node->children.push_back(PlanSelect(*stmt.query));
     }
@@ -1064,7 +1069,7 @@ PlanNodePtr Planner::PlanCreateMaterializedView(const MaterializedViewStatement&
         SystemCatalog::MaterializedViewInfo mv;
         mv.view_name = stmt.view_name;
         mv.backing_table = SystemCatalog::MaterializedViewBackingTable(stmt.view_name);
-        mv.columns.clear();
+        mv.columns = output_columns;
         mv.query_text = stmt.query ? stmt.query->ToString() : "";
         catalog_->CreateMaterializedView(mv);
     }
@@ -1088,6 +1093,10 @@ PlanNodePtr Planner::PlanAlterMaterializedView(const AlterMaterializedViewStatem
                 StatementPtr parsed = parser.Parse();
                 if (parsed && parsed->GetType() == NodeType::SELECT_STMT) {
                     auto sel = std::static_pointer_cast<SelectStatement>(parsed);
+                    // 类型推断：与 CREATE 路径一致，产出与 catalog 已存
+                    // MaterializedViewInfo.columns 对比，差异由 executor 报
+                    // 「schema drift detected」错。
+                    node->columns = InferSelectOutputSchema(*sel, symbol_table_);
                     PlanNodePtr sub = PlanSelect(*sel);
                     if (sub) node->children.push_back(sub);
                 }
@@ -1215,7 +1224,9 @@ PlanNodePtr Planner::PlanDropSequence(const DropSequenceStatement& stmt) {
 // 注意：我们不在这里执行 inner；inner 是 EXPLAIN 时本就不该真正跑（任务文档
 // 要求「不执行，只展示计划」）。
 PlanNodePtr Planner::PlanExplain(const ExplainStatement& stmt) {
-    auto node = std::make_shared<ExplainNode>(stmt.analyze);
+    // format 默认 "TEXT"，Planner::PlanExplain 把它透传到 ExplainNode，
+    // ExplainExecutor 据此选择 ToString / ToJson / ToSExpr 输出。
+    auto node = std::make_shared<ExplainNode>(stmt.analyze, stmt.format);
     if (stmt.inner) {
         PlanNodePtr inner_plan = CreatePlan(stmt.inner);
         if (inner_plan) {
@@ -1415,6 +1426,397 @@ PlanNodePtr Planner::PlanGroupingSets(const SelectStatement& stmt, PlanNodePtr s
         result = sop;
     }
     return result;
+}
+
+// ============ 物化视图输出列类型推断 ============
+//
+// 给 MaterializedViewExecutor 在 Init 阶段使用：不需要跑子计划就能得到 SELECT
+// 的输出 schema。Planner 已经在 PlanCreateMaterializedView / PlanAlterMaterializedView
+// 阶段调用它，把结果存到 node->columns；executor 直接读取。
+//
+// 算法：对 SelectStatement::select_list 逐项求值。每一项根据其表达式类型
+// （Literal / ColumnRef / Binary / Unary / FunctionCall / Case / Cast / Subquery /
+// Window）推导其结果类型的字符串表示（"INT" / "FLOAT" / "VARCHAR" / ...）。对
+// SELECT * / t.* 用 from_table + joins 的列展开来生成多项。
+//
+// 失败回退：未知函数 / 无法解析的列时退化为 VARCHAR(255)，与历史 probe 行为
+// 一致；不会抛错 —— 调用方拿到的 ColumnDefinition 直接用来建表。
+//
+// 列名：select_aliases[i] 优先；为空时取 ColumnRefExpr 的 column_name；
+// 否则 "col<i>"（与历史 col0/col1 命名兼容）。
+
+namespace {
+
+using sqlcompiler::BinaryExpr;
+using sqlcompiler::BinaryOperator;
+using sqlcompiler::CaseExprNode;
+using sqlcompiler::CastExprNode;
+using sqlcompiler::ColumnDefinition;
+using sqlcompiler::ColumnInfo;
+using sqlcompiler::ColumnRefExpr;
+using sqlcompiler::Expr;
+using sqlcompiler::ExprPtr;
+using sqlcompiler::FunctionCallExpr;
+using sqlcompiler::LiteralExpr;
+using sqlcompiler::LiteralType;
+using sqlcompiler::SelectStatement;
+using sqlcompiler::SubqueryExprNode;
+using sqlcompiler::SubqueryType;
+using sqlcompiler::SymbolTable;
+using sqlcompiler::TableInfo;
+using sqlcompiler::UnaryExpr;
+using sqlcompiler::UnaryOperator;
+using sqlcompiler::WindowFuncNode;
+
+// 类型字符串常量
+constexpr const char* kInt     = "INT";
+constexpr const char* kFloat   = "FLOAT";
+constexpr const char* kVarchar = "VARCHAR";
+constexpr const char* kDate    = "DATE";
+constexpr const char* kTs      = "TIMESTAMP";
+constexpr const char* kTime    = "TIME";
+
+const char* LiteralDataType(LiteralType lt) {
+    switch (lt) {
+        case LiteralType::INTEGER:    return kInt;
+        case LiteralType::FLOAT:      return kFloat;
+        case LiteralType::STRING:     return kVarchar;
+        case LiteralType::BOOLEAN:    return kInt;
+        case LiteralType::DATE:       return kDate;
+        case LiteralType::TIMESTAMP:  return kTs;
+        case LiteralType::TIME:       return kTime;
+        case LiteralType::JSON:       return kVarchar;
+        case LiteralType::NULL_VALUE: return kVarchar;
+    }
+    return kVarchar;
+}
+
+bool IsAggregateFuncName(const std::string& name) {
+    return name == "COUNT" || name == "SUM" || name == "AVG" ||
+           name == "MIN" || name == "MAX" ||
+           name == "STDDEV" || name == "STDDEV_POP" || name == "STDDEV_SAMP" ||
+           name == "VARIANCE" || name == "VAR_POP" || name == "VAR_SAMP" ||
+           name == "MEDIAN" ||
+           name == "STRING_AGG" || name == "GROUP_CONCAT" ||
+           name == "PERCENTILE_CONT" || name == "PERCENTILE_DISC";
+}
+
+bool IsStringFuncName(const std::string& name) {
+    return name == "UPPER" || name == "LOWER" ||
+           name == "SUBSTR" || name == "SUBSTRING" ||
+           name == "TRIM" || name == "REPLACE" ||
+           name == "CONCAT" ||
+           name == "LPAD" || name == "RPAD" ||
+           name == "LEFT" || name == "RIGHT" ||
+           name == "REVERSE" || name == "REPEAT" ||
+           name == "LTRIM" || name == "RTRIM" ||
+           name == "CHAR" || name == "CHR";
+}
+
+bool IsMathFuncName(const std::string& name) {
+    return name == "ABS" || name == "SIGN" ||
+           name == "ROUND" || name == "CEIL" || name == "CEILING" ||
+           name == "FLOOR" || name == "TRUNCATE" || name == "TRUNC" ||
+           name == "MOD" || name == "POWER" || name == "POW" ||
+           name == "SQRT" || name == "EXP" || name == "LN" || name == "LOG" ||
+           name == "SIN" || name == "COS" || name == "TAN" ||
+           name == "ASIN" || name == "ACOS" || name == "ATAN" ||
+           name == "RAND" || name == "RANDOM";
+}
+
+bool IsDateFuncName(const std::string& name) {
+    return name == "NOW" || name == "CURRENT_DATE" || name == "CURRENT_TIME" ||
+           name == "CURRENT_TIMESTAMP" || name == "GETDATE" ||
+           name == "DATE_TRUNC" || name == "DATE_PART" ||
+           name == "FROM_UNIXTIME" || name == "UNIX_TIMESTAMP" ||
+           name == "DATE_ADD" || name == "DATE_SUB" ||
+           name == "DATE_FORMAT" || name == "STRFTIME" ||
+           name == "TIMESTAMPDIFF" || name == "DATEDIFF";
+}
+
+// 推断一个表达式的结果类型（"INT" / "FLOAT" / "VARCHAR" / "DATE" / ...）。
+// 当无法推断时返回 "VARCHAR"（与历史 probe 行为一致）。
+//
+// source_tables：SELECT 的 from_table + joins（按出现顺序）。未限定列引用
+// 仅在这张表集合中查找 —— 防止取到 __mv_xxx / 视图 / 同名其他表导致错位。
+std::string InferExprType(const ExprPtr& e,
+                          const SymbolTable& st,
+                          const std::vector<std::string>& source_tables);
+
+std::string InferExprTypeImpl(const Expr* raw,
+                              const SymbolTable& st,
+                              const std::vector<std::string>& source_tables) {
+    if (!raw) return kVarchar;
+    switch (raw->GetType()) {
+        case NodeType::LITERAL_EXPR: {
+            const auto* lit = static_cast<const LiteralExpr*>(raw);
+            return LiteralDataType(lit->literal_type);
+        }
+        case NodeType::COLUMN_REF_EXPR: {
+            const auto* cr = static_cast<const ColumnRefExpr*>(raw);
+            // 限定表名 col：table.col。
+            if (!cr->table_name.empty()) {
+                const TableInfo* t = st.GetTable(cr->table_name);
+                if (t) {
+                    const ColumnInfo* c = t->GetColumn(cr->column_name);
+                    if (c) return c->data_type;
+                }
+            } else {
+                // 未限定列名：先在 SELECT 的 from_table（含 joins）中查找，
+                // 找不到再回退到全表扫描 —— 否则会取到 __mv_xxx / 视图等
+                // 无关表的同名列，导致类型推断错位。
+                for (const auto& tname : source_tables) {
+                    const TableInfo* t = st.GetTable(tname);
+                    if (!t) continue;
+                    const ColumnInfo* c = t->GetColumn(cr->column_name);
+                    if (c) return c->data_type;
+                }
+                for (const auto& name : st.GetAllTableNames()) {
+                    const TableInfo* t = st.GetTable(name);
+                    if (t) {
+                        const ColumnInfo* c = t->GetColumn(cr->column_name);
+                        if (c) return c->data_type;
+                    }
+                }
+            }
+            return kVarchar;
+        }
+        case NodeType::BINARY_EXPR: {
+            const auto* b = static_cast<const BinaryExpr*>(raw);
+            std::string lt = InferExprType(b->left, st, source_tables);
+            std::string rt = InferExprType(b->right, st, source_tables);
+            switch (b->op) {
+                case BinaryOperator::ADD:
+                case BinaryOperator::SUB:
+                case BinaryOperator::MUL:
+                case BinaryOperator::DIV:
+                    // 任一侧是 FLOAT -> FLOAT；否则 INT。
+                    if (lt == kFloat || rt == kFloat) return kFloat;
+                    if (lt == kVarchar || rt == kVarchar) return kVarchar;
+                    return kInt;
+                case BinaryOperator::CONCAT:
+                    return kVarchar;
+                case BinaryOperator::INTERVAL_ADD:
+                case BinaryOperator::INTERVAL_SUB:
+                    // DATE/TIMESTAMP ± INTERVAL -> VARCHAR（持久化文本）
+                    return kVarchar;
+                case BinaryOperator::EQUAL:
+                case BinaryOperator::NOT_EQUAL:
+                case BinaryOperator::LESS:
+                case BinaryOperator::LESS_EQUAL:
+                case BinaryOperator::GREATER:
+                case BinaryOperator::GREATER_EQUAL:
+                case BinaryOperator::AND:
+                case BinaryOperator::OR:
+                case BinaryOperator::LIKE:
+                case BinaryOperator::IN_LIST:
+                case BinaryOperator::BETWEEN:
+                case BinaryOperator::IS_NULL:
+                case BinaryOperator::IS_NOT_NULL:
+                    return kInt;
+            }
+            return kInt;
+        }
+        case NodeType::UNARY_EXPR: {
+            const auto* u = static_cast<const UnaryExpr*>(raw);
+            if (u->op == UnaryOperator::NOT) return kInt;
+            // NEGATE -> 操作数类型
+            return InferExprType(u->operand, st, source_tables);
+        }
+        case NodeType::FUNCTION_CALL_EXPR: {
+            const auto* f = static_cast<const FunctionCallExpr*>(raw);
+            std::string name;
+            for (char c : f->function_name) name.push_back(
+                static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+            if (name == "*" || name == "STAR") {
+                // SELECT * 由外层展开，这里退化到 VARCHAR。
+                return kVarchar;
+            }
+            if (IsAggregateFuncName(name)) {
+                if (name == "COUNT") return kInt;
+                // 其余聚合（SUM/AVG/MIN/MAX/STDDEV/VARIANCE/MEDIAN）取首个参数的类型：
+                //   FLOAT 操作数 -> FLOAT；INT -> INT；STRING 视为 FLOAT 不合理，
+                //   退化到 VARCHAR。
+                if (f->arguments.empty()) return kInt;
+                std::string arg_t = InferExprType(f->arguments[0], st, source_tables);
+                if (arg_t == kFloat) return kFloat;
+                if (arg_t == kInt) return kInt;
+                return kVarchar;
+            }
+            if (IsStringFuncName(name)) return kVarchar;
+            if (name == "LENGTH" || name == "LEN" || name == "CHAR_LENGTH" ||
+                name == "POSITION" || name == "INSTR") return kInt;
+            if (IsMathFuncName(name)) {
+                // 涉及三角 / 指数 / 对数通常返回 FLOAT；INT-in / INT-out 的
+                // 取整函数（CEIL/FLOOR）保留 INT。
+                if (name == "CEIL" || name == "CEILING" ||
+                    name == "FLOOR" || name == "ROUND" ||
+                    name == "TRUNCATE" || name == "TRUNC" ||
+                    name == "MOD" || name == "SIGN") {
+                    if (!f->arguments.empty()) {
+                        std::string arg_t = InferExprType(f->arguments[0], st, source_tables);
+                        if (arg_t == kInt) return kInt;
+                    }
+                    return kFloat;
+                }
+                return kFloat;
+            }
+            if (name == "COALESCE" || name == "IFNULL" || name == "NULLIF") {
+                if (f->arguments.empty()) return kVarchar;
+                return InferExprType(f->arguments[0], st, source_tables);
+            }
+            if (name == "CAST" || name == "CONVERT") {
+                // CAST(arg AS type) / CONVERT(arg, type)：第二个参数是目标类型。
+                // 此实现的语法形式：CAST(<expr> AS <type>) 由 CastExprNode 承载，
+                // 不会落在这里；这里仅作为兜底，识别 CONVERT(expr, type)。
+                if (f->arguments.size() >= 2) {
+                    if (auto lt = std::dynamic_pointer_cast<LiteralExpr>(f->arguments[1])) {
+                        return LiteralDataType(lt->literal_type);
+                    }
+                }
+                return kVarchar;
+            }
+            if (IsDateFuncName(name)) return kVarchar;
+            if (name == "EXTRACT") {
+                // EXTRACT(field FROM source)：field 是第一个参数（字符串字面量），
+                // 结果是 INT（YEAR/MONTH/DAY/HOUR/MINUTE/SECOND）。
+                return kInt;
+            }
+            // 未知函数：退化为 VARCHAR。
+            return kVarchar;
+        }
+        case NodeType::CASE_EXPR: {
+            const auto* c = static_cast<const CaseExprNode*>(raw);
+            for (const auto& w : c->whens) {
+                if (w.then_expr) return InferExprType(w.then_expr, st, source_tables);
+            }
+            if (c->else_expr) return InferExprType(c->else_expr, st, source_tables);
+            return kVarchar;
+        }
+        case NodeType::CAST_EXPR: {
+            const auto* c = static_cast<const CastExprNode*>(raw);
+            return c->target_type.empty() ? kVarchar : c->target_type;
+        }
+        case NodeType::SUBQUERY_EXPR: {
+            const auto* s = static_cast<const SubqueryExprNode*>(raw);
+            // SCALAR：取子查询首列的类型；IN/EXISTS/ANY 返回 INT（布尔）。
+            if (s->kind == SubqueryType::SCALAR && s->subquery &&
+                !s->subquery->select_list.empty()) {
+                return InferExprType(s->subquery->select_list[0], st, source_tables);
+            }
+            return kInt;
+        }
+        case NodeType::WINDOW_FUNC_EXPR: {
+            const auto* w = static_cast<const WindowFuncNode*>(raw);
+            // 与对应的聚合 / 标量函数同型：递归求参数推断即可（这里简单把
+            // function_name 当作普通函数处理）。
+            FunctionCallExpr pseudo(w->function_name, w->arguments);
+            return InferExprTypeImpl(&pseudo, st, source_tables);
+        }
+        default:
+            return kVarchar;
+    }
+}
+
+std::string InferExprType(const ExprPtr& e,
+                          const SymbolTable& st,
+                          const std::vector<std::string>& source_tables) {
+    return InferExprTypeImpl(e.get(), st, source_tables);
+}
+
+// 展开 SELECT * / t.*：按 from_table + joins 的列顺序产生 ColumnDefinition。
+// 仅处理「单源表 + 无派生表 / 无 LATERAL」的最常见情况；其他情况退化为
+// 单列 VARCHAR（与历史行为一致）。
+std::vector<ColumnDefinition> ExpandSelectStar(const SelectStatement& stmt,
+                                               const SymbolTable& st) {
+    std::vector<ColumnDefinition> out;
+    // 仅当 select_list 是单个 "*" / "t.*" 时展开。混合形式（含别名、与其他
+    // 表达式并列）不展开 —— 与执行期 ProjectExecutor 的处理对齐。
+    if (stmt.select_list.size() != 1 || !stmt.select_list[0]) return out;
+    auto* fc = static_cast<const FunctionCallExpr*>(stmt.select_list[0].get());
+    std::string name;
+    for (char c : fc->function_name) name.push_back(
+        static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    if (name != "*" && name != "STAR") return out;
+    // t.*：限定到指定表。
+    if (!fc->arguments.empty() && fc->arguments[0] &&
+        fc->arguments[0]->GetType() == NodeType::COLUMN_REF_EXPR) {
+        const auto* cr = static_cast<const ColumnRefExpr*>(fc->arguments[0].get());
+        const TableInfo* t = st.GetTable(cr->column_name);
+        if (t) {
+            for (const auto& c : t->columns) {
+                ColumnDefinition cd;
+                cd.column_name = c.name;
+                cd.data_type = c.data_type;
+                cd.char_length = c.char_length;
+                out.push_back(std::move(cd));
+            }
+            return out;
+        }
+    }
+    // 普通 SELECT *：from_table + joins 的全部列。
+    if (!stmt.from_table.empty() && stmt.joins.empty() && !stmt.derived_table &&
+        stmt.values_rows.empty()) {
+        const TableInfo* t = st.GetTable(stmt.from_table);
+        if (t) {
+            for (const auto& c : t->columns) {
+                ColumnDefinition cd;
+                cd.column_name = c.name;
+                cd.data_type = c.data_type;
+                cd.char_length = c.char_length;
+                out.push_back(std::move(cd));
+            }
+            return out;
+        }
+    }
+    // 兜底：fall through，调用方按"未展开"处理（返回单列）。
+    return out;
+}
+
+}  // namespace
+
+std::vector<ColumnDefinition> Planner::InferSelectOutputSchema(
+    const SelectStatement& stmt, const SymbolTable& symbol_table) {
+    std::vector<ColumnDefinition> out;
+    out.reserve(stmt.select_list.size());
+
+    // SELECT * 展开：覆盖最常见的「整表复制」情形。
+    if (stmt.select_list.size() == 1 && stmt.select_list[0] &&
+        stmt.select_list[0]->GetType() == NodeType::FUNCTION_CALL_EXPR) {
+        auto expanded = ExpandSelectStar(stmt, symbol_table);
+        if (!expanded.empty()) return expanded;
+    }
+
+    // 收集 SELECT 引用的源表（from_table + joins）。未限定列引用先在这
+    // 张表集合里查找，避免取到 __mv_xxx / 视图同名表导致类型推断错位。
+    std::vector<std::string> source_tables;
+    if (!stmt.from_table.empty()) source_tables.push_back(stmt.from_table);
+    if (stmt.derived_table) source_tables.push_back(stmt.derived_alias);
+    for (const auto& j : stmt.joins) source_tables.push_back(j.table_name);
+
+    for (size_t i = 0; i < stmt.select_list.size(); ++i) {
+        const auto& e = stmt.select_list[i];
+        ColumnDefinition cd;
+        // 1) 列名：select_aliases[i] 优先；空时取 ColumnRefExpr 的 column_name；
+        //    否则 "col<i>"（与历史 col0/col1 命名一致）。
+        if (i < stmt.select_aliases.size() && !stmt.select_aliases[i].empty()) {
+            cd.column_name = stmt.select_aliases[i];
+        } else if (e && e->GetType() == NodeType::COLUMN_REF_EXPR) {
+            cd.column_name =
+                std::static_pointer_cast<ColumnRefExpr>(e)->column_name;
+        } else {
+            cd.column_name = "col" + std::to_string(i);
+        }
+        // 2) 类型：递归推断。source_tables 取自 SELECT 的 FROM + joins —— 未限定
+        //    列引用只在这张表集合中查找，防止取到 __mv_xxx / 视图同名表。
+        cd.data_type = InferExprType(e, symbol_table, source_tables);
+        // VARCHAR 不限长时给个默认 255（与旧 probe 行为一致）。
+        if (cd.data_type == kVarchar && cd.char_length < 0) {
+            cd.char_length = 255;
+        }
+        out.push_back(std::move(cd));
+    }
+    return out;
 }
 
 }  // namespace sqlcompiler

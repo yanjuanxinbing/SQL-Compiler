@@ -85,6 +85,32 @@ bool Parser::IsAtEnd() const {
     return CurrentToken().type == TokenType::END_OF_FILE;
 }
 
+// ================= 工具：把 Token 的位置写到 AST 节点上 =================
+//
+// Spec 1.3 要求语义错误携带源码位置。AST 节点在 Node 基类上已经有 line / column
+// 字段（默认 -1），由 Parser 在节点构造后立刻填入，以便 SemanticAnalyzer 在
+// 任何报错位置直接读取。
+//
+// 用法：`stmt->line = cur.line; stmt->column = cur.column;`
+// 下面的辅助函数封装该模式，避免每个 make_shared 调用点都要写两行重复代码。
+
+namespace {
+
+// 把 `t` 的位置写到 `node` 上。Node* 可以为空（空指针直接返回，不报错）。
+void SetNodePos(sqlcompiler::Node* node, const sqlcompiler::Token& t) {
+    if (node == nullptr) return;
+    node->line = t.line;
+    node->column = t.column;
+}
+
+// 重载：shared_ptr 版本，方便在 `auto stmt = std::make_shared<...>()` 后链式调用。
+template <typename T>
+void SetNodePos(const std::shared_ptr<T>& node, const sqlcompiler::Token& t) {
+    SetNodePos(node.get(), t);
+}
+
+}  // namespace
+
 // ================= 语句解析 =================
 
 StatementPtr Parser::ParseStatement() {
@@ -145,6 +171,7 @@ StatementPtr Parser::ParseStatement() {
         Advance(); // DESCRIBE / DESC
         Token t = Expect(TokenType::IDENTIFIER, "expected table name after DESCRIBE/DESC");
         auto stmt = std::make_shared<ShowStatement>();
+        SetNodePos(stmt, cur);
         stmt->kind = ShowStatement::Kind::COLUMNS;
         stmt->target_table = t.lexeme;
         return stmt;
@@ -161,6 +188,7 @@ StatementPtr Parser::ParseStatement() {
             Advance();  // REPLACE
             Expect(TokenType::KEYWORD_INTO, "expected INTO after REPLACE");
             auto stmt = std::make_shared<InsertStatement>();
+            SetNodePos(stmt, cur);
             stmt->is_replace = true;
             stmt->table_name = ParseTableNameAllowSchema();
             // 复制 ParseInsertStatement 余下的列名 / VALUES / ON DUPLICATE 解析。
@@ -283,6 +311,7 @@ StatementPtr Parser::ParseStatement() {
             Expect(TokenType::KEYWORD_TABLE, "expected TABLE after TRUNCATE");
             Token t = Expect(TokenType::IDENTIFIER, "expected table name");
             auto stmt = std::make_shared<TruncateTableStatement>();
+            SetNodePos(stmt, cur);
             stmt->table_name = t.lexeme;
             return stmt;
         }
@@ -306,8 +335,9 @@ StatementPtr Parser::ParseStatement() {
 }
 
 StatementPtr Parser::ParseSelectStatement(bool consume_trailers) {
-    Expect(TokenType::KEYWORD_SELECT, "expected SELECT");
+    Token select_tok = Expect(TokenType::KEYWORD_SELECT, "expected SELECT");
     auto stmt = std::make_shared<SelectStatement>();
+    SetNodePos(stmt, select_tok);
     if (Match(TokenType::KEYWORD_DISTINCT)) {
         stmt->is_distinct = true;
     }
@@ -673,10 +703,11 @@ void Parser::ParseFromClause(SelectStatement& stmt) {
 }
 
 StatementPtr Parser::ParseInsertStatement() {
-    Expect(TokenType::KEYWORD_INSERT, "expected INSERT");
+    Token insert_tok = Expect(TokenType::KEYWORD_INSERT, "expected INSERT");
     Expect(TokenType::KEYWORD_INTO, "expected INTO");
     std::string table_name = ParseTableNameAllowSchema();
     auto stmt = std::make_shared<InsertStatement>();
+    SetNodePos(stmt, insert_tok);
     stmt->table_name = std::move(table_name);
     if (Match(TokenType::LEFT_PAREN)) {
         while (!Check(TokenType::RIGHT_PAREN) && !IsAtEnd()) {
@@ -747,9 +778,10 @@ std::vector<std::pair<std::string, ExprPtr>> Parser::ParseUpsertAssignments() {
 }
 
 StatementPtr Parser::ParseUpdateStatement() {
-    Expect(TokenType::KEYWORD_UPDATE, "expected UPDATE");
+    Token update_tok = Expect(TokenType::KEYWORD_UPDATE, "expected UPDATE");
     std::string table_name = ParseTableNameAllowSchema();
     auto stmt = std::make_shared<UpdateStatement>();
+    SetNodePos(stmt, update_tok);
     stmt->table_name = std::move(table_name);
     // 可选别名：UPDATE t AS t SET ... FROM s AS ss WHERE ...
     // 解析规则：当前 token 是 KEYWORD_AS 时消耗之；否则若 token 是 IDENTIFIER 且
@@ -852,10 +884,11 @@ StatementPtr Parser::ParseUpdateStatement() {
 }
 
 StatementPtr Parser::ParseDeleteStatement() {
-    Expect(TokenType::KEYWORD_DELETE, "expected DELETE");
+    Token delete_tok = Expect(TokenType::KEYWORD_DELETE, "expected DELETE");
     Expect(TokenType::KEYWORD_FROM, "expected FROM");
     std::string table_name = ParseTableNameAllowSchema();
     auto stmt = std::make_shared<DeleteStatement>();
+    SetNodePos(stmt, delete_tok);
     stmt->table_name = std::move(table_name);
     if (Check(TokenType::KEYWORD_WHERE)) {
         stmt->where_clause = ParseWhereClause();
@@ -892,9 +925,10 @@ void Parser::ParseReturningClause(std::vector<ExprPtr>& returning_exprs,
 //   [WHEN MATCHED THEN UPDATE SET col = expr [, ...]]
 //   [WHEN NOT MATCHED THEN INSERT (cols) VALUES (exprs)]
 StatementPtr Parser::ParseMergeStatement() {
-    Expect(TokenType::KEYWORD_MERGE, "expected MERGE");
+    Token merge_tok = Expect(TokenType::KEYWORD_MERGE, "expected MERGE");
     Expect(TokenType::KEYWORD_INTO, "expected INTO after MERGE");
     auto stmt = std::make_shared<MergeStatement>();
+    SetNodePos(stmt, merge_tok);
     stmt->target_table = ParseTableNameAllowSchema();
     if (Match(TokenType::KEYWORD_AS)) {
         Token a = Expect(TokenType::IDENTIFIER, "expected target alias after AS");
@@ -1003,7 +1037,7 @@ StatementPtr Parser::ParseMergeStatement() {
 }
 
 StatementPtr Parser::ParseCreateTableStatement() {
-    Expect(TokenType::KEYWORD_CREATE, "expected CREATE");
+    Token create_tok = Expect(TokenType::KEYWORD_CREATE, "expected CREATE");
     Expect(TokenType::KEYWORD_TABLE, "expected TABLE");
     bool if_not_exists = false;
     if (Check(TokenType::KEYWORD_IF)) {
@@ -1025,6 +1059,7 @@ StatementPtr Parser::ParseCreateTableStatement() {
     }
     std::string table_name = ParseTableNameAllowSchema();
     auto stmt = std::make_shared<CreateTableStatement>();
+    SetNodePos(stmt, create_tok);
     stmt->table_name = std::move(table_name);
     stmt->if_not_exists = if_not_exists;
     Expect(TokenType::LEFT_PAREN, "expected '(' after table name");
@@ -1034,7 +1069,7 @@ StatementPtr Parser::ParseCreateTableStatement() {
 }
 
 StatementPtr Parser::ParseDropTableStatement() {
-    Expect(TokenType::KEYWORD_DROP, "expected DROP");
+    Token drop_tok = Expect(TokenType::KEYWORD_DROP, "expected DROP");
     Expect(TokenType::KEYWORD_TABLE, "expected TABLE");
     bool if_exists = false;
     if (Check(TokenType::KEYWORD_IF)) {
@@ -1054,14 +1089,16 @@ StatementPtr Parser::ParseDropTableStatement() {
     }
     std::string table_name = ParseTableNameAllowSchema();
     auto stmt = std::make_shared<DropTableStatement>();
+    SetNodePos(stmt, drop_tok);
     stmt->table_name = std::move(table_name);
     stmt->if_exists = if_exists;
     return stmt;
 }
 
 StatementPtr Parser::ParseCreateIndexStatement() {
-    Expect(TokenType::KEYWORD_CREATE, "expected CREATE");
+    Token create_tok = Expect(TokenType::KEYWORD_CREATE, "expected CREATE");
     auto stmt = std::make_shared<CreateIndexStatement>();
+    SetNodePos(stmt, create_tok);
     if (Match(TokenType::KEYWORD_UNIQUE)) {
         stmt->is_unique = true;
     }
@@ -1081,9 +1118,10 @@ StatementPtr Parser::ParseCreateIndexStatement() {
 }
 
 StatementPtr Parser::ParseDropIndexStatement() {
-    Expect(TokenType::KEYWORD_DROP, "expected DROP");
+    Token drop_tok = Expect(TokenType::KEYWORD_DROP, "expected DROP");
     Expect(TokenType::KEYWORD_INDEX, "expected INDEX");
     auto stmt = std::make_shared<DropIndexStatement>();
+    SetNodePos(stmt, drop_tok);
     if (Check(TokenType::KEYWORD_IF)) {
         Advance();
         bool saw_exists = false;
@@ -1116,10 +1154,11 @@ StatementPtr Parser::ParseDropIndexStatement() {
 // 当前实现仅保证语法可解析与计划可生成，语义层 ALTER_TABLE 被作为 no-op
 // 处理：执行期不真正改动表结构，保证后续 SELECT 看到的数据一致。
 StatementPtr Parser::ParseAlterTableStatement() {
-    Expect(TokenType::KEYWORD_ALTER, "expected ALTER");
+    Token alter_tok = Expect(TokenType::KEYWORD_ALTER, "expected ALTER");
     Expect(TokenType::KEYWORD_TABLE, "expected TABLE");
     std::string table_name = ParseTableNameAllowSchema();
     auto stmt = std::make_shared<AlterStatement>();
+    SetNodePos(stmt, alter_tok);
     stmt->table_name = std::move(table_name);
     auto parse_column_type = [](const Token& ty, ColumnDefinition* cd) {
         if (ty.type == TokenType::KEYWORD_INT)       { cd->data_type = "INT";       }
@@ -2468,9 +2507,13 @@ ExprPtr Parser::ParseColumnRefOrFunctionCall() {
             return std::make_shared<FunctionCallExpr>("*", std::vector<ExprPtr>{});
         }
         Token second = Expect(TokenType::IDENTIFIER, "expected column name after '.'");
-        return std::make_shared<ColumnRefExpr>(first.lexeme, second.lexeme);
+        auto cr = std::make_shared<ColumnRefExpr>(first.lexeme, second.lexeme);
+        SetNodePos(cr, first);
+        return cr;
     }
-    return std::make_shared<ColumnRefExpr>("", first.lexeme);
+    auto cr = std::make_shared<ColumnRefExpr>("", first.lexeme);
+    SetNodePos(cr, first);
+    return cr;
 }
 
 // ============ 27–33 新增语法：解析函数实现 ============
@@ -3573,6 +3616,37 @@ StatementPtr Parser::ParseExplainStatement() {
         CurrentToken().lexeme == "ANALYZE") {
         Advance();
         stmt->analyze = true;
+    }
+    // 可选 FORMAT TEXT|JSON|SEXPR：决定 EXPLAIN 的输出格式。
+    // TEXT 是默认（与原行为一致，向后兼容）；JSON / SEXPR 走结构化路径。
+    // 注意 TEXT/JSON 在 Lexer 是关键字 (KEYWORD_TEXT/KEYWORD_JSON)，SEXPR 不是
+    // 关键字，仍走 IDENTIFIER 分支；这里统一接收关键字与标识符两种来源。
+    if (CurrentToken().type == TokenType::IDENTIFIER &&
+        CurrentToken().lexeme == "FORMAT") {
+        Advance();
+        std::string fmt_name;
+        TokenType ct = CurrentToken().type;
+        if (ct == TokenType::IDENTIFIER) {
+            fmt_name = CurrentToken().lexeme;
+            Advance();
+        } else if (ct == TokenType::KEYWORD_TEXT) {
+            fmt_name = "TEXT";
+            Advance();
+        } else if (ct == TokenType::KEYWORD_JSON) {
+            fmt_name = "JSON";
+            Advance();
+        } else {
+            throw CompilerException(ErrorStage::SYNTAX,
+                "expected format name after FORMAT (got '" + CurrentToken().lexeme + "')",
+                CurrentToken().line, CurrentToken().column);
+        }
+        if (fmt_name != "TEXT" && fmt_name != "JSON" && fmt_name != "SEXPR") {
+            throw CompilerException(ErrorStage::SYNTAX,
+                "EXPLAIN FORMAT must be one of TEXT, JSON, SEXPR (got '"
+                + fmt_name + "')",
+                CurrentToken().line, CurrentToken().column);
+        }
+        stmt->format = fmt_name;
     }
     // 解析内部语句。这里递归调用 ParseStatement() 而不是直接拼装：保持与
     // 顶层语句调度完全一致的优先级（含 WITH/SET OP/CTE/INSERT ... SELECT 等）。

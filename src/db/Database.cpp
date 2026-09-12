@@ -6,6 +6,7 @@
 #include "parser/Parser.h"
 #include "plan/Planner.h"
 #include "semantic/SemanticAnalyzer.h"
+#include "semantic/SemanticErrorStage.h"
 #include "txn/LogManager.h"
 #include "txn/RecoveryManager.h"
 
@@ -104,6 +105,11 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size)
     disk_manager_ = std::make_unique<DiskManager>(db_file_path_);
     buffer_pool_manager_ = std::make_unique<BufferPoolManager>(
         buffer_pool_size, disk_manager_.get());
+    // Spec 2.3 "接口设计与数据库集成"：在 BPM + DM 之上提供统一的存储访问
+    // 门面 StorageAccess，供 catalog / 执行引擎 / 算子使用。BPM 与 DM 的所有权
+    // 仍在 Database 内部，StorageAccess 仅持有非所有权裸指针。
+    storage_ = std::make_unique<StorageAccess>(buffer_pool_manager_.get(),
+                                               disk_manager_.get());
 
     // Phase B：先打开 WAL 文件，然后跑恢复（ARIES 3-phase），再决定是 Bootstrap
     // 还是 LoadFromDisk。注意：LogManager 必须在 catalog LoadFromDisk 之前完成，
@@ -128,7 +134,7 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size)
     txn_manager_->SetLogManager(log_manager_.get());
     txn_manager_->SetDiskManager(disk_manager_.get());
 
-    catalog_ = std::make_unique<SystemCatalog>(buffer_pool_manager_.get());
+    catalog_ = std::make_unique<SystemCatalog>(storage_.get());
     // 把 LogManager 注入 catalog 中的 TableHeap，让 CREATE TABLE / INDEX
     // 也走 WAL。Phase B 的 WAL 钩子在 TableHeap / BPlusTree 的 SetLogManager 里。
     // 此时 table_heaps_ / index_trees_ 均为空；第二次调用会在 Bootstrap /
@@ -160,6 +166,13 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size)
 
     execution_engine_ = std::make_unique<ExecutionEngine>(catalog_.get(),
                                                          txn_manager_.get());
+    // 把 StorageAccess 注入 ExecutionEngine，确保新构造的 ExecutionContext 看到
+    // 统一的存储门面（ctx->storage.GetPage(...) 即可访问 BPM）。
+    execution_engine_->SetStorageAccess(storage_.get());
+    // 71_proc_out_params：把 Database 持有的会话变量表注入到 ExecutionEngine，
+    // Execute() 在每次调用时把它挂到 ExecutionContext 上，让 SET @var / CALL 的
+    // OUT / INOUT / Trigger AFTER @col 等所有写路径直接落到 Database 同一张表。
+    execution_engine_->SetSessionVars(&session_vars_);
 
     // Phase B：每次 Database 启动都让 LogManager 的 durable_lsn 至少推进到当前
     // 文件末尾。AppendRecord 一条占位记录后 Flush，让后续 FlushPage 的 LSN 检查
@@ -173,6 +186,12 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size)
 
 Database::~Database() {
     Shutdown();
+}
+
+void Database::ResetLastArtifacts() {
+    last_tokens_.clear();
+    last_ast_.reset();
+    last_plan_.reset();
 }
 
 ExecutionResult Database::ExecuteSQL(const std::string& sql) {
@@ -196,10 +215,16 @@ ExecutionResult Database::ExecuteSQL(const std::string& sql) {
         std::_Exit(1);
     }
 
+    // Phase 1.5：调试输出模式缓存。每次新语句入口都先清空；后续各阶段成功后
+    // 再写入新值；任一阶段失败时，对应缓存条目保持为空。
+    ResetLastArtifacts();
+
     ExecutionResult result;
     try {
         Lexer lexer(sql);
         auto tokens = lexer.Tokenize();
+        // 词法成功：缓存 tokens（移动前快照，供 \.tokens 显示）。
+        last_tokens_ = tokens;
         Parser parser(std::move(tokens));
         auto statement = parser.Parse();
         if (!statement) {
@@ -229,15 +254,36 @@ ExecutionResult Database::ExecuteSQL(const std::string& sql) {
             txn_manager_->LogBegin(autocommit_txn);
         }
         try {
+            // 语法成功：缓存 AST。用 shared_ptr aliasing 构造（共享原 statement
+            // 的控制块，单独指向同一对象），避免 unique_ptr 路径下的双重释放。
+            last_ast_ = std::shared_ptr<Statement>(statement, statement.get());
             SemanticAnalyzer analyzer(catalog_.get(), catalog_->GetSymbolTable());
             if (!analyzer.Analyze(statement)) {
+                // Spec 1.3: 每个语义错误都应携带 [Kind] 标签 + line=col 位置。
+                // 格式: `semantic error [<Kind>] line=N[, col=M]: <message>`
+                // 多个错误之间用 "; " 分隔。
+                auto format_one = [](const SemanticError& e) {
+                    std::string out = "semantic error [";
+                    out += SemanticErrorKindToString(e.kind);
+                    out += "]";
+                    if (e.line >= 0) {
+                        out += " line=" + std::to_string(e.line);
+                        if (e.column >= 0) {
+                            out += ", col=" + std::to_string(e.column);
+                        }
+                        out += ":";
+                    }
+                    out += " ";
+                    out += e.message;
+                    return out;
+                };
                 std::string msg;
                 for (const auto& e : analyzer.GetErrors()) {
                     if (!msg.empty()) msg += "; ";
-                    msg += e.message;
+                    msg += format_one(e);
                 }
                 result.success = false;
-                result.message = "semantic error: " + msg;
+                result.message = msg;
                 if (need_autocommit && txn_manager_ != nullptr) {
                     txn_manager_->Rollback();
                 }
@@ -247,6 +293,8 @@ ExecutionResult Database::ExecuteSQL(const std::string& sql) {
             auto plan = planner.CreatePlan(statement);
             Optimizer optimizer(catalog_.get());
             plan = optimizer.Optimize(plan);
+            // 计划成功：缓存计划树（共享所有权）。
+            last_plan_ = std::shared_ptr<PlanNode>(plan, plan.get());
             auto exec_result = execution_engine_->Execute(plan);
             if (exec_result.success && buffer_pool_manager_) {
                 buffer_pool_manager_->FlushAllPages();

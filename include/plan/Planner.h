@@ -16,6 +16,32 @@ public:
     // 将语句转换为逻辑执行计划
     PlanNodePtr CreatePlan(const StatementPtr& statement);
 
+    // 给物化视图执行器使用：根据 SELECT 语句的 select_list 推断每列的输出类型。
+    // 不依赖执行期求值 —— 对空表也能正确产出 schema（避免「VARCHAR 占位列」
+    // 的回退）。
+    //
+    // 覆盖：
+    //   - 字面量（INTEGER/FLOAT/STRING/BOOLEAN/DATE/TIMESTAMP/TIME/JSON/NULL）
+    //   - 列引用（限定 / 未限定；通过 symbol_table 查找源列的类型）
+    //   - SELECT * / t.*：按 from_table + joins 的列顺序展开，每列类型来自 catalog
+    //   - 算术 / 比较 / 逻辑二元表达式（CONCAT -> VARCHAR；算术按操作数推断；
+    //     比较 / 逻辑 -> INT）
+    //   - 一元表达式（NOT -> INT；NEGATE -> 操作数类型）
+    //   - 函数调用：标量（UPPER / LOWER / SUBSTR / TRIM / REPLACE / LENGTH /
+    //     COALESCE / IFNULL / NULLIF / 数学 / 日期函数 / CAST），聚合
+    //     （SUM/AVG/COUNT/MIN/MAX/STDDEV/VARIANCE/MEDIAN 按输入类型推断，
+    //     COUNT 总是 INT）
+    //   - CASE WHEN（取首个 THEN 的类型；空时取 ELSE）
+    //   - CAST(expr AS type)
+    //   - 子查询（SCALAR 取首列；IN/EXISTS/ANY -> INT）
+    //   - 窗口函数（与对应聚合 / 标量函数同型）
+    //
+    // 失败回退：未知函数 / 无法解析的列时退化为 VARCHAR（与历史 probe 行为一致）。
+    // 失败不会抛错 —— 调用方可以基于 ColumnDefinition 直接建表。
+    static std::vector<ColumnDefinition> InferSelectOutputSchema(
+        const SelectStatement& stmt,
+        const SymbolTable& symbol_table);
+
 private:
     SystemCatalog* catalog_;
     SymbolTable& symbol_table_;

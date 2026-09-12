@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -53,15 +55,24 @@ namespace sqlcompiler {
 //
 // === DECLARE ... HANDLER FOR ... ===
 //
-// 注册一个异常处理器到当前 frame 的 handlers_ 列表。
-//   - type == CONTINUE：handler body 执行后继续执行触发语句之后。
-//   - type == EXIT：未实现（执行器抛 "not supported"，保留语法可解析）。
-//   - type == UNDO：未实现（同上）。
+// 注册一个异常处理器到当前 frame 的 handlers_ 列表。type 决定 handler body
+// 执行完之后的 unwind 行为：
+//   - CONTINUE：handler body 执行后继续执行触发语句之后的下一条语句。
+//   - EXIT：    handler body 执行后离开 handler 声明所在 block（procedure
+//               隐式 BEGIN 或最近的 IF/WHILE/LOOP/REPEAT/CASE body），
+//               相当于在该 block 末尾做了一次 "LEAVE block"。
+//   - UNDO：    与 EXIT 类似，但在 unwind 之前对该 block 进入时分配的
+//               SAVEPOINT 做 ROLLBACK TO；若无显式事务则退化为 EXIT。
 //
 // condition 匹配规则：
 //   - SQLEXCEPTION / SQLWARNING / NOT_FOUND：视为匹配任何 RuntimeError
 //     （V1 简化：三类都捕获）。
 //   - SQLSTATE 'XXXXX'：仅当异常的 SQLSTATE 等于此值时匹配。
+//
+// 优先级（与 MySQL/MariaDB 对齐）：
+//   1) 更具体的 condition 胜出（SQLSTATE > class）。
+//   2) 同 specificity 下，最近声明的 handler 胜出（LIFO）。
+//   3) UNDO > EXIT > CONTINUE 优先级（仅在 block 退出语义上有区别）。
 //
 // === DECLARE name CURSOR FOR <select> / OPEN / FETCH / CLOSE ===
 //
@@ -83,9 +94,14 @@ namespace sqlcompiler {
 // 在结束时把 frame.locals 中参数名对应的值写入 ExecutionContext::out_args_
 // 字典。INOUT 在调用方先求值再传入；OUT 调用前为 NULL。
 //
-// 由于 OUT 写入 out_args_，下游 SQL 必须通过专用 SELECT 函数（V1 暂未实现）
-// 或持有表方式读取结果。当前 59_procs.sql 测试使用持有表方式：
-//   procedure 把 OUT 值 INSERT 到某张表；调用方 SELECT 该表。
+// 71_proc_out_params 后：procedure 输出参数通过两种机制回传给调用方：
+//   1) context->out_args_ 字典（保留兼容，持有表形式仍可用）；
+//   2) session_variables 表：CallExecutor 把 OUT/INOUT 实参的 @var 名
+//      绑定到对应形参，RunProcedure 结束后把 frame.locals[param] 的最终值
+//      同步到 ExecutionContext::session_vars_[sv_name]，调用方在 CALL
+//      后立即 SELECT @var 即可读取。
+// SET @var = expr 在 procedure 体内直接写 session_vars_，不经过 frame.locals；
+// 即 SET 会话变量在 procedure 调用结束后对调用方可见。
 
 // 调用用户自定义函数 (UDF) 时使用的栈帧：
 //   - locals 把"形参名 → 实参值"和"局部变量名 → 当前值"统一管理；
@@ -94,6 +110,13 @@ namespace sqlcompiler {
 //     循环入口压栈时检查，循环退出时清空。
 //   - cursors / handlers 在 DECLARE 时填充；handler 匹配 SIGNAL / RUNTIME
 //     异常时使用。
+//   - block_stack / pending_exit_block_id / pending_undo 用于 EXIT / UNDO
+//     HANDLER 的块边界 unwind：block_stack 跟踪嵌套 BEGIN-block（含 procedure
+//     隐式块、IF/WHILE/LOOP/REPEAT/CASE body），每个 block 拥有唯一 id；
+//     异常匹配到 EXIT / UNDO handler 时把"目标 block id"写入
+//     pending_exit_block_id，外层 block 在自己的 iteration 末尾检查并退出。
+//     pending_undo 标记 UNDO handler 触发的回滚请求，block 退出前先
+//     ROLLBACK TO SAVEPOINT 再 RELEASE SAVEPOINT。
 // 该结构只在 UdfExecutor 内部使用，不暴露给其他算子。
 struct FunctionFrame {
     // 参数与局部变量统一存放在同一 map 中（命名空间不冲突时这是 OK 的，
@@ -112,13 +135,41 @@ struct FunctionFrame {
 
     // 59_procs: 异常处理器。当前 frame 注册的 DECLARE HANDLER 全部压栈，
     // SIGNAL/异常时按 LIFO 顺序遍历，找到第一个匹配的 handler 后执行。
+    // 每个 handler 携带其声明所在 block 的 id（block_id >= 0）。当异常
+    // 命中 EXIT/UNDO handler 时，把 block_id 写入 pending_exit_block_id；
+    // 外层 block 在 iteration 末尾检查并按需退出 / 回滚。
     struct HandlerEntry {
         DeclareHandlerStatement::Type type;
         DeclareHandlerStatement::CondKind cond_kind;
         std::string cond_sqlstate;  // 仅 SQLSTATE 条件时使用
         StatementPtr body;
+        // 声明所在 block 的 id。-1 = procedure/function 顶层隐式 block。
+        // 退出时只 unwind 到该 id 为止，不影响外层 block。
+        int block_id = -1;
     };
     std::vector<HandlerEntry> handlers;
+
+    // 68_proc_handlers: 嵌套 block 栈。每个 block 对应一个 BEGIN...END
+    // 边界：procedure/function 顶层（隐式 BEGIN）以及 IF/WHILE/LOOP/REPEAT/
+    // CASE body（嵌套 BEGIN）。id 单调递增；savepoint_name 用于 UNDO 的
+    // 块级 SAVEPOINT / ROLLBACK TO / RELEASE。仅当 block 进入时显式事务
+    // 已激活才分配 savepoint（auto-commit 下 UNDO 退化为 EXIT）。
+    struct BlockFrame {
+        int id = -1;
+        std::string label;
+        std::string savepoint_name;
+        bool savepoint_active = false;  // false 表示未分配（无 txn 时）
+    };
+    std::vector<BlockFrame> block_stack;
+    int next_block_id_ = 0;
+    // EXIT / UNDO handler 命中时写入 pending_exit_block_id；-1 表示无。
+    // pending_undo == true 时，匹配到的 block 退出前先 ROLLBACK TO。
+    int pending_exit_block_id = -1;
+    bool pending_undo = false;
+    // 标记 UNDO / EXIT 触发的"块级 unwind"是否已完成 unwind。某些路径
+    // （如顶层 procedure body 末尾）需要检查：若已完成 unwind 即可跳过
+    // 后续语句，但同时需要保留 done / control 等原有标志的语义。
+    bool block_unwound = false;
 
     // 59_procs: cursor 表。每个 cursor 是 (query AST, 物化行缓冲, 当前
     // 索引, 是否 OPEN)。DECLARE 时填充 query；OPEN 时再 plan + 物化。
@@ -158,9 +209,13 @@ public:
 
     // 过程调用入口：parameters 可携带 mode（IN/OUT/INOUT），执行结束后
     // 把 mode != IN 的形参写入 context->out_args_。
+    // 71_proc_out_params：可选 out_arg_session_map 把 OUT/INOUT 形参的最终
+    // 值进一步同步到 session_vars_[sv_name]，让 CALL 后立即 SELECT @var 可见。
     // 返回过程中是否正常完成（false 表示 SIGNAL 等导致异常向上抛）。
-    bool RunProcedure(const SystemCatalog::ProcedureDefinition& proc,
-                      std::unordered_map<std::string, Value> arg_bind);
+    bool RunProcedure(
+        const SystemCatalog::ProcedureDefinition& proc,
+        std::unordered_map<std::string, Value> arg_bind,
+        std::unordered_map<std::string, std::string> out_arg_session_map = {});
 
     // 执行 fn.body_statements，返回值。执行期间抛出 CompilerException 时
     // 会原样上抛。
@@ -180,10 +235,38 @@ private:
     static bool MatchesHandler(const DeclareHandlerStatement::CondKind kind,
                                const std::string& cond_sqlstate,
                                const std::string& err_sqlstate);
+    // 68_proc_handlers: 在 frame.handlers 中按"specificity 优先 +
+    // 最近声明优先 + UNDO>EXIT>CONTINUE"规则选最佳匹配。返回下标；
+    // 若无匹配返回 (size_t)-1。
+    static size_t SelectBestHandler(
+        const std::vector<FunctionFrame::HandlerEntry>& handlers,
+        const std::string& err_sqlstate);
     // 抛出一个携带 SQLSTATE/MESSAGE 的 RuntimeError，由 SIGNAL 或
     // 通用错误转换得到。
     [[noreturn]] static void RaiseRuntimeError(const std::string& sqlstate,
                                                const std::string& message);
+
+    // ---- 68_proc_handlers: EXIT / UNDO HANDLER 块边界支撑 ----
+    // 进入一个 BEGIN-block：分配唯一 id，若当前有显式事务则分配同名
+    // SAVEPOINT（auto-commit 下不分配，UNDO 退化为 EXIT）。返回新 block 的 id。
+    int EnterBlock(FunctionFrame& frame, const std::string& label);
+    // block 正常结束（无 EXIT/UNDO 触发）：若分配过 savepoint 则 RELEASE。
+    // 同时清除 frame.pending_exit_block_id / pending_undo，避免污染外层。
+    void ExitBlockNormally(FunctionFrame& frame);
+    // block 因 EXIT/UNDO 触发而退出：若 pending_undo 则先 ROLLBACK TO，
+    // 再 RELEASE SAVEPOINT；调用方负责在调用后传播 pending_exit_block_id。
+    void ExitBlockWithControl(FunctionFrame& frame, bool undo);
+    // 在 body 退出前调用：根据 frame.pending_exit_block_id 决定是否
+    // 触发本 block 的 unwind。返回 true 表示调用方应立即 return（pending
+    // 标记指向外层 block，需向上传播）。具体行为：
+    //   - 无 pending：pop 本 block，无 rollback（正常退出）。
+    //   - pending 指向本 block：pop 本 block，undo 时 rollback，并清标记。
+    //   - pending 指向外层 block：pop 本 block（无 rollback），保留标记
+    //     供外层 block 处理，返回 true 让调用方向上 propagate。
+    bool FinalizeBlockExit(FunctionFrame& frame);
+
+    // 把一条 SQLSTATE 字符串规范化（去掉外层单引号）。
+    static std::string NormalizeSqlstate(const std::string& s);
 
     SystemCatalog* catalog_;
     ExecutionContext* context_;

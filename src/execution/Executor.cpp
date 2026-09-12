@@ -54,9 +54,25 @@ void ExecutionContext::PopCteOverride(const std::string& name) {
 }
 
 Value ExecutionContext::GetSessionVar(const std::string& name) const {
-    auto it = session_log_.find(name);
-    if (it == session_log_.end()) return Value::MakeNull();
+    // 71_proc_out_params：session_log_ 现在是非所有权指针，指向 Database 的
+    // session_vars_。没注入时（罕见，例如直接构造 ctx 的内部单元测试）退化为
+    // 空 map，行为与 V1 之前一致（所有 @var 视为 NULL）。
+    if (session_log_ == nullptr) return Value::MakeNull();
+    auto it = session_log_->find(name);
+    if (it == session_log_->end()) return Value::MakeNull();
     return it->second;
+}
+
+void ExecutionContext::SetSessionVar(const std::string& name, Value v) {
+    if (session_log_ == nullptr) return;
+    (*session_log_)[name] = std::move(v);
+}
+
+const std::unordered_map<std::string, Value>&
+ExecutionContext::GetSessionLog() const {
+    static const std::unordered_map<std::string, Value> kEmpty;
+    if (session_log_ == nullptr) return kEmpty;
+    return *session_log_;
 }
 
 Executor::Executor(ExecutionContext* context) : context_(context) {

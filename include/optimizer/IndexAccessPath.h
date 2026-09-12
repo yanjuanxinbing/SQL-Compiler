@@ -2,11 +2,18 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
+#include "ast/AST.h"
 #include "catalog/SystemCatalog.h"
 #include "plan/Plan.h"
 
 namespace sqlcompiler {
+
+// 把合取谓词 (a AND b AND c) 拆成一组子句 [a, b, c]。
+// 非 AND 节点原样返回单元素。PushDownPredicates 与 TryRewriteWithIndex
+// 共用此 helper。
+void SplitConjuncts(const ExprPtr& expr, std::vector<ExprPtr>* out);
 
 // 访问路径选择：尝试把 Filter(谓词) -> SeqScan(表) 改写成 IndexScan。
 //

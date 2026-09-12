@@ -2,7 +2,7 @@
 
 #include <vector>
 
-#include "storage/BufferPoolManager.h"
+#include "storage/StorageAccess.h"
 #include "storage_engine/Tuple.h"
 
 namespace sqlcompiler {
@@ -24,13 +24,13 @@ class LogManager;
 // 供执行引擎的SeqScan/Insert/Delete/Update等算子调用
 class TableHeap {
 public:
-    TableHeap(BufferPoolManager* buffer_pool_manager, page_id_t first_page_id);
+    TableHeap(StorageAccess* storage, page_id_t first_page_id);
 
     // 创建一张全新的表堆（分配首页并初始化页头），返回新建的TableHeap
-    static TableHeap* Create(BufferPoolManager* buffer_pool_manager);
+    static TableHeap* Create(StorageAccess* storage);
 
     // 打开一张已存在的表堆（如数据库重启后，由SystemCatalog持有的first_page_id）
-    static TableHeap* Open(BufferPoolManager* buffer_pool_manager, page_id_t first_page_id);
+    static TableHeap* Open(StorageAccess* storage, page_id_t first_page_id);
 
     // 插入一条记录：从first_page_id开始寻找有足够空闲空间的页，
     // 若都写满则通过buffer_pool_manager_->NewPage()追加新页。
@@ -87,7 +87,7 @@ public:
     Iterator Begin();
 
 private:
-    BufferPoolManager* buffer_pool_manager_;
+    StorageAccess* storage_;
     page_id_t first_page_id_;
     Transaction* active_txn_ = nullptr;
     LogManager* log_manager_ = nullptr;  // Phase B：可选 WAL 写出器

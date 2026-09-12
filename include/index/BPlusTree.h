@@ -4,6 +4,7 @@
 #include <utility>
 #include <vector>
 
+#include "index/BPlusTreePage.h"
 #include "index/IndexKey.h"
 #include "index/PageGuard.h"
 #include "storage/BufferPoolManager.h"
@@ -26,9 +27,11 @@ class LogManager;
 //   - 空树的根是一个空叶子页（而非 INVALID），插入路径无需处理「树为空」特例。
 //   - 根页 id 恒定不变（见 SplitRoot），因此目录里存的 root_page_id 永不失效。
 //
-// 明确不做（TODO）：删除只打墓碑，不做节点合并与再平衡，大量删除后会留下半空
-// 节点。这个取舍换来的是删除路径无需同时 pin 多个兄弟节点，也就不存在缓冲池
-// 耗尽与 pin 泄漏的风险。
+// 删除语义：Delete 沿下降路径记录「path stack」，到叶子后做一次 erase，再自底向上
+// 走 path stack 修复 underflow：先尝试 redistribute（兄弟有富余），失败则 merge
+// （把右兄弟并入当前节点，必要时递归向上）。空页通过 DeletePage 归还缓冲池；根
+// 若是只剩一个孩子的内部节点，则把那个孩子搬进根页（root_page_id 不变，目录
+// 元数据免维护）。所有写操作同时走 Phase A 的 undo 与 Phase B 的 WAL 钩子。
 class BPlusTree {
 public:
     BPlusTree(BufferPoolManager* bpm, std::vector<ValueType> key_schema,
@@ -109,6 +112,49 @@ private:
     // 两个孩子的内部节点。这样目录里的 root_page_id 一经写入就永不失效，
     // 省掉「根分裂后必须回写目录元数据」这条极易遗漏的一致性路径。
     bool SplitRoot();
+
+    // 删除再平衡（path-stack descent）所需的一组私有辅助。
+
+    // 处理一层 underflow：parent_pid 的第 separator_index 个孩子已「失血」，
+    // 若其左右兄弟有富余则 redistribute，否则 merge；合并后若 parent 也
+    // underflow 则递归向上。root_page_id 之上不再回溯。失败（缓冲池耗尽等）
+    // 返回 false，调用方负责判断是否要让整次 Delete 失败。
+    bool RedistributeOrMerge(page_id_t parent_pid, size_t separator_index);
+
+    // 物理合并：把 right_pid 的全部条目并入 left_pid，更新 left_pid 的页头
+    // （key_count / first_child / 内部或叶子的指针）。不修改 parent 的分隔符
+    // 也不释放 right_pid —— 由调用者（RedistributeOrMerge）负责后续：
+    // 对叶子是修 next/prev 链，对内部节点是顺手做，对所有情况都是 DeletePage。
+    // 对于内部节点，调用方必须把 parent 中分隔 left 与 right 的 (key, rid,
+    // key_bytes) 传进来——它会出现在合并结果中（child = right.first_child），
+    // 否则路径上的全序不变式被破坏。key_bytes 与 key_len 对应；key_len=0 表示
+    // 无 key_bytes（罕见，例如空复合键）；仅 type == kInternal 时使用。
+    // 返回 false 表示缓冲池耗尽或页损坏。
+    bool MergeNodes(page_id_t left_pid, page_id_t right_pid, bptree::PageType type,
+                    const IndexKey* parent_sep_key, const RID* parent_sep_rid,
+                    const std::vector<char>* parent_sep_key_bytes);
+
+    // 把 sibling 的一条 (key,rid) 转移到 deficient_leaf。sibling_is_left 为
+    // true 表示 sibling 在 deficient 左侧：取 sibling 的最后一条移到 deficient
+    // 头部，并把 parent 的对应分隔键改为 sibling 此刻的第一条（因为 right 的
+    // 第一条已迁走）；为 false 则取 sibling 的第一条移到 deficient 尾部，并把
+    // parent 的对应分隔键改为 deficient 此刻的最后一条（因为新条目落到
+    // deficient，最左键变了）。parent_pid 与 separator_index 用来定位 parent
+    // 中分隔 deficient 与 sibling 的那条 entry；leaf 链上的 next/prev 不变。
+    bool RedistributeLeaf(page_id_t deficient_leaf, page_id_t sibling,
+                          bool sibling_is_left, page_id_t parent_pid,
+                          size_t separator_index);
+
+    // 内部节点的 redistribute：把 sibling 的最末/最首 entry 转到 deficient，
+    // 并把 parent 的 separator 通过 deficient/sibling 旋转。parent_pid 与
+    // separator_index 用来定位 parent 中的分隔键以更新。
+    bool RedistributeInternal(page_id_t deficient_internal, page_id_t sibling,
+                              bool sibling_is_left, page_id_t parent_pid,
+                              size_t separator_index);
+
+    // 若 root 此刻是「只剩一个孩子的内部节点」，把那个孩子搬进 root 页本身，
+    // 释放被搬走的子页。root_page_id 永不改变。
+    bool CollapseRoot();
 
     BufferPoolManager* bpm_;
     std::vector<ValueType> key_schema_;

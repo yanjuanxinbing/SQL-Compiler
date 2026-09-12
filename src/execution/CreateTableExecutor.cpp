@@ -6,6 +6,71 @@
 
 namespace sqlcompiler {
 
+namespace {
+
+// 53_ddl: 严格 FOREIGN KEY 校验。
+// 在 cat->CreateTable(info) 之前一次性完成所有校验，避免表落盘后才发现
+// FK 错误导致「表存在但 FK 缺失」的部分落盘状态。校验失败抛 CompilerException。
+//
+// 校验项：
+//   1. 子列必须存在于当前表；
+//   2. 父表必须存在（schema 也已校验过）；
+//   3. 父列必须存在于父表；
+//   4. 子列与父列数量必须一致。
+void ValidateForeignKeys(SystemCatalog* cat,
+                        const TableInfo& info,
+                        const std::vector<ForeignKeyDef>& foreign_keys,
+                        const std::vector<ColumnDefinition>& columns) {
+    auto validate_col_in_table = [](const TableInfo* t, const std::string& col) {
+        if (!t) return false;
+        return t->GetColumn(col) != nullptr;
+    };
+    // 表级 FOREIGN KEY
+    for (const auto& fk : foreign_keys) {
+        if (fk.child_cols.size() != fk.parent_cols.size()) {
+            throw CompilerException(ErrorStage::SEMANTIC,
+                "FOREIGN KEY: child_cols / parent_cols length mismatch (" +
+                std::to_string(fk.child_cols.size()) + " vs " +
+                std::to_string(fk.parent_cols.size()) + ")");
+        }
+        for (const auto& cc : fk.child_cols) {
+            if (!validate_col_in_table(&info, cc)) {
+                throw CompilerException(ErrorStage::SEMANTIC,
+                    "FOREIGN KEY: child column not found: " + cc);
+            }
+        }
+        const TableInfo* pt = cat->GetTable(fk.parent_table);
+        if (pt == nullptr) {
+            throw CompilerException(ErrorStage::SEMANTIC,
+                "FOREIGN KEY: parent table does not exist: " + fk.parent_table);
+        }
+        for (const auto& pc : fk.parent_cols) {
+            if (!validate_col_in_table(pt, pc)) {
+                throw CompilerException(ErrorStage::SEMANTIC,
+                    "FOREIGN KEY: parent column not found: " +
+                    fk.parent_table + "." + pc);
+            }
+        }
+    }
+    // 列级 REFERENCES parent(col) —— 单列 FK 默认 RESTRICT。
+    for (const auto& cd : columns) {
+        for (const auto& ifk : cd.inline_foreign_keys) {
+            const TableInfo* pt = cat->GetTable(ifk.parent_table);
+            if (pt == nullptr) {
+                throw CompilerException(ErrorStage::SEMANTIC,
+                    "FOREIGN KEY: parent table does not exist: " + ifk.parent_table);
+            }
+            if (!validate_col_in_table(pt, ifk.parent_col)) {
+                throw CompilerException(ErrorStage::SEMANTIC,
+                    "FOREIGN KEY: parent column not found: " +
+                    ifk.parent_table + "." + ifk.parent_col);
+            }
+        }
+    }
+}
+
+}  // namespace
+
 CreateTableExecutor::CreateTableExecutor(ExecutionContext* context, std::string table_name,
                                           std::vector<ColumnDefinition> columns,
                                           std::vector<std::vector<std::string>> primary_keys,
@@ -72,6 +137,11 @@ void CreateTableExecutor::Init() {
                 "schema does not exist: " + qn.first);
         }
     }
+    // 53_ddl: 严格 FOREIGN KEY 校验 —— 在 CreateTable 之前一次性完成。
+    // 旧实现是「先 CreateTable，再校验 FK」，校验失败时表已落盘但 FK 缺失，
+    // 留下部分落盘状态；本任务下统一前移到 CreateTable 之前，校验失败抛
+    // CompilerException，副作用为零。
+    ValidateForeignKeys(cat, info, foreign_keys_, columns_);
     // Phase B：让 catalog 的内部写路径（sys_tables / sys_indexes）也带上当前
     // 事务，让 WAL 记录里 txn_id 与 DML 一致。
     cat->SetActiveTransaction(context_->GetTransaction());
@@ -127,36 +197,10 @@ void CreateTableExecutor::Init() {
     }
 
     // 53_ddl: 注册 FOREIGN KEY 约束到 catalog。
-    //   - 合并列级 (column.inline_foreign_keys) 与表级 (foreign_keys_) 列表。
-    //   - 校验 parent_table 存在、子列与父列长度一致、子列在当前表上存在；
-    //     校验失败回滚 CREATE TABLE 失败但表已落盘 —— 当前实现容忍部分落盘
-    //     状态（下一条语句会因 FK 不完整而失败，但不阻塞当前 CREATE TABLE）。
-    //   - 校验 parent_cols 实际存在于 parent_table 中；不一致抛错。
-    auto validate_col_in_table = [](const TableInfo* t, const std::string& col) {
-        if (!t) return false;
-        return t->GetColumn(col) != nullptr;
-    };
+    //   校验已在 CreateTable 之前由 ValidateForeignKeys 完成（参见上文）；
+    //   此处仅执行 AddForeignKey 的注册副作用，避免表落盘后再校验 FK
+    //   失败导致"表存在但 FK 缺失"的部分落盘状态。
     for (const auto& fk : foreign_keys_) {
-        for (const auto& cc : fk.child_cols) {
-            if (!validate_col_in_table(&info, cc)) {
-                cat->SetActiveTransaction(nullptr);
-                throw CompilerException(ErrorStage::SEMANTIC,
-                    "FOREIGN KEY: child column not found: " + cc);
-            }
-        }
-        // parent_table 在当前点可能尚未建（顺序未定的 DDL）；若存在则校验列。
-        // 否则保留 FK 不做列校验，等真正 INSERT/UPDATE 时再校验父表存在性。
-        const TableInfo* pt = cat->GetTable(fk.parent_table);
-        if (pt != nullptr) {
-            for (const auto& pc : fk.parent_cols) {
-                if (!validate_col_in_table(pt, pc)) {
-                    cat->SetActiveTransaction(nullptr);
-                    throw CompilerException(ErrorStage::SEMANTIC,
-                        "FOREIGN KEY: parent column not found: " +
-                        fk.parent_table + "." + pc);
-                }
-            }
-        }
         cat->AddForeignKey(table_name_, fk.child_cols, fk.parent_table,
                            fk.parent_cols, fk.on_delete_action,
                            fk.on_update_action);
@@ -164,17 +208,8 @@ void CreateTableExecutor::Init() {
     // 列级 REFERENCES parent(col) —— 单列 FK 默认 RESTRICT。
     for (const auto& cd : columns_) {
         for (const auto& ifk : cd.inline_foreign_keys) {
-            std::vector<std::string> child_cols = {cd.column_name};
-            std::vector<std::string> parent_cols = {ifk.parent_col};
-            const TableInfo* pt = cat->GetTable(ifk.parent_table);
-            if (pt != nullptr && !validate_col_in_table(pt, ifk.parent_col)) {
-                cat->SetActiveTransaction(nullptr);
-                throw CompilerException(ErrorStage::SEMANTIC,
-                    "FOREIGN KEY: parent column not found: " +
-                    ifk.parent_table + "." + ifk.parent_col);
-            }
-            cat->AddForeignKey(table_name_, child_cols, ifk.parent_table,
-                               parent_cols, /*on_delete=*/0, /*on_update=*/0);
+            cat->AddForeignKey(table_name_, {cd.column_name}, ifk.parent_table,
+                               {ifk.parent_col}, /*on_delete=*/0, /*on_update=*/0);
         }
     }
     cat->SetActiveTransaction(nullptr);

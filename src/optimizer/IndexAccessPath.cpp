@@ -10,20 +10,6 @@ namespace sqlcompiler {
 
 namespace {
 
-// 把合取谓词拆成一组 AND 连接的子句。非 AND 节点原样返回单元素。
-void SplitConjuncts(const ExprPtr& expr, std::vector<ExprPtr>* out) {
-    if (!expr) return;
-    if (expr->GetType() == NodeType::BINARY_EXPR) {
-        const auto* bin = static_cast<const BinaryExpr*>(expr.get());
-        if (bin->op == BinaryOperator::AND) {
-            SplitConjuncts(bin->left, out);
-            SplitConjuncts(bin->right, out);
-            return;
-        }
-    }
-    out->push_back(expr);
-}
-
 bool IsLiteral(const ExprPtr& e) {
     return e && e->GetType() == NodeType::LITERAL_EXPR;
 }
@@ -121,6 +107,22 @@ bool MatchColumnCompare(const ExprPtr& expr, const std::string& table_name,
 }
 
 }  // namespace
+
+// 把合取谓词 (a AND b AND c) 拆成一组子句 [a, b, c]。
+// 非 AND 节点原样返回单元素。PushDownPredicates 与 TryRewriteWithIndex
+// 共用此 helper；放在 sqlcompiler 命名空间下以便其他 .cpp 直接调用。
+void SplitConjuncts(const ExprPtr& expr, std::vector<ExprPtr>* out) {
+    if (!expr) return;
+    if (expr->GetType() == NodeType::BINARY_EXPR) {
+        const auto* bin = static_cast<const BinaryExpr*>(expr.get());
+        if (bin->op == BinaryOperator::AND) {
+            SplitConjuncts(bin->left, out);
+            SplitConjuncts(bin->right, out);
+            return;
+        }
+    }
+    out->push_back(expr);
+}
 
 PlanNodePtr TryRewriteWithIndex(SystemCatalog* catalog,
                                 const std::string& table_name,

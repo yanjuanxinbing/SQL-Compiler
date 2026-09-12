@@ -274,11 +274,16 @@ std::string ToUpper(const std::string& s) {
 }
 
 bool IsIdentStart(char c) {
-    return std::isalpha(static_cast<unsigned char>(c)) || c == '_';
+    // 71_proc_out_params: '@' 视为 session variable 标识符的起始字符，
+    // 让后续解析路径（ParsePrimaryExpr -> ColumnRefExpr）能把 '@x' 当成
+    // 普通的列引用，ExpressionEvaluator 再回退到 session_vars_ 表里查找。
+    // 之前只接受字母 / 下划线，session variable 形式的标识符无法被词法
+    // 化（会被识别为 'unexpected character: @'）。
+    return std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '@';
 }
 
 bool IsIdentPart(char c) {
-    return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '@';
 }
 
 bool IsDigit(char c) {

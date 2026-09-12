@@ -149,6 +149,37 @@ bool Value::IsNull() const {
     return type_ == ValueType::NULL_TYPE;
 }
 
+bool Value::IsTruthy() const {
+    // SQL 三值逻辑：NULL 在 WHERE 中按"不通过"处理。
+    if (IsNull()) return false;
+    switch (type_) {
+        case ValueType::INTEGER:
+            return int_val_ != 0;
+        case ValueType::FLOAT:
+            // NaN 视为 false；其他非 0 即 true。
+            return float_val_ != 0.0 && !std::isnan(float_val_);
+        case ValueType::VARCHAR: {
+            // 空串视为 false；其余大小写不敏感匹配 "false"/"0"。
+            const std::string& s = str_val_;
+            if (s.empty()) return false;
+            if (s.size() == 1 && s[0] == '0') return false;
+            // 长度上限：长字符串几乎不可能是布尔字面量，直接 true
+            if (s.size() > 5) return true;
+            // 小写化后比对 "false"/"0"
+            char buf[8] = {};
+            for (size_t i = 0; i < s.size() && i < sizeof(buf) - 1; ++i) {
+                buf[i] = static_cast<char>(std::tolower(
+                    static_cast<unsigned char>(s[i])));
+            }
+            buf[s.size()] = '\0';
+            return !(std::strcmp(buf, "false") == 0 || std::strcmp(buf, "0") == 0);
+        }
+        case ValueType::NULL_TYPE:
+            return false;
+    }
+    return false;
+}
+
 int32_t Value::AsInt() const {
     return int_val_;
 }

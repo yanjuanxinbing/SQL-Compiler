@@ -9,6 +9,7 @@
 #include "optimizer/Optimizer.h"
 #include "plan/Planner.h"
 #include "semantic/SemanticAnalyzer.h"
+#include "txn/TransactionManager.h"  // 68_proc_handlers: SAVEPOINT/ROLLBACK TO
 
 namespace sqlcompiler {
 
@@ -48,15 +49,26 @@ void ExecuteDmlStatement(SystemCatalog* catalog,
 // === SIGNAL SQLSTATE 'XXXXX' SET MESSAGE_TEXT = '...' ===
 //   抛 std::runtime_error("SIGNAL SQLSTATE 'XXXXX' MESSAGE 'msg'")。
 //   ExecuteStatement 用 try/catch 包住每条语句；触发时遍历
-//   frame.handlers_ 找匹配 handler：
+//   frame.handlers_ 找匹配 handler（最高 specificity + 最近声明优先）：
 //     - type == CONTINUE：执行 body 后继续当前函数帧的执行。
-//     - type == EXIT/UNDO：V1 未实现，执行器直接抛出以提醒调用方。
+//     - type == EXIT：执行 body 后 unwind 到 handler 所在 block 末尾。
+//     - type == UNDO：执行 body 后 ROLLBACK TO 该 block 的 SAVEPOINT，
+//       再 unwind 到该 block 末尾；若当前无显式事务退化为 EXIT。
 //
 // === DECLARE ... HANDLER FOR ... ===
 //   注册到 frame.handlers_。匹配规则：
 //     - SQLEXCEPTION / SQLWARNING / NOT_FOUND：捕获任意 RuntimeError
 //       （V1 简化，三类一并处理）。
 //     - SQLSTATE 'XXXXX'：仅当异常的 SQLSTATE 等于此值时匹配。
+//
+//   type 决定 handler body 执行完之后的 unwind 行为：
+//     - CONTINUE：handler body 后继续当前函数帧的执行。
+//     - EXIT    ：handler body 后 unwind 到 handler 声明所在 block
+//                 （procedure body 或最近的 IF/WHILE/LOOP/REPEAT/CASE body）
+//                 末尾；无 SAVEPOINT 时仅做 block pop。
+//     - UNDO    ：同 EXIT，但在 unwind 前对该 block 进入时分配的
+//                 SAVEPOINT 做 ROLLBACK TO；handler body 与 block 内 DML
+//                 共享同一 SAVEPOINT 作用域（V1 简化，与 MySQL 不同）。
 //
 // === DECLARE name CURSOR FOR <select> / OPEN / FETCH / CLOSE ===
 //   cursor 在 frame.cursors_ 中以 cursor_name 为键存储：
@@ -72,7 +84,10 @@ void ExecuteDmlStatement(SystemCatalog* catalog,
 // === OUT / INOUT 参数 ===
 //   procedure 参数可标记 OUT/INOUT。RunProcedure 在结束时把 frame.locals
 //   中这些参数名对应的 Value 写入 context->out_args_。下游 SQL 可通过
-//   持有表读取（V1 简化，不实现 SELECT @out_arg 形式）。
+//   SELECT @out_arg 形式直接读取：71_proc_out_params 让 CallExecutor 把
+//   每个 OUT/INOUT 形参与"调用方传入的 @var"绑定，RunProcedure 结束后
+//   再把最终值复制到 ExecutionContext::session_vars_（即 Database 持有的
+//   会话变量表）。持有表方式依然有效（59_procs 兼容）。
 
 namespace {
 
@@ -177,46 +192,193 @@ bool UdfExecutor::MatchesHandler(const DeclareHandlerStatement::CondKind kind,
     return false;
 }
 
+// 68_proc_handlers: 从 CompilerException 的 message 中提取 SQLSTATE。
+// 现有 SIGNAL 抛出的消息格式为 "SIGNAL SQLSTATE 'XXXXX' MESSAGE 'msg'"；
+// 若无法解析（异常来自非 SIGNAL 的 RUNTIME 路径），返回空字符串，
+// 此时只有 class-based handler 会匹配。
+static std::string ExtractErrSqlstateFromMessage(const std::string& msg) {
+    auto pos = msg.find("SQLSTATE '");
+    if (pos == std::string::npos) return "";
+    auto p2 = msg.find('\'', pos + 10);
+    if (p2 == std::string::npos) return "";
+    return msg.substr(pos + 10, p2 - (pos + 10));
+}
+
+// 68_proc_handlers: 在 frame.handlers 中选出"最佳"匹配 handler。
+// 优先级（与 MySQL/MariaDB 对齐）：
+//   1) 更具体的 condition 胜出（SQLSTATE > class）。
+//   2) 同 specificity 下，最近声明的胜出（LIFO：遍历中后到的覆盖前者）。
+//   3) UNDO > EXIT > CONTINUE 优先级：当多个 type 同时候选时，类型更
+//      强的优先；只在同 type / 同 specificity 内才用声明序决胜。
+// 返回 frame.handlers 中的下标（std::numeric_limits<size_t>::max() 表示无）。
+size_t UdfExecutor::SelectBestHandler(
+    const std::vector<FunctionFrame::HandlerEntry>& handlers,
+    const std::string& err_sqlstate) {
+    size_t best_idx = static_cast<size_t>(-1);
+    int best_spec = -1;  // 0 = class, 1 = SQLSTATE
+    int best_strength = -1;  // 0 = CONTINUE, 1 = EXIT, 2 = UNDO
+    for (size_t i = 0; i < handlers.size(); ++i) {
+        const auto& h = handlers[i];
+        if (!MatchesHandler(h.cond_kind, h.cond_sqlstate, err_sqlstate)) {
+            continue;
+        }
+        int spec = (h.cond_kind == DeclareHandlerStatement::CondKind::SQLSTATE) ? 1 : 0;
+        int strength = 0;
+        switch (h.type) {
+            case DeclareHandlerStatement::Type::CONTINUE: strength = 0; break;
+            case DeclareHandlerStatement::Type::EXIT:     strength = 1; break;
+            case DeclareHandlerStatement::Type::UNDO:     strength = 2; break;
+        }
+        if (best_idx == static_cast<size_t>(-1) ||
+            spec > best_spec ||
+            (spec == best_spec && strength > best_strength)) {
+            best_idx = i;
+            best_spec = spec;
+            best_strength = strength;
+        }
+    }
+    return best_idx;
+}
+
+// 68_proc_handlers: 把当前 SAVEPOINT 名按 hash 表构造，避免名字冲突。
+// 形如 "__sp_udf_<id>__"，对 procedure / function 全局唯一。
+static std::string MakeBlockSavepointName(int block_id) {
+    return "__sp_udf_" + std::to_string(block_id) + "__";
+}
+
+int UdfExecutor::EnterBlock(FunctionFrame& frame, const std::string& label) {
+    FunctionFrame::BlockFrame bf;
+    bf.id = frame.next_block_id_++;
+    bf.label = label;
+    bf.savepoint_name = MakeBlockSavepointName(bf.id);
+    // 仅当当前已有显式事务时才分配 SAVEPOINT；auto-commit 下没有 txn，
+    // UNDO handler 退化为 EXIT（无 savepoint 可 ROLLBACK TO）。
+    TransactionManager* mgr =
+        context_ ? context_->GetTransactionManager() : nullptr;
+    if (mgr != nullptr && mgr->GetCurrentTransaction() != nullptr) {
+        mgr->Savepoint(bf.savepoint_name);
+        bf.savepoint_active = true;
+    } else {
+        bf.savepoint_active = false;
+    }
+    frame.block_stack.push_back(std::move(bf));
+    return frame.block_stack.back().id;
+}
+
+void UdfExecutor::ExitBlockNormally(FunctionFrame& frame) {
+    if (frame.block_stack.empty()) return;
+    FunctionFrame::BlockFrame bf = frame.block_stack.back();
+    frame.block_stack.pop_back();
+    // 仅当 pending_exit_block_id 仍指向自己时清掉（外层 EXIT 不应被本 block
+    // 复位）。具体而言：本函数用于"正常结束"路径——此时 frame 上的
+    // pending_* 应当为 -1/false（handler 触发时会走 ExitBlockWithControl）。
+    // 但为了健壮性，仍在 savepoint_active 时 RELEASE 一次。
+    if (bf.savepoint_active && context_ != nullptr) {
+        TransactionManager* mgr = context_->GetTransactionManager();
+        if (mgr != nullptr) {
+            mgr->ReleaseSavepoint(bf.savepoint_name);
+        }
+    }
+    // block 正常退出：清掉可能仍挂在 frame 上的 undo 标记。
+    // 注意：不要在 handler 触发的 unwind 路径上调用本函数——
+    // 那种情况应该走 ExitBlockWithControl。
+}
+
+void UdfExecutor::ExitBlockWithControl(FunctionFrame& frame, bool undo) {
+    if (frame.block_stack.empty()) return;
+    FunctionFrame::BlockFrame bf = frame.block_stack.back();
+    frame.block_stack.pop_back();
+    if (bf.savepoint_active && context_ != nullptr) {
+        TransactionManager* mgr = context_->GetTransactionManager();
+        if (mgr != nullptr) {
+            if (undo) {
+                // UNDO：先 ROLLBACK TO 把 block 内写入撤销，再 RELEASE
+                // 把 savepoint 弹栈（避免后续 SAVEPOINT 栈污染）。
+                mgr->RollbackToSavepoint(bf.savepoint_name);
+            }
+            mgr->ReleaseSavepoint(bf.savepoint_name);
+        }
+    }
+    // EXIT/UNDO 触发的 unwind：本 block 标记为已 unwind，调用方据此跳过
+    // block 内的剩余语句。pending_exit_block_id 留给调用方判断是否继续
+    // 外层 unwind（若 handler 声明在更外层 block，调用方会负责）。
+}
+
+std::string UdfExecutor::NormalizeSqlstate(const std::string& s) {
+    if (s.size() >= 2 && s.front() == '\'' && s.back() == '\'') {
+        return s.substr(1, s.size() - 2);
+    }
+    return s;
+}
+
+bool UdfExecutor::FinalizeBlockExit(FunctionFrame& frame) {
+    if (frame.block_stack.empty()) return false;
+    if (frame.pending_exit_block_id == -1) {
+        // 无 pending：正常退出，仅做 RELEASE。
+        ExitBlockWithControl(frame, false);
+        return false;
+    }
+    int top_id = frame.block_stack.back().id;
+    if (frame.pending_exit_block_id == top_id) {
+        // 本 block 是 EXIT/UNDO 目标：触发 unwind，按需 rollback。
+        ExitBlockWithControl(frame, frame.pending_undo);
+        frame.pending_exit_block_id = -1;
+        frame.pending_undo = false;
+        return false;
+    }
+    // pending 指向外层 block：clean pop，保留标记让外层处理。
+    ExitBlockWithControl(frame, false);
+    return true;
+}
+
 Value UdfExecutor::Run() {
     FunctionFrame frame;
     // 把形参值拷到 locals 中，后续 SET 也能改写形参引用（同 SQL/PSM 行为）。
     for (const auto& kv : initial_args_) {
         frame.locals[kv.first] = kv.second;
     }
+    // 68_proc_handlers: 把整个 function body 视作一个隐式 BEGIN-block，
+    // 进入时分配 SAVEPOINT（若有 txn）。handler 在此处声明时 block_id = 0。
+    EnterBlock(frame, "function_body");
     for (const auto& s : fn_->body_statements) {
         if (!s) continue;
         if (frame.done) break;
+        // EXIT / UNDO 触发的 unwind：只在目标 block == 当前 block 时停止
+        // 顶层 body（target 是内层 block 时应继续，让内层 block 在其末尾
+        // 通过 FinalizeBlockExit 自行 unwind）。
+        if (!frame.block_stack.empty() &&
+            frame.pending_exit_block_id == frame.block_stack.back().id) {
+            break;
+        }
         try {
             ExecuteStatement(s, frame);
         } catch (const CompilerException& ce) {
-            // SIGNAL/运行期错误：尝试 handler 匹配。
-            // ce.message() 形如 "SIGNAL SQLSTATE 'XXXXX' MESSAGE '...'"。
-            std::string msg = ce.what();
-            std::string err_sqlstate;
-            // 抽取 SQLSTATE
-            auto pos = msg.find("SQLSTATE '");
-            if (pos != std::string::npos) {
-                auto p2 = msg.find('\'', pos + 10);
-                if (p2 != std::string::npos) {
-                    err_sqlstate = msg.substr(pos + 10, p2 - (pos + 10));
-                }
+            // SIGNAL / 运行期错误：按 specificity + LIFO + UNDO>EXIT>CONTINUE
+            // 选出最佳 handler。
+            std::string err_sqlstate =
+                ExtractErrSqlstateFromMessage(std::string(ce.what()));
+            size_t best = SelectBestHandler(frame.handlers, err_sqlstate);
+            if (best == static_cast<size_t>(-1)) throw;
+            const auto& h = frame.handlers[best];
+            if (h.type == DeclareHandlerStatement::Type::CONTINUE) {
+                // CONTINUE：执行 body 后继续当前函数帧。
+                if (h.body) ExecuteStatement(h.body, frame);
+            } else {
+                // EXIT / UNDO：先执行 body，再 unwind 到 handler 所在 block
+                // 末尾；UNDO 还需在 unwind 前 ROLLBACK TO 该 block 的
+                // SAVEPOINT（无 savepoint 时退化为 EXIT）。
+                if (h.body) ExecuteStatement(h.body, frame);
+                frame.pending_exit_block_id = h.block_id;
+                frame.pending_undo =
+                    (h.type == DeclareHandlerStatement::Type::UNDO);
             }
-            bool handled = false;
-            for (const auto& h : frame.handlers) {
-                if (MatchesHandler(h.cond_kind, h.cond_sqlstate, err_sqlstate)) {
-                    if (h.type == DeclareHandlerStatement::Type::CONTINUE) {
-                        if (h.body) ExecuteStatement(h.body, frame);
-                        handled = true;
-                    } else {
-                        // EXIT / UNDO：V1 暂不支持。
-                        throw CompilerException(ErrorStage::RUNTIME,
-                            "EXIT / UNDO handler not implemented (V1 only supports CONTINUE)");
-                    }
-                    break;
-                }
-            }
-            if (!handled) throw;
         }
+    }
+    // 顶层 block 退出（handler 命中或正常结束）。
+    (void)FinalizeBlockExit(frame);
+    // 兜底：理论上 block_stack 此时应为空，若意外残留也清掉。
+    while (!frame.block_stack.empty()) {
+        ExitBlockNormally(frame);
     }
     if (!frame.done) {
         throw CompilerException(ErrorStage::RUNTIME,
@@ -225,49 +387,63 @@ Value UdfExecutor::Run() {
     return frame.result;
 }
 
-bool UdfExecutor::RunProcedure(const SystemCatalog::ProcedureDefinition& proc,
-                               std::unordered_map<std::string, Value> arg_bind) {
+bool UdfExecutor::RunProcedure(
+    const SystemCatalog::ProcedureDefinition& proc,
+    std::unordered_map<std::string, Value> arg_bind,
+    std::unordered_map<std::string, std::string> out_arg_session_map) {
     FunctionFrame frame;
     proc_params_ = proc.parameters;
     for (const auto& kv : arg_bind) {
         frame.locals[kv.first] = kv.second;
     }
     bool ok = true;
+    // 68_proc_handlers: procedure body 也是隐式 BEGIN-block。
+    EnterBlock(frame, "procedure_body");
     try {
         for (const auto& s : proc.body_statements) {
             if (!s) continue;
             if (frame.done) break;
+            // EXIT / UNDO 触发的 unwind：只在目标 block == 当前 block 时停止
+            // 顶层 body；target 是内层 block 时应继续，让内层 block 在末尾
+            // 通过 FinalizeBlockExit 自行 unwind。
+            if (!frame.block_stack.empty() &&
+                frame.pending_exit_block_id == frame.block_stack.back().id) {
+                break;
+            }
             try {
                 ExecuteStatement(s, frame);
             } catch (const CompilerException& ce) {
-                std::string msg = ce.what();
-                std::string err_sqlstate;
-                auto pos = msg.find("SQLSTATE '");
-                if (pos != std::string::npos) {
-                    auto p2 = msg.find('\'', pos + 10);
-                    if (p2 != std::string::npos) {
-                        err_sqlstate = msg.substr(pos + 10, p2 - (pos + 10));
-                    }
+                std::string err_sqlstate =
+                    ExtractErrSqlstateFromMessage(std::string(ce.what()));
+                size_t best = SelectBestHandler(frame.handlers, err_sqlstate);
+                if (best == static_cast<size_t>(-1)) throw;
+                const auto& h = frame.handlers[best];
+                if (h.type == DeclareHandlerStatement::Type::CONTINUE) {
+                    if (h.body) ExecuteStatement(h.body, frame);
+                } else {
+                    if (h.body) ExecuteStatement(h.body, frame);
+                    frame.pending_exit_block_id = h.block_id;
+                    frame.pending_undo =
+                        (h.type == DeclareHandlerStatement::Type::UNDO);
                 }
-                bool handled = false;
-                for (const auto& h : frame.handlers) {
-                    if (MatchesHandler(h.cond_kind, h.cond_sqlstate, err_sqlstate)) {
-                        if (h.type == DeclareHandlerStatement::Type::CONTINUE) {
-                            if (h.body) ExecuteStatement(h.body, frame);
-                            handled = true;
-                        } else {
-                            throw CompilerException(ErrorStage::RUNTIME,
-                                "EXIT / UNDO handler not implemented (V1 only supports CONTINUE)");
-                        }
-                        break;
-                    }
-                }
-                if (!handled) throw;
             }
         }
     } catch (...) {
         ok = false;
+        // unwind 已由 ExecuteStatement 内部 block 退出逻辑负责，
+        // 这里只需要把所有仍在栈上的 block 做兜底 RELEASE，避免悬挂
+        // SAVEPOINT 污染外层 txn。
+        while (!frame.block_stack.empty()) {
+            ExitBlockNormally(frame);
+        }
         throw;
+    }
+
+    // 顶层 block 退出（handler 命中或正常结束）。
+    (void)FinalizeBlockExit(frame);
+    // 兜底清理。
+    while (!frame.block_stack.empty()) {
+        ExitBlockNormally(frame);
     }
 
     // OUT / INOUT 回写到 ExecutionContext。
@@ -278,6 +454,16 @@ bool UdfExecutor::RunProcedure(const SystemCatalog::ProcedureDefinition& proc,
             if (it != frame.locals.end()) {
                 context_->SetOutArg(p.name, it->second);
             }
+        }
+        // 71_proc_out_params：把 OUT/INOUT 的最终值同步到 session_vars_，
+        // 让调用方在 CALL 后立即 SELECT @out_arg 可见。绑定表为空时
+        // （持有表形式 / IN-only 过程）跳过，保持 V1 行为。
+        for (const auto& kv : out_arg_session_map) {
+            const std::string& param_name = kv.first;
+            const std::string& sv_name = kv.second;
+            auto it = frame.locals.find(param_name);
+            if (it == frame.locals.end()) continue;
+            context_->SetSessionVar(sv_name, it->second);
         }
     }
     return ok;
@@ -310,38 +496,66 @@ void UdfExecutor::ExecuteStatement(const StatementPtr& stmt, FunctionFrame& fram
         case NodeType::SET_VAR_STMT: {
             const auto& sv = static_cast<const SetVarStatement&>(*stmt);
             Value v = EvaluateExpr(sv.expr, frame, Tuple());
-            frame.locals[sv.target] = v;
+            // 71_proc_out_params：target 以 '@' 开头视为 session variable
+            // （即 MySQL 的「会话变量」语义），直接写入 ctx->session_vars_
+            // 而非 frame.locals，让 procedure 调用结束后调用方 SELECT @var
+            // 即可读到。target 以 'NEW.' / 'OLD.' / 普通名字 走旧路径。
+            if (!sv.target.empty() && sv.target.front() == '@') {
+                std::string sv_name(sv.target.begin() + 1, sv.target.end());
+                if (context_ != nullptr) {
+                    context_->SetSessionVar(sv_name, std::move(v));
+                }
+            } else {
+                frame.locals[sv.target] = std::move(v);
+            }
             return;
         }
         case NodeType::IF_STMT: {
             const auto& ifs = static_cast<const IfStatement&>(*stmt);
             Value cond = EvaluateExpr(ifs.condition, frame, Tuple());
             if (IsTruthyValue(cond)) {
+                // 68_proc_handlers: 把 THEN body 当作独立 block；handler 在
+                // 这里声明时 block_id 指向这个新 block。
+                EnterBlock(frame, "if_then");
                 for (const auto& s : ifs.then_body) {
-                    if (frame.done) return;
+                    if (frame.done) break;
+                    if (!frame.block_stack.empty() &&
+                        frame.pending_exit_block_id != -1) break;
                     if (s) ExecuteStatement(s, frame);
                 }
+                if (FinalizeBlockExit(frame)) return;  // pending 指向外层
                 return;
             }
             for (const auto& ec : ifs.elseif_clauses) {
                 Value v = EvaluateExpr(ec.condition, frame, Tuple());
                 if (IsTruthyValue(v)) {
+                    EnterBlock(frame, "if_elseif");
                     for (const auto& s : ec.body) {
-                        if (frame.done) return;
+                        if (frame.done) break;
+                        if (!frame.block_stack.empty() &&
+                            frame.pending_exit_block_id != -1) break;
                         if (s) ExecuteStatement(s, frame);
                     }
+                    if (FinalizeBlockExit(frame)) return;
                     return;
                 }
             }
+            EnterBlock(frame, "if_else");
             for (const auto& s : ifs.else_body) {
-                if (frame.done) return;
+                if (frame.done) break;
+                if (!frame.block_stack.empty() &&
+                    frame.pending_exit_block_id != -1) break;
                 if (s) ExecuteStatement(s, frame);
             }
+            if (FinalizeBlockExit(frame)) return;
             return;
         }
         case NodeType::WHILE_STMT: {
             const auto& ws = static_cast<const WhileStatement&>(*stmt);
             const size_t kMaxIter = 10000;
+            // 68_proc_handlers: WHILE body 是一个 block；每条 statement
+            // 执行后检查 frame.control 与 frame.pending_exit_block_id。
+            EnterBlock(frame, "while_body");
             // 注意：frame.label_stack 故意不在此处压栈/弹栈 —— 之前用
             // push_back + pop_back 包裹循环体会被 body 内的 LEAVE/ITERATE
             // 以及 SIGNAL 异常路径破坏平衡，导致 pop_back 在空栈上断言失败。
@@ -352,6 +566,9 @@ void UdfExecutor::ExecuteStatement(const StatementPtr& stmt, FunctionFrame& fram
                 if (!IsTruthyValue(cond)) break;
                 for (const auto& s : ws.body) {
                     if (frame.done || frame.control != FunctionFrame::Control::NONE) break;
+                    // EXIT / UNDO 命中本 block 或外层 block 时停止 body。
+                    if (!frame.block_stack.empty() &&
+                        frame.pending_exit_block_id != -1) break;
                     if (s) ExecuteStatement(s, frame);
                 }
                 if (frame.done) break;
@@ -363,12 +580,18 @@ void UdfExecutor::ExecuteStatement(const StatementPtr& stmt, FunctionFrame& fram
                     frame.control = FunctionFrame::Control::NONE;
                     continue;
                 }
+                // EXIT/UNDO 已 unwind 到本/外层 block：跳出循环。
+                if (!frame.block_stack.empty() &&
+                    frame.pending_exit_block_id != -1) break;
             }
+            if (FinalizeBlockExit(frame)) return;
             return;
         }
         case NodeType::LOOP_STMT: {
             const auto& ls = static_cast<const LoopStatement&>(*stmt);
             const size_t kMaxIter = 10000;
+            // 68_proc_handlers: LOOP body 是一个 block。
+            EnterBlock(frame, "loop_body");
             // 同 WHILE：不再维护 label_stack 平衡，依赖 frame.control。
             // ls.label 当前保留但 V1 未使用（标签栈需要嵌套循环上下文，
             // 与 RAII 友好的异常路径难以共存；59_procs 全程不使用 label）。
@@ -377,6 +600,8 @@ void UdfExecutor::ExecuteStatement(const StatementPtr& stmt, FunctionFrame& fram
                 if (frame.done) break;
                 for (const auto& s : ls.body) {
                     if (frame.done || frame.control != FunctionFrame::Control::NONE) break;
+                    if (!frame.block_stack.empty() &&
+                        frame.pending_exit_block_id != -1) break;
                     if (s) ExecuteStatement(s, frame);
                 }
                 if (frame.done) break;
@@ -388,18 +613,25 @@ void UdfExecutor::ExecuteStatement(const StatementPtr& stmt, FunctionFrame& fram
                     frame.control = FunctionFrame::Control::NONE;
                     continue;
                 }
+                if (!frame.block_stack.empty() &&
+                    frame.pending_exit_block_id != -1) break;
             }
+            if (FinalizeBlockExit(frame)) return;
             return;
         }
         case NodeType::REPEAT_STMT: {
             const auto& rs = static_cast<const RepeatStatement&>(*stmt);
             const size_t kMaxIter = 10000;
+            // 68_proc_handlers: REPEAT body 是一个 block。
+            EnterBlock(frame, "repeat_body");
             // 同上：不再 push_back/pop_back label_stack。
             (void)rs.label;
             for (size_t iter = 0; iter < kMaxIter; ++iter) {
                 if (frame.done) break;
                 for (const auto& s : rs.body) {
                     if (frame.done || frame.control != FunctionFrame::Control::NONE) break;
+                    if (!frame.block_stack.empty() &&
+                        frame.pending_exit_block_id != -1) break;
                     if (s) ExecuteStatement(s, frame);
                 }
                 if (frame.done) break;
@@ -412,14 +644,18 @@ void UdfExecutor::ExecuteStatement(const StatementPtr& stmt, FunctionFrame& fram
                     frame.control = FunctionFrame::Control::NONE;
                     continue;
                 }
+                if (!frame.block_stack.empty() &&
+                    frame.pending_exit_block_id != -1) break;
                 // 评估 UNTIL cond：truthy 即退出。
                 Value cond = EvaluateExpr(rs.until_expr, frame, Tuple());
                 if (IsTruthyValue(cond)) break;
             }
+            if (FinalizeBlockExit(frame)) return;
             return;
         }
         case NodeType::CASE_STMT: {
             const auto& cs = static_cast<const CaseStatement&>(*stmt);
+            // 68_proc_handlers: CASE 体内每个 WHEN / ELSE 分支视为独立 block。
             for (const auto& w : cs.whens) {
                 if (!w.when_expr) continue;
                 Value matched = Value::MakeNull();
@@ -436,17 +672,25 @@ void UdfExecutor::ExecuteStatement(const StatementPtr& stmt, FunctionFrame& fram
                     matched = EvaluateExpr(w.when_expr, frame, Tuple());
                 }
                 if (IsTruthyValue(matched)) {
+                    EnterBlock(frame, "case_when");
                     for (const auto& s : w.body) {
-                        if (frame.done) return;
+                        if (frame.done) break;
+                        if (!frame.block_stack.empty() &&
+                            frame.pending_exit_block_id != -1) break;
                         if (s) ExecuteStatement(s, frame);
                     }
+                    if (FinalizeBlockExit(frame)) return;
                     return;
                 }
             }
+            EnterBlock(frame, "case_else");
             for (const auto& s : cs.else_body) {
-                if (frame.done) return;
+                if (frame.done) break;
+                if (!frame.block_stack.empty() &&
+                    frame.pending_exit_block_id != -1) break;
                 if (s) ExecuteStatement(s, frame);
             }
+            if (FinalizeBlockExit(frame)) return;
             return;
         }
         case NodeType::LEAVE_STMT: {
@@ -477,6 +721,15 @@ void UdfExecutor::ExecuteStatement(const StatementPtr& stmt, FunctionFrame& fram
             he.cond_kind = dh.cond_kind;
             he.cond_sqlstate = dh.cond_sqlstate;
             he.body = dh.body;
+            // 68_proc_handlers: 记录 handler 声明所在 block 的 id。
+            // EXIT / UNDO 触发时按这个 id 做块级 unwind；-1 表示 procedure
+            // 顶层隐式 block。block_stack 为空（理论上不应该发生）时
+            // 视作顶层，回退到 -1。
+            if (!frame.block_stack.empty()) {
+                he.block_id = frame.block_stack.back().id;
+            } else {
+                he.block_id = -1;
+            }
             frame.handlers.push_back(std::move(he));
             return;
         }

@@ -140,6 +140,23 @@ set /a FAILED = FAILED + 1
 set "FAILED_TESTS=!FAILED_TESTS! 60_trigger_persist!"
 :trigger_persist_done
 
+REM ---- Phase E: Debug meta-command smoke test (62_debug_meta) ----
+REM Driven by run_debug_meta.bat: feeds a SELECT into the REPL then verifies
+REM the \.tokens / \.ast / \.plan outputs through findstr matches.
+echo.
+echo [ RUN  ] debug_meta (run_debug_meta.bat)
+call "%SCRIPT_DIR%run_debug_meta.bat" > nul 2>&1
+set "DEBUG_META_EXITCODE=!errorlevel!"
+if !DEBUG_META_EXITCODE! neq 0 goto :debug_meta_fail
+set /a PASSED = PASSED + 1
+echo  [ OK ]
+goto :debug_meta_done
+:debug_meta_fail
+echo [FAIL] (debug_meta exit=!DEBUG_META_EXITCODE!)
+set /a FAILED = FAILED + 1
+set "FAILED_TESTS=!FAILED_TESTS! 62_debug_meta!"
+:debug_meta_done
+
 echo.
 echo ==========================================
 echo   Summary:  !PASSED! passed,  !FAILED! failed

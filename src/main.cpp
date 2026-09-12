@@ -4,9 +4,106 @@
 #include <vector>
 #include <cctype>
 
+#include "ast/AST.h"
 #include "db/Database.h"
+#include "lexer/Token.h"
+#include "plan/Plan.h"
 
 namespace {
+
+// ============ 调试输出模式（Phase 1.5）============
+//
+// REPL 的三条元命令 \.tokens / \.ast / \.plan 把"最近一次成功通过对应阶段的
+// 编译产物"打印到 stdout。这里的三个 Print* 函数只负责格式化输出；底层数据
+// （tokens / AST / plan）来自 Database 的 LastTokens / LastAst / LastPlan
+// 访问器，由 ExecuteSQL 在各阶段成功后写入。
+//
+// 输出格式：
+//   - PrintTokens：每行一个 token，格式 "[TYPE] 'lexeme' @line:col"。
+//                  超过 200 个时截断并追加 "... (N more tokens)" 行。
+//   - PrintAst：直接复用 ast::Node::ToString()，再按行输出带首行标题。
+//   - PrintPlan：复用 plan::PlanNode::ToString()（与 EXPLAIN 输出同源）；
+//                若计划为空（如纯 BEGIN/COMMIT 的 NoOpNode），打印 "(empty plan)"。
+
+// 把任意 ASCII 控制字符（如换行）转义成可见形式，便于在 REPL 中阅读 token
+// 的 lexeme。原 \t / \n 等可能让 "sqlcompiler> Error:" 的 prompt 解析器
+// 抓不到 prompt 边界。
+std::string EscapeForDisplay(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:   out += c;      break;
+        }
+    }
+    return out;
+}
+
+void PrintTokens(const std::vector<sqlcompiler::Token>& tokens) {
+    constexpr size_t kMaxPrint = 200;
+    std::cout << "[tokens] " << tokens.size() << " token(s):" << std::endl;
+    size_t n = std::min(tokens.size(), kMaxPrint);
+    for (size_t i = 0; i < n; ++i) {
+        const auto& t = tokens[i];
+        std::cout << "  [" << sqlcompiler::TokenTypeToString(t.type)
+                  << "] '" << EscapeForDisplay(t.lexeme)
+                  << "' @line=" << t.line
+                  << ":col=" << t.column << std::endl;
+    }
+    if (tokens.size() > kMaxPrint) {
+        std::cout << "  ... (" << (tokens.size() - kMaxPrint)
+                  << " more tokens)" << std::endl;
+    }
+}
+
+void PrintAst(const sqlcompiler::Statement* ast) {
+    if (ast == nullptr) {
+        std::cout << "[ast] (no statement; the last SQL did not parse)"
+                  << std::endl;
+        return;
+    }
+    std::cout << "[ast]" << std::endl;
+    // ast::Node::ToString() 已自带换行（SelectStatement 等多行表达式排版），
+    // 直接整段输出即可。为视觉对齐加一个缩进。
+    std::string s = ast->ToString();
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t nl = s.find('\n', pos);
+        if (nl == std::string::npos) {
+            std::cout << "  " << s.substr(pos) << std::endl;
+            break;
+        }
+        std::cout << "  " << s.substr(pos, nl - pos) << std::endl;
+        pos = nl + 1;
+    }
+}
+
+void PrintPlan(const sqlcompiler::PlanNode* plan) {
+    if (plan == nullptr) {
+        std::cout << "[plan] (no plan; the last SQL did not produce an "
+                     "optimized plan)"
+                  << std::endl;
+        return;
+    }
+    std::cout << "[plan]" << std::endl;
+    // plan::PlanNode::ToString() 与 EXPLAIN 同源：每行一个节点（顶层节点无缩进，
+    // 每深一层缩进 +2 空格）。直接整段输出即可。
+    std::string s = plan->ToString();
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t nl = s.find('\n', pos);
+        if (nl == std::string::npos) {
+            std::cout << "  " << s.substr(pos) << std::endl;
+            break;
+        }
+        std::cout << "  " << s.substr(pos, nl - pos) << std::endl;
+        pos = nl + 1;
+    }
+}
 
 // 判断文本是否仅由空白与 SQL 行注释（-- ...）组成。
 // 用于 REPL 跳过完全由注释构成的输入（典型场景：用户以 `-- xxx;` 行注释一段语句），
@@ -221,7 +318,43 @@ int main(int argc, char** argv) {
     std::string line;
     std::string sql;
     std::cout << "sqlcompiler> " << std::flush;
+    // Phase 1.5：首次启动时打印一行帮助，让用户知道有调试元命令可用。
+    // 启动 banner 之前已在外层输出"sqlcompiler> "，这里再追加一行避免覆盖 prompt。
+    std::cout << "Meta-commands: \\.tokens, \\.ast, \\.plan "
+              << " (show last statement's debug info)" << std::endl;
+    std::cout << "sqlcompiler> " << std::flush;
     while (std::getline(std::cin, line)) {
+        // ---- Phase 1.5: 元命令就地处理 ----
+        // 调试元命令不写库、不需要 ';'，也不需要拼到 sql 累加器里。
+        // 当 sql 累加器为空（即上一条语句已完整消化）且本行就是元命令时，
+        // 直接处理并跳过常规 ExecuteSQL 路径。
+        // 注意：累加器非空时不处理，避免用户在多行 SQL 中误打 "\.tokens"
+        // 整段作为字面字符串被截断解析。
+        if (sql.empty()) {
+            // 复制行做 trim（不去改原 line，下一轮循环还要用）。
+            std::string cmd = line;
+            size_t ca = cmd.find_first_not_of(" \t\r\n");
+            size_t cb = cmd.find_last_not_of(" \t\r\n");
+            std::string trimmed_cmd =
+                (ca == std::string::npos) ? std::string()
+                                          : cmd.substr(ca, cb - ca + 1);
+            if (trimmed_cmd == R"(\.tokens)") {
+                PrintTokens(database->LastTokens());
+                std::cout << "sqlcompiler> " << std::flush;
+                continue;
+            }
+            if (trimmed_cmd == R"(\.ast)") {
+                PrintAst(database->LastAst());
+                std::cout << "sqlcompiler> " << std::flush;
+                continue;
+            }
+            if (trimmed_cmd == R"(\.plan)") {
+                PrintPlan(database->LastPlan());
+                std::cout << "sqlcompiler> " << std::flush;
+                continue;
+            }
+        }
+
         sql += line;
         sql += "\n";
         if (!HasCompleteStatement(sql)) {

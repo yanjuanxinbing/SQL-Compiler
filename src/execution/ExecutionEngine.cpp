@@ -29,6 +29,7 @@
 #include "execution/SubqueryExecutor.h"
 #include "execution/ValuesExecutor.h"     // 55_query
 #include "execution/ApplyExecutor.h"      // 55_query
+#include "execution/TimingProxyExecutor.h"  // 69_explain_analyze: ANALYZE 代理
 #include "execution/TransactionExecutor.h"
 #include "execution/TruncateTableExecutor.h"
 #include "execution/UpdateExecutor.h"
@@ -398,6 +399,17 @@ ExecutionResult ExecutionEngine::Execute(const PlanNodePtr& plan) {
     if (txn_manager_ != nullptr) {
         ctx.SetTransaction(txn_manager_->GetCurrentTransaction());
     }
+    // Spec 2.3：把 Database 注入的 StorageAccess 挂到 ctx 上，让算子通过
+    // ctx.GetStorage() 调用 BPM/DM，而不是直接拿 BufferPoolManager 指针。
+    if (storage_access_ != nullptr) {
+        ctx.SetStorage(storage_access_);
+    }
+    // 71_proc_out_params：把 Database 注入的 session_vars_ 挂到 ctx 上，让
+    // ExpressionEvaluator、UdfExecutor、TriggerExecutor 都能读写同一张表。
+    // 这条注入路径确保 CALL/SELECT 跨 ExecuteSQL 调用能看到上一次的 @var 写入。
+    if (session_vars_ != nullptr) {
+        ctx.SetSessionVars(session_vars_);
+    }
     return ExecuteSubplan(plan, &ctx);
 }
 
@@ -528,21 +540,29 @@ ExecutionResult ExecutionEngine::ExecuteSubplan(const PlanNodePtr& plan, Executi
 }
 
 ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
-                                           ExecutionContext* context) {
+                                           ExecutionContext* context,
+                                           bool wrap_timing) {
     if (!plan_node) return nullptr;
+    // EXPLAIN ANALYZE 辅助：wrap_timing 为 true 时把每个构造出的算子套上
+    // TimingProxyExecutor，用于收集 per-node Init/Next 时长与行数。
+    auto wrap = [&](ExecutorPtr exec) -> ExecutorPtr {
+        if (!wrap_timing || !exec) return exec;
+        return std::make_unique<TimingProxyExecutor>(
+            context, std::move(exec), plan_node.get());
+    };
     switch (plan_node->GetType()) {
         case PlanNodeType::SEQ_SCAN: {
             auto n = std::static_pointer_cast<SeqScanNode>(plan_node);
             // CTE hint: table_alias 以 "__cte__" 开头时优先路由到 CTE_BIND
             if (!n->table_alias.empty() && n->table_alias.rfind("__cte__", 0) == 0) {
                 std::string cte_name = n->table_alias.substr(7);
-                return std::make_unique<CteBindExecutor>(context, std::move(cte_name));
+                return wrap(std::make_unique<CteBindExecutor>(context, std::move(cte_name)));
             }
             // 派生表占位（FROM (SELECT ...) AS alias）：table_name == alias 且
             // children[0] 挂有 Planner 递归生成的子计划。让真正的子计划替代占位 SeqScan。
             if (!n->table_alias.empty() && n->table_alias == n->table_name &&
                 !plan_node->children.empty()) {
-                return BuildExecutor(plan_node->children[0], context);
+                return BuildExecutor(plan_node->children[0], context, wrap_timing);
             }
             // 递归 CTE 在递归部分里以 `JOIN cte_name alias` 形式引用 CTE。
             // Planner 没有改写这种带别名的 SeqScanNode，于是这里补一次检查：
@@ -550,19 +570,20 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             // CteDefineExecutor 注册），改走 CteBindExecutor。否则退回普通的
             // SeqScanExecutor，由 catalog 查找 table_heap。
             if (!n->table_name.empty() && context->HasCte(n->table_name)) {
-                return std::make_unique<CteBindExecutor>(context, n->table_name);
+                return wrap(std::make_unique<CteBindExecutor>(context, n->table_name));
             }
-            return std::make_unique<SeqScanExecutor>(context, n->table_name);
+            return wrap(std::make_unique<SeqScanExecutor>(context, n->table_name,
+                                                          n->table_alias, n->predicate));
         }
         case PlanNodeType::INDEX_SCAN: {
             auto n = std::static_pointer_cast<IndexScanNode>(plan_node);
             auto col_map = BuildCombinedColumnIndexMap(
                 context->GetCatalog(), std::vector<std::pair<std::string, std::string>>{{n->table_name, n->table_alias}});
-            return std::make_unique<IndexScanExecutor>(context, n, col_map);
+            return wrap(std::make_unique<IndexScanExecutor>(context, n, col_map));
         }
         case PlanNodeType::FILTER: {
             auto n = std::static_pointer_cast<FilterNode>(plan_node);
-            auto child = BuildExecutor(plan_node->children.empty() ? nullptr : plan_node->children[0], context);
+            auto child = BuildExecutor(plan_node->children.empty() ? nullptr : plan_node->children[0], context, wrap_timing);
             if (!child) return nullptr;
             // For HAVING (child is Aggregate): aggregate_exprs become named slots
             // in the output tuple. We map aggregate function calls to positions.
@@ -600,7 +621,7 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
                     }
                 }
             }
-            return std::make_unique<FilterExecutor>(context, std::move(child), n->predicate, cmap);
+            return wrap(std::make_unique<FilterExecutor>(context, std::move(child), n->predicate, cmap));
         }
         case PlanNodeType::PROJECT: {
             auto n = std::static_pointer_cast<ProjectNode>(plan_node);
@@ -610,12 +631,12 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
                 ExecutorPtr proj = std::make_unique<ProjectExecutor>(
                     context, nullptr, n->columns, empty_cmap);
                 if (n->is_distinct) {
-                    return std::make_unique<DistinctExecutor>(context, std::move(proj),
-                                                              n->columns.size());
+                    return wrap(std::make_unique<DistinctExecutor>(context, std::move(proj),
+                                                                   n->columns.size()));
                 }
-                return proj;
+                return wrap(std::move(proj));
             }
-            auto child = BuildExecutor(plan_node->children[0], context);
+            auto child = BuildExecutor(plan_node->children[0], context, wrap_timing);
             if (!child) return nullptr;
             // If child is an Aggregate, the aggregate already produced tuples
             // matching the SELECT list; pass through unchanged.
@@ -623,10 +644,10 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
                 if (n->is_distinct) {
                     // AggregateExecutor 的输出列数 == aggregate_exprs 数，
                     // 没有 underlying 追加；DISTINCT 仍按全部列参与去重。
-                    return std::make_unique<DistinctExecutor>(context, std::move(child),
-                                                              n->columns.size());
+                    return wrap(std::make_unique<DistinctExecutor>(context, std::move(child),
+                                                                   n->columns.size()));
                 }
-                return child;
+                return wrap(std::move(child));
             }
             // If child is a Filter (HAVING) whose own child is Aggregate, pass
             // through unchanged.
@@ -634,10 +655,10 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
                 plan_node->children[0]->children.size() > 0 &&
                 plan_node->children[0]->children[0]->GetType() == PlanNodeType::AGGREGATE) {
                 if (n->is_distinct) {
-                    return std::make_unique<DistinctExecutor>(context, std::move(child),
-                                                              n->columns.size());
+                    return wrap(std::make_unique<DistinctExecutor>(context, std::move(child),
+                                                                   n->columns.size()));
                 }
-                return child;
+                return wrap(std::move(child));
             }
             // ---- 60_funcs: GROUPING SETS / ROLLUP / CUBE 路径 ----
             // 子计划（SetOpNode 的 children）已经是聚合后的输出，元组形状与
@@ -645,10 +666,10 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             // 会按标量函数处理，从而得到 NULL。直接透传避免重复求值。
             if (plan_node->children[0]->GetType() == PlanNodeType::SET_OP) {
                 if (n->is_distinct) {
-                    return std::make_unique<DistinctExecutor>(context, std::move(child),
-                                                              n->columns.size());
+                    return wrap(std::make_unique<DistinctExecutor>(context, std::move(child),
+                                                                   n->columns.size()));
                 }
-                return child;
+                return wrap(std::move(child));
             }
             auto cmap = BuildCombinedColumnIndexMapWithDerived(catalog_, plan_node, CollectScanTableNames(plan_node));
             ExecutorPtr proj_exec = std::make_unique<ProjectExecutor>(context, std::move(child), n->columns, cmap, n->aliases);
@@ -656,20 +677,20 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
                 // ProjectExecutor 输出的元组形状是 [select_values ++ underlying_tuple]，
                 // Distinct 必须仅按前缀 n->columns.size() 列哈希，否则 underlying
                 // 列（id/name 等）会让同一 dept 的两行永远不被识别为重复。
-                return std::make_unique<DistinctExecutor>(context, std::move(proj_exec),
-                                                          n->columns.size());
+                return wrap(std::make_unique<DistinctExecutor>(context, std::move(proj_exec),
+                                                               n->columns.size()));
             }
-            return proj_exec;
+            return wrap(std::move(proj_exec));
         }
         case PlanNodeType::LIMIT: {
             auto n = std::static_pointer_cast<LimitNode>(plan_node);
-            auto child = BuildExecutor(plan_node->children.empty() ? nullptr : plan_node->children[0], context);
+            auto child = BuildExecutor(plan_node->children.empty() ? nullptr : plan_node->children[0], context, wrap_timing);
             if (!child) return nullptr;
-            return std::make_unique<LimitExecutor>(context, std::move(child), n->limit_count, n->offset);
+            return wrap(std::make_unique<LimitExecutor>(context, std::move(child), n->limit_count, n->offset));
         }
         case PlanNodeType::SORT: {
             auto n = std::static_pointer_cast<SortNode>(plan_node);
-            auto child = BuildExecutor(plan_node->children.empty() ? nullptr : plan_node->children[0], context);
+            auto child = BuildExecutor(plan_node->children.empty() ? nullptr : plan_node->children[0], context, wrap_timing);
             if (!child) return nullptr;
             // Build a column_index_map for evaluating ORDER BY expressions against
             // the tuple stream that reaches Sort.
@@ -803,55 +824,55 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             } else {
                 cmap = BuildCombinedColumnIndexMapWithDerived(catalog_, plan_node, CollectScanTableNames(plan_node));
             }
-            return std::make_unique<SortExecutor>(context, std::move(child), n->order_items, cmap);
+            return wrap(std::make_unique<SortExecutor>(context, std::move(child), n->order_items, cmap));
         }
         case PlanNodeType::AGGREGATE: {
             auto n = std::static_pointer_cast<AggregateNode>(plan_node);
-            auto child = BuildExecutor(plan_node->children.empty() ? nullptr : plan_node->children[0], context);
+            auto child = BuildExecutor(plan_node->children.empty() ? nullptr : plan_node->children[0], context, wrap_timing);
             if (!child) return nullptr;
             auto cmap = BuildCombinedColumnIndexMapWithDerived(catalog_, plan_node, CollectScanTableNames(plan_node));
-            return std::make_unique<AggregateExecutor>(context, std::move(child),
-                                                        n->group_by_exprs, n->aggregate_exprs,
-                                                        cmap);
+            return wrap(std::make_unique<AggregateExecutor>(context, std::move(child),
+                                                             n->group_by_exprs, n->aggregate_exprs,
+                                                             cmap));
         }
         case PlanNodeType::JOIN: {
             auto n = std::static_pointer_cast<JoinNode>(plan_node);
             if (plan_node->children.size() < 2) return nullptr;
-            auto left = BuildExecutor(plan_node->children[0], context);
-            auto right = BuildExecutor(plan_node->children[1], context);
+            auto left = BuildExecutor(plan_node->children[0], context, wrap_timing);
+            auto right = BuildExecutor(plan_node->children[1], context, wrap_timing);
             if (!left || !right) return nullptr;
             auto cmap = BuildCombinedColumnIndexMapWithDerived(catalog_, plan_node, CollectScanTableNames(plan_node));
-            return std::make_unique<JoinExecutor>(context, std::move(left), std::move(right),
-                                                  n->join_type, n->condition, cmap);
+            return wrap(std::make_unique<JoinExecutor>(context, std::move(left), std::move(right),
+                                                       n->join_type, n->condition, cmap));
         }
         case PlanNodeType::INSERT: {
             auto n = std::static_pointer_cast<InsertNode>(plan_node);
             if (n->query_plan) {
                 // INSERT ... SELECT：从子计划取行写入目标表。
-                return std::make_unique<InsertExecutor>(context, n->table_name,
-                                                         n->columns, n->query_plan,
-                                                         n->returning_exprs,
-                                                         n->returning_aliases);
+                return wrap(std::make_unique<InsertExecutor>(context, n->table_name,
+                                                              n->columns, n->query_plan,
+                                                              n->returning_exprs,
+                                                              n->returning_aliases));
             }
-            return std::make_unique<InsertExecutor>(context, n->table_name, n->columns,
-                                                     n->values_list, n->is_replace,
-                                                     n->returning_exprs,
-                                                     n->returning_aliases);
+            return wrap(std::make_unique<InsertExecutor>(context, n->table_name, n->columns,
+                                                          n->values_list, n->is_replace,
+                                                          n->returning_exprs,
+                                                          n->returning_aliases));
         }
         case PlanNodeType::UPSERT: {
             auto n = std::static_pointer_cast<UpsertNode>(plan_node);
-            return std::make_unique<UpsertExecutor>(context, n->table_name,
-                                                    n->columns, n->values_list,
-                                                    n->upsert_assignments,
-                                                    n->returning_exprs,
-                                                    n->returning_aliases);
+            return wrap(std::make_unique<UpsertExecutor>(context, n->table_name,
+                                                         n->columns, n->values_list,
+                                                         n->upsert_assignments,
+                                                         n->returning_exprs,
+                                                         n->returning_aliases));
         }
         case PlanNodeType::UPDATE: {
             auto n = std::static_pointer_cast<UpdateNode>(plan_node);
-            return std::make_unique<UpdateExecutor>(context, n->table_name, n->assignments,
-                                                     n->predicate, BuildColumnIndexMap(n->table_name),
-                                                     n->returning_exprs,
-                                                     n->returning_aliases);
+            return wrap(std::make_unique<UpdateExecutor>(context, n->table_name, n->assignments,
+                                                          n->predicate, BuildColumnIndexMap(n->table_name),
+                                                          n->returning_exprs,
+                                                          n->returning_aliases));
         }
         case PlanNodeType::UPDATE_FROM: {
             // 54_dml: UPDATE ... FROM —— 构造 join 子计划 + UpdateFromExecutor。
@@ -861,7 +882,7 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             auto n = std::static_pointer_cast<UpdateFromNode>(plan_node);
             ExecutorPtr join_child = nullptr;
             if (!plan_node->children.empty()) {
-                join_child = BuildExecutor(plan_node->children[0], context);
+                join_child = BuildExecutor(plan_node->children[0], context, wrap_timing);
             }
             auto target_cmap = BuildColumnIndexMap(n->table_name);
             // combined cmap = target_cmap + 来自 join_child 子树的全部列下标。
@@ -874,29 +895,29 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
                     combined_cmap[kv.first] = kv.second;
                 }
             }
-            return std::make_unique<UpdateFromExecutor>(context, n->table_name,
-                                                       n->target_alias,
-                                                       n->assignments,
-                                                       n->where_clause,
-                                                       target_cmap,
-                                                       combined_cmap,
-                                                       std::move(join_child),
-                                                       n->returning_exprs,
-                                                       n->returning_aliases);
+            return wrap(std::make_unique<UpdateFromExecutor>(context, n->table_name,
+                                                              n->target_alias,
+                                                              n->assignments,
+                                                              n->where_clause,
+                                                              target_cmap,
+                                                              combined_cmap,
+                                                              std::move(join_child),
+                                                              n->returning_exprs,
+                                                              n->returning_aliases));
         }
         case PlanNodeType::DELETE: {
             auto n = std::static_pointer_cast<DeleteNode>(plan_node);
-            return std::make_unique<DeleteExecutor>(context, n->table_name, n->predicate,
-                                                     BuildColumnIndexMap(n->table_name),
-                                                     n->returning_exprs,
-                                                     n->returning_aliases);
+            return wrap(std::make_unique<DeleteExecutor>(context, n->table_name, n->predicate,
+                                                          BuildColumnIndexMap(n->table_name),
+                                                          n->returning_exprs,
+                                                          n->returning_aliases));
         }
         case PlanNodeType::MERGE: {
             // 54_dml: MERGE INTO —— 构造 source 子执行器 + MergeExecutor。
             auto n = std::static_pointer_cast<MergeNode>(plan_node);
             ExecutorPtr source_child = nullptr;
             if (!plan_node->children.empty()) {
-                source_child = BuildExecutor(plan_node->children[0], context);
+                source_child = BuildExecutor(plan_node->children[0], context, wrap_timing);
             }
             auto target_cmap = BuildColumnIndexMap(n->target_table);
             auto combined_cmap = target_cmap;
@@ -928,73 +949,73 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
                     combined_cmap[n->source_table + "." + src->columns[i].name] = offset + i;
                 }
             }
-            return std::make_unique<MergeExecutor>(context, n->target_table,
-                                                  n->target_alias,
-                                                  n->source_alias,
-                                                  n->on_condition,
-                                                  target_cmap,
-                                                  combined_cmap,
-                                                  std::move(source_child),
-                                                  n->has_matched_update,
-                                                  n->matched_assignments,
-                                                  n->has_not_matched_insert,
-                                                  n->not_matched_columns,
-                                                  n->not_matched_values);
+            return wrap(std::make_unique<MergeExecutor>(context, n->target_table,
+                                                         n->target_alias,
+                                                         n->source_alias,
+                                                         n->on_condition,
+                                                         target_cmap,
+                                                         combined_cmap,
+                                                         std::move(source_child),
+                                                         n->has_matched_update,
+                                                         n->matched_assignments,
+                                                         n->has_not_matched_insert,
+                                                         n->not_matched_columns,
+                                                         n->not_matched_values));
         }
         case PlanNodeType::CREATE_TABLE: {
             auto n = std::static_pointer_cast<CreateTableNode>(plan_node);
-            return std::make_unique<CreateTableExecutor>(context, n->table_name,
-                                                          n->columns, n->primary_keys,
-                                                          n->unique_constraints,
-                                                          n->foreign_keys,
-                                                          n->table_checks,
-                                                          n->if_not_exists);
+            return wrap(std::make_unique<CreateTableExecutor>(context, n->table_name,
+                                                              n->columns, n->primary_keys,
+                                                              n->unique_constraints,
+                                                              n->foreign_keys,
+                                                              n->table_checks,
+                                                              n->if_not_exists));
         }
         case PlanNodeType::DROP_TABLE: {
             auto n = std::static_pointer_cast<DropTableNode>(plan_node);
-            return std::make_unique<DropTableExecutor>(context, n->table_name,
-                                                       n->if_exists);
+            return wrap(std::make_unique<DropTableExecutor>(context, n->table_name,
+                                                             n->if_exists));
         }
         case PlanNodeType::CREATE_INDEX: {
             auto n = std::static_pointer_cast<CreateIndexNode>(plan_node);
-            return std::make_unique<CreateIndexExecutor>(
-                context, n->index_name, n->table_name, n->key_columns, n->is_unique);
+            return wrap(std::make_unique<CreateIndexExecutor>(
+                context, n->index_name, n->table_name, n->key_columns, n->is_unique));
         }
         case PlanNodeType::DROP_INDEX: {
             auto n = std::static_pointer_cast<DropIndexNode>(plan_node);
-            return std::make_unique<DropIndexExecutor>(context, n->index_name,
-                                                       n->if_exists);
+            return wrap(std::make_unique<DropIndexExecutor>(context, n->index_name,
+                                                             n->if_exists));
         }
         case PlanNodeType::TRUNCATE_TABLE: {
             auto n = std::static_pointer_cast<TruncateTableNode>(plan_node);
-            return std::make_unique<TruncateTableExecutor>(context, n->table_name);
+            return wrap(std::make_unique<TruncateTableExecutor>(context, n->table_name));
         }
         case PlanNodeType::ALTER_TABLE: {
             auto n = std::static_pointer_cast<AlterTableNode>(plan_node);
-            return std::make_unique<AlterTableExecutor>(context, n.get());
+            return wrap(std::make_unique<AlterTableExecutor>(context, n.get()));
         }
         // ---- 53_ddl: SCHEMA / SEQUENCE ----
         case PlanNodeType::CREATE_SCHEMA: {
             auto n = std::static_pointer_cast<CreateSchemaNode>(plan_node);
-            return std::make_unique<CreateSchemaExecutor>(context, n.get());
+            return wrap(std::make_unique<CreateSchemaExecutor>(context, n.get()));
         }
         case PlanNodeType::DROP_SCHEMA: {
             auto n = std::static_pointer_cast<DropSchemaNode>(plan_node);
-            return std::make_unique<DropSchemaExecutor>(context, n.get());
+            return wrap(std::make_unique<DropSchemaExecutor>(context, n.get()));
         }
         case PlanNodeType::CREATE_SEQUENCE: {
             auto n = std::static_pointer_cast<CreateSequenceNode>(plan_node);
-            return std::make_unique<CreateSequenceExecutor>(context, n.get());
+            return wrap(std::make_unique<CreateSequenceExecutor>(context, n.get()));
         }
         case PlanNodeType::DROP_SEQUENCE: {
             auto n = std::static_pointer_cast<DropSequenceNode>(plan_node);
-            return std::make_unique<DropSequenceExecutor>(context, n.get());
+            return wrap(std::make_unique<DropSequenceExecutor>(context, n.get()));
         }
         case PlanNodeType::SET_OP: {
             auto n = std::static_pointer_cast<SetOpNode>(plan_node);
             if (plan_node->children.size() < 2) return nullptr;
-            auto left = BuildExecutor(plan_node->children[0], context);
-            auto right = BuildExecutor(plan_node->children[1], context);
+            auto left = BuildExecutor(plan_node->children[0], context, wrap_timing);
+            auto right = BuildExecutor(plan_node->children[1], context, wrap_timing);
             if (!left || !right) return nullptr;
             std::string kind_str;
             switch (n->kind) {
@@ -1003,24 +1024,24 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
                 case SetOpNode::Kind::INTERSECT: kind_str = "INTERSECT"; break;
                 case SetOpNode::Kind::EXCEPT:    kind_str = "EXCEPT"; break;
             }
-            return std::make_unique<SetOpExecutor>(context, std::move(left),
-                                                    std::move(right), kind_str);
+            return wrap(std::make_unique<SetOpExecutor>(context, std::move(left),
+                                                        std::move(right), kind_str));
         }
         case PlanNodeType::VALUES: {
             // 55_query: VALUES 行构造器。直接构造 ValuesExecutor；
             // 其下游 ProjectNode 由 BuildExecutor 后续递归构造。
             auto n = std::static_pointer_cast<ValuesNode>(plan_node);
-            return std::make_unique<ValuesExecutor>(context,
-                                                    n->rows,
-                                                    n->column_aliases,
-                                                    n->derived_alias);
+            return wrap(std::make_unique<ValuesExecutor>(context,
+                                                         n->rows,
+                                                         n->column_aliases,
+                                                         n->derived_alias));
         }
         case PlanNodeType::APPLY: {
             // 55_query: LATERAL / CROSS APPLY —— 对每条外层行驱动右子计划。
             auto n = std::static_pointer_cast<ApplyNode>(plan_node);
             if (plan_node->children.size() < 2) return nullptr;
-            auto left = BuildExecutor(plan_node->children[0], context);
-            auto right = BuildExecutor(plan_node->children[1], context);
+            auto left = BuildExecutor(plan_node->children[0], context, wrap_timing);
+            auto right = BuildExecutor(plan_node->children[1], context, wrap_timing);
             if (!left || !right) return nullptr;
             // 构造 combined cmap：左侧 plan_node->children[0] 子树里所有扫描表
             // 的列下标，由 BuildCombinedColumnIndexMapWithDerived 给出。
@@ -1033,23 +1054,23 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             for (const auto& s : n->lateral_inner_tables) {
                 if (!s.empty()) lateral_inner.insert(s);
             }
-            return std::make_unique<ApplyExecutor>(context, std::move(left),
-                                                   std::move(right),
-                                                   n->is_left_outer,
-                                                   std::move(cmap),
-                                                   std::move(lateral_inner));
+            return wrap(std::make_unique<ApplyExecutor>(context, std::move(left),
+                                                        std::move(right),
+                                                        n->is_left_outer,
+                                                        std::move(cmap),
+                                                        std::move(lateral_inner)));
         }
         case PlanNodeType::SUBQUERY: {
             auto n = std::static_pointer_cast<SubqueryNode>(plan_node);
-            return std::make_unique<SubqueryExecutor>(context, n.get());
+            return wrap(std::make_unique<SubqueryExecutor>(context, n.get()));
         }
         case PlanNodeType::CTE_BIND: {
             auto n = std::static_pointer_cast<CteBindNode>(plan_node);
-            return std::make_unique<CteBindExecutor>(context, n->cte_name);
+            return wrap(std::make_unique<CteBindExecutor>(context, n->cte_name));
         }
         case PlanNodeType::CTE_DEFINE: {
             auto n = std::static_pointer_cast<CteDefineNode>(plan_node);
-            return std::make_unique<CteDefineExecutor>(context, n.get());
+            return wrap(std::make_unique<CteDefineExecutor>(context, n.get()));
         }
         case PlanNodeType::WINDOW: {
             auto n = std::static_pointer_cast<WindowNode>(plan_node);
@@ -1058,7 +1079,7 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             // table_name == table_alias（即表名 == 派生别名）的 SeqScan
             // 改走子计划路径，并把列映射到子计划输出列上。
             if (!plan_node->children.empty()) {
-                auto child = BuildExecutor(plan_node->children[0], context);
+                auto child = BuildExecutor(plan_node->children[0], context, wrap_timing);
                 if (!child) return nullptr;
                 // 列引用通过 alias.col 形式；column_index_map 从扫描表中派生。
                 // 若 child 是 derived-table 占位 SeqScan，其 table_name 在 catalog 中
@@ -1114,9 +1135,9 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
                     cmap = BuildCombinedColumnIndexMapWithDerived(
                         catalog_, plan_node, CollectScanTableNames(plan_node));
                 }
-                return std::make_unique<WindowExecutor>(context, std::move(child),
-                                                        n->select_list, n->aliases,
-                                                        cmap, n->named_windows);
+                return wrap(std::make_unique<WindowExecutor>(context, std::move(child),
+                                                             n->select_list, n->aliases,
+                                                             cmap, n->named_windows));
             }
             return nullptr;
         }
@@ -1125,58 +1146,58 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             // BEGIN/COMMIT/ROLLBACK/SAVEPOINT/RELEASE 等纯副作用语句。
             // 这里直接返回一个立即结束的 executor，让 ExecutionEngine 把它当 DDL
             // 看待（OK 提示）。
-            return std::make_unique<NoOpExecutor>(context);
+            return wrap(std::make_unique<NoOpExecutor>(context));
         // ---- 48_acid_undo: 事务控制节点 ----
         case PlanNodeType::BEGIN_TXN:
-            return std::make_unique<BeginExecutor>(context);
+            return wrap(std::make_unique<BeginExecutor>(context));
         case PlanNodeType::COMMIT_TXN:
-            return std::make_unique<CommitExecutor>(context);
+            return wrap(std::make_unique<CommitExecutor>(context));
         case PlanNodeType::ROLLBACK_TXN:
-            return std::make_unique<RollbackExecutor>(context);
+            return wrap(std::make_unique<RollbackExecutor>(context));
         case PlanNodeType::SAVEPOINT: {
             auto n = std::static_pointer_cast<SavepointNode>(plan_node);
-            return std::make_unique<SavepointExecutor>(context, n->savepoint_name);
+            return wrap(std::make_unique<SavepointExecutor>(context, n->savepoint_name));
         }
         case PlanNodeType::ROLLBACK_TO_SP: {
             auto n = std::static_pointer_cast<RollbackToSavepointNode>(plan_node);
-            return std::make_unique<RollbackToSavepointExecutor>(context, n->savepoint_name);
+            return wrap(std::make_unique<RollbackToSavepointExecutor>(context, n->savepoint_name));
         }
         case PlanNodeType::RELEASE_SP: {
             auto n = std::static_pointer_cast<ReleaseSavepointNode>(plan_node);
-            return std::make_unique<ReleaseSavepointExecutor>(context, n->savepoint_name);
+            return wrap(std::make_unique<ReleaseSavepointExecutor>(context, n->savepoint_name));
         }
         case PlanNodeType::CREATE_VIEW:
-            return std::make_unique<NoOpExecutor>(context);
+            return wrap(std::make_unique<NoOpExecutor>(context));
         case PlanNodeType::CREATE_TRIGGER:
-            return std::make_unique<NoOpExecutor>(context);
+            return wrap(std::make_unique<NoOpExecutor>(context));
         // ---- 60_view_trigger (Category 9)：物化视图执行 ----
         case PlanNodeType::CREATE_MATERIALIZED_VIEW: {
-            return std::make_unique<MaterializedViewExecutor>(
+            return wrap(std::make_unique<MaterializedViewExecutor>(
                 context, MaterializedViewExecutor::Kind::CREATE,
-                plan_node.get());
+                plan_node.get()));
         }
         case PlanNodeType::ALTER_MATERIALIZED_VIEW: {
-            return std::make_unique<MaterializedViewExecutor>(
+            return wrap(std::make_unique<MaterializedViewExecutor>(
                 context, MaterializedViewExecutor::Kind::REFRESH,
-                plan_node.get());
+                plan_node.get()));
         }
         case PlanNodeType::CREATE_FUNCTION:
-            return std::make_unique<NoOpExecutor>(context);
+            return wrap(std::make_unique<NoOpExecutor>(context));
         // ---- 59_procs (Category 8) ----
         case PlanNodeType::CREATE_PROCEDURE:
-            return std::make_unique<NoOpExecutor>(context);
+            return wrap(std::make_unique<NoOpExecutor>(context));
         case PlanNodeType::CALL: {
             auto n = std::static_pointer_cast<CallNode>(plan_node);
-            return std::make_unique<CallExecutor>(context, n.get());
+            return wrap(std::make_unique<CallExecutor>(context, n.get()));
         }
         // ---- 46_meta ----
         case PlanNodeType::EXPLAIN: {
             auto n = std::static_pointer_cast<ExplainNode>(plan_node);
-            return std::make_unique<ExplainExecutor>(context, n.get());
+            return wrap(std::make_unique<ExplainExecutor>(context, n.get()));
         }
         case PlanNodeType::SHOW: {
             auto n = std::static_pointer_cast<ShowNode>(plan_node);
-            return std::make_unique<ShowExecutor>(context, n.get());
+            return wrap(std::make_unique<ShowExecutor>(context, n.get()));
         }
         default:
             throw CompilerException(ErrorStage::CODEGEN,

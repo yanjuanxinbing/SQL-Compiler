@@ -84,20 +84,40 @@ public:
     virtual PlanNodeType GetType() const = 0;
     virtual std::string ToString() const = 0;
 
+    // 结构化序列化：JSON 与 S-expr 两种格式。默认实现走与 ToString() 同源
+    // 的中心化 dispatcher，自动递归 children，不依赖各子类的自定义 ToString。
+    // 各子类无需 override 即可拿到结构化输出。
+    virtual std::string ToJson() const;
+    virtual std::string ToSExpr() const;
+
     std::vector<std::shared_ptr<PlanNode>> children;
 };
 using PlanNodePtr = std::shared_ptr<PlanNode>;
 
 // 全表扫描节点：table_alias 用于限定列引用（如 FROM user u -> 列 u.id）
+//
+// 可选 predicate 字段由 Optimizer::PushDownPredicates 写入：把原本位于
+// Filter 节点的、单表可下推的合取项下沉到 scan 里，让算子在产出 Tuple 的
+// 同时就过滤掉不需要的行，省掉一层 Executor 间传递的开销。语义上等价于
+// `Filter(predicate) -> SeqScan(table)`。
 class SeqScanNode : public PlanNode {
 public:
-    SeqScanNode(std::string table_name, std::string table_alias = "");
+    SeqScanNode(std::string table_name, std::string table_alias = "",
+                ExprPtr predicate = nullptr);
 
     PlanNodeType GetType() const override;
     std::string ToString() const override;
 
     std::string table_name;
     std::string table_alias;
+    ExprPtr predicate;  // 下推的谓词；nullptr 表示无下推
+    // ---- 1.6 列裁剪 ----
+    // Optimizer::PruneColumns 在自顶向下传播「上层用到的列」后，把叶子
+    // 节点需要读取的列名写到本字段（保持原表列序）。空 vector 表示
+    // 「读取全部列」（保留向后兼容：未经过列裁剪的旧计划按此处理）。
+    // 下推的 predicate 涉及的列会自动并入本集合，保证执行器拿到 tuple
+    // 后能解析谓词里的列引用。
+    std::vector<std::string> read_columns;
 };
 
 // 过滤节点
@@ -136,6 +156,11 @@ public:
     // 无法用索引消解的剩余谓词，回表拿到 Tuple 后再判一次。
     // 为空表示索引区间已经精确等价于原谓词。
     ExprPtr residual_predicate;
+
+    // ---- 1.6 列裁剪 ----
+    // Optimizer::PruneColumns 把上层需要的列名写到本字段（保持原表列序）。
+    // 空 vector 表示读取全部列（向后兼容）。
+    std::vector<std::string> read_columns;
 };
 
 // 投影节点
@@ -642,12 +667,14 @@ public:
 // 文本，并把它包成一行结果集返回到上层。
 class ExplainNode : public PlanNode {
 public:
-    ExplainNode(bool analyze);
+    // format ∈ { "TEXT", "JSON", "SEXPR" }。默认 TEXT 保持向后兼容。
+    ExplainNode(bool analyze, std::string format = "TEXT");
 
     PlanNodeType GetType() const override;
     std::string ToString() const override;
 
     bool analyze = false;
+    std::string format;
 };
 
 // ============ 48_acid_undo: 事务控制节点 ============
@@ -839,6 +866,9 @@ public:
 // ALTER MATERIALIZED VIEW name REFRESH
 // 截断 backing table 并重新执行 SELECT。
 // 子计划同 CREATE_MATERIALIZED_VIEW —— 复用 PlanSelect 的输出。
+// columns 字段由 Planner 在 PlanAlterMaterializedView 阶段通过 InferSelectOutputSchema
+// 计算（不需要执行 SELECT 就能得到 schema），供 MaterializedViewExecutor 检测
+// schema drift —— 若与 catalog 中已存的 MV columns 不一致则报错，让用户 drop+recreate。
 class AlterMaterializedViewNode : public PlanNode {
 public:
     AlterMaterializedViewNode(std::string view_name);
@@ -847,6 +877,7 @@ public:
     std::string ToString() const override;
 
     std::string view_name;
+    std::vector<ColumnDefinition> columns;
 };
 
 }  // namespace sqlcompiler

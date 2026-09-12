@@ -5,16 +5,30 @@
 #include <vector>
 
 #include "ast/AST.h"
+#include "common/Error.h"
+#include "semantic/SemanticErrorStage.h"
 #include "semantic/SymbolTable.h"
 
 namespace sqlcompiler {
 
 class SystemCatalog;
 
-// 语义错误描述
+// 语义错误描述（Spec 1.3）：stage + line + column + kind + message。
+// 用户可见的错误消息由 stage/kind/line/column/message 五元组组装而成。
 struct SemanticError {
+    // 错误发生在哪个阶段。语义分析阶段的错误统一为 ErrorStage::SEMANTIC，
+    // 保留字段便于将来扩展（例如约束校验抛错）。
+    ErrorStage stage = ErrorStage::SEMANTIC;
+
+    // 阶段内的细分类。Other 表示不适合以上任何分类的兜底。
+    SemanticErrorKind kind = SemanticErrorKind::Other;
+
+    // 用户可读的错误原因。
     std::string message;
+
+    // 源码位置（1-based）。-1 表示该错误不携带位置信息。
     int line = -1;
+    int column = -1;
 };
 
 // 语义分析器：在AST上进行表/列存在性检查、类型检查等
@@ -54,8 +68,14 @@ private:
     bool AnalyzeInternal(const StatementPtr& statement, bool& ok);
 
     // ---- 通用检查函数 ----
-    bool CheckTableExists(const std::string& table_name);
-    bool CheckColumnExists(const std::string& table_name, const std::string& column_name);
+    // 当 Node 非空时从节点读取 line/column，否则使用默认值 -1。
+    // 一些检查函数没有 AST 节点上下文（如纯字符串检查函数），可以显式
+    // 传 line/column 或保持默认 -1。
+    bool CheckTableExists(const std::string& table_name,
+                          int line = -1, int column = -1);
+    bool CheckColumnExists(const std::string& table_name,
+                           const std::string& column_name,
+                           int line = -1, int column = -1);
     bool CheckExpression(const ExprPtr& expr, const std::string& table_name);
 
     // 别名映射：每个 pair 是 (alias_or_name, real_table_name)。用于把限定列
@@ -73,7 +93,24 @@ private:
                                          const std::vector<std::string>& aliases,
                                          const TableAliasMap& table_aliases = {});
 
-    void AddError(const std::string& message, int line = -1);
+    // 添加一个语义错误。stage 默认为 ErrorStage::SEMANTIC；kind 决定
+    // 错误消息里 `[<Kind>]` 标签；line/column 在 -1 时表示无位置信息。
+    // 这是 SemanticAnalyzer 内部唯一的错误入口，外部代码不应直接构造
+    // SemanticError 并 push_back。
+    void AddError(SemanticErrorKind kind,
+                  const std::string& message,
+                  int line = -1,
+                  int column = -1,
+                  ErrorStage stage = ErrorStage::SEMANTIC);
+
+    // "Did you mean" suggestion: among `candidates`, find the names whose
+    // Levenshtein distance to `bad_name` is <= 2, sort by (distance, name)
+    // ascending, and return a human-readable hint string. Returns the empty
+    // string when no candidate qualifies, so callers can simply append the
+    // result with a space when non-empty.
+    std::string SuggestClosestName(
+        const std::string& bad_name,
+        const std::vector<std::string>& candidates) const;
 };
 
 }  // namespace sqlcompiler

@@ -35,6 +35,16 @@ public:
     double AsFloat() const;
     const std::string& AsVarchar() const;
 
+    // 谓词真值判定：用于 WHERE / HAVING / IF 等布尔上下文。
+    //  - NULL → false（SQL 三值逻辑在 WHERE 中按"不通过"处理，与标准一致）
+    //  - INTEGER: 非 0 即 true
+    //  - FLOAT: 非 0.0 即 true（NaN 视为 false）
+    //  - VARCHAR: "true"/"1" 等视为 true，"false"/"0"/"" 视为 false，
+    //             其他非空字符串视为 true
+    // 旧实现 FilterExecutor 直接 `AsInt() != 0`，对 VARCHAR/FLOAT 结果
+    // 会读到无关 int_val_ 字段——是潜在 bug。
+    bool IsTruthy() const;
+
     // 序列化到buf（调用方需保证buf足够大），返回写入的字节数
     // column_type 用于 NULL 值：NULL 在磁盘上占用的字节数应与该列一个非空值的
     // 序列化字节数一致，避免反序列化时错位读取后续列。

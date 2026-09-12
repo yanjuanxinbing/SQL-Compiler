@@ -290,6 +290,17 @@ page_id_t ChooseChild(const char* d, const std::vector<InternalEntry>& entries,
     return child;
 }
 
+// ============================================================================
+// 删除再平衡的占用阈值
+//
+// 用法：删除后某非根节点的 key_count 跌破阈值，则 RedistributeOrMerge。
+// 「四分之一上限」是工程里常用的简单策略——比 B 树经典的「一半」宽松得多，
+// 因为我们用的是预分裂策略，节点本来就偏满，下界放到 1/4 既能回收大多数空页
+// 又避免一次删除触发长链合并。
+// ============================================================================
+constexpr int kLeafMinOccupancy = (kMaxLeafSlots + 1) / 4;       // ≈ 63
+constexpr int kInternalMinOccupancy = (kMaxInternalSlots + 1) / 4;  // ≈ 51
+
 }  // namespace
 
 // ============================================================================
@@ -754,47 +765,784 @@ RID BPlusTree::FindFirst(const IndexKey& key) const {
 }
 
 bool BPlusTree::Delete(const IndexKey& key, const RID& rid) {
-    page_id_t leaf_pid = FindLeafPage(key, rid);
-    if (leaf_pid < 0) return false;
+    // =====================================================================
+    // 1) Path-stack descent：边下降边记下 (parent_pid, separator_index)，
+    //    到达叶子后即可定位叶子的「父亲-我-索引」。
+    //    - 根没有父亲，用 INVALID_PAGE_ID 标记，sep_index 取 0 仅占位。
+    //    - 走 first_child 时该层 separator_index = 0（first_child 视为
+    //      child[0]，其「左分隔键」是 sentinel）；走 entries[i].child 时
+    //      separator_index = i + 1，因为 entries[i] 是该孩子与左侧兄弟的
+    //      分隔键。
+    // =====================================================================
+    struct Frame {
+        page_id_t parent_pid;
+        size_t separator_index;
+    };
+    std::vector<Frame> path;
+    path.reserve(8);
 
-    // 目标可能落在相邻叶子（重复键跨页），最多向后看一页
-    for (int attempt = 0; attempt < 2 && leaf_pid >= 0; ++attempt) {
-        PageGuard g = PageGuard::Fetch(bpm_, leaf_pid);
-        if (!g.Valid()) return false;
-        char* d = g.Data();
-        std::vector<LeafEntry> entries;
-        if (!ReadLeafEntries(d, key_schema_, &entries)) return false;
+    page_id_t pid = root_page_id_;
+    while (true) {
+        PageGuard node = PageGuard::Fetch(bpm_, pid);
+        if (!node.Valid()) return false;
+        const char* d = node.Data();
+        const PageType type = GetPageType(d);
+        if (type == PageType::kLeaf) {
+            node.Release();
+            break;
+        }
+        if (type != PageType::kInternal) return false;
+        std::vector<InternalEntry> entries;
+        if (!ReadInternalEntries(d, key_schema_, &entries)) return false;
+        // 找到要去的 child 索引：0 = first_child，i+1 = entries[i].child
+        size_t idx = 0;
+        page_id_t child_pid = GetFirstChild(d);
         for (size_t i = 0; i < entries.size(); ++i) {
-            if (CompareKeyOnly(entries[i].key, key) == 0 &&
-                entries[i].rid == rid) {
-                // Phase A：写之前抓叶子整页 before-image。
-                if (active_txn_ != nullptr && active_txn_->IsActive()) {
-                    active_txn_->AppendUndo(leaf_pid, d, PAGE_SIZE,
-                                            "BPlusTree::Delete(leaf)");
-                }
-                // Phase B：抓叶子 before-image 给 WAL。
-                std::vector<char> leaf_before;
-                if (log_manager_ != nullptr) {
-                    leaf_before.assign(d, d + PAGE_SIZE);
-                }
-                entries.erase(entries.begin() + static_cast<long>(i));
-                if (!WriteLeafEntries(d, entries, GetNextLeaf(d), GetPrevLeaf(d))) {
-                    return false;
-                }
-                g.MarkDirty();
-                // Phase B：写 UPDATE 记录。
-                if (log_manager_ != nullptr) {
-                    lsn_t lsn = EmitPageImageRecord(log_manager_, leaf_pid,
-                                                   leaf_before.data(), d,
-                                                   active_txn_);
-                    g.SetPageLsn(lsn);
-                }
-                return true;
+            if (CompareKeyThenRid(key, rid, entries[i].key, entries[i].rid) >= 0) {
+                ++idx;
+                child_pid = entries[i].child;
+            } else {
+                break;
             }
         }
-        leaf_pid = GetNextLeaf(d);
+        path.push_back(Frame{pid, idx});
+        node.Release();
+        pid = child_pid;
     }
-    return false;
+
+    // =====================================================================
+    // 2) 在叶子层做实际删除。重复键跨页时最多往后看一页，沿用旧 Delete 的语义。
+    // =====================================================================
+    bool deleted = false;
+    size_t after_count = 0;
+    page_id_t erased_leaf = INVALID_PAGE_ID;
+    {
+        page_id_t leaf_pid = pid;
+        for (int attempt = 0; attempt < 2 && leaf_pid >= 0; ++attempt) {
+            PageGuard g = PageGuard::Fetch(bpm_, leaf_pid);
+            if (!g.Valid()) return false;
+            char* d = g.Data();
+            std::vector<LeafEntry> entries;
+            if (!ReadLeafEntries(d, key_schema_, &entries)) return false;
+            for (size_t i = 0; i < entries.size(); ++i) {
+                if (CompareKeyOnly(entries[i].key, key) == 0 &&
+                    entries[i].rid == rid) {
+                    // Phase A：写之前抓叶子整页 before-image。
+                    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+                        active_txn_->AppendUndo(leaf_pid, d, PAGE_SIZE,
+                                                "BPlusTree::Delete(leaf)");
+                    }
+                    // Phase B：抓叶子 before-image 给 WAL。
+                    std::vector<char> leaf_before;
+                    if (log_manager_ != nullptr) {
+                        leaf_before.assign(d, d + PAGE_SIZE);
+                    }
+                    entries.erase(entries.begin() + static_cast<long>(i));
+                    if (!WriteLeafEntries(d, entries, GetNextLeaf(d), GetPrevLeaf(d))) {
+                        return false;
+                    }
+                    g.MarkDirty();
+                    after_count = entries.size();
+                    erased_leaf = leaf_pid;
+                    // Phase B：写 UPDATE 记录。
+                    if (log_manager_ != nullptr) {
+                        lsn_t lsn = EmitPageImageRecord(log_manager_, leaf_pid,
+                                                       leaf_before.data(), d,
+                                                       active_txn_);
+                        g.SetPageLsn(lsn);
+                    }
+                    deleted = true;
+                    break;
+                }
+            }
+            if (deleted) break;
+            leaf_pid = GetNextLeaf(d);
+        }
+    }
+    if (!deleted) return false;
+
+    // =====================================================================
+    // 3) 自底向上修 underflow。仅当叶子的 key_count 跌破阈值才需要处理，
+    //    否则说明删得还不够狠，无需无谓改动兄弟。
+    // =====================================================================
+    if (after_count >= static_cast<size_t>(kLeafMinOccupancy)) {
+        // 路径上叶子仍是健康的，无需 redistribute/merge，直接返回
+        return true;
+    }
+
+    // 叶子是根（path 为空）时无需处理——根无最小占用
+    if (path.empty()) {
+        // 即使叶子空了也允许：root_page_id 保持有效，下次插入会重新激活
+        return true;
+    }
+
+    // 从 path 末尾往上修。栈顶就是叶子的直接父亲。
+    // 每处理一层，要检查该层的父亲（也就是上一层 frame 的 parent）是否也
+    // 因为合并/借出而 underflow；若是，则再向上走一级。
+    size_t level = path.size() - 1;
+    while (true) {
+        const Frame& frame = path[level];
+        if (!RedistributeOrMerge(frame.parent_pid, frame.separator_index)) {
+            // 修复失败：保守地返回 false，调用方按未删除处理（数据一致性不会破坏）
+            return false;
+        }
+        // 处理到根或顶层：尝试塌缩
+        if (frame.parent_pid == root_page_id_ || level == 0) {
+            (void)CollapseRoot();
+            break;
+        }
+        // 检查父（上一层 frame.parent_pid）是否因我们刚才的合并而 underflow。
+        // 若 underflow，则 frame.parent_pid 仍为 deficient，让上一层处理它。
+        const page_id_t upper_parent = path[level - 1].parent_pid;
+        {
+            PageGuard pg = PageGuard::Fetch(bpm_, upper_parent);
+            if (!pg.Valid()) {
+                // 拿不到父：保守返回 false
+                return false;
+            }
+            const char* ud = pg.Data();
+            if (GetPageType(ud) == PageType::kInternal) {
+                const int cnt = GetKeyCount(ud);
+                if (cnt < kInternalMinOccupancy) {
+                    --level;
+                    continue;
+                }
+            }
+            // 父未 underflow，但它的孩子减少了，仍可能在 root 一层需要塌缩
+        }
+        (void)CollapseRoot();
+        break;
+    }
+    return true;
+}
+
+// ============================================================================
+// 删除再平衡辅助
+// ============================================================================
+
+bool BPlusTree::RedistributeOrMerge(page_id_t parent_pid, size_t separator_index) {
+    if (parent_pid < 0 || parent_pid == root_page_id_) {
+        // parent 是根：无需做，但若根塌缩条件满足则 CollapseRoot 会处理
+        return true;
+    }
+
+    PageGuard parent = PageGuard::Fetch(bpm_, parent_pid);
+    if (!parent.Valid()) return false;
+    char* pd = parent.Data();
+    if (GetPageType(pd) != PageType::kInternal) {
+        // 父亲不是内部节点（根是叶子）—— 不需要 underflow 修复
+        return true;
+    }
+    std::vector<InternalEntry> p_entries;
+    if (!ReadInternalEntries(pd, key_schema_, &p_entries)) return false;
+    const page_id_t p_first_child = GetFirstChild(pd);
+
+    // 定位 deficient 与其兄弟。
+    // separator_index = 0 表示 deficient = first_child；separator_index > 0
+    // 表示 deficient = entries[separator_index - 1].child。
+    page_id_t deficient_pid;
+    page_id_t left_pid = INVALID_PAGE_ID;
+    page_id_t right_pid = INVALID_PAGE_ID;
+    if (separator_index == 0) {
+        deficient_pid = p_first_child;
+        if (p_entries.empty()) {
+            // 内部节点只有一个孩子：所有 underflow 都该走 CollapseRoot
+            return true;
+        }
+        right_pid = p_entries[0].child;
+    } else {
+        deficient_pid = p_entries[separator_index - 1].child;
+        if (separator_index - 1 > 0) {
+            left_pid = p_entries[separator_index - 2].child;
+        } else {
+            left_pid = p_first_child;
+        }
+        if (separator_index < p_entries.size()) {
+            right_pid = p_entries[separator_index].child;
+        }
+    }
+
+    // 选择兄弟：优先有富余的那个；都没有则合并
+    PageType deficient_type = PageType::kUninitialized;
+    {
+        PageGuard dg = PageGuard::Fetch(bpm_, deficient_pid);
+        if (!dg.Valid()) return false;
+        deficient_type = GetPageType(dg.Data());
+    }
+
+    // 计算 deficient 当前 key_count，决定是否真的需要修
+    int deficient_count = 0;
+    int min_occ = (deficient_type == PageType::kLeaf) ? kLeafMinOccupancy
+                                                      : kInternalMinOccupancy;
+    {
+        PageGuard dg = PageGuard::Fetch(bpm_, deficient_pid);
+        if (!dg.Valid()) return false;
+        deficient_count = GetKeyCount(dg.Data());
+    }
+    if (deficient_count >= min_occ) {
+        // 不知为何走到这一步（上层估计失误），啥都不做
+        return true;
+    }
+
+    // 先看右兄弟能否借出
+    auto can_borrow = [&](page_id_t sib_pid) -> bool {
+        if (sib_pid < 0) return false;
+        PageGuard sg = PageGuard::Fetch(bpm_, sib_pid);
+        if (!sg.Valid()) return false;
+        if (GetPageType(sg.Data()) != deficient_type) return false;
+        const int cnt = GetKeyCount(sg.Data());
+        return cnt > min_occ;
+    };
+
+    bool tried_left = false;
+    bool tried_right = false;
+    if (can_borrow(right_pid)) {
+        if (deficient_type == PageType::kLeaf) {
+            return RedistributeLeaf(deficient_pid, right_pid,
+                                    /*sibling_is_left=*/false,
+                                    parent_pid, separator_index);
+        } else {
+            return RedistributeInternal(deficient_pid, right_pid,
+                                        /*sibling_is_left=*/false,
+                                        parent_pid, separator_index);
+        }
+    }
+    tried_right = true;
+    (void)tried_right;
+    if (can_borrow(left_pid)) {
+        tried_left = true;
+        if (deficient_type == PageType::kLeaf) {
+            return RedistributeLeaf(deficient_pid, left_pid,
+                                    /*sibling_is_left=*/true,
+                                    parent_pid, separator_index);
+        } else {
+            return RedistributeInternal(deficient_pid, left_pid,
+                                        /*sibling_is_left=*/true,
+                                        parent_pid, separator_index);
+        }
+    }
+    (void)tried_left;
+
+    // 兄弟都没有富余：合并。优先 deficient + right；缺右就 left + deficient。
+    page_id_t merge_left, merge_right;
+    bool merging_into_left = true;  // true 表示最终结果写到 left_pid
+    if (right_pid >= 0) {
+        merge_left = deficient_pid;
+        merge_right = right_pid;
+        merging_into_left = true;
+    } else if (left_pid >= 0) {
+        merge_left = left_pid;
+        merge_right = deficient_pid;
+        merging_into_left = false;
+    } else {
+        // 不该发生：deficient 既没有左兄弟也没有右兄弟
+        return false;
+    }
+
+    // 先把两条 sibling 链上涉及的页抓牢，避免合并后还有页要写
+    const IndexKey* sep_key_ptr = nullptr;
+    const RID* sep_rid_ptr = nullptr;
+    const std::vector<char>* sep_kb_ptr = nullptr;
+    IndexKey sep_key;
+    RID sep_rid;
+    std::vector<char> sep_kb;
+    if (deficient_type == PageType::kInternal) {
+        // 计算 parent 中分隔 merge_left 与 merge_right 的条目，作为合并分隔键。
+        size_t sep_idx;
+        if (merging_into_left) {
+            sep_idx = separator_index;
+        } else {
+            sep_idx = separator_index - 1;
+        }
+        if (sep_idx >= p_entries.size()) return false;
+        sep_key = p_entries[sep_idx].key;
+        sep_rid = p_entries[sep_idx].rid;
+        sep_kb = p_entries[sep_idx].key_bytes;
+        sep_key_ptr = &sep_key;
+        sep_rid_ptr = &sep_rid;
+        sep_kb_ptr = &sep_kb;
+    }
+    if (!MergeNodes(merge_left, merge_right, deficient_type,
+                    sep_key_ptr, sep_rid_ptr, sep_kb_ptr)) {
+        return false;
+    }
+
+    // 对叶子还要修 next/prev 链：merge_left 已在 MergeNodes 内把 next 设为
+    // merge_right 的 next；还需要把 merge_right.next 的 prev 指回 merge_left。
+    if (deficient_type == PageType::kLeaf) {
+        page_id_t right_next = INVALID_PAGE_ID;
+        {
+            // 此刻 merge_right 仍在缓冲池（DeletePage 还没调），可以读
+            PageGuard rg = PageGuard::Fetch(bpm_, merge_right);
+            if (rg.Valid()) right_next = GetNextLeaf(rg.Data());
+        }
+        if (right_next >= 0) {
+            PageGuard ng = PageGuard::Fetch(bpm_, right_next);
+            if (ng.Valid()) {
+                char* nd = ng.Data();
+                if (active_txn_ != nullptr && active_txn_->IsActive()) {
+                    active_txn_->AppendUndo(right_next, nd, PAGE_SIZE,
+                                            "BPlusTree::MergeNodes(leaf-next.prev)");
+                }
+                std::vector<char> before;
+                if (log_manager_ != nullptr) before.assign(nd, nd + PAGE_SIZE);
+                SetPrevLeaf(nd, merge_left);
+                ng.MarkDirty();
+                if (log_manager_ != nullptr) {
+                    lsn_t lsn = EmitPageImageRecord(log_manager_, right_next,
+                                                   before.data(), nd, active_txn_);
+                    ng.SetPageLsn(lsn);
+                }
+            }
+        }
+    }
+
+    // 从 parent 中删除合并掉的那个分隔键
+    std::vector<char> parent_before;
+    if (log_manager_ != nullptr) {
+        parent_before.assign(pd, pd + PAGE_SIZE);
+    }
+    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+        active_txn_->AppendUndo(parent_pid, pd, PAGE_SIZE,
+                                "BPlusTree::MergeNodes(parent-erase-sep)");
+    }
+
+    size_t erase_idx = static_cast<size_t>(-1);
+    if (merging_into_left) {
+        // 把 right 并入 left：删除 separator_index（分隔 left 与 right 的键）
+        erase_idx = separator_index;
+    } else {
+        // 把 right=deficient 并入 left=sibling：删除 separator_index - 1
+        erase_idx = separator_index - 1;
+    }
+    if (erase_idx >= p_entries.size()) return false;
+    p_entries.erase(p_entries.begin() + static_cast<long>(erase_idx));
+    if (!WriteInternalEntries(pd, p_first_child, p_entries)) return false;
+    parent.MarkDirty();
+    if (log_manager_ != nullptr) {
+        lsn_t lsn = EmitPageImageRecord(log_manager_, parent_pid,
+                                       parent_before.data(), pd, active_txn_);
+        parent.SetPageLsn(lsn);
+    }
+    parent.Release();
+
+    // 释放被合并掉的页
+    bpm_->DeletePage(merge_right);
+
+    // 现在 parent 可能也 underflow 了；调用方（Delete 的循环）会继续向上处理
+    return true;
+}
+
+bool BPlusTree::MergeNodes(page_id_t left_pid, page_id_t right_pid,
+                          PageType /*type*/, const IndexKey* parent_sep_key,
+                          const RID* parent_sep_rid,
+                          const std::vector<char>* parent_sep_key_bytes) {
+    // Phase B：抓 before-image
+    // 合并的写入只动 left 这一页（结果在 left）。若 left 与 right 都是叶子，
+    // 我们需要分别抓两页的 before-image（因为 WAL 是整页更新）。
+    PageGuard left = PageGuard::Fetch(bpm_, left_pid);
+    if (!left.Valid()) return false;
+    PageGuard right = PageGuard::Fetch(bpm_, right_pid);
+    if (!right.Valid()) return false;
+    char* ld = left.Data();
+    char* rd = right.Data();
+
+    // Phase A：写之前抓 before-image
+    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+        active_txn_->AppendUndo(left_pid, ld, PAGE_SIZE, "BPlusTree::MergeNodes(left)");
+        active_txn_->AppendUndo(right_pid, rd, PAGE_SIZE, "BPlusTree::MergeNodes(right)");
+    }
+
+    std::vector<char> left_before;
+    std::vector<char> right_before;
+    if (log_manager_ != nullptr) {
+        left_before.assign(ld, ld + PAGE_SIZE);
+        right_before.assign(rd, rd + PAGE_SIZE);
+    }
+
+    bool ok = false;
+    if (GetPageType(ld) == PageType::kLeaf && GetPageType(rd) == PageType::kLeaf) {
+        std::vector<LeafEntry> le, re;
+        if (!ReadLeafEntries(ld, key_schema_, &le)) return false;
+        if (!ReadLeafEntries(rd, key_schema_, &re)) return false;
+        le.insert(le.end(), re.begin(), re.end());
+        if (le.size() > static_cast<size_t>(kMaxLeafSlots)) return false;
+        // 合并后 left 的 next = right.next，prev = left.prev（left 占据原位）
+        if (!WriteLeafEntries(ld, le, GetNextLeaf(rd), GetPrevLeaf(ld))) return false;
+        ok = true;
+    } else if (GetPageType(ld) == PageType::kInternal &&
+               GetPageType(rd) == PageType::kInternal) {
+        // 内部节点合并：parent_sep（parent 中分隔 left 与 right 的那条 entry）
+        // 必须出现在合并结果中，其 child = right.first_child，正好充当
+        // left 最后一项与 right 第一项之间的分隔键。
+        if (parent_sep_key == nullptr || parent_sep_rid == nullptr) return false;
+        std::vector<InternalEntry> le, re;
+        if (!ReadInternalEntries(ld, key_schema_, &le)) return false;
+        if (!ReadInternalEntries(rd, key_schema_, &re)) return false;
+        const page_id_t left_first = GetFirstChild(ld);
+        if (le.size() + 1 + re.size() > static_cast<size_t>(kMaxInternalSlots)) {
+            return false;
+        }
+        InternalEntry sep;
+        sep.key = *parent_sep_key;
+        sep.rid = *parent_sep_rid;
+        sep.child = GetFirstChild(rd);
+        if (parent_sep_key_bytes != nullptr && !parent_sep_key_bytes->empty()) {
+            sep.key_bytes = *parent_sep_key_bytes;
+        } else {
+            // parent_sep_key_bytes 缺失：调用方大概率忘了传；这里用父分隔键的
+            // 序列化补救，避免写入时缺 key_bytes 导致读取解析失败。
+            sep.key_bytes = SerializeKey(sep.key, key_schema_);
+        }
+        le.push_back(std::move(sep));
+        for (auto& r : re) {
+            le.push_back(std::move(r));
+        }
+        if (!WriteInternalEntries(ld, left_first, le)) return false;
+        ok = true;
+    } else {
+        return false;  // 类型不一致：损坏
+    }
+    if (!ok) return false;
+
+    left.MarkDirty();
+    if (log_manager_ != nullptr) {
+        lsn_t lsn_l = EmitPageImageRecord(log_manager_, left_pid,
+                                         left_before.data(), ld, active_txn_);
+        left.SetPageLsn(lsn_l);
+        // right 也写一条 UPDATE（之后 DeletePage，但 redo 时若走 right 也无害）
+        lsn_t lsn_r = EmitPageImageRecord(log_manager_, right_pid,
+                                         right_before.data(), rd, active_txn_);
+        right.SetPageLsn(lsn_r);
+    }
+    return true;
+}
+
+bool BPlusTree::RedistributeLeaf(page_id_t deficient_leaf, page_id_t sibling,
+                                bool sibling_is_left, page_id_t parent_pid,
+                                size_t separator_index) {
+    PageGuard dg = PageGuard::Fetch(bpm_, deficient_leaf);
+    if (!dg.Valid()) return false;
+    PageGuard sg = PageGuard::Fetch(bpm_, sibling);
+    if (!sg.Valid()) return false;
+    PageGuard pg = PageGuard::Fetch(bpm_, parent_pid);
+    if (!pg.Valid()) return false;
+    char* dd = dg.Data();
+    char* sd = sg.Data();
+    char* pd = pg.Data();
+
+    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+        active_txn_->AppendUndo(deficient_leaf, dd, PAGE_SIZE,
+                                "BPlusTree::RedistributeLeaf(deficient)");
+        active_txn_->AppendUndo(sibling, sd, PAGE_SIZE,
+                                "BPlusTree::RedistributeLeaf(sibling)");
+        active_txn_->AppendUndo(parent_pid, pd, PAGE_SIZE,
+                                "BPlusTree::RedistributeLeaf(parent)");
+    }
+    std::vector<char> dbefore, sbefore, pbefore;
+    if (log_manager_ != nullptr) {
+        dbefore.assign(dd, dd + PAGE_SIZE);
+        sbefore.assign(sd, sd + PAGE_SIZE);
+        pbefore.assign(pd, pd + PAGE_SIZE);
+    }
+
+    std::vector<LeafEntry> de, se;
+    if (!ReadLeafEntries(dd, key_schema_, &de)) return false;
+    if (!ReadLeafEntries(sd, key_schema_, &se)) return false;
+    if (se.empty()) return false;
+    std::vector<InternalEntry> pe;
+    if (!ReadInternalEntries(pd, key_schema_, &pe)) return false;
+    const page_id_t p_first = GetFirstChild(pd);
+
+    // 找 parent 中分隔 deficient 与 sibling 的 entry
+    size_t sep_in_parent;
+    if (sibling_is_left) {
+        if (separator_index == 0) return false;
+        sep_in_parent = separator_index - 1;
+    } else {
+        sep_in_parent = separator_index;
+    }
+    if (sep_in_parent >= pe.size()) return false;
+
+    if (sibling_is_left) {
+        // 把 sibling 最后一条搬到 deficient 的最前
+        LeafEntry moved = std::move(se.back());
+        se.pop_back();
+        de.insert(de.begin(), std::move(moved));
+        // parent sep 现在指向 deficient；deficient 头部新增了 moved（即 se 的旧
+        // 最后一条，键小于原 parent sep？不一定）。
+        // ——正确规则：parent sep 应是 sibling.first[0]，因为 sibling 仍然在
+        // 左侧，sibling 的第一条 < parent sep <= deficient 的第一条。
+        // sibling 仍然拥有 first_child 之外的孩子吗？sibling 失去的是 se.back()
+        // 这条 entry 与其 child；新 sibling 是 [first_child, ..., 旧 entries[0..N-2]]
+        // 即 children = first_child, entries[0..N-2].child. 损失了最后一个 child。
+        // sibling 的新第一条 entry 不变（即 entries[0]），但 parent sep 应改为
+        // sibling 新第一条 entry 的 (key, rid)。sibling 新第一条 entry 实际上是
+        // 原 entries[0]（即 se.front() 现在的内容）。
+        if (se.empty()) return false;
+        pe[sep_in_parent].key = se.front().key;
+        pe[sep_in_parent].rid = se.front().rid;
+        pe[sep_in_parent].key_bytes = se.front().key_bytes;
+    } else {
+        // 把 sibling 第一条搬到 deficient 的最后
+        LeafEntry moved = std::move(se.front());
+        se.erase(se.begin());
+        de.push_back(std::move(moved));
+        // parent sep 现在指向 sibling 的第一条 = 原 sibling 第二条；
+        // ——但 sibling 是右兄弟，parent sep 指向 deficient 还是 sibling？
+        // 答：separator 是分隔 deficient（左）与 sibling（右）的键，应该让
+        //     deficient 的第一条成为新 sep——deficient 获得 moved（来自
+        //     sibling），但 moved 比 sibling 的旧第一条小，所以 deficient 的
+        //     新第一条就是 moved。
+        if (de.empty()) return false;
+        pe[sep_in_parent].key = de.front().key;
+        pe[sep_in_parent].rid = de.front().rid;
+        pe[sep_in_parent].key_bytes = de.front().key_bytes;
+    }
+
+    // 保留 deficient 与 sibling 当前的 next/prev 链不变。
+    if (!WriteLeafEntries(dd, de, GetNextLeaf(dd), GetPrevLeaf(dd))) return false;
+    if (!WriteLeafEntries(sd, se, GetNextLeaf(sd), GetPrevLeaf(sd))) return false;
+    if (!WriteInternalEntries(pd, p_first, pe)) return false;
+    dg.MarkDirty();
+    sg.MarkDirty();
+    pg.MarkDirty();
+
+    if (log_manager_ != nullptr) {
+        lsn_t dl = EmitPageImageRecord(log_manager_, deficient_leaf,
+                                      dbefore.data(), dd, active_txn_);
+        dg.SetPageLsn(dl);
+        lsn_t sl = EmitPageImageRecord(log_manager_, sibling,
+                                      sbefore.data(), sd, active_txn_);
+        sg.SetPageLsn(sl);
+        lsn_t pl = EmitPageImageRecord(log_manager_, parent_pid,
+                                      pbefore.data(), pd, active_txn_);
+        pg.SetPageLsn(pl);
+    }
+    return true;
+}
+
+bool BPlusTree::RedistributeInternal(page_id_t deficient_internal, page_id_t sibling,
+                                    bool sibling_is_left, page_id_t parent_pid,
+                                    size_t separator_index) {
+    PageGuard dg = PageGuard::Fetch(bpm_, deficient_internal);
+    if (!dg.Valid()) return false;
+    PageGuard sg = PageGuard::Fetch(bpm_, sibling);
+    if (!sg.Valid()) return false;
+    PageGuard pg = PageGuard::Fetch(bpm_, parent_pid);
+    if (!pg.Valid()) return false;
+    char* dd = dg.Data();
+    char* sd = sg.Data();
+    char* pd = pg.Data();
+
+    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+        active_txn_->AppendUndo(deficient_internal, dd, PAGE_SIZE,
+                                "BPlusTree::RedistributeInternal(deficient)");
+        active_txn_->AppendUndo(sibling, sd, PAGE_SIZE,
+                                "BPlusTree::RedistributeInternal(sibling)");
+        active_txn_->AppendUndo(parent_pid, pd, PAGE_SIZE,
+                                "BPlusTree::RedistributeInternal(parent)");
+    }
+    std::vector<char> dbefore, sbefore, pbefore;
+    if (log_manager_ != nullptr) {
+        dbefore.assign(dd, dd + PAGE_SIZE);
+        sbefore.assign(sd, sd + PAGE_SIZE);
+        pbefore.assign(pd, pd + PAGE_SIZE);
+    }
+
+    std::vector<InternalEntry> de, se;
+    if (!ReadInternalEntries(dd, key_schema_, &de)) return false;
+    if (!ReadInternalEntries(sd, key_schema_, &se)) return false;
+    if (se.empty()) return false;
+    std::vector<InternalEntry> pe;
+    if (!ReadInternalEntries(pd, key_schema_, &pe)) return false;
+    const page_id_t d_first_old = GetFirstChild(dd);
+    const page_id_t s_first = GetFirstChild(sd);
+    const page_id_t p_first = GetFirstChild(pd);
+
+    // 找到 parent 中分隔 deficient 与 sibling 的那条 entry。
+    //   separator_index = 0 表示 deficient = p_first_child；
+    //   separator_index > 0 表示 deficient = pe[separator_index - 1].child。
+    //   分隔 deficient 与 sibling 的条目：
+    //     sibling 是右 → pe[separator_index]
+    //     sibling 是左 → pe[separator_index - 1]
+    size_t sep_in_parent;
+    if (sibling_is_left) {
+        if (separator_index == 0) return false;  // 左兄弟不存在
+        sep_in_parent = separator_index - 1;
+    } else {
+        sep_in_parent = separator_index;
+    }
+    if (sep_in_parent >= pe.size()) return false;
+
+    // ----- 重组 -----
+    //
+    // sibling 是左：
+    //   取 sibling.entries.last（包含一个 child = promoted_child）。
+    //   sibling 失去该 entry 与 promoted_child 这个子节点。
+    //   deficient 接纳 promoted_child 作为新的 first_child，并新增 entries[0]
+    //     其 (key, rid) 沿用旧 parent separator，child = d_first_old
+    //     （即旧 deficient.first_child，现在是新的 deficient.entries[0].child）。
+    //   parent.sep_in_parent 升级为 sibling.last 的 (key, rid)，child = promoted_child。
+    //
+    // sibling 是右：
+    //   取 sibling.entries.first（其 child = promoted_child，但 child 仍归
+    //     sibling 所有——sibling 只失 entries.first 与 promoted_child 这个子节点？
+    //     不对：sibling.entries.first 是分隔 sibling.first_child 与 promoted_child
+    //     的键。拿走该 entry 后 sibling 仍拥有 first_child 与 promoted_child
+    //     以及它们之间的「空白」（没有 entry）。再 promote promoted_child
+    //     移到 deficient 末尾。
+    //   deficient.entries 末尾追加新条目：
+    //     (key, rid) = 旧 parent sep，child = d_first_old
+    //     （即原 deficient.first_child，现在变成新条目.deficient 末尾的 child）。
+    //   deficient.first_child 保持不变。
+    //   parent.sep_in_parent 升级为 sibling.first 的 (key, rid)，child = d_first_old
+    //     （deficient 的 first_child，作为新 parent sep 右侧的孩子）。
+    //
+    // ——写时按「先记旧值再覆盖」的顺序避免丢数据。
+    if (sibling_is_left) {
+        const InternalEntry old_parent_sep = pe[sep_in_parent];
+        InternalEntry moved = std::move(se.back());
+        se.pop_back();
+        const page_id_t promoted_child = moved.child;
+
+        // 新 parent sep
+        pe[sep_in_parent].key = moved.key;
+        pe[sep_in_parent].rid = moved.rid;
+        pe[sep_in_parent].key_bytes = std::move(moved.key_bytes);
+        pe[sep_in_parent].child = promoted_child;
+
+        // 新 deficient.head = (parent_sep.key/rid, child = d_first_old)
+        InternalEntry de_head;
+        de_head.key = old_parent_sep.key;
+        de_head.rid = old_parent_sep.rid;
+        de_head.key_bytes = old_parent_sep.key_bytes;
+        de_head.child = d_first_old;
+        de.insert(de.begin(), std::move(de_head));
+
+        // 写回：deficient 用 promoted_child 作为新 first_child
+        if (!WriteInternalEntries(dd, promoted_child, de)) return false;
+        if (!WriteInternalEntries(sd, s_first, se)) return false;
+        if (!WriteInternalEntries(pd, p_first, pe)) return false;
+    } else {
+        const InternalEntry old_parent_sep = pe[sep_in_parent];
+        InternalEntry moved = std::move(se.front());
+        se.erase(se.begin());
+        // moved.child 是 sibling 失去的子节点，但 promoted_child 仍归 sibling 所有
+        // （sibling 仍持有 first_child 与 promoted_child，只是它们之间没有 entry）。
+        const page_id_t promoted_child = moved.child;
+
+        // 新 parent sep: child = d_first_old（deficient 的 first_child，是新 sep 右侧孩子）
+        pe[sep_in_parent].key = moved.key;
+        pe[sep_in_parent].rid = moved.rid;
+        pe[sep_in_parent].key_bytes = std::move(moved.key_bytes);
+        pe[sep_in_parent].child = d_first_old;
+
+        // 新 deficient.tail = (parent_sep.key/rid, child = d_first_old)
+        // ——等等，这里 child = d_first_old 就和 parent sep.child 重复。
+        // 正确语义：新 deficient.tail 的 child = promoted_child
+        // （即从 sibling 搬过来的那个 child，它在 deficient 末尾）。deficient
+        // 的 first_child 保持 d_first_old 不变。
+        InternalEntry de_tail;
+        de_tail.key = old_parent_sep.key;
+        de_tail.rid = old_parent_sep.rid;
+        de_tail.key_bytes = old_parent_sep.key_bytes;
+        de_tail.child = promoted_child;
+        de.push_back(std::move(de_tail));
+
+        // 写回：deficient 用 d_first_old（不变）作为 first_child
+        if (!WriteInternalEntries(dd, d_first_old, de)) return false;
+        if (!WriteInternalEntries(sd, s_first, se)) return false;
+        if (!WriteInternalEntries(pd, p_first, pe)) return false;
+    }
+
+    dg.MarkDirty();
+    sg.MarkDirty();
+    pg.MarkDirty();
+
+    if (log_manager_ != nullptr) {
+        lsn_t dl = EmitPageImageRecord(log_manager_, deficient_internal,
+                                      dbefore.data(), dd, active_txn_);
+        dg.SetPageLsn(dl);
+        lsn_t sl = EmitPageImageRecord(log_manager_, sibling,
+                                      sbefore.data(), sd, active_txn_);
+        sg.SetPageLsn(sl);
+        lsn_t pl = EmitPageImageRecord(log_manager_, parent_pid,
+                                      pbefore.data(), pd, active_txn_);
+        pg.SetPageLsn(pl);
+    }
+    return true;
+}
+
+bool BPlusTree::CollapseRoot() {
+    PageGuard root = PageGuard::Fetch(bpm_, root_page_id_);
+    if (!root.Valid()) return false;
+    char* rd = root.Data();
+    if (GetPageType(rd) != PageType::kInternal) return false;
+    std::vector<InternalEntry> entries;
+    if (!ReadInternalEntries(rd, key_schema_, &entries)) return false;
+    const page_id_t first_child = GetFirstChild(rd);
+
+    // root 是空内部节点（树被删空）→ 让 root 退化成空叶子，下一次插入能自愈
+    if (entries.empty() || first_child < 0) {
+        std::vector<char> rbefore;
+        if (log_manager_ != nullptr) rbefore.assign(rd, rd + PAGE_SIZE);
+        if (active_txn_ != nullptr && active_txn_->IsActive()) {
+            active_txn_->AppendUndo(root_page_id_, rd, PAGE_SIZE,
+                                    "BPlusTree::CollapseRoot(empty)");
+        }
+        InitLeaf(rd);
+        root.MarkDirty();
+        if (log_manager_ != nullptr) {
+            lsn_t lsn = EmitPageImageRecord(log_manager_, root_page_id_,
+                                           rbefore.data(), rd, active_txn_);
+            root.SetPageLsn(lsn);
+        }
+        return true;
+    }
+
+    // 只有一个孩子：把孩子搬进 root
+    if (entries.size() == 1 && entries[0].child == first_child) {
+        // 上面这个条件其实意味着 root 有「first_child == entries[0].child」
+        // 即 first_child 之外还有一个相同的 child 指针。这不应发生。
+        return false;
+    }
+    if (entries.size() != 1) return false;  // 还需两层以上，不塌缩
+
+    // 抓唯一孩子
+    PageGuard child = PageGuard::Fetch(bpm_, first_child);
+    if (!child.Valid()) return false;
+    char* cd = child.Data();
+    if (GetPageType(cd) != PageType::kInternal) return false;  // 根是叶子就不塌缩
+
+    // 把 child 的内容复制到 root
+    std::vector<char> rbefore, cbefore;
+    if (log_manager_ != nullptr) {
+        rbefore.assign(rd, rd + PAGE_SIZE);
+        cbefore.assign(cd, cd + PAGE_SIZE);
+    }
+    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+        active_txn_->AppendUndo(root_page_id_, rd, PAGE_SIZE,
+                                "BPlusTree::CollapseRoot(root)");
+        active_txn_->AppendUndo(first_child, cd, PAGE_SIZE,
+                                "BPlusTree::CollapseRoot(child)");
+    }
+    std::memcpy(rd, cd, PAGE_SIZE);
+    root.MarkDirty();
+    if (log_manager_ != nullptr) {
+        lsn_t lsn_r = EmitPageImageRecord(log_manager_, root_page_id_,
+                                         rbefore.data(), rd, active_txn_);
+        root.SetPageLsn(lsn_r);
+        lsn_t lsn_c = EmitPageImageRecord(log_manager_, first_child,
+                                         cbefore.data(), cd, active_txn_);
+        child.SetPageLsn(lsn_c);
+    }
+    root.Release();
+    child.Release();
+
+    // 释放被搬走的子页
+    bpm_->DeletePage(first_child);
+    return true;
 }
 
 // ============================================================================
