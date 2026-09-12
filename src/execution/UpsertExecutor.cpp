@@ -94,16 +94,22 @@ void ApplyDefaults(const TableInfo& info,
 UpsertExecutor::UpsertExecutor(ExecutionContext* context, std::string table_name,
                                 std::vector<std::string> columns,
                                 std::vector<std::vector<ExprPtr>> values_list,
-                                std::vector<std::pair<std::string, ExprPtr>> upsert_assignments)
+                                std::vector<std::pair<std::string, ExprPtr>> upsert_assignments,
+                                std::vector<ExprPtr> returning_exprs,
+                                std::vector<std::string> returning_aliases)
     : Executor(context), table_name_(std::move(table_name)),
       columns_(std::move(columns)),
       values_list_(std::move(values_list)),
-      upsert_assignments_(std::move(upsert_assignments)) {
+      upsert_assignments_(std::move(upsert_assignments)),
+      returning_exprs_(std::move(returning_exprs)),
+      returning_aliases_(std::move(returning_aliases)) {
 }
 
 void UpsertExecutor::Init() {
     executed_ = false;
     affected_rows_ = 0;
+    pending_returning_.clear();
+    pending_pos_ = 0;
     const TableInfo* info = context_->GetCatalog()->GetTable(table_name_);
     if (info) {
         column_types_.clear();
@@ -226,6 +232,7 @@ void UpsertExecutor::InsertCandidateRow(std::vector<Value>& row_values) {
     }
     heap->SetActiveTransaction(nullptr);
     InsertIntoIndexes(context_->GetCatalog(), *info, t.GetValues(), rid, txn);
+    EmitReturning(t);
 }
 
 void UpsertExecutor::UpdateConflictingRow(const std::vector<Value>& candidate_values,
@@ -293,6 +300,7 @@ void UpsertExecutor::UpdateConflictingRow(const std::vector<Value>& candidate_va
     if (ok) {
         InsertIntoIndexes(context_->GetCatalog(), *info,
                           new_t.GetValues(), existing_rid, txn);
+        EmitReturning(new_t);
     } else {
         // 写堆失败：把刚摘掉的旧键放回去，避免索引凭空少一条
         InsertIntoIndexes(context_->GetCatalog(), *info, cur.GetValues(), existing_rid, txn);
@@ -301,7 +309,25 @@ void UpsertExecutor::UpdateConflictingRow(const std::vector<Value>& candidate_va
     }
 }
 
+void UpsertExecutor::EmitReturning(const Tuple& row) {
+    if (returning_exprs_.empty()) return;
+    ExpressionEvaluator eval(column_index_map_, context_, nullptr);
+    std::vector<Value> out;
+    out.reserve(returning_exprs_.size());
+    for (const auto& e : returning_exprs_) {
+        out.push_back(eval.Evaluate(e, row));
+    }
+    pending_returning_.push_back(Tuple(std::move(out)));
+}
+
 bool UpsertExecutor::Next(Tuple* tuple) {
+    // 优先消费 pending RETURNING 行。
+    if (pending_pos_ < pending_returning_.size()) {
+        if (tuple) *tuple = pending_returning_[pending_pos_++];
+        return true;
+    }
+    pending_returning_.clear();
+    pending_pos_ = 0;
     if (executed_) return false;
     executed_ = true;
 
@@ -349,6 +375,11 @@ bool UpsertExecutor::Next(Tuple* tuple) {
         ++affected_rows_;
     }
 
+    // 至少消费一次 pending_returning_（一次循环可能产生多行）。
+    if (pending_pos_ < pending_returning_.size()) {
+        if (tuple) *tuple = pending_returning_[pending_pos_++];
+        return true;
+    }
     if (tuple) *tuple = Tuple({Value::MakeInt(affected_rows_)});
     return false;
 }

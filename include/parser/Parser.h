@@ -23,6 +23,11 @@ public:
 private:
     std::vector<Token> tokens_;
     size_t current_;
+    // 60_funcs: ParseGroupByClause 在解析 GROUPING SETS / ROLLUP / CUBE 时
+    // 把展开后的 grouping sets 暂存在这里，让 ParseSelectStatement 在
+    // 拿到普通 GROUP BY 返回值后立刻把 pending 内容搬到 SelectStatement::grouping_sets
+    // 并清空该字段。非 GROUPING SETS 路径下保持空。
+    std::vector<std::vector<ExprPtr>> pending_grouping_sets_;
 
     // ---- 基础工具函数 ----
     const Token& CurrentToken() const;
@@ -52,6 +57,9 @@ private:
     StatementPtr ParseReleaseSavepointStatement();
     StatementPtr ParseCreateViewStatement();
     StatementPtr ParseDropViewStatement();
+    // 60_view_trigger (Category 9): MATERIALIZED VIEW 解析入口
+    StatementPtr ParseMaterializedViewStatement();
+    StatementPtr ParseAlterMaterializedViewStatement();
     StatementPtr ParseCreateTriggerStatement();
     StatementPtr ParseDropTriggerStatement();
     StatementPtr ParseCreateFunctionStatement();
@@ -59,6 +67,25 @@ private:
     // ---- 46_meta: 元命令 ----
     StatementPtr ParseExplainStatement();
     StatementPtr ParseShowStatement();
+    // ---- 53_ddl: DDL 扩展 ----
+    StatementPtr ParseCreateSchemaStatement();
+    StatementPtr ParseDropSchemaStatement();
+    StatementPtr ParseCreateSequenceStatement();
+    StatementPtr ParseDropSequenceStatement();
+    // ---- 54_dml: DML 扩展 ----
+    StatementPtr ParseMergeStatement();
+    // ---- 子句解析 ----
+    // ---- RETURNING 解析 ----
+    // 解析 RETURNING expr [AS alias] [, expr [AS alias] ...] 子句。调用前已看到
+    // KEYWORD_RETURNING；解析后 returning_exprs / returning_aliases 平行。
+    void ParseReturningClause(std::vector<ExprPtr>& returning_exprs,
+                              std::vector<std::string>& returning_aliases);
+    // 表级 FOREIGN KEY 子句辅助（当前 token 已是 FOREIGN）
+    void ParseTableLevelForeignKey(CreateTableStatement& stmt);
+    // 读取一个标识符形式的表名，并接受可选的 schema 前缀（schema.table）。
+    // 返回的字符串保留 "schema.table" 形式（如果存在），让 catalog 把 schema
+    // 与表名一并处理。
+    std::string ParseTableNameAllowSchema();
 
     // ---- 子句解析 ----
     std::vector<ExprPtr> ParseSelectList();
@@ -91,9 +118,37 @@ private:
     //   SET name = expr;  （name 可为 "NEW.col" / "OLD.col"）
     //   IF cond THEN stmts [ELSEIF ...] [ELSE ...] END IF;
     //   WHILE cond DO stmts END WHILE;
+    // 59_procs (Category 8) 扩展：
+    //   LOOP body END LOOP [label];
+    //   REPEAT body UNTIL cond END REPEAT [label];
+    //   CASE [subject] WHEN ... THEN ... [ELSE ...] END CASE;
+    //   LEAVE label; / ITERATE label;
+    //   SIGNAL SQLSTATE '...' SET MESSAGE_TEXT = '...';
+    //   DECLARE [type] HANDLER FOR cond stmt;
+    //   DECLARE name CURSOR FOR select; OPEN name; FETCH name INTO ...; CLOSE name;
     StatementPtr ParseFunctionBodyStatement();
     // 解析一段语句列表直到遇到 end_token 为止（不含 end_token）。
     std::vector<StatementPtr> ParseFunctionBodyUntil(TokenType end_token);
+    // ---- 59_procs (Category 8) ----
+    StatementPtr ParseCreateProcedureStatement();
+    StatementPtr ParseDropProcedureStatement();
+    StatementPtr ParseCallStatement();
+    // 解析 [label:] loop_keyword body end_keyword [label];（含可选 label）
+    StatementPtr ParseLoopStatement();
+    StatementPtr ParseRepeatStatement();
+    StatementPtr ParseBodyCaseStatement();
+    // 解析 LEAVE / ITERATE
+    StatementPtr ParseLeaveStatement();
+    StatementPtr ParseIterateStatement();
+    // 解析 SIGNAL SQLSTATE '...' SET MESSAGE_TEXT = '...'
+    StatementPtr ParseSignalStatement();
+    // 解析 DECLARE [type] HANDLER FOR cond stmt;
+    StatementPtr ParseDeclareHandlerStatement();
+    // 解析 DECLARE name CURSOR FOR select; / OPEN / FETCH / CLOSE
+    StatementPtr ParseDeclareCursorStatement();
+    StatementPtr ParseCursorOpenStatement();
+    StatementPtr ParseCursorFetchStatement();
+    StatementPtr ParseCursorCloseStatement();
 
     // 解析 [table.]column 或 table.* 形式的列引用
     ExprPtr ParseColumnRefOrFunctionCall();

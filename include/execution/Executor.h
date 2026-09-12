@@ -67,6 +67,17 @@ public:
     const std::unordered_set<std::string>* GetInnerTables() const {
         return inner_tables_;
     }
+    // 55_query: ApplyExecutor 在 LATERAL 路径下需要把右子计划视为「子查询上下文」，
+    // 让 EvaluateColumnRef 知道哪些表名是右子计划的内部表，从而把同名 outer
+    // 引用回退到 outer_bind。本方法在 ApplyExecutor 构造时被调用一次，
+    // 把当前 inner_tables 替换为 stored_lateral_inner_tables_。
+    void SetLateralInnerTables(std::unordered_set<std::string> tables) {
+        stored_lateral_inner_tables_ = std::move(tables);
+    }
+    const std::unordered_set<std::string>* GetLateralInnerTables() const {
+        return stored_lateral_inner_tables_.empty() ? nullptr
+                                                     : &stored_lateral_inner_tables_;
+    }
 
     // 43_upsert: ON DUPLICATE KEY UPDATE 的赋值右侧可能出现 VALUES(col) 形式
     // 引用「本次候选行」的列值。该绑定由 UpsertExecutor 在评估冲突路径上的
@@ -86,6 +97,50 @@ public:
     void SetTransaction(Transaction* txn) { txn_ = txn; }
     Transaction* GetTransaction() const { return txn_; }
 
+    // ---- 59_procs (Category 8)：OUT 参数返回值表 ----
+    //
+    // CALL name(...) 执行后，procedure 的 OUT / INOUT 参数被回写到本字典
+    // （key = 参数名）。下游 SQL 通过 CALL 后立即 SELECT * FROM
+    // session_out_args（或在 V1 简化为 INSERT 持有表的方式）来读取结果。
+    // 该结构仅在 Database 同一会话内有效，跨会话不保留。
+    void SetOutArg(const std::string& name, Value value) {
+        out_args_[name] = std::move(value);
+    }
+    const std::unordered_map<std::string, Value>& GetOutArgs() const {
+        return out_args_;
+    }
+    void ClearOutArgs() { out_args_.clear(); }
+
+    // 59_procs (Category 8)：procedure 当前局部变量绑定。
+    // 当 CALL 在执行 procedure body 时，UdfExecutor 把当前 frame.locals
+    // 暴露给 ExecutionContext，让 procedure 内嵌 DML（INSERT/UPDATE/DELETE）
+    // 在解析表达式时能引用"局部变量 x"等。该绑定由 UdfExecutor 在
+    // ExecuteStatement 中按"单语句"粒度推入/弹出。
+    void SetProcLocals(const std::unordered_map<std::string, Value>* locals) {
+        proc_locals_ = locals;
+    }
+    const std::unordered_map<std::string, Value>* GetProcLocals() const {
+        return proc_locals_;
+    }
+
+    // 60_view_trigger (Category 9): AFTER 触发器 / STATEMENT 级触发器共享的会话状态。
+    // - session_log_：AFTER 触发器把"会话变量"以 name → value 的形式写入；
+    //   后续 SQL 可以通过 SET @var = ... 等路径回读。V1 主要用于记录 AFTER 副作用。
+    // - statement_fired_：STATEMENT 级触发器避免在每行重复执行的标记。
+    //   InsertExecutor / UpdateExecutor / DeleteExecutor 入口处清空，
+    //   TriggerExecutor::FireAfter 在已 fire 时直接返回。
+    void SetSessionVar(const std::string& name, Value v) {
+        session_log_[name] = std::move(v);
+    }
+    Value GetSessionVar(const std::string& name) const;
+    const std::unordered_map<std::string, Value>& GetSessionLog() const {
+        return session_log_;
+    }
+    bool MarkStatementFired(const std::string& key) {
+        return !statement_fired_.insert(key).second;  // true 表示已 fire 过
+    }
+    void ClearStatementFired() { statement_fired_.clear(); }
+
 private:
     SystemCatalog* catalog_;
     std::unordered_map<std::string, CteMaterialization> cte_results_;
@@ -98,10 +153,20 @@ private:
     const std::unordered_set<std::string>* inner_tables_ = nullptr;
     // 43_upsert: ON DUPLICATE KEY UPDATE 中 VALUES(col) 的候选行绑定。
     const std::unordered_map<std::string, Value>* upsert_values_bind_ = nullptr;
+    // 55_query: LATERAL 内层表集合（在 ApplyExecutor 启动时一次性设置，
+    // 让后续 Filter/Project 的 evaluator 把 inner_tables 当作子查询上下文）。
+    std::unordered_set<std::string> stored_lateral_inner_tables_;
     // Phase A：当前事务（nullptr = 隐式 auto-commit）。
     Transaction* txn_ = nullptr;
     // Phase A：所属事务管理器（由 ExecutionEngine 在构造 ctx 时注入）。
     TransactionManager* txn_manager_ = nullptr;
+    // 59_procs (Category 8): CALL 返回的 OUT / INOUT 参数值。
+    std::unordered_map<std::string, Value> out_args_;
+    // 59_procs (Category 8): procedure 当前局部变量绑定。
+    const std::unordered_map<std::string, Value>* proc_locals_ = nullptr;
+    // 60_view_trigger (Category 9): AFTER 触发器会话变量 + 语句级 fire 标记。
+    std::unordered_map<std::string, Value> session_log_;
+    std::unordered_set<std::string> statement_fired_;
 };
 
 // 执行算子基类，采用火山模型（Volcano / Iterator Model）：

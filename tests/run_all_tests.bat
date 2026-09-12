@@ -123,6 +123,23 @@ set /a FAILED = FAILED + 1
 set "FAILED_TESTS=!FAILED_TESTS! 50_undo_clr!"
 :acid_clr_done
 
+REM ---- Phase D: Trigger persistence smoke test (60_view_trigger) ----
+REM Driven by run_trigger_persistence.bat: phase1 creates a trigger and exits;
+REM phase2 reopens the same DB and drops the trigger (success proves persistence).
+echo.
+echo [ RUN  ] trigger_persist (run_trigger_persistence.bat)
+call "%SCRIPT_DIR%run_trigger_persistence.bat" > nul 2>&1
+set "TRIG_PERSIST_EXITCODE=!errorlevel!"
+if !TRIG_PERSIST_EXITCODE! neq 0 goto :trigger_persist_fail
+set /a PASSED = PASSED + 1
+echo  [ OK ]
+goto :trigger_persist_done
+:trigger_persist_fail
+echo [FAIL] (trigger_persist exit=!TRIG_PERSIST_EXITCODE!)
+set /a FAILED = FAILED + 1
+set "FAILED_TESTS=!FAILED_TESTS! 60_trigger_persist!"
+:trigger_persist_done
+
 echo.
 echo ==========================================
 echo   Summary:  !PASSED! passed,  !FAILED! failed

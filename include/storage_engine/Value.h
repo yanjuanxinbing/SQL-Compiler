@@ -13,6 +13,11 @@ enum class ValueType { INTEGER, FLOAT, VARCHAR, NULL_TYPE };
 // 映射到运行时的ValueType
 ValueType ValueTypeFromString(const std::string& type_name);
 
+// 52_data_types: 把 double 格式化为短精度十进制字符串，用于 DECIMAL/NUMERIC
+// 列写入（"%.12g" 风格）。保留足够有效数字覆盖 DECIMAL(10, 2) 等常见精度，
+// 又不会把 IEEE-754 的二进制噪声（如 99999999.98999999...）原样写入。
+std::string FormatDecimal(double v);
+
 // 运行时的值，供执行引擎在各算子之间传递数据（Tuple的每一列即为一个Value）
 class Value {
 public:

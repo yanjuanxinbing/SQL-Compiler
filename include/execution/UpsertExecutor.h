@@ -42,10 +42,13 @@ class UpsertExecutor : public Executor {
     UpsertExecutor(ExecutionContext* context, std::string table_name,
                    std::vector<std::string> columns,
                    std::vector<std::vector<ExprPtr>> values_list,
-                   std::vector<std::pair<std::string, ExprPtr>> upsert_assignments);
+                   std::vector<std::pair<std::string, ExprPtr>> upsert_assignments,
+                   std::vector<ExprPtr> returning_exprs = {},
+                   std::vector<std::string> returning_aliases = {});
 
     void Init() override;
-    // 一次性把所有候选行 upsert 完毕。Next 返回一次（受影响的行数）后返回 false。
+    // 无 RETURNING 时返回一次（受影响行数）。有 RETURNING 时按顺序 emit 每条
+    // upsert 后的 RETURNING 行；emit 完毕后再调一次 Next 返回 false。
     bool Next(Tuple* tuple) override;
 
  private:
@@ -55,7 +58,8 @@ class UpsertExecutor : public Executor {
 
     // 把候选行写入表堆（无冲突路径），返回受影响行数（始终 1）。
     // 复用 InsertExecutor 的 InsertRow：NOT NULL / 长度 / CHECK / PRIMARY KEY 唯一性
-    // / UNIQUE INDEX 全部沿用既有语义。
+    // / UNIQUE INDEX 全部沿用既有语义。upsert 后若 returning_exprs_ 非空，会把
+    // 评估结果追加到 pending_returning_。
     void InsertCandidateRow(std::vector<Value>& row_values);
 
     // 用 PRIMARY KEY 在主键索引里探测候选行是否冲突。
@@ -64,14 +68,24 @@ class UpsertExecutor : public Executor {
                                RID* existing_rid_out) const;
 
     // 冲突路径：取出 existing_rid 对应行的现有列值，按 upsert_assignments 改写，
-    // 重新跑约束，写回堆并同步索引。
+    // 重新跑约束，写回堆并同步索引。改写后若 returning_exprs_ 非空，会把评估结果
+    // 追加到 pending_returning_。
     void UpdateConflictingRow(const std::vector<Value>& candidate_values,
                               const RID& existing_rid);
+
+    // 54_dml: 评估 returning_exprs_ 并追加到 pending_returning_。
+    void EmitReturning(const Tuple& row);
 
     std::string table_name_;
     std::vector<std::string> columns_;
     std::vector<std::vector<ExprPtr>> values_list_;
     std::vector<std::pair<std::string, ExprPtr>> upsert_assignments_;
+
+    // 54_dml: RETURNING 缓冲。
+    std::vector<ExprPtr> returning_exprs_;
+    std::vector<std::string> returning_aliases_;
+    std::vector<Tuple> pending_returning_;
+    size_t pending_pos_ = 0;
 
     // 表 schema 缓存（Init 时填充）
     std::vector<ValueType> column_types_;

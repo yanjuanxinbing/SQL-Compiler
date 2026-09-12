@@ -155,6 +155,8 @@ const std::unordered_map<std::string, TokenType>& KeywordTable() {
         {"REGEXP",    TokenType::KEYWORD_REGEXP},
         {"RLIKE",     TokenType::KEYWORD_RLIKE},
         {"ESCAPE",    TokenType::KEYWORD_ESCAPE},
+        // 56_pattern: SIMILAR TO 扩展关键字
+        {"SIMILAR",   TokenType::KEYWORD_SIMILAR},
         // 45_datetime: DATE / TIMESTAMP / INTERVAL / EXTRACT
         {"DATE",      TokenType::KEYWORD_DATE},
         {"TIMESTAMP", TokenType::KEYWORD_TIMESTAMP},
@@ -166,6 +168,98 @@ const std::unordered_map<std::string, TokenType>& KeywordTable() {
         {"DESCRIBE",  TokenType::KEYWORD_DESCRIBE},
         {"TABLES",    TokenType::KEYWORD_TABLES},
         {"COLUMNS",   TokenType::KEYWORD_COLUMNS},
+        // 52_data_types: 新数据类型关键字
+        {"BOOLEAN",   TokenType::KEYWORD_BOOLEAN},
+        {"BOOL",      TokenType::KEYWORD_BOOL},
+        {"CHAR",      TokenType::KEYWORD_CHAR},
+        {"TEXT",      TokenType::KEYWORD_TEXT},
+        {"DECIMAL",   TokenType::KEYWORD_DECIMAL},
+        {"NUMERIC",   TokenType::KEYWORD_NUMERIC},
+        {"DOUBLE",    TokenType::KEYWORD_DOUBLE},
+        {"REAL",      TokenType::KEYWORD_REAL},
+        {"SMALLINT",  TokenType::KEYWORD_SMALLINT},
+        {"TINYINT",   TokenType::KEYWORD_TINYINT},
+        {"TIME",      TokenType::KEYWORD_TIME},
+        {"JSON",      TokenType::KEYWORD_JSON},
+        {"UUID",      TokenType::KEYWORD_UUID},
+        {"AUTO_INCREMENT", TokenType::KEYWORD_AUTO_INCREMENT},
+        {"SERIAL",    TokenType::KEYWORD_SERIAL},
+        {"IDENTITY",  TokenType::KEYWORD_IDENTITY},
+        {"TRUE",      TokenType::KEYWORD_TRUE},
+        {"FALSE",     TokenType::KEYWORD_FALSE},
+        // 53_ddl: DDL 扩展（FK / SCHEMA / SEQUENCE）
+        {"SCHEMA",    TokenType::KEYWORD_SCHEMA},
+        {"SEQUENCE",  TokenType::KEYWORD_SEQUENCE},
+        {"NEXTVAL",   TokenType::KEYWORD_NEXTVAL},
+        {"FOREIGN",   TokenType::KEYWORD_FOREIGN},
+        {"REFERENCES",TokenType::KEYWORD_REFERENCES},
+        {"CASCADE",   TokenType::KEYWORD_CASCADE},
+        {"RESTRICT",  TokenType::KEYWORD_RESTRICT},
+        {"ACTION",    TokenType::KEYWORD_ACTION},
+        // 58_constraints: 命名约束前缀
+        {"CONSTRAINT", TokenType::KEYWORD_CONSTRAINT},
+        // 54_dml: DML 扩展（MERGE / RETURNING）
+        {"MERGE",     TokenType::KEYWORD_MERGE},
+        {"MATCHED",   TokenType::KEYWORD_MATCHED},
+        {"RETURNING", TokenType::KEYWORD_RETURNING},
+        // 55_query: 查询/表达式扩展关键字
+        {"LATERAL", TokenType::KEYWORD_LATERAL},
+        {"FETCH",   TokenType::KEYWORD_FETCH},
+        {"OFFSET",  TokenType::KEYWORD_OFFSET},
+        {"FIRST",   TokenType::KEYWORD_FIRST},
+        {"NEXT",    TokenType::KEYWORD_NEXT},
+        // ROWS / KEY 已在 KEYWORD_ROWS / KEYWORD_KEY 处声明，复用同一枚举值。
+        {"ONLY",    TokenType::KEYWORD_ONLY},
+        {"TIES",    TokenType::KEYWORD_TIES},
+        {"SHARE",   TokenType::KEYWORD_SHARE},
+        {"NO",      TokenType::KEYWORD_NO},
+        // ---- 60_funcs: Category 6 函数 / 聚合扩展 ----
+        // 聚合 / 标量函数名（STDDEV / VARIANCE / MEDIAN / STRING_AGG /
+        // GROUP_CONCAT / PERCENTILE_CONT / PERCENTILE_DISC / GREATEST /
+        // LEAST / RAND / RANDOM）保留为标识符，由 parser / executor 按
+        // FunctionCallExpr.function_name 字段识别；不注册为关键字，
+        // 否则 lexer 会把它们变成 KEYWORD_* 与 ParseColumnRefOrFunctionCall
+        // 期望的 IDENTIFIER 冲突。
+        {"FILTER",          TokenType::KEYWORD_FILTER},
+        {"SETS",            TokenType::KEYWORD_SETS},
+        {"ROLLUP",          TokenType::KEYWORD_ROLLUP},
+        {"CUBE",            TokenType::KEYWORD_CUBE},
+        {"GROUPING",        TokenType::KEYWORD_GROUPING},
+        {"IGNORE",          TokenType::KEYWORD_IGNORE},
+        {"RESPECT",         TokenType::KEYWORD_RESPECT},
+        {"NULLS",           TokenType::KEYWORD_NULLS},
+        {"WITHIN",          TokenType::KEYWORD_WITHIN},
+        // ---- 59_procs (Category 8): 过程语言扩展 ----
+        {"LOOP",            TokenType::KEYWORD_LOOP},
+        {"REPEAT",          TokenType::KEYWORD_REPEAT},
+        {"UNTIL",           TokenType::KEYWORD_UNTIL},
+        {"OPEN",            TokenType::KEYWORD_OPEN},
+        {"CLOSE",           TokenType::KEYWORD_CLOSE},
+        {"LEAVE",           TokenType::KEYWORD_LEAVE},
+        {"ITERATE",         TokenType::KEYWORD_ITERATE},
+        {"SIGNAL",          TokenType::KEYWORD_SIGNAL},
+        {"SQLSTATE",        TokenType::KEYWORD_SQLSTATE},
+        {"MESSAGE_TEXT",    TokenType::KEYWORD_MESSAGE_TEXT},
+        {"HANDLER",         TokenType::KEYWORD_HANDLER},
+        {"CONTINUE",        TokenType::KEYWORD_CONTINUE},
+        {"SQLEXCEPTION",    TokenType::KEYWORD_SQLEXCEPTION},
+        {"SQLWARNING",      TokenType::KEYWORD_SQLWARNING},
+        {"FOUND",           TokenType::KEYWORD_FOUND},
+        {"CURSOR",          TokenType::KEYWORD_CURSOR},
+        {"PROCEDURE",       TokenType::KEYWORD_PROCEDURE},
+        {"CALL",            TokenType::KEYWORD_CALL},
+        {"OUT",             TokenType::KEYWORD_OUT},
+        {"INOUT",           TokenType::KEYWORD_INOUT},
+        {"EXIT",            TokenType::KEYWORD_EXIT},
+        {"UNDO",            TokenType::KEYWORD_UNDO},
+        {"CONDITION",       TokenType::KEYWORD_CONDITION},
+        // ---- 60_view_trigger (Category 9): VIEW / TRIGGER 扩展 ----
+        {"MATERIALIZED",    TokenType::KEYWORD_MATERIALIZED},
+        {"REFRESH",         TokenType::KEYWORD_REFRESH},
+        {"STATEMENT",       TokenType::KEYWORD_STATEMENT},
+        {"OPTION",          TokenType::KEYWORD_OPTION},
+        {"CASCADED",        TokenType::KEYWORD_CASCADED},
+        {"LOCAL",           TokenType::KEYWORD_LOCAL},
     };
     return kKeywords;
 }

@@ -166,6 +166,19 @@ std::string FunctionCallExpr::ToString() const {
         }
     }
     oss << ")";
+    if (filter_expr) {
+        oss << " FILTER (WHERE " << filter_expr->ToString() << ")";
+    }
+    if (!within_group_order_by.empty()) {
+        oss << " WITHIN GROUP (ORDER BY ";
+        for (size_t i = 0; i < within_group_order_by.size(); ++i) {
+            if (i > 0) oss << ", ";
+            const auto& ob = within_group_order_by[i];
+            oss << (ob.expr ? ob.expr->ToString() : "?");
+            if (!ob.ascending) oss << " DESC";
+        }
+        oss << ")";
+    }
     return oss.str();
 }
 
@@ -203,6 +216,19 @@ std::string SelectStatement::ToString() const {
             if (i > 0) oss << ", ";
             oss << (group_by[i] ? group_by[i]->ToString() : "?");
         }
+    }
+    if (!grouping_sets.empty()) {
+        oss << " GROUPING SETS (";
+        for (size_t g = 0; g < grouping_sets.size(); ++g) {
+            if (g > 0) oss << ", ";
+            oss << "(";
+            for (size_t i = 0; i < grouping_sets[g].size(); ++i) {
+                if (i > 0) oss << ", ";
+                oss << (grouping_sets[g][i] ? grouping_sets[g][i]->ToString() : "");
+            }
+            oss << ")";
+        }
+        oss << ")";
     }
     if (having_clause) {
         oss << " HAVING " << having_clause->ToString();
@@ -442,6 +468,10 @@ std::string AlterStatement::ToString() const {
             }
             break;
         }
+        case AlterAction::RENAME_COLUMN:
+            oss << "RENAME COLUMN " << rename_column_old_name
+                << " TO " << rename_column_new_name;
+            break;
     }
     return oss.str();
 }
@@ -510,7 +540,9 @@ std::string WindowFuncNode::ToString() const {
         if (i > 0) oss << ", ";
         oss << (arguments[i] ? arguments[i]->ToString() : "?");
     }
-    oss << ") OVER ";
+    oss << ") ";
+    oss << (ignore_nulls ? "IGNORE NULLS " : "RESPECT NULLS ");
+    oss << "OVER ";
     if (!window_name.empty()) {
         oss << window_name;
     } else {
@@ -612,10 +644,11 @@ std::string LikeExprNode::ToString() const {
     oss << "("
         << (operand ? operand->ToString() : "?") << " ";
     switch (kind) {
-        case Kind::LIKE:   oss << "LIKE";   break;
-        case Kind::ILIKE:  oss << "ILIKE";  break;
-        case Kind::REGEXP: oss << "REGEXP"; break;
-        case Kind::RLIKE:  oss << "RLIKE";  break;
+        case Kind::LIKE:        oss << "LIKE";        break;
+        case Kind::ILIKE:       oss << "ILIKE";       break;
+        case Kind::REGEXP:      oss << "REGEXP";      break;
+        case Kind::RLIKE:       oss << "RLIKE";       break;
+        case Kind::SIMILAR_TO:  oss << "SIMILAR TO";  break;
     }
     oss << " " << (pattern ? pattern->ToString() : "?");
     if (has_escape) {
@@ -726,6 +759,29 @@ std::string DropViewStatement::ToString() const {
     return std::string("DROP VIEW ") + (if_exists ? "IF EXISTS " : "") + view_name;
 }
 
+// 60_view_trigger (Category 9)
+MaterializedViewStatement::MaterializedViewStatement() {
+}
+NodeType MaterializedViewStatement::GetType() const {
+    return NodeType::CREATE_MATERIALIZED_VIEW_STMT;
+}
+std::string MaterializedViewStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "CREATE MATERIALIZED VIEW " << view_name << " AS ";
+    if (query) oss << query->ToString();
+    return oss.str();
+}
+
+// 60_view_trigger (Category 9)
+AlterMaterializedViewStatement::AlterMaterializedViewStatement() {
+}
+NodeType AlterMaterializedViewStatement::GetType() const {
+    return NodeType::ALTER_MATERIALIZED_VIEW_STMT;
+}
+std::string AlterMaterializedViewStatement::ToString() const {
+    return std::string("ALTER MATERIALIZED VIEW ") + view_name + " REFRESH";
+}
+
 CreateTriggerStatement::CreateTriggerStatement() {
 }
 NodeType CreateTriggerStatement::GetType() const { return NodeType::CREATE_TRIGGER_STMT; }
@@ -738,7 +794,8 @@ std::string CreateTriggerStatement::ToString() const {
         case TriggerEvent::UPDATE: oss << "UPDATE "; break;
         case TriggerEvent::DELETE: oss << "DELETE "; break;
     }
-    oss << "ON " << table_name << " FOR EACH ROW SET ";
+    oss << "ON " << table_name << " FOR EACH "
+        << (for_each_row ? "ROW " : "STATEMENT ") << "SET ";
     for (size_t i = 0; i < assignments.size(); ++i) {
         if (i) oss << ", ";
         oss << assignments[i].first << " = "
@@ -783,6 +840,7 @@ NodeType DeclareVarStatement::GetType() const { return NodeType::DECLARE_VAR_STM
 std::string DeclareVarStatement::ToString() const {
     std::string out = "DECLARE " + var_name + " " + data_type;
     if (char_length > 0) out += "(" + std::to_string(char_length) + ")";
+    if (default_expr) out += " DEFAULT " + default_expr->ToString();
     return out;
 }
 
@@ -845,6 +903,193 @@ DropFunctionStatement::DropFunctionStatement() {
 NodeType DropFunctionStatement::GetType() const { return NodeType::DROP_FUNCTION_STMT; }
 std::string DropFunctionStatement::ToString() const {
     return std::string("DROP FUNCTION ") + (if_exists ? "IF EXISTS " : "") + function_name;
+}
+
+// ============ 59_procs (Category 8)：过程语言扩展语句 ============
+
+LoopStatement::LoopStatement() {
+}
+NodeType LoopStatement::GetType() const { return NodeType::LOOP_STMT; }
+std::string LoopStatement::ToString() const {
+    std::ostringstream oss;
+    if (!label.empty()) oss << label << ": ";
+    oss << "LOOP";
+    for (const auto& s : body) {
+        if (s) oss << " " << s->ToString() << ";";
+    }
+    oss << " END LOOP";
+    if (!label.empty()) oss << " " << label;
+    return oss.str();
+}
+
+RepeatStatement::RepeatStatement() {
+}
+NodeType RepeatStatement::GetType() const { return NodeType::REPEAT_STMT; }
+std::string RepeatStatement::ToString() const {
+    std::ostringstream oss;
+    if (!label.empty()) oss << label << ": ";
+    oss << "REPEAT";
+    for (const auto& s : body) {
+        if (s) oss << " " << s->ToString() << ";";
+    }
+    oss << " UNTIL " << (until_expr ? until_expr->ToString() : "?")
+        << " END REPEAT";
+    if (!label.empty()) oss << " " << label;
+    return oss.str();
+}
+
+CaseStatement::CaseStatement() {
+}
+NodeType CaseStatement::GetType() const { return NodeType::CASE_STMT; }
+std::string CaseStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "CASE";
+    if (subject) oss << " " << subject->ToString();
+    for (const auto& w : whens) {
+        oss << " WHEN " << (w.when_expr ? w.when_expr->ToString() : "?") << " THEN";
+        for (const auto& s : w.body) {
+            if (s) oss << " " << s->ToString() << ";";
+        }
+    }
+    if (!else_body.empty()) {
+        oss << " ELSE";
+        for (const auto& s : else_body) {
+            if (s) oss << " " << s->ToString() << ";";
+        }
+    }
+    oss << " END CASE";
+    return oss.str();
+}
+
+LeaveStatement::LeaveStatement(std::string l) : label(std::move(l)) {
+}
+NodeType LeaveStatement::GetType() const { return NodeType::LEAVE_STMT; }
+std::string LeaveStatement::ToString() const {
+    return "LEAVE " + label;
+}
+
+IterateStatement::IterateStatement(std::string l) : label(std::move(l)) {
+}
+NodeType IterateStatement::GetType() const { return NodeType::ITERATE_STMT; }
+std::string IterateStatement::ToString() const {
+    return "ITERATE " + label;
+}
+
+SignalStatement::SignalStatement() {
+}
+NodeType SignalStatement::GetType() const { return NodeType::SIGNAL_STMT; }
+std::string SignalStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "SIGNAL SQLSTATE '" << sqlstate << "' SET MESSAGE_TEXT = '"
+        << message_text << "'";
+    return oss.str();
+}
+
+DeclareHandlerStatement::DeclareHandlerStatement() {
+}
+NodeType DeclareHandlerStatement::GetType() const { return NodeType::DECLARE_HANDLER_STMT; }
+std::string DeclareHandlerStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "DECLARE ";
+    switch (type) {
+        case Type::CONTINUE: oss << "CONTINUE "; break;
+        case Type::EXIT:     oss << "EXIT ";     break;
+        case Type::UNDO:     oss << "UNDO ";     break;
+    }
+    oss << "HANDLER FOR ";
+    switch (cond_kind) {
+        case CondKind::SQLEXCEPTION: oss << "SQLEXCEPTION"; break;
+        case CondKind::SQLWARNING:   oss << "SQLWARNING";   break;
+        case CondKind::NOT_FOUND:    oss << "NOT FOUND";    break;
+        case CondKind::SQLSTATE:     oss << "SQLSTATE '" << cond_sqlstate << "'"; break;
+    }
+    oss << " " << (body ? body->ToString() : ";");
+    return oss.str();
+}
+
+DeclareCursorStatement::DeclareCursorStatement(std::string cursor_name, SelectStatementPtr q)
+    : cursor_name(std::move(cursor_name)), query(std::move(q)) {
+}
+NodeType DeclareCursorStatement::GetType() const { return NodeType::DECLARE_CURSOR_STMT; }
+std::string DeclareCursorStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "DECLARE " << cursor_name << " CURSOR FOR "
+        << (query ? query->ToString() : "<null>");
+    return oss.str();
+}
+
+CursorOpenStatement::CursorOpenStatement(std::string cursor_name)
+    : cursor_name(std::move(cursor_name)) {
+}
+NodeType CursorOpenStatement::GetType() const { return NodeType::CURSOR_OPEN_STMT; }
+std::string CursorOpenStatement::ToString() const {
+    return "OPEN " + cursor_name;
+}
+
+CursorFetchStatement::CursorFetchStatement(std::string cursor_name,
+                                           std::vector<std::string> into_vars)
+    : cursor_name(std::move(cursor_name)), into_vars(std::move(into_vars)) {
+}
+NodeType CursorFetchStatement::GetType() const { return NodeType::CURSOR_FETCH_STMT; }
+std::string CursorFetchStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "FETCH " << cursor_name << " INTO";
+    for (size_t i = 0; i < into_vars.size(); ++i) {
+        if (i) oss << ",";
+        oss << " " << into_vars[i];
+    }
+    return oss.str();
+}
+
+CursorCloseStatement::CursorCloseStatement(std::string cursor_name)
+    : cursor_name(std::move(cursor_name)) {
+}
+NodeType CursorCloseStatement::GetType() const { return NodeType::CURSOR_CLOSE_STMT; }
+std::string CursorCloseStatement::ToString() const {
+    return "CLOSE " + cursor_name;
+}
+
+// ============ 59_procs (Category 8)：PROCEDURE / CALL ============
+
+CreateProcedureStatement::CreateProcedureStatement() {
+}
+NodeType CreateProcedureStatement::GetType() const { return NodeType::CREATE_PROCEDURE_STMT; }
+std::string CreateProcedureStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "CREATE PROCEDURE " << procedure_name << "(";
+    for (size_t i = 0; i < parameters.size(); ++i) {
+        if (i) oss << ", ";
+        switch (parameters[i].mode) {
+            case 0: break;
+            case 1: oss << "OUT "; break;
+            case 2: oss << "INOUT "; break;
+        }
+        oss << parameters[i].name << " " << parameters[i].data_type;
+    }
+    oss << ") BEGIN ... END";
+    return oss.str();
+}
+
+DropProcedureStatement::DropProcedureStatement() {
+}
+NodeType DropProcedureStatement::GetType() const { return NodeType::DROP_PROCEDURE_STMT; }
+std::string DropProcedureStatement::ToString() const {
+    return std::string("DROP PROCEDURE ") + (if_exists ? "IF EXISTS " : "") +
+           procedure_name;
+}
+
+CallStatement::CallStatement() {
+}
+NodeType CallStatement::GetType() const { return NodeType::CALL_STMT; }
+std::string CallStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "CALL " << procedure_name << "(";
+    for (size_t i = 0; i < arguments.size(); ++i) {
+        if (i) oss << ", ";
+        oss << (arguments[i] ? arguments[i]->ToString() : "?");
+    }
+    oss << ")";
+    return oss.str();
 }
 
 // ============ 45_datetime：EXTRACT / INTERVAL ============
@@ -921,6 +1166,124 @@ std::string ShowStatement::ToString() const {
         case Kind::COLUMNS:      oss << "COLUMNS FROM " << target_table; break;
         case Kind::INDEX:        oss << "INDEX FROM " << target_table; break;
         case Kind::CREATE_TABLE: oss << "CREATE TABLE " << target_table; break;
+    }
+    return oss.str();
+}
+
+// ============ 53_ddl: SCHEMA / SEQUENCE / NEXTVAL ============
+
+CreateSchemaStatement::CreateSchemaStatement() = default;
+CreateSchemaStatement::CreateSchemaStatement(std::string name)
+    : schema_name(std::move(name)) {}
+
+NodeType CreateSchemaStatement::GetType() const {
+    return NodeType::CREATE_SCHEMA_STMT;
+}
+std::string CreateSchemaStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "CREATE SCHEMA ";
+    if (if_not_exists) oss << "IF NOT EXISTS ";
+    oss << schema_name;
+    return oss.str();
+}
+
+DropSchemaStatement::DropSchemaStatement() = default;
+DropSchemaStatement::DropSchemaStatement(std::string name)
+    : schema_name(std::move(name)) {}
+
+NodeType DropSchemaStatement::GetType() const {
+    return NodeType::DROP_SCHEMA_STMT;
+}
+std::string DropSchemaStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "DROP SCHEMA ";
+    if (if_exists) oss << "IF EXISTS ";
+    oss << schema_name;
+    return oss.str();
+}
+
+CreateSequenceStatement::CreateSequenceStatement() = default;
+
+NodeType CreateSequenceStatement::GetType() const {
+    return NodeType::CREATE_SEQUENCE_STMT;
+}
+std::string CreateSequenceStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "CREATE SEQUENCE ";
+    if (if_not_exists) oss << "IF NOT EXISTS ";
+    oss << sequence_name << " START " << start_value
+        << " INCREMENT " << increment;
+    return oss.str();
+}
+
+DropSequenceStatement::DropSequenceStatement() = default;
+DropSequenceStatement::DropSequenceStatement(std::string name)
+    : sequence_name(std::move(name)) {}
+
+NodeType DropSequenceStatement::GetType() const {
+    return NodeType::DROP_SEQUENCE_STMT;
+}
+std::string DropSequenceStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "DROP SEQUENCE ";
+    if (if_exists) oss << "IF EXISTS ";
+    oss << sequence_name;
+    return oss.str();
+}
+
+NextvalExpr::NextvalExpr(std::string sequence_name)
+    : sequence_name(std::move(sequence_name)) {}
+
+NodeType NextvalExpr::GetType() const {
+    return NodeType::NEXTVAL_EXPR;
+}
+std::string NextvalExpr::ToString() const {
+    return "NEXTVAL FOR " + sequence_name;
+}
+
+// ============ 54_dml：MERGE 语句 ============
+
+MergeStatement::MergeStatement() {
+}
+
+NodeType MergeStatement::GetType() const {
+    return NodeType::MERGE_STMT;
+}
+
+std::string MergeStatement::ToString() const {
+    std::ostringstream oss;
+    oss << "MERGE INTO " << target_table;
+    if (!target_alias.empty()) oss << " AS " << target_alias;
+    oss << " USING ";
+    if (source_query) {
+        oss << "(" << source_query->ToString() << ")";
+    } else {
+        oss << source_table;
+    }
+    if (!source_alias.empty()) oss << " AS " << source_alias;
+    oss << " ON " << (on_condition ? on_condition->ToString() : "?");
+    if (has_matched_update) {
+        oss << " WHEN MATCHED THEN UPDATE SET ";
+        for (size_t i = 0; i < matched_assignments.size(); ++i) {
+            if (i) oss << ", ";
+            oss << matched_assignments[i].first << " = "
+                << (matched_assignments[i].second
+                        ? matched_assignments[i].second->ToString()
+                        : "?");
+        }
+    }
+    if (has_not_matched_insert) {
+        oss << " WHEN NOT MATCHED THEN INSERT (";
+        for (size_t i = 0; i < insert_columns.size(); ++i) {
+            if (i) oss << ", ";
+            oss << insert_columns[i];
+        }
+        oss << ") VALUES (";
+        for (size_t i = 0; i < insert_values.size(); ++i) {
+            if (i) oss << ", ";
+            oss << (insert_values[i] ? insert_values[i]->ToString() : "?");
+        }
+        oss << ")";
     }
     return oss.str();
 }

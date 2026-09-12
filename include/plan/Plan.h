@@ -39,6 +39,9 @@ enum class PlanNodeType {
     CREATE_VIEW,   // 视图已记入 catalog，no-op 执行（供后续 SELECT FROM view 查询）
     CREATE_TRIGGER,// 触发器已记入 catalog，no-op 执行
     CREATE_FUNCTION,// UDF 已记入 catalog，no-op 执行
+    // ---- 59_procs (Category 8) ----
+    CREATE_PROCEDURE, // 过程已记入 catalog，no-op 执行
+    CALL,             // CALL proc(args) —— 复用 UdfExecutor 解释器
     VIEW_DEFINE,   // 视图定义：执行时把视图的 SELECT 翻译成子查询占位 SeqScanNode，
                    // ExecutionEngine 识别 alias 后改走子计划
     UPSERT,        // 43_upsert: ON DUPLICATE KEY UPDATE —— 主键冲突时改写已有行
@@ -54,6 +57,24 @@ enum class PlanNodeType {
     // ---- 46_meta: 元命令 ----
     EXPLAIN,       // EXPLAIN [ANALYZE] <statement> —— 把 inner 的计划树打印成文本
     SHOW,          // SHOW TABLES / SHOW COLUMNS / SHOW INDEX / SHOW CREATE TABLE
+
+    // ---- 53_ddl: DDL 扩展（FK / SCHEMA / SEQUENCE） ----
+    CREATE_SCHEMA,  // CREATE SCHEMA name —— 注册 schema 命名空间
+    DROP_SCHEMA,    // DROP SCHEMA name —— 校验非空后移除
+    CREATE_SEQUENCE,// CREATE SEQUENCE name [START n] [INCREMENT n] —— 注册序列
+    DROP_SEQUENCE,  // DROP SEQUENCE name —— 释放序列
+
+    // ---- 54_dml: DML 扩展（RETURNING / UPDATE-FROM / MERGE / REPLACE）----
+    UPDATE_FROM,    // UPDATE ... FROM source ... —— 跨表更新；children[0] 是 JoinNode 子计划
+    MERGE,          // MERGE INTO target USING source ON cond ...
+
+    // ---- 55_query: 查询/表达式扩展 ----
+    VALUES,         // (VALUES (1,2), (3,4)) 作为 FROM 派生表：逐行发射字面量元组
+    APPLY,          // LATERAL/CROSS APPLY：对每条外层行跑一次右子计划并发出拼接行
+
+    // ---- 60_view_trigger (Category 9): VIEW / TRIGGER 扩展 ----
+    CREATE_MATERIALIZED_VIEW,  // 物化视图：建 backing table + 物化数据
+    ALTER_MATERIALIZED_VIEW,   // 物化视图 REFRESH：truncate + 重新执行 SELECT
 };
 
 // 执行计划节点基类，采用树形结构，子节点为输入
@@ -199,6 +220,14 @@ public:
     // 该子计划（语义上"插入源"），children[0] 即 query_plan。执行器优先消费它，
     // values_list 与 query_plan 互斥（query_plan 非空时使用源计划，否则用 values_list）。
     PlanNodePtr query_plan;
+    // ---- 54_dml: REPLACE INTO 标记 ----
+    // true 时按 MySQL REPLACE 语义：候选行在 PK/UNIQUE 上冲突，先删旧行再插新行。
+    // 当前实现走 UpsertExecutor 的"删除+插入"路径。
+    bool is_replace = false;
+    // ---- 54_dml: RETURNING 子句 ----
+    // INSERT 成功后，对新行求值 returning_exprs 并以结果集形式返回。
+    std::vector<ExprPtr> returning_exprs;
+    std::vector<std::string> returning_aliases;
 };
 
 // 43_upsert: ON DUPLICATE KEY UPDATE 节点。
@@ -220,6 +249,9 @@ public:
     std::vector<std::vector<ExprPtr>> values_list;
     // col = expr[, ...]；expr 内允许出现 UpsertValuesRefExpr 引用本次候选行的列。
     std::vector<std::pair<std::string, ExprPtr>> upsert_assignments;
+    // ---- 54_dml: RETURNING 子句（与 InsertNode 共享语义） ----
+    std::vector<ExprPtr> returning_exprs;
+    std::vector<std::string> returning_aliases;
 };
 
 // 更新节点
@@ -234,6 +266,38 @@ public:
     std::string table_name;
     std::vector<std::pair<std::string, ExprPtr>> assignments;
     ExprPtr predicate;  // 可为空
+    // ---- 54_dml: UPDATE ... FROM source ----
+    // 当 from_sources 非空时，由 Planner 构造一个 UpdateFromNode（见下）走 join 路径；
+    // 当前 UpdateNode 仅承载 from_sources 为空的情况。target_alias 可为空。
+    std::string target_alias;
+    // ---- 54_dml: RETURNING 子句 ----
+    std::vector<ExprPtr> returning_exprs;
+    std::vector<std::string> returning_aliases;
+};
+
+// 54_dml: UPDATE ... FROM 节点。
+//
+// 与 UpdateNode 类似，但带一个 JoinNode 子计划：children[0] 是 Planner
+// 把 target × from_sources 拼成的连接结果，每行包含 target 与 source 的所有列。
+// 执行器对每行"joined tuple"评估 SET 赋值（按 target 列下标写回），并复用
+// UPDATE 的约束 / 索引维护 / WAL 路径。
+class UpdateFromNode : public PlanNode {
+public:
+    UpdateFromNode(std::string table_name,
+                   std::vector<std::pair<std::string, ExprPtr>> assignments);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string table_name;
+    // target 表的别名（UPDATE t AS t SET ... FROM s WHERE ...），空字符串表示无别名。
+    std::string target_alias;
+    std::vector<std::pair<std::string, ExprPtr>> assignments;
+    // WHERE 谓词：在 UPDATE FROM 路径下，连接条件 + 过滤条件都在这里（PG/Oracle 风格）。
+    ExprPtr where_clause;
+    // ---- 54_dml: RETURNING 子句 ----
+    std::vector<ExprPtr> returning_exprs;
+    std::vector<std::string> returning_aliases;
 };
 
 // 删除节点
@@ -246,6 +310,40 @@ public:
 
     std::string table_name;
     ExprPtr predicate;  // 可为空
+    // ---- 54_dml: RETURNING 子句 ----
+    std::vector<ExprPtr> returning_exprs;
+    std::vector<std::string> returning_aliases;
+};
+
+// 54_dml: MERGE INTO 节点。
+//
+// target_table：被合并的目标表；source_table / source_alias：USING 子句的数据源；
+// source_plan：Planner 把 source_table 或 (SELECT ...) AS alias 转成的子计划，
+// 输出列顺序与 source_table 视图（或派生表 SELECT list）一致。
+// on_condition：target × source 的连接条件，用于判定 MATCHED / NOT MATCHED。
+// matched_assignments / not_matched_insert_*：分别承载 WHEN MATCHED / NOT MATCHED
+// 分支的具体动作。MergeExecutor 枚举 source_plan 的每一行评估 on_condition 后
+// 走对应分支；与现有 CHECK / UNIQUE / FK / WAL 路径完全共享。
+class MergeNode : public PlanNode {
+public:
+    MergeNode(std::string target_table);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string target_table;
+    std::string target_alias;
+    std::string source_table;
+    std::string source_alias;
+    PlanNodePtr source_plan;
+    ExprPtr on_condition;
+
+    bool has_matched_update = false;
+    std::vector<std::pair<std::string, ExprPtr>> matched_assignments;
+
+    bool has_not_matched_insert = false;
+    std::vector<std::string> not_matched_columns;
+    std::vector<ExprPtr> not_matched_values;
 };
 
 // 建表节点
@@ -253,6 +351,9 @@ class CreateTableNode : public PlanNode {
 public:
     CreateTableNode(std::string table_name, std::vector<ColumnDefinition> columns,
                     std::vector<std::vector<std::string>> primary_keys = {},
+                    std::vector<std::vector<std::string>> unique_constraints = {},
+                    std::vector<ForeignKeyDef> foreign_keys = {},
+                    std::vector<TableCheckDef> table_checks = {},
                     bool if_not_exists = false);
 
     PlanNodeType GetType() const override;
@@ -262,6 +363,15 @@ public:
     std::vector<ColumnDefinition> columns;
     // 表级 PRIMARY KEY(a, b) 的分组信息，需原样传到 Catalog 才能按「组合唯一」校验
     std::vector<std::vector<std::string>> primary_keys;
+    // 52_data_types: 表级 UNIQUE(col, ...) 约束。CreateTableExecutor 据此
+    // 自动建立等价的隐式唯一索引。
+    std::vector<std::vector<std::string>> unique_constraints;
+    // 53_ddl: 表级 FOREIGN KEY 约束。CreateTableExecutor 把它们登记到
+    // catalog.fk_constraints_，并在 INSERT/UPDATE/DELETE 路径上兑现约束。
+    std::vector<ForeignKeyDef> foreign_keys;
+    // 58_constraints: 表级 CHECK(expr) / CONSTRAINT name CHECK(expr)。
+    // CreateTableExecutor 把它原样落到 catalog，约束校验在写入路径上做。
+    std::vector<TableCheckDef> table_checks;
     // CREATE TABLE IF NOT EXISTS 标记
     bool if_not_exists = false;
 };
@@ -316,7 +426,7 @@ public:
     std::string table_name;
 };
 
-// ALTER TABLE 节点：承载 4 类动作（ADD/DROP/RENAME/MODIFY）。
+// ALTER TABLE 节点：承载 5 类动作（ADD/DROP/RENAME/MODIFY/RENAME_COLUMN）。
 // 当前执行器以 no-op 处理（DDL 扩展语法的最小实现），保证后续
 // SELECT 仍能访问原表。
 class AlterTableNode : public PlanNode {
@@ -334,6 +444,9 @@ public:
     std::string drop_column_name;
     // RENAME TO 时填写新表名。
     std::string new_table_name;
+    // 53_ddl: RENAME COLUMN 时填写被改名列名与新列名。
+    std::string rename_column_old_name;
+    std::string rename_column_new_name;
 };
 
 // 集合运算节点
@@ -464,10 +577,37 @@ public:
     std::string function_name;
 };
 
+// ============ 59_procs (Category 8)：CREATE PROCEDURE / CALL 节点 ============
+
+// CREATE PROCEDURE：no-op。
+class CreateProcedureNode : public PlanNode {
+public:
+    explicit CreateProcedureNode(std::string procedure_name);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string procedure_name;
+};
+
+// CALL proc(args) —— 在新函数帧里执行 procedure 的 body。
+// 实参按位置映射到形参；OUT / INOUT 参数在 procedure 完成后由执行器
+// 写回 ExecutionContext::out_args_。
+class CallNode : public PlanNode {
+public:
+    CallNode(std::string procedure_name, std::vector<ExprPtr> arguments);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string procedure_name;
+    std::vector<ExprPtr> arguments;
+};
+
 // DROP VIEW / DROP TRIGGER / DROP FUNCTION：no-op。
 class DropObjectNode : public PlanNode {
 public:
-    enum class Kind { VIEW, TRIGGER, FUNCTION };
+    enum class Kind { VIEW, TRIGGER, FUNCTION, PROCEDURE };
     DropObjectNode(Kind kind, std::string object_name, bool if_exists);
 
     PlanNodeType GetType() const override;
@@ -584,6 +724,129 @@ public:
 
     Kind kind;
     std::string target_table;
+};
+
+// ============ 55_query: VALUES / APPLY 计划节点 ============
+
+// VALUES 节点：承载 (VALUES (a,b), (c,d)) AS t(id, name) 的字面量行。
+// children 为空；执行器按 rows 顺序发射每个 Tuple。
+class ValuesNode : public PlanNode {
+public:
+    ValuesNode(std::vector<std::vector<ExprPtr>> rows,
+               std::vector<std::string> column_aliases,
+               std::string derived_alias);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::vector<std::vector<ExprPtr>> rows;
+    std::vector<std::string> column_aliases;  // 可空
+    std::string derived_alias;                 // 派生表别名 t
+};
+
+// APPLY 节点（LATERAL）：对每条外层（左）行驱动一次右子计划，发出拼接行。
+// is_left_outer == true 对应 LEFT OUTER APPLY（无匹配也补 NULL 行），
+// 当前 V1 始终为 INNER CROSS APPLY：右子计划无输出时不发该外层行。
+// lateral_alias 是 LATERAL 派生表的别名（如 `sub`），供 ExecutionEngine 把
+// 右子计划的输出列以 `<alias>.<col>` 形式登记到 column_index_map。
+// lateral_inner_tables 是右子查询的 from_table_alias 与 join 别名集合，
+// 让右子计划 evaluator 识别「qualified ref 是内层表名还是外层引用」。
+class ApplyNode : public PlanNode {
+public:
+    ApplyNode(bool is_left_outer, std::string lateral_alias,
+              std::vector<std::string> lateral_inner_tables);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    bool is_left_outer = false;
+    std::string lateral_alias;
+    std::vector<std::string> lateral_inner_tables;
+};
+
+// ============ 53_ddl: SCHEMA / SEQUENCE 计划节点 ============
+
+class CreateSchemaNode : public PlanNode {
+public:
+    CreateSchemaNode(std::string name, bool if_not_exists = false);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string schema_name;
+    bool if_not_exists;
+};
+
+class DropSchemaNode : public PlanNode {
+public:
+    DropSchemaNode(std::string name, bool if_exists = false);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string schema_name;
+    bool if_exists;
+};
+
+class CreateSequenceNode : public PlanNode {
+public:
+    CreateSequenceNode(std::string name, int64_t start_value = 1,
+                       int64_t increment = 1, bool if_not_exists = false);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string sequence_name;
+    int64_t start_value;
+    int64_t increment;
+    bool if_not_exists;
+};
+
+class DropSequenceNode : public PlanNode {
+public:
+    DropSequenceNode(std::string name, bool if_exists = false);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string sequence_name;
+    bool if_exists;
+};
+
+// ============ 60_view_trigger (Category 9)：物化视图节点 ============
+
+// CREATE MATERIALIZED VIEW name AS <select>
+// 执行流程：
+//   1. 把 SELECT 的输出列定型为 ColumnDefinition；
+//   2. catalog 内建一张 backing table（表名 "__mv_<view_name>"）；
+//   3. 立即执行 SELECT 的子计划，把每行写入 backing table。
+// 子计划挂在 children[0] 上，由 MaterializedViewExecutor 在 Init 阶段
+// 收集全部行后批量 InsertTuple。
+class CreateMaterializedViewNode : public PlanNode {
+public:
+    CreateMaterializedViewNode(std::string view_name,
+                               std::vector<ColumnDefinition> columns,
+                               bool if_not_exists = false);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string view_name;
+    std::vector<ColumnDefinition> columns;
+    bool if_not_exists = false;
+};
+
+// ALTER MATERIALIZED VIEW name REFRESH
+// 截断 backing table 并重新执行 SELECT。
+// 子计划同 CREATE_MATERIALIZED_VIEW —— 复用 PlanSelect 的输出。
+class AlterMaterializedViewNode : public PlanNode {
+public:
+    AlterMaterializedViewNode(std::string view_name);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string view_name;
 };
 
 }  // namespace sqlcompiler

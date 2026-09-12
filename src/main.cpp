@@ -94,13 +94,15 @@ bool HasCompleteStatement(const std::string& s) {
             if (create_fn_seen && w == "BEGIN") {
                 ++begin_depth;
             } else if (create_fn_seen && w == "END") {
-                // END IF / END WHILE 是 IF / WHILE 块的结束，不是函数体的 END。
-                // 看到 END 后看下一个非空白关键字：若是 IF / WHILE，则跳过。
+                // END IF / END WHILE / END LOOP / END REPEAT / END CASE 都是
+                // 子块的结束，不是函数/过程体的 END。看到 END 后看下一个非空白
+                // 关键字：若是上述关键字之一，则跳过。
                 size_t j = i + w.size();
                 while (j < s.size() &&
                        (std::isspace(static_cast<unsigned char>(s[j])))) ++j;
                 std::string next = extract_word_upper(s, j);
-                if (next == "IF" || next == "WHILE") {
+                if (next == "IF" || next == "WHILE" || next == "LOOP" ||
+                    next == "REPEAT" || next == "CASE") {
                     // 跳过整个 next 词，避免下一次循环再处理它
                     i += w.size() + (j - (i + w.size())) + next.size() - 1;
                     continue;
@@ -145,7 +147,13 @@ void PadTo(const std::string& s, size_t width) {
 
 void PrintResult(const sqlcompiler::ExecutionResult& result) {
     if (!result.success) {
-        std::cerr << "Error: " << result.message << std::endl;
+        // 52_data_types: 先 flush stdout 确保 prompt 落地，再让 cerr 单独写
+        // 到新的一行。否则当 stdout 缓冲 + stderr 无缓冲时，错误行可能拼接到
+        // "sqlcompiler> " 之后，触发测试驱动里的 "^sqlcompiler> Error:" 模
+        // 式误判。这里额外在 cerr 行首加 '\n' 是最后兜底：即使 OS 层把两个
+        // write() 合并成一行，也会把错误切到独立行。
+        std::cout.flush();
+        std::cerr << "\nError: " << result.message << std::endl;
         return;
     }
     if (result.column_names.empty()) {

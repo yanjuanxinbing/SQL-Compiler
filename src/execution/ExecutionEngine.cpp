@@ -3,6 +3,8 @@
 #include "common/Error.h"
 #include "execution/AggregateExecutor.h"
 #include "execution/AlterTableExecutor.h"
+#include "execution/CallExecutor.h"            // 59_procs (Category 8): CALL
+#include "execution/SchemaSequenceExecutor.h"  // 53_ddl: SCHEMA/SEQUENCE
 #include "execution/CreateTableExecutor.h"
 #include "execution/CteExecutor.h"
 #include "execution/DeleteExecutor.h"
@@ -16,6 +18,8 @@
 #include "execution/InsertExecutor.h"
 #include "execution/JoinExecutor.h"
 #include "execution/LimitExecutor.h"
+#include "execution/MaterializedViewExecutor.h"  // 60_view_trigger
+#include "execution/MergeExecutor.h"  // 54_dml: MERGE
 #include "execution/NoOpExecutor.h"
 #include "execution/ProjectExecutor.h"
 #include "execution/SeqScanExecutor.h"
@@ -23,6 +27,8 @@
 #include "execution/SortExecutor.h"
 #include "execution/SetOpExecutor.h"
 #include "execution/SubqueryExecutor.h"
+#include "execution/ValuesExecutor.h"     // 55_query
+#include "execution/ApplyExecutor.h"      // 55_query
 #include "execution/TransactionExecutor.h"
 #include "execution/TruncateTableExecutor.h"
 #include "execution/UpdateExecutor.h"
@@ -60,6 +66,15 @@ std::vector<std::pair<std::string, std::string>> CollectScanTableNames(
     if (!node) return names;
     if (node->GetType() == PlanNodeType::SEQ_SCAN) {
         auto s = std::static_pointer_cast<SeqScanNode>(node);
+        // 55_query: 跳过派生表占位（table_alias == table_name 且 children 非空）；
+        // 这类节点的「表名/别名」并非真实表，BuildCombinedColumnIndexMapWithDerived
+        // 已通过 DeriveTerminalColumns 把内层输出列暴露给外层 cmap；占位的
+        // children 是 LATERAL 子查询等内层计划，不应再递归扫描其内表的真实 schema，
+        // 否则会把内层表的列污染到外层 cmap（如内层 t1.val 覆盖外层 t1.val 的下标）。
+        if (!s->table_alias.empty() && s->table_alias == s->table_name &&
+            !node->children.empty()) {
+            return names;  // 占位节点不向下递归、也不计入 names。
+        }
         names.emplace_back(s->table_name, s->table_alias);
     }
     if (node->GetType() == PlanNodeType::INDEX_SCAN) {
@@ -147,6 +162,22 @@ std::vector<std::string> DeriveTerminalColumns(SystemCatalog* catalog,
         }
     }
     if (!p) return cols;
+    // 55_query: VALUES 节点 —— 列名直接来自 column_aliases。
+    if (p->GetType() == PlanNodeType::VALUES) {
+        auto v = std::static_pointer_cast<ValuesNode>(p);
+        size_t ncols = v->column_aliases.empty()
+                          ? (v->rows.empty() ? 0 : v->rows[0].size())
+                          : v->column_aliases.size();
+        cols.reserve(ncols);
+        for (size_t i = 0; i < ncols; ++i) {
+            if (i < v->column_aliases.size() && !v->column_aliases[i].empty()) {
+                cols.push_back(v->column_aliases[i]);
+            } else {
+                cols.push_back("col" + std::to_string(i));
+            }
+        }
+        return cols;
+    }
     if (p->GetType() == PlanNodeType::WINDOW) {
         auto wn = std::static_pointer_cast<WindowNode>(p);
         cols.reserve(wn->select_list.size());
@@ -185,6 +216,21 @@ std::vector<std::string> DeriveTerminalColumns(SystemCatalog* catalog,
                 cols.push_back(e->ToString());
             } else {
                 cols.push_back("?");
+            }
+        }
+        return cols;
+    }
+    if (p->GetType() == PlanNodeType::VALUES) {
+        auto v = std::static_pointer_cast<ValuesNode>(p);
+        size_t ncols = v->column_aliases.empty()
+                          ? (v->rows.empty() ? 0 : v->rows[0].size())
+                          : v->column_aliases.size();
+        cols.reserve(ncols);
+        for (size_t i = 0; i < ncols; ++i) {
+            if (i < v->column_aliases.size() && !v->column_aliases[i].empty()) {
+                cols.push_back(v->column_aliases[i]);
+            } else {
+                cols.push_back("col" + std::to_string(i));
             }
         }
         return cols;
@@ -287,6 +333,50 @@ std::unordered_map<std::string, size_t> BuildCombinedColumnIndexMapWithDerived(
             if (info) offset += info->columns.size();
             return;
         }
+        // 55_query: LATERAL ApplyNode ——右子查询的输出列按「派生表」语义
+        // 暴露在外层 column_index_map 中：以 ApplyNode.lateral_alias 为限定符。
+        // 左子树照常递归；右子树输出列从 DeriveTerminalColumns(children[1]) 取出。
+        if (n->GetType() == PlanNodeType::APPLY) {
+            auto ap = std::static_pointer_cast<ApplyNode>(n);
+            // 走左子树（正常递归）
+            if (!n->children.empty()) walk(n->children[0], offset);
+            // 右子树：以 lateral_alias 暴露其输出列
+            if (n->children.size() >= 2 && !ap->lateral_alias.empty()) {
+                auto cols = DeriveTerminalColumns(catalog, n->children[1]);
+                for (size_t i = 0; i < cols.size(); ++i) {
+                    const std::string& cname = cols[i];
+                    m[ap->lateral_alias + "." + cname] = offset + i;
+                    // 不覆盖 unqualified（保留左表入口）；只在第一个出现时设。
+                    if (m.find(cname) == m.end()) {
+                        m[cname] = offset + i;
+                    }
+                }
+                offset += cols.size();
+            }
+            return;
+        }
+        // 55_query: VALUES 节点 — 输出列从 column_aliases / rows 推导。
+        // VALUES 没有 catalog schema；按 ValuesNode.column_aliases 注册列。
+        if (n->GetType() == PlanNodeType::VALUES) {
+            auto v = std::static_pointer_cast<ValuesNode>(n);
+            const std::vector<std::string>* aliases = &v->column_aliases;
+            size_t ncols = aliases->empty()
+                              ? (v->rows.empty() ? 0 : v->rows[0].size())
+                              : aliases->size();
+            for (size_t i = 0; i < ncols; ++i) {
+                std::string cname;
+                if (i < aliases->size() && !(*aliases)[i].empty()) {
+                    cname = (*aliases)[i];
+                } else {
+                    cname = "col" + std::to_string(i);
+                }
+                if (m.find(cname) == m.end()) {
+                    m[cname] = offset + i;
+                }
+            }
+            offset += ncols;
+            return;
+        }
         for (auto& ch : n->children) walk(ch, offset);
     };
     size_t offset = 0;
@@ -338,11 +428,84 @@ ExecutionResult ExecutionEngine::ExecuteSubplan(const PlanNodePtr& plan, Executi
                          plan->GetType() == PlanNodeType::SET_OP ||
                          plan->GetType() == PlanNodeType::WINDOW ||
                          plan->GetType() == PlanNodeType::VIEW_DEFINE ||
+                         // 55_query：VALUES / APPLY 也是"返回结果集"的查询
+                         plan->GetType() == PlanNodeType::VALUES ||
+                         plan->GetType() == PlanNodeType::APPLY ||
                          // 46_meta：EXPLAIN / SHOW 也是"返回结果集"的查询
                          plan->GetType() == PlanNodeType::EXPLAIN ||
                          plan->GetType() == PlanNodeType::SHOW);
+        // 54_dml: RETURNING-aware 的 DML 在 returning_exprs 非空时把 emit 的行
+        // 当作查询结果集返回。UPDATE_FROM 始终按"每条命中返回一条 RETURNING"处理
+        // —— 当 returning_exprs 非空时是查询，否则是普通 DML。
+        if (!is_query) {
+            auto has_returning = [](const PlanNodePtr& p) -> bool {
+                switch (p->GetType()) {
+                    case PlanNodeType::INSERT:
+                        return !std::static_pointer_cast<InsertNode>(p)->returning_exprs.empty();
+                    case PlanNodeType::UPSERT:
+                        return !std::static_pointer_cast<UpsertNode>(p)->returning_exprs.empty();
+                    case PlanNodeType::UPDATE:
+                        return !std::static_pointer_cast<UpdateNode>(p)->returning_exprs.empty();
+                    case PlanNodeType::UPDATE_FROM:
+                        return !std::static_pointer_cast<UpdateFromNode>(p)->returning_exprs.empty();
+                    case PlanNodeType::DELETE:
+                        return !std::static_pointer_cast<DeleteNode>(p)->returning_exprs.empty();
+                    default:
+                        return false;
+                }
+            };
+            if (has_returning(plan)) {
+                is_query = true;
+                // 推导 RETURNING 列名：依次走 returning_aliases / column refs /
+                // expression ToString()。
+                std::vector<std::string> names;
+                auto collect = [&](const std::vector<ExprPtr>& exprs,
+                                   const std::vector<std::string>& aliases) {
+                    for (size_t i = 0; i < exprs.size(); ++i) {
+                        if (i < aliases.size() && !aliases[i].empty()) {
+                            names.push_back(aliases[i]);
+                            continue;
+                        }
+                        const auto& e = exprs[i];
+                        if (e && e->GetType() == NodeType::COLUMN_REF_EXPR) {
+                            names.push_back(std::static_pointer_cast<ColumnRefExpr>(e)->column_name);
+                        } else if (e) {
+                            names.push_back(e->ToString());
+                        } else {
+                            names.push_back("?");
+                        }
+                    }
+                };
+                switch (plan->GetType()) {
+                    case PlanNodeType::INSERT:
+                        collect(std::static_pointer_cast<InsertNode>(plan)->returning_exprs,
+                                std::static_pointer_cast<InsertNode>(plan)->returning_aliases);
+                        break;
+                    case PlanNodeType::UPSERT:
+                        collect(std::static_pointer_cast<UpsertNode>(plan)->returning_exprs,
+                                std::static_pointer_cast<UpsertNode>(plan)->returning_aliases);
+                        break;
+                    case PlanNodeType::UPDATE:
+                        collect(std::static_pointer_cast<UpdateNode>(plan)->returning_exprs,
+                                std::static_pointer_cast<UpdateNode>(plan)->returning_aliases);
+                        break;
+                    case PlanNodeType::UPDATE_FROM:
+                        collect(std::static_pointer_cast<UpdateFromNode>(plan)->returning_exprs,
+                                std::static_pointer_cast<UpdateFromNode>(plan)->returning_aliases);
+                        break;
+                    case PlanNodeType::DELETE:
+                        collect(std::static_pointer_cast<DeleteNode>(plan)->returning_exprs,
+                                std::static_pointer_cast<DeleteNode>(plan)->returning_aliases);
+                        break;
+                    default: break;
+                }
+                result.column_names = std::move(names);
+            }
+        }
         if (is_query) {
-            result.column_names = DeriveOutputColumnNames(plan);
+            if (result.column_names.empty()) {
+                result.column_names = DeriveOutputColumnNames(plan);
+            }
         }
         while (true) {
             Tuple t;
@@ -470,6 +633,17 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             if (plan_node->children[0]->GetType() == PlanNodeType::FILTER &&
                 plan_node->children[0]->children.size() > 0 &&
                 plan_node->children[0]->children[0]->GetType() == PlanNodeType::AGGREGATE) {
+                if (n->is_distinct) {
+                    return std::make_unique<DistinctExecutor>(context, std::move(child),
+                                                              n->columns.size());
+                }
+                return child;
+            }
+            // ---- 60_funcs: GROUPING SETS / ROLLUP / CUBE 路径 ----
+            // 子计划（SetOpNode 的 children）已经是聚合后的输出，元组形状与
+            // 外层 SELECT list 对齐；外层 ProjectNode 若再求值"聚合函数调用"
+            // 会按标量函数处理，从而得到 NULL。直接透传避免重复求值。
+            if (plan_node->children[0]->GetType() == PlanNodeType::SET_OP) {
                 if (n->is_distinct) {
                     return std::make_unique<DistinctExecutor>(context, std::move(child),
                                                               n->columns.size());
@@ -655,31 +829,125 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             if (n->query_plan) {
                 // INSERT ... SELECT：从子计划取行写入目标表。
                 return std::make_unique<InsertExecutor>(context, n->table_name,
-                                                         n->columns, n->query_plan);
+                                                         n->columns, n->query_plan,
+                                                         n->returning_exprs,
+                                                         n->returning_aliases);
             }
             return std::make_unique<InsertExecutor>(context, n->table_name, n->columns,
-                                                     n->values_list);
+                                                     n->values_list, n->is_replace,
+                                                     n->returning_exprs,
+                                                     n->returning_aliases);
         }
         case PlanNodeType::UPSERT: {
             auto n = std::static_pointer_cast<UpsertNode>(plan_node);
             return std::make_unique<UpsertExecutor>(context, n->table_name,
                                                     n->columns, n->values_list,
-                                                    n->upsert_assignments);
+                                                    n->upsert_assignments,
+                                                    n->returning_exprs,
+                                                    n->returning_aliases);
         }
         case PlanNodeType::UPDATE: {
             auto n = std::static_pointer_cast<UpdateNode>(plan_node);
             return std::make_unique<UpdateExecutor>(context, n->table_name, n->assignments,
-                                                     n->predicate, BuildColumnIndexMap(n->table_name));
+                                                     n->predicate, BuildColumnIndexMap(n->table_name),
+                                                     n->returning_exprs,
+                                                     n->returning_aliases);
+        }
+        case PlanNodeType::UPDATE_FROM: {
+            // 54_dml: UPDATE ... FROM —— 构造 join 子计划 + UpdateFromExecutor。
+            // combined cmap 覆盖 target + 所有 source 列；target cmap 用于 SET 与
+            // RETURNING 评估（只用 target 列），以保证 returning_exprs 中的"target
+            // 列名"不会与"同名的 source 列名"误命中。
+            auto n = std::static_pointer_cast<UpdateFromNode>(plan_node);
+            ExecutorPtr join_child = nullptr;
+            if (!plan_node->children.empty()) {
+                join_child = BuildExecutor(plan_node->children[0], context);
+            }
+            auto target_cmap = BuildColumnIndexMap(n->table_name);
+            // combined cmap = target_cmap + 来自 join_child 子树的全部列下标。
+            // 这里用 PlanNode 递归 CollectScanTableNames 推导所有扫描表 / 别名。
+            auto combined_cmap = BuildCombinedColumnIndexMapWithDerived(
+                catalog_, plan_node, CollectScanTableNames(plan_node));
+            // 在 combined 中显式登记 target 表自身的列，确保 target.x 形式命中。
+            for (const auto& kv : target_cmap) {
+                if (combined_cmap.find(kv.first) == combined_cmap.end()) {
+                    combined_cmap[kv.first] = kv.second;
+                }
+            }
+            return std::make_unique<UpdateFromExecutor>(context, n->table_name,
+                                                       n->target_alias,
+                                                       n->assignments,
+                                                       n->where_clause,
+                                                       target_cmap,
+                                                       combined_cmap,
+                                                       std::move(join_child),
+                                                       n->returning_exprs,
+                                                       n->returning_aliases);
         }
         case PlanNodeType::DELETE: {
             auto n = std::static_pointer_cast<DeleteNode>(plan_node);
             return std::make_unique<DeleteExecutor>(context, n->table_name, n->predicate,
-                                                     BuildColumnIndexMap(n->table_name));
+                                                     BuildColumnIndexMap(n->table_name),
+                                                     n->returning_exprs,
+                                                     n->returning_aliases);
+        }
+        case PlanNodeType::MERGE: {
+            // 54_dml: MERGE INTO —— 构造 source 子执行器 + MergeExecutor。
+            auto n = std::static_pointer_cast<MergeNode>(plan_node);
+            ExecutorPtr source_child = nullptr;
+            if (!plan_node->children.empty()) {
+                source_child = BuildExecutor(plan_node->children[0], context);
+            }
+            auto target_cmap = BuildColumnIndexMap(n->target_table);
+            auto combined_cmap = target_cmap;
+            const TableInfo* tgt = context->GetCatalog()->GetTable(n->target_table);
+            size_t offset = tgt ? tgt->columns.size() : 0;
+            std::string src_label = n->source_alias.empty() ? n->source_table : n->source_alias;
+            // 关键修复：必须按 source_table（真实表名）去 catalog 拿 schema，
+            // 不能用 src_label（别名，catalog 不识别）。
+            const TableInfo* src = context->GetCatalog()->GetTable(n->source_table);
+            if (src) {
+                for (size_t i = 0; i < src->columns.size(); ++i) {
+                    const auto& c = src->columns[i];
+                    combined_cmap[src_label + "." + c.name] = offset + i;
+                    // 不覆盖 unqualified 形式（保留 target 的入口），避免 source 列
+                    // 撞 target 同名列。
+                }
+            }
+            // 同时把 target 的列以 "<target_alias>.<col>" 形式追加，便于 on_condition
+            // 用 `t.id` 这类限定引用。
+            if (tgt && !n->target_alias.empty() && n->target_alias != n->target_table) {
+                for (size_t i = 0; i < tgt->columns.size(); ++i) {
+                    combined_cmap[n->target_alias + "." + tgt->columns[i].name] = i;
+                }
+            }
+            // 同时把 source 的列以 "<real_table>.<col>" 形式追加，匹配不带别名的
+            // s.val 形式（如果用户写了 `source.val` 而非 `s.val`）。
+            if (src && !n->source_table.empty() && n->source_table != src_label) {
+                for (size_t i = 0; i < src->columns.size(); ++i) {
+                    combined_cmap[n->source_table + "." + src->columns[i].name] = offset + i;
+                }
+            }
+            return std::make_unique<MergeExecutor>(context, n->target_table,
+                                                  n->target_alias,
+                                                  n->source_alias,
+                                                  n->on_condition,
+                                                  target_cmap,
+                                                  combined_cmap,
+                                                  std::move(source_child),
+                                                  n->has_matched_update,
+                                                  n->matched_assignments,
+                                                  n->has_not_matched_insert,
+                                                  n->not_matched_columns,
+                                                  n->not_matched_values);
         }
         case PlanNodeType::CREATE_TABLE: {
             auto n = std::static_pointer_cast<CreateTableNode>(plan_node);
             return std::make_unique<CreateTableExecutor>(context, n->table_name,
                                                           n->columns, n->primary_keys,
+                                                          n->unique_constraints,
+                                                          n->foreign_keys,
+                                                          n->table_checks,
                                                           n->if_not_exists);
         }
         case PlanNodeType::DROP_TABLE: {
@@ -705,6 +973,23 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             auto n = std::static_pointer_cast<AlterTableNode>(plan_node);
             return std::make_unique<AlterTableExecutor>(context, n.get());
         }
+        // ---- 53_ddl: SCHEMA / SEQUENCE ----
+        case PlanNodeType::CREATE_SCHEMA: {
+            auto n = std::static_pointer_cast<CreateSchemaNode>(plan_node);
+            return std::make_unique<CreateSchemaExecutor>(context, n.get());
+        }
+        case PlanNodeType::DROP_SCHEMA: {
+            auto n = std::static_pointer_cast<DropSchemaNode>(plan_node);
+            return std::make_unique<DropSchemaExecutor>(context, n.get());
+        }
+        case PlanNodeType::CREATE_SEQUENCE: {
+            auto n = std::static_pointer_cast<CreateSequenceNode>(plan_node);
+            return std::make_unique<CreateSequenceExecutor>(context, n.get());
+        }
+        case PlanNodeType::DROP_SEQUENCE: {
+            auto n = std::static_pointer_cast<DropSequenceNode>(plan_node);
+            return std::make_unique<DropSequenceExecutor>(context, n.get());
+        }
         case PlanNodeType::SET_OP: {
             auto n = std::static_pointer_cast<SetOpNode>(plan_node);
             if (plan_node->children.size() < 2) return nullptr;
@@ -720,6 +1005,39 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             }
             return std::make_unique<SetOpExecutor>(context, std::move(left),
                                                     std::move(right), kind_str);
+        }
+        case PlanNodeType::VALUES: {
+            // 55_query: VALUES 行构造器。直接构造 ValuesExecutor；
+            // 其下游 ProjectNode 由 BuildExecutor 后续递归构造。
+            auto n = std::static_pointer_cast<ValuesNode>(plan_node);
+            return std::make_unique<ValuesExecutor>(context,
+                                                    n->rows,
+                                                    n->column_aliases,
+                                                    n->derived_alias);
+        }
+        case PlanNodeType::APPLY: {
+            // 55_query: LATERAL / CROSS APPLY —— 对每条外层行驱动右子计划。
+            auto n = std::static_pointer_cast<ApplyNode>(plan_node);
+            if (plan_node->children.size() < 2) return nullptr;
+            auto left = BuildExecutor(plan_node->children[0], context);
+            auto right = BuildExecutor(plan_node->children[1], context);
+            if (!left || !right) return nullptr;
+            // 构造 combined cmap：左侧 plan_node->children[0] 子树里所有扫描表
+            // 的列下标，由 BuildCombinedColumnIndexMapWithDerived 给出。
+            // 这些列是右子计划在被设为 outer_bind 时需要回查的列。
+            auto cmap = BuildCombinedColumnIndexMapWithDerived(
+                catalog_, plan_node->children[0], CollectScanTableNames(plan_node->children[0]));
+            // 把 Planner 收集的「LATERAL 内层表名」搬到 unordered_set，传给 ApplyExecutor
+            // 注入到 ExecutionContext，让右子计划的 evaluator 识别 inner tables。
+            std::unordered_set<std::string> lateral_inner;
+            for (const auto& s : n->lateral_inner_tables) {
+                if (!s.empty()) lateral_inner.insert(s);
+            }
+            return std::make_unique<ApplyExecutor>(context, std::move(left),
+                                                   std::move(right),
+                                                   n->is_left_outer,
+                                                   std::move(cmap),
+                                                   std::move(lateral_inner));
         }
         case PlanNodeType::SUBQUERY: {
             auto n = std::static_pointer_cast<SubqueryNode>(plan_node);
@@ -831,8 +1149,26 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             return std::make_unique<NoOpExecutor>(context);
         case PlanNodeType::CREATE_TRIGGER:
             return std::make_unique<NoOpExecutor>(context);
+        // ---- 60_view_trigger (Category 9)：物化视图执行 ----
+        case PlanNodeType::CREATE_MATERIALIZED_VIEW: {
+            return std::make_unique<MaterializedViewExecutor>(
+                context, MaterializedViewExecutor::Kind::CREATE,
+                plan_node.get());
+        }
+        case PlanNodeType::ALTER_MATERIALIZED_VIEW: {
+            return std::make_unique<MaterializedViewExecutor>(
+                context, MaterializedViewExecutor::Kind::REFRESH,
+                plan_node.get());
+        }
         case PlanNodeType::CREATE_FUNCTION:
             return std::make_unique<NoOpExecutor>(context);
+        // ---- 59_procs (Category 8) ----
+        case PlanNodeType::CREATE_PROCEDURE:
+            return std::make_unique<NoOpExecutor>(context);
+        case PlanNodeType::CALL: {
+            auto n = std::static_pointer_cast<CallNode>(plan_node);
+            return std::make_unique<CallExecutor>(context, n.get());
+        }
         // ---- 46_meta ----
         case PlanNodeType::EXPLAIN: {
             auto n = std::static_pointer_cast<ExplainNode>(plan_node);
@@ -977,6 +1313,25 @@ std::vector<std::string> ExecutionEngine::DeriveOutputColumnNames(const PlanNode
                 const TableInfo* info = catalog_->GetTable(tname);
                 if (info) {
                     for (const auto& c : info->columns) names.push_back(c.name);
+                    continue;
+                }
+                // 55_query: VALUES 节点作为 SELECT * 的源 —— 直接采用
+                // ValuesNode.column_aliases。
+                if (!proj->children.empty() &&
+                    proj->children[0]->GetType() == PlanNodeType::VALUES) {
+                    auto v = std::static_pointer_cast<ValuesNode>(
+                        proj->children[0]);
+                    size_t ncols = v->column_aliases.empty()
+                                      ? (v->rows.empty() ? 0 : v->rows[0].size())
+                                      : v->column_aliases.size();
+                    for (size_t i = 0; i < ncols; ++i) {
+                        if (i < v->column_aliases.size() &&
+                            !v->column_aliases[i].empty()) {
+                            names.push_back(v->column_aliases[i]);
+                        } else {
+                            names.push_back("col" + std::to_string(i));
+                        }
+                    }
                     continue;
                 }
                 // 派生表占位：把内层计划的输出列填入

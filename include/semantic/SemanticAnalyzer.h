@@ -41,6 +41,7 @@ private:
     bool AnalyzeInsert(const InsertStatement& stmt);
     bool AnalyzeUpdate(const UpdateStatement& stmt);
     bool AnalyzeDelete(const DeleteStatement& stmt);
+    bool AnalyzeMerge(const MergeStatement& stmt);
     bool AnalyzeCreateTable(const CreateTableStatement& stmt);
     bool AnalyzeDropTable(const DropTableStatement& stmt);
     bool AnalyzeCreateIndex(const CreateIndexStatement& stmt);

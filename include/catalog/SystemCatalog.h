@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <vector>
 
@@ -113,6 +114,12 @@ public:
     struct ViewDefinition {
         std::string view_name;
         SelectStatementPtr query;
+        // 60_view_trigger (Category 9): WITH [CASCADED|LOCAL] CHECK OPTION 状态。
+        // has_check_option=true 时视图的 WHERE 表达式需要在 INSERT/UPDATE 通过该
+        // 视图时进行校验；check_option_cascaded=true 表示 CASCADED，默认 LOCAL。
+        ExprPtr check_option_where = nullptr;
+        bool has_check_option = false;
+        bool check_option_cascaded = false;
     };
     struct FunctionDefinition {
         std::string function_name;
@@ -128,7 +135,20 @@ public:
         TriggerTiming timing = TriggerTiming::BEFORE;
         TriggerEvent event = TriggerEvent::INSERT;
         std::string table_name;
+        // 60_view_trigger (Category 9)：FOR EACH ROW (默认 true) /
+        // FOR EACH STATEMENT (false)。STATEMENT 级触发器在每条 DML 上只跑一次。
+        bool for_each_row = true;
         std::vector<std::pair<std::string, ExprPtr>> assignments;
+    };
+
+    // 60_view_trigger (Category 9)：物化视图的元数据。
+    // backing_table 字段是 catalog 内真实存在的一张堆表（默认名 "__mv_<view_name>"）；
+    // query_text 字段保存原始 SELECT 文本，REFRESH 时由 Planner 重新解析并执行。
+    struct MaterializedViewInfo {
+        std::string view_name;
+        std::string backing_table;     // 通常 "__mv_<view_name>"
+        std::vector<ColumnDefinition> columns;  // 输出列定型
+        std::string query_text;         // 原始 SELECT 文本（用于 REFRESH 重解析）
     };
 
     bool CreateView(const ViewDefinition& def);
@@ -137,6 +157,21 @@ public:
     const ViewDefinition* GetView(const std::string& view_name) const;
     // 返回值同 GetView，但大小写不敏感（UDF 调用大小写差异时的回退路径）。
     const ViewDefinition* LookupView(const std::string& view_name) const;
+    // 60_view_trigger: 在视图已注册后回填 WITH CHECK OPTION 配置。
+    // 由 Planner::PlanCreateView 在用户写了 WITH CHECK OPTION 时调用。
+    void SetViewCheckOption(const std::string& view_name,
+                            ExprPtr where_expr,
+                            bool cascaded);
+
+    // 60_view_trigger (Category 9)：物化视图注册表。
+    bool CreateMaterializedView(const MaterializedViewInfo& info);
+    bool DropMaterializedView(const std::string& view_name);
+    bool HasMaterializedView(const std::string& view_name) const;
+    const MaterializedViewInfo* GetMaterializedView(const std::string& view_name) const;
+    const MaterializedViewInfo* LookupMaterializedView(const std::string& view_name) const;
+    // 物化视图默认 backing 表名规则："__mv_<view_name>"。
+    // 视图名包含空格 / 大小写时保持原样，便于调试。
+    static std::string MaterializedViewBackingTable(const std::string& view_name);
 
     bool CreateFunction(const FunctionDefinition& def);
     bool DropFunction(const std::string& function_name);
@@ -144,6 +179,25 @@ public:
     const FunctionDefinition* GetFunction(const std::string& function_name) const;
     // 大小写不敏感的函数查找：UDF 调用方可能使用与 CREATE 时不同的大小写。
     const FunctionDefinition* LookupFunction(const std::string& name) const;
+
+    // ---- 59_procs (Category 8)：过程定义 ----
+    //
+    // 过程与函数共享 body_statements 的形态（DECLARE / SET / IF / WHILE /
+    // LOOP / REPEAT / CASE / LEAVE / ITERATE / SIGNAL / HANDLER / CURSOR /
+    // RETURN），但过程没有 RETURN 值（V1 中执行器也允许 RETURN 但忽略结果）。
+    // OUT 参数由调用方按名字取回（见 ExecutionContext::out_args_）。
+    struct ProcedureDefinition {
+        std::string procedure_name;
+        std::vector<FunctionParameter> parameters;
+        std::vector<StatementPtr> body_statements;
+    };
+
+    bool CreateProcedure(const ProcedureDefinition& def);
+    bool DropProcedure(const std::string& procedure_name, bool if_exists);
+    bool HasProcedure(const std::string& procedure_name) const;
+    const ProcedureDefinition* GetProcedure(const std::string& procedure_name) const;
+    // 大小写不敏感的查找。
+    const ProcedureDefinition* LookupProcedure(const std::string& name) const;
 
     bool CreateTrigger(const TriggerDefinition& def);
     bool DropTrigger(const std::string& trigger_name);
@@ -155,6 +209,16 @@ public:
         TriggerTiming timing,
         TriggerEvent event) const;
 
+    // 60_view_trigger (Category 9)：触发器持久化。
+    // 把 trigger 元数据写到一张独立的 __sys_triggers__ 堆（与 __sys_indexes__
+    // 类似的做法）；LoadFromDisk 时再读回内存态，让重启后 CREATE TRIGGER 的
+    // 结果仍生效。
+    //
+    // 设计取舍：触发器体内的 assignments 是 ExprPtr（AST 节点），落盘前需要
+    // 转成可重新解析的文本；恢复时用 Parser 把文本重新解析回 ExprPtr。
+    // 为简化实现，assignments 序列化成一个拼接字符串（lhs1 = expr1; lhs2 = expr2; ...），
+    // DROP 时按 trigger_name 精确匹配并整行删除。
+
     // ---- ALTER TABLE 支撑 ----
     //
     // 这些表层变更原语供执行器在 ALTER TABLE 各分支中调用：
@@ -163,7 +227,7 @@ public:
     //   - RenameTableHeapKey          移动 table_heaps_ 的键（重命名用）
     //   - DropIndexesForTable         失效并清掉该表所有索引（schema 可能变化，
     //                                 重建/迁移索引超出本任务范围）
-    //   - UpdateTableSchema           一站式封装：把 in-memory 状态更新到新 schema，
+    //   - UpdateTableSchema           一站式封装：把 in-memory 状态更新到新 schema,
     //                                 并替换 sys_tables 记录。执行器负责行的字节重写。
     bool DropPersistedTableMetadata(const std::string& table_name);
     bool PersistTableInfo(const TableInfo& info);
@@ -174,6 +238,52 @@ public:
     // new_info.table_name 必须与 old_name 相同除非是 RENAME TO。
     bool UpdateTableSchema(const std::string& old_name, const TableInfo& new_info);
 
+    // ---- 53_ddl: 命名空间与序列 ----
+    //
+    // Schema：catalog 维护一组已知 schema 名称；CREATE TABLE schema.tbl 时若
+    //   schema 不在集合中则报错；DROP SCHEMA 时若还有属于该 schema 的表则报错。
+    // Sequence：catalog 维护一组 sequence；NEXTVAL FOR 由 ExpressionEvaluator
+    //   走 NextSequence() 原子推进并返回当前值。
+
+    bool CreateSchema(const std::string& schema_name, bool if_not_exists);
+    bool DropSchema(const std::string& schema_name, bool if_exists);
+    bool HasSchema(const std::string& schema_name) const;
+    // 把形如 "finance.txn" 的限定名拆成 (schema, table)；schema 为空表示无限定。
+    static std::pair<std::string, std::string> SplitQualifiedName(
+        const std::string& maybe_qualified);
+
+    struct SequenceState {
+        int64_t current_value = 1;  // 最近一次 NEXTVAL 之前已发出的值；下一次返回 current + step
+        int64_t step = 1;
+        int64_t start_value = 1;
+    };
+    bool CreateSequence(const std::string& name, int64_t start_value,
+                        int64_t step, bool if_not_exists);
+    bool DropSequence(const std::string& name, bool if_exists);
+    bool HasSequence(const std::string& name) const;
+    // 推进序列并返回新当前值。序列不存在时返回 false。
+    bool NextSequence(const std::string& name, int64_t* out_value);
+
+    // ---- 53_ddl: FOREIGN KEY 约束元数据 ----
+    //
+    // 存储格式：每条 FK 关联一对 (child_table, parent_table)，按 child_table
+    // 索引。执行期在 INSERT/UPDATE 子表写入时检查 parent 行存在；在 DELETE/
+    // UPDATE 父表时根据 on_delete_action 决定 CASCADE / RESTRICT / SET NULL。
+    // 表元数据 blob 不含 FK 部分（避免改动历史二进制布局），运行时仅维护
+    // 内存态即可。
+    bool AddForeignKey(const std::string& child_table,
+                       const std::vector<std::string>& child_cols,
+                       const std::string& parent_table,
+                       const std::vector<std::string>& parent_cols,
+                       int on_delete_action, int on_update_action);
+    // child_table 上的全部 FK。子表不存在返回空 vector。
+    std::vector<ForeignKeyDef> GetForeignKeysForChild(
+        const std::string& child_table) const;
+    // 引用 parent_table 的全部 FK（child + child_cols + actions）。
+    // 用于 DELETE/UPDATE 父表时扫描所有需要级联 / 限制 / 置空的子行。
+    std::vector<std::pair<std::string, ForeignKeyDef>> GetForeignKeysReferencing(
+        const std::string& parent_table) const;
+
 private:
     BufferPoolManager* buffer_pool_manager_;
     LogManager* log_manager_ = nullptr;  // Phase B：可选 WAL 写出器
@@ -183,6 +293,9 @@ private:
     // 索引目录堆的首页。旧版本数据库没有这张堆，此时为 INVALID_PAGE_ID，
     // 首次 CREATE INDEX 时惰性创建——这样旧库文件仍能正常打开。
     page_id_t sys_indexes_first_page_id_;
+    // 60_view_trigger (Category 9): 触发器目录堆的首页。旧库没有时为 INVALID_PAGE_ID，
+    // 首次 CREATE TRIGGER 时惰性创建。
+    page_id_t sys_triggers_first_page_id_;
 
     // 各用户表对应的数据堆，key为表名
     std::unordered_map<std::string, std::unique_ptr<TableHeap>> table_heaps_;
@@ -193,10 +306,22 @@ private:
     std::unordered_map<std::string, IndexInfo> indexes_;
     std::unordered_map<std::string, std::unique_ptr<BPlusTree>> index_trees_;
 
+    // 60_view_trigger (Category 9)：触发器目录堆与物化视图字典。
+    std::unique_ptr<TableHeap> trigger_heap_;  // __sys_triggers__ 堆
+    std::unordered_map<std::string, MaterializedViewInfo> materialized_views_;
+
     // 40_txn_view_udf：视图 / UDF / 触发器字典。
     std::unordered_map<std::string, ViewDefinition> views_;
     std::unordered_map<std::string, FunctionDefinition> functions_;
     std::unordered_map<std::string, TriggerDefinition> triggers_;
+    // 59_procs (Category 8)：过程字典。
+    std::unordered_map<std::string, ProcedureDefinition> procedures_;
+
+    // 53_ddl：schema / sequence / FK 内存态。
+    std::unordered_set<std::string> schemas_;
+    std::unordered_map<std::string, SequenceState> sequences_;
+    // FK 按 child_table 索引；每条 FK 的 child_table 字段冗余存储以便遍历。
+    std::unordered_map<std::string, std::vector<ForeignKeyDef>> foreign_keys_;
 
     // 将一条表的元数据（表名、列定义列表）编码为记录，追加写入sys_tables堆表
     bool PersistTableMetadata(const TableInfo& table_info);
@@ -216,6 +341,22 @@ private:
     bool OpenIndexTree(const IndexInfo& index_info);
     // 删除某张表的全部索引（含 B+Tree 页面回收）
     void DropIndexesOfTable(const std::string& table_name);
+
+    // ---- 60_view_trigger (Category 9)：触发器目录内部实现 ----
+    // 确保 __sys_triggers__ 堆存在（必要时创建并把首页 id 记入 sys_tables）。
+    bool EnsureSysTriggersHeap();
+    // 把一条 trigger 元数据写到 __sys_triggers__ 堆。
+    bool PersistTriggerMetadata(const TriggerDefinition& def);
+    // 从 __sys_triggers__ 删除 trigger_name 对应的那条记录。
+    void RemoveTriggerMetadata(const std::string& trigger_name);
+    // 从 __sys_triggers__ 重新加载全部触发器到内存态。
+    void LoadTriggersFromDisk();
+    // 把 trigger 的 assignments 列表序列化为单一字符串（"lhs1 = expr1; lhs2 = expr2; ..."）。
+    static std::string SerializeTriggerAssignments(
+        const std::vector<std::pair<std::string, ExprPtr>>& assignments);
+    // 反序列化（用 Parser 把字符串重新解析为 ExprPtr）；失败返回空 vector。
+    static std::vector<std::pair<std::string, ExprPtr>> DeserializeTriggerAssignments(
+        const std::string& text);
 };
 
 }  // namespace sqlcompiler

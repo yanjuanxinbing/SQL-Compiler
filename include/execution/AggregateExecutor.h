@@ -43,6 +43,27 @@ private:
         bool    min_max_init = false;
         // 仅 COUNT(DISTINCT col) / SUM(DISTINCT col) 有效：按组收集到的去重集合。
         std::unordered_set<std::string> distinct_values;
+        // ---- 60_funcs: STDDEV/VARIANCE（Welford 单遍累加器）----
+        double  welford_mean = 0.0;
+        double  welford_m2   = 0.0;
+        // ---- 60_funcs: MEDIAN/PERCENTILE_CONT/PERCENTILE_DISC（有序集合聚合）----
+        // 直接收集到的样本值（不参与 SUM/AVG 等路径，独立于上述字段）。
+        std::vector<Value> collected_values;
+        // ---- 60_funcs: PERCENTILE_* 专用 (fraction_p, sort_key) 样本对 ----
+        // 因为 percent_rank 的样本值与分位点 p 分属两个不同评估路径，
+        // 放在同一个 vector 会导致索引含义混淆。这里单独存放一个并行 vector。
+        std::vector<Value> percentile_p_samples;
+        std::vector<Value> percentile_sort_keys;
+        // ---- 60_funcs: STRING_AGG（值 + 可选 WITHIN GROUP 排序键）----
+        // 每条记录为 (sort_key_value, string_value)；sort_key 为 NULL 时
+        // 表示未指定排序键，按插入顺序输出。
+        std::vector<std::pair<Value, std::string>> string_agg_entries;
+        // STRING_AGG 分隔符：执行期首次见到该聚合调用时确定。
+        std::string string_agg_delim;
+        // 是否已记录分隔符
+        bool string_agg_delim_set = false;
+        // 是否需要 WITHIN GROUP 排序输出
+        bool string_agg_has_order = false;
     };
 
     struct Group {

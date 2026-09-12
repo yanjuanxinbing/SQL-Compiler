@@ -67,10 +67,38 @@ public:
                            const std::vector<Value>* old_row,  // 可空
                            std::vector<Value>& row_values);    // 就地修改
 
-    // AFTER 触发器：当前实现仅打印日志（按任务文档约定保留为 no-op）。
+    // 60_view_trigger (Category 9): AFTER 触发器执行。
+    //
+    // - trigger_def 直接传入（含 for_each_row 与 assignments）。
+    // - old_row / new_row 描述 OLD/NEW 上下文；INSERT 上 OLD 各列视为 NULL。
+    // - STATEMENT 级触发器只在第一条被传入时执行（call_once = true），
+    //   内部维护"已经为该语句执行过"的标记；后续调用即便 old/new 不同也直接返回。
+    //   标记在每次 DML 语句开始时通过 ResetStatementFireState 清零。
+    //
+    // 当前实现：AFTER 仅"评估 trigger body 的 assignments"作为副作用。
+    //   - NEW.col = expr：写回 frame 但不修改表行（AFTER 时已落盘）。
+    //   - 把 expr 的最终值附加到 ExecutionContext::session_log_ 字典作为
+    //     'session 变量'（@xxx），便于用户通过会话变量回读 AFTER 的副作用。
+    //   - 不支持的复杂 body（IF/WHILE 等）由上层在 V1 跳过；保持简单。
+    //
+    // 不抛错：触发器体内的运行错误通过 CompilerException 上抛，由调用方捕获。
     static void FireAfter(SystemCatalog* catalog,
+                          ExecutionContext* context,
                           const std::string& table_name,
-                          TriggerEvent event);
+                          TriggerEvent event,
+                          const std::unordered_map<std::string, size_t>& column_index_map,
+                          const std::vector<Value>* old_row,
+                          const std::vector<Value>* new_row);
+
+    // 清空"已为当前语句 fire 过 AFTER"的标记。每条 DML 语句执行入口处调用。
+    static void ResetStatementFireState(ExecutionContext* context);
+
+    // 把 AFTER 触发器产生的"会话日志"返回给用户。
+    // V1：执行器以 session_log_[name] = value 形式持有；调用方（如 CALL/SELECT
+    // 路径上的特定函数）可以读回。
+    // 默认 no-op；让 V1 简化通过 INSERT INTO log 的方式记录 AFTER 副作用。
+    static const std::unordered_map<std::string, Value>& SessionLog(
+        const ExecutionContext* context);
 };
 
 }  // namespace sqlcompiler

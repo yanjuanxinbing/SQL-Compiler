@@ -24,6 +24,7 @@ private:
     PlanNodePtr PlanInsert(const InsertStatement& stmt);
     PlanNodePtr PlanUpdate(const UpdateStatement& stmt);
     PlanNodePtr PlanDelete(const DeleteStatement& stmt);
+    PlanNodePtr PlanMerge(const MergeStatement& stmt);
     PlanNodePtr PlanCreateTable(const CreateTableStatement& stmt);
     PlanNodePtr PlanDropTable(const DropTableStatement& stmt);
     PlanNodePtr PlanCreateIndex(const CreateIndexStatement& stmt);
@@ -40,10 +41,22 @@ private:
     PlanNodePtr PlanRollbackTo(const RollbackToStatement& stmt);
     PlanNodePtr PlanCreateView(const CreateViewStatement& stmt);
     PlanNodePtr PlanDropView(const DropViewStatement& stmt);
+    // 60_view_trigger (Category 9): MATERIALIZED VIEW 计划入口
+    PlanNodePtr PlanCreateMaterializedView(const MaterializedViewStatement& stmt);
+    PlanNodePtr PlanAlterMaterializedView(const AlterMaterializedViewStatement& stmt);
     PlanNodePtr PlanCreateTrigger(const CreateTriggerStatement& stmt);
     PlanNodePtr PlanDropTrigger(const DropTriggerStatement& stmt);
     PlanNodePtr PlanCreateFunction(const CreateFunctionStatement& stmt);
     PlanNodePtr PlanDropFunction(const DropFunctionStatement& stmt);
+    // ---- 59_procs (Category 8) ----
+    PlanNodePtr PlanCreateProcedure(const CreateProcedureStatement& stmt);
+    PlanNodePtr PlanDropProcedure(const DropProcedureStatement& stmt);
+    PlanNodePtr PlanCall(const CallStatement& stmt);
+    // ---- 53_ddl: SCHEMA / SEQUENCE ----
+    PlanNodePtr PlanCreateSchema(const CreateSchemaStatement& stmt);
+    PlanNodePtr PlanDropSchema(const DropSchemaStatement& stmt);
+    PlanNodePtr PlanCreateSequence(const CreateSequenceStatement& stmt);
+    PlanNodePtr PlanDropSequence(const DropSequenceStatement& stmt);
     // ---- 46_meta ----
     PlanNodePtr PlanExplain(const ExplainStatement& stmt);
     PlanNodePtr PlanShow(const ShowStatement& stmt);
@@ -68,6 +81,13 @@ private:
     void MarkUdfCallsInExpr(ExprPtr& expr) const;
     void MarkUdfCallsInList(std::vector<ExprPtr>& list) const;
     void MarkUdfCallsInSelect(const SelectStatement& stmt) const;
+
+    // ---- 60_funcs: GROUPING SETS / ROLLUP / CUBE 展开 ----
+    // 把 stmt 中 grouping_sets 拆解为多个"按子集分组"的子 SELECT，
+    // 各子 SELECT 的 SELECT list 把不在该子集的分组列替换为 NULL，
+    // 最后用 UNION ALL 把它们合并。scan_input 是 FROM + WHERE + JOIN
+    // 链已经建好的子计划；HAVING 复制到每个子 SELECT 内部。
+    PlanNodePtr PlanGroupingSets(const SelectStatement& stmt, PlanNodePtr scan_input);
 };
 
 }  // namespace sqlcompiler

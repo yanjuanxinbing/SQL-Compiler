@@ -1,9 +1,12 @@
 #include "plan/Planner.h"
 
 #include "catalog/SystemCatalog.h"
+#include "lexer/Lexer.h"
+#include "parser/Parser.h"
 
 #include <cctype>
 #include <functional>
+#include <set>
 #include <utility>
 
 namespace sqlcompiler {
@@ -31,8 +34,15 @@ bool ContainsAggregateExpr(const ExprPtr& e) {
             auto f = std::static_pointer_cast<FunctionCallExpr>(e);
             std::string name;
             for (char c : f->function_name) name.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+            // 60_funcs: 把新增的统计 / 有序集合聚合纳入聚合识别，否则
+            // SELECT STDDEV(v) FROM stats 会被当成投影表达式漏掉聚合路径。
             if (name == "COUNT" || name == "SUM" || name == "AVG" ||
-                name == "MIN" || name == "MAX") {
+                name == "MIN" || name == "MAX" ||
+                name == "STDDEV" || name == "STDDEV_POP" || name == "STDDEV_SAMP" ||
+                name == "VARIANCE" || name == "VAR_POP" || name == "VAR_SAMP" ||
+                name == "MEDIAN" ||
+                name == "STRING_AGG" || name == "GROUP_CONCAT" ||
+                name == "PERCENTILE_CONT" || name == "PERCENTILE_DISC") {
                 return true;
             }
             for (auto& a : f->arguments) {
@@ -109,7 +119,13 @@ ExprPtr RewriteAggregateRefs(const ExprPtr& expr,
             std::string name;
             for (char c : f->function_name) name.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
             if (name == "COUNT" || name == "SUM" || name == "AVG" ||
-                name == "MIN" || name == "MAX") {
+                name == "MIN" || name == "MAX" ||
+                // 60_funcs: HAVING 中也可能引用 STDDEV/MEDIAN 等聚合
+                name == "STDDEV" || name == "STDDEV_POP" || name == "STDDEV_SAMP" ||
+                name == "VARIANCE" || name == "VAR_POP" || name == "VAR_SAMP" ||
+                name == "MEDIAN" ||
+                name == "STRING_AGG" || name == "GROUP_CONCAT" ||
+                name == "PERCENTILE_CONT" || name == "PERCENTILE_DISC") {
                 // Find matching aggregate in aggregate_exprs by name
                 for (size_t i = 0; i < aggregate_exprs.size(); ++i) {
                     const auto& ae = aggregate_exprs[i];
@@ -149,6 +165,8 @@ PlanNodePtr Planner::CreatePlan(const StatementPtr& statement) {
             return PlanUpdate(*std::static_pointer_cast<UpdateStatement>(statement));
         case NodeType::DELETE_STMT:
             return PlanDelete(*std::static_pointer_cast<DeleteStatement>(statement));
+        case NodeType::MERGE_STMT:
+            return PlanMerge(*std::static_pointer_cast<MergeStatement>(statement));
         case NodeType::CREATE_TABLE_STMT:
             return PlanCreateTable(*std::static_pointer_cast<CreateTableStatement>(statement));
         case NodeType::DROP_TABLE_STMT:
@@ -176,10 +194,26 @@ PlanNodePtr Planner::CreatePlan(const StatementPtr& statement) {
             return PlanSavepoint(*std::static_pointer_cast<SavepointStatement>(statement));
         case NodeType::RELEASE_SAVEPOINT_STMT:
             return PlanReleaseSavepoint(*std::static_pointer_cast<ReleaseSavepointStatement>(statement));
+        // ---- 53_ddl: SCHEMA / SEQUENCE ----
+        case NodeType::CREATE_SCHEMA_STMT:
+            return PlanCreateSchema(*std::static_pointer_cast<CreateSchemaStatement>(statement));
+        case NodeType::DROP_SCHEMA_STMT:
+            return PlanDropSchema(*std::static_pointer_cast<DropSchemaStatement>(statement));
+        case NodeType::CREATE_SEQUENCE_STMT:
+            return PlanCreateSequence(*std::static_pointer_cast<CreateSequenceStatement>(statement));
+        case NodeType::DROP_SEQUENCE_STMT:
+            return PlanDropSequence(*std::static_pointer_cast<DropSequenceStatement>(statement));
         case NodeType::CREATE_VIEW_STMT:
             return PlanCreateView(*std::static_pointer_cast<CreateViewStatement>(statement));
         case NodeType::DROP_VIEW_STMT:
             return PlanDropView(*std::static_pointer_cast<DropViewStatement>(statement));
+        // 60_view_trigger (Category 9): MATERIALIZED VIEW / ALTER MATERIALIZED VIEW
+        case NodeType::CREATE_MATERIALIZED_VIEW_STMT:
+            return PlanCreateMaterializedView(
+                *std::static_pointer_cast<MaterializedViewStatement>(statement));
+        case NodeType::ALTER_MATERIALIZED_VIEW_STMT:
+            return PlanAlterMaterializedView(
+                *std::static_pointer_cast<AlterMaterializedViewStatement>(statement));
         case NodeType::CREATE_TRIGGER_STMT:
             return PlanCreateTrigger(*std::static_pointer_cast<CreateTriggerStatement>(statement));
         case NodeType::DROP_TRIGGER_STMT:
@@ -188,6 +222,13 @@ PlanNodePtr Planner::CreatePlan(const StatementPtr& statement) {
             return PlanCreateFunction(*std::static_pointer_cast<CreateFunctionStatement>(statement));
         case NodeType::DROP_FUNCTION_STMT:
             return PlanDropFunction(*std::static_pointer_cast<DropFunctionStatement>(statement));
+        // ---- 59_procs (Category 8) ----
+        case NodeType::CREATE_PROCEDURE_STMT:
+            return PlanCreateProcedure(*std::static_pointer_cast<CreateProcedureStatement>(statement));
+        case NodeType::DROP_PROCEDURE_STMT:
+            return PlanDropProcedure(*std::static_pointer_cast<DropProcedureStatement>(statement));
+        case NodeType::CALL_STMT:
+            return PlanCall(*std::static_pointer_cast<CallStatement>(statement));
         // ---- 46_meta ----
         case NodeType::EXPLAIN_STMT:
             return PlanExplain(*std::static_pointer_cast<ExplainStatement>(statement));
@@ -212,6 +253,46 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
     // 递归地把 select_list / where / having / order_by / join 中嵌套的
     // SubqueryExprNode 关联到 subquery_plan 上。
     PlanSubqueriesInSelect(stmt);
+    // 55_query: FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE / FOR KEY SHARE
+    // 在本单写引擎下是 parse-only hint：解析器已把它记到 stmt.for_update_kind，
+    // 此处不构造任何加锁路径。锁语义本身不强制执行（详见
+    // tests/sql/55_query.sql 顶部说明）。
+    (void)stmt.for_update_kind;
+    // 55_query: VALUES 派生表 FROM (VALUES (1,'a'), (2,'b')) AS t(id, name)
+    // 把 values_rows / values_column_aliases 装到 ValuesNode 上，子计划 children 为空。
+    if (!stmt.values_rows.empty()) {
+        auto values = std::make_shared<ValuesNode>(
+            stmt.values_rows, stmt.values_column_aliases, stmt.derived_alias);
+        PlanNodePtr current = values;
+        // outer WHERE
+        if (stmt.where_clause) {
+            auto f = std::make_shared<FilterNode>(stmt.where_clause);
+            f->children.push_back(current);
+            current = f;
+        }
+        bool has_window = SelectHasWindowFunc(stmt);
+        if (has_window) {
+            auto wn = std::make_shared<WindowNode>(stmt.select_list, stmt.select_aliases,
+                                                   stmt.named_windows);
+            wn->children.push_back(current);
+            current = wn;
+        } else {
+            auto proj = std::make_shared<ProjectNode>(stmt.select_list, stmt.select_aliases, stmt.is_distinct);
+            proj->children.push_back(current);
+            current = proj;
+        }
+        if (!stmt.order_by.empty()) {
+            auto s = std::make_shared<SortNode>(stmt.order_by);
+            s->children.push_back(current);
+            current = s;
+        }
+        if (stmt.limit >= 0) {
+            auto l = std::make_shared<LimitNode>(stmt.limit, stmt.limit_offset);
+            l->children.push_back(current);
+            current = l;
+        }
+        return current;
+    }
     // 派生表 FROM (SELECT ...) AS alias —— 把子查询递归规划成子树当作 FROM。
     if (stmt.derived_table) {
         PlanNodePtr sub_plan = PlanSelect(*stmt.derived_table);
@@ -311,6 +392,42 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
             }
             effective_condition = combined;
         }
+        // 55_query: LATERAL 派生表 join ——对每条外层行跑一次右子计划（带 outer_bind），
+        // 并把产生的右行与左行拼接。Planner 这里生成 ApplyNode；执行器负责每行重算。
+        // 右子查询用一个 SeqScanNode 占位（table_alias == table_name）包装，
+        // 让 BuildCombinedColumnIndexMapWithDerived 走「派生表」路径按输出列
+        // 暴露给外层 cmap，避免把内层 SeqScan 的真实表名写入 outer_cmap。
+        if (j.is_lateral) {
+            std::string derived_alias = !j.table_alias.empty() ? j.table_alias : j.table_name;
+            // 收集右子计划的「内层表名」：from_table_alias 与 joins 的别名/表名，
+            // 供 ApplyExecutor 在 ctx 中注册，让右子计划的 evaluator 知道哪些限定
+            // 列是内层（不走 outer_bind）。
+            std::vector<std::string> lateral_inner_tables;
+            if (j.lateral_subquery) {
+                if (!j.lateral_subquery->from_table_alias.empty()) {
+                    lateral_inner_tables.push_back(j.lateral_subquery->from_table_alias);
+                }
+                for (const auto& lj : j.lateral_subquery->joins) {
+                    if (!lj.table_name.empty()) {
+                        lateral_inner_tables.push_back(lj.table_name);
+                    }
+                    if (!lj.table_alias.empty()) {
+                        lateral_inner_tables.push_back(lj.table_alias);
+                    }
+                }
+            }
+            auto apply = std::make_shared<ApplyNode>(false, derived_alias,
+                                                    lateral_inner_tables);
+            apply->children.push_back(current);
+            if (j.lateral_subquery) {
+                PlanNodePtr lateral_plan = PlanSelect(*j.lateral_subquery);
+                auto placeholder = std::make_shared<SeqScanNode>(derived_alias, derived_alias);
+                placeholder->children.push_back(lateral_plan);
+                apply->children.push_back(placeholder);
+            }
+            current = apply;
+            continue;
+        }
         auto join = std::make_shared<JoinNode>(j.join_type, effective_condition);
         join->children.push_back(current);
         join->children.push_back(std::make_shared<SeqScanNode>(j.table_name, j.table_alias));
@@ -321,6 +438,35 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
         auto f = std::make_shared<FilterNode>(stmt.where_clause);
         f->children.push_back(current);
         current = f;
+    }
+    // ---- 60_funcs: GROUPING SETS / ROLLUP / CUBE 展开 ----
+    // 把 grouping_sets 拆分为多个"按子集分组"的子 SELECT，UNION ALL 起来。
+    // 在 PlanSelect 主流程中，scan_input 已经是 WHERE 之后的子计划。
+    if (!stmt.grouping_sets.empty()) {
+        current = PlanGroupingSets(stmt, current);
+        // 跳过原始的 GROUP BY 路径；HAVING 已经在子 SELECT 内部处理。
+        bool has_window = SelectHasWindowFunc(stmt);
+        if (has_window) {
+            auto wn = std::make_shared<WindowNode>(stmt.select_list, stmt.select_aliases,
+                                                   stmt.named_windows);
+            if (current) wn->children.push_back(current);
+            current = wn;
+        } else {
+            auto proj = std::make_shared<ProjectNode>(stmt.select_list, stmt.select_aliases, stmt.is_distinct);
+            if (current) proj->children.push_back(current);
+            current = proj;
+        }
+        if (!stmt.order_by.empty()) {
+            auto s = std::make_shared<SortNode>(stmt.order_by);
+            if (current) s->children.push_back(current);
+            current = s;
+        }
+        if (stmt.limit >= 0) {
+            auto l = std::make_shared<LimitNode>(stmt.limit, stmt.limit_offset);
+            if (current) l->children.push_back(current);
+            current = l;
+        }
+        return current;
     }
     // Aggregate: needed when GROUP BY present OR SELECT/HAVING uses aggregate functions
     bool needs_agg = !stmt.group_by.empty() || SelectHasAggregate(stmt);
@@ -374,11 +520,32 @@ PlanNodePtr Planner::PlanInsert(const InsertStatement& stmt) {
     // 43_upsert: ON DUPLICATE KEY UPDATE 路径走 UpsertNode，由 UpsertExecutor 处理。
     // 注意：目前仅支持 VALUES 数据源（query 非空时无候选行，无法直接构造冲突行）。
     if (stmt.has_on_duplicate) {
-        return std::make_shared<UpsertNode>(stmt.table_name, stmt.columns,
-                                            stmt.values_list,
-                                            stmt.upsert_assignments);
+        auto node = std::make_shared<UpsertNode>(stmt.table_name, stmt.columns,
+                                                 stmt.values_list,
+                                                 stmt.upsert_assignments);
+        node->returning_exprs = stmt.returning_exprs;
+        node->returning_aliases = stmt.returning_aliases;
+        return node;
     }
-    auto node = std::make_shared<InsertNode>(stmt.table_name, stmt.columns, stmt.values_list);
+    // 60_view_trigger: INSERT INTO view_name —— V1 接受语法并存储 CHECK OPTION。
+    // 当 target 是单表 view（无 JOIN、无嵌套子查询）时，把目标表改写为底层表，
+    // 让写路径直接进入底层 TableHeap。CHECK OPTION 评估放到执行期由 InsertExecutor
+    // 校验（在主约束校验前）。多表 / 嵌套视图保持原 INSERT 语义，由执行期报"表不存在"。
+    std::string insert_target = stmt.table_name;
+    if (catalog_ != nullptr && !catalog_->HasTable(stmt.table_name)) {
+        const SystemCatalog::ViewDefinition* v = catalog_->LookupView(stmt.table_name);
+        if (v != nullptr && v->query != nullptr && v->query->joins.empty() &&
+            !v->query->from_table.empty() && catalog_->HasTable(v->query->from_table)) {
+            insert_target = v->query->from_table;
+            InsertStatement& mut = const_cast<InsertStatement&>(stmt);
+            mut.table_name = insert_target;
+        }
+    }
+    auto node = std::make_shared<InsertNode>(insert_target, stmt.columns, stmt.values_list);
+    // 54_dml: REPLACE INTO 与 RETURNING 透传到执行器。
+    node->is_replace = stmt.is_replace;
+    node->returning_exprs = stmt.returning_exprs;
+    node->returning_aliases = stmt.returning_aliases;
     if (stmt.query) {
         // INSERT INTO dst SELECT ... —— 把 SELECT/WITH/SetOp 转换为内部子计划，
         // 并把它挂到 children[0] 上，作为执行期 INSERT 的"输入源"。
@@ -397,11 +564,78 @@ PlanNodePtr Planner::PlanInsert(const InsertStatement& stmt) {
 }
 
 PlanNodePtr Planner::PlanUpdate(const UpdateStatement& stmt) {
-    return std::make_shared<UpdateNode>(stmt.table_name, stmt.assignments, stmt.where_clause);
+    // 54_dml: UPDATE ... FROM —— 走 UpdateFromNode + JoinNode 子计划。
+    // 实现：对 stmt.from_sources 做左深 join（与 SELECT 的 join 路径对齐）；
+    // 连接条件仍由 where_clause 描述，所以 planner 这里不构造 JoinNode 的 condition
+    // —— 把它留给 UpdateFromExecutor 在每行 joined tuple 上评估 WHERE 过滤；
+    // 但 ON 条件对 UPDATE FROM 无直接意义，where_clause 中形如 t.id = s.tid 即可。
+    // V1 范围：from_sources 仅支持普通表名 + 可选别名（不支持 (SELECT ...) 派生表，
+    // parser 已在该路径抛错）。
+    if (!stmt.from_sources.empty()) {
+        // 把 target 作为最左表，from_sources 逐个右联。每个 join 是 CROSS JOIN
+        // （无 ON 条件），由 WHERE 子句统一过滤；这是 PG/Oracle 风格。
+        PlanNodePtr joined = std::make_shared<SeqScanNode>(
+            stmt.table_name,
+            stmt.table_alias.empty() ? stmt.table_name : stmt.table_alias);
+        for (const auto& j : stmt.from_sources) {
+            auto join = std::make_shared<JoinNode>(JoinType::INNER, nullptr);
+            join->children.push_back(joined);
+            join->children.push_back(std::make_shared<SeqScanNode>(
+                j.table_name,
+                j.table_alias.empty() ? j.table_name : j.table_alias));
+            joined = join;
+        }
+        auto node = std::make_shared<UpdateFromNode>(stmt.table_name, stmt.assignments);
+        node->target_alias = stmt.table_alias;
+        node->returning_exprs = stmt.returning_exprs;
+        node->returning_aliases = stmt.returning_aliases;
+        node->where_clause = stmt.where_clause;
+        node->children.push_back(joined);
+        return node;
+    }
+    auto node = std::make_shared<UpdateNode>(stmt.table_name, stmt.assignments, stmt.where_clause);
+    node->target_alias = stmt.table_alias;
+    node->returning_exprs = stmt.returning_exprs;
+    node->returning_aliases = stmt.returning_aliases;
+    return node;
 }
 
 PlanNodePtr Planner::PlanDelete(const DeleteStatement& stmt) {
-    return std::make_shared<DeleteNode>(stmt.table_name, stmt.where_clause);
+    auto node = std::make_shared<DeleteNode>(stmt.table_name, stmt.where_clause);
+    node->returning_exprs = stmt.returning_exprs;
+    node->returning_aliases = stmt.returning_aliases;
+    return node;
+}
+
+PlanNodePtr Planner::PlanMerge(const MergeStatement& stmt) {
+    auto node = std::make_shared<MergeNode>(stmt.target_table);
+    node->target_alias = stmt.target_alias;
+    node->source_table = stmt.source_table;
+    node->source_alias = stmt.source_alias;
+    node->on_condition = stmt.on_condition;
+    node->has_matched_update = stmt.has_matched_update;
+    node->matched_assignments = stmt.matched_assignments;
+    node->has_not_matched_insert = stmt.has_not_matched_insert;
+    node->not_matched_columns = stmt.insert_columns;
+    node->not_matched_values = stmt.insert_values;
+    // 把 source 转为内部子计划：
+    //   - source_query 非空：直接 PlanSelect 该 SelectStatement。
+    //   - 否则：source_table 是普通表名，包成 SeqScanNode。
+    if (stmt.source_query) {
+        ExprPtr on_copy = stmt.on_condition;
+        PlanSubqueriesInExpr(on_copy);
+        node->on_condition = on_copy;
+        PlanSubqueriesInSelect(const_cast<SelectStatement&>(*stmt.source_query));
+        node->source_plan = PlanSelect(const_cast<SelectStatement&>(*stmt.source_query));
+    } else {
+        node->source_plan = std::make_shared<SeqScanNode>(
+            stmt.source_table,
+            stmt.source_alias.empty() ? stmt.source_table : stmt.source_alias);
+    }
+    if (node->source_plan) {
+        node->children.push_back(node->source_plan);
+    }
+    return node;
 }
 
 PlanNodePtr Planner::PlanCreateTable(const CreateTableStatement& stmt) {
@@ -421,6 +655,9 @@ PlanNodePtr Planner::PlanCreateTable(const CreateTableStatement& stmt) {
     }
     return std::make_shared<CreateTableNode>(stmt.table_name, std::move(cols),
                                              stmt.primary_keys,
+                                             stmt.unique_constraints,
+                                             stmt.foreign_keys,
+                                             stmt.table_checks,
                                              stmt.if_not_exists);
 }
 
@@ -446,6 +683,9 @@ PlanNodePtr Planner::PlanAlterTable(const AlterStatement& stmt) {
     node->column_def = stmt.column_def;
     node->drop_column_name = stmt.drop_column_name;
     node->new_table_name = stmt.new_table_name;
+    // 53_ddl: RENAME COLUMN 信息透传到执行器。
+    node->rename_column_old_name = stmt.rename_column_old_name;
+    node->rename_column_new_name = stmt.rename_column_new_name;
     return node;
 }
 
@@ -776,13 +1016,87 @@ PlanNodePtr Planner::PlanRollbackTo(const RollbackToStatement& stmt) {
 
 PlanNodePtr Planner::PlanCreateView(const CreateViewStatement& stmt) {
     // 把视图定义登记到 catalog；测试只验证语法接受与无副作用。
+    // 60_view_trigger: OR REPLACE 时若视图已存在，先 DropView 再 CreateView。
     if (catalog_ && stmt.query) {
+        if (stmt.is_or_replace && catalog_->HasView(stmt.view_name)) {
+            catalog_->DropView(stmt.view_name);
+        }
         SystemCatalog::ViewDefinition def;
         def.view_name = stmt.view_name;
         def.query = stmt.query;
         catalog_->CreateView(def);
+        // 60_view_trigger: WITH CHECK OPTION 把视图的 WHERE 条件记到 view_meta_。
+        // V1 接受语法并持久化选项，但在写路径上仅对单表视图启用 enforcement。
+        if (stmt.with_check_option) {
+            catalog_->SetViewCheckOption(stmt.view_name,
+                                         stmt.query ? stmt.query->where_clause : nullptr,
+                                         stmt.check_option_cascaded);
+        }
     }
     return std::make_shared<CreateViewNode>(stmt.view_name);
+}
+
+// 60_view_trigger (Category 9): CREATE MATERIALIZED VIEW
+//
+// V1 实施策略：
+//   - 把 SELECT 的输出列定型为 ColumnDefinition（通过 DeriveOutputColumns 走子计划）。
+//   - catalog 内注册 MaterializedViewInfo（backing_table = "__mv_<name>"）。
+//   - 立即执行 SELECT 并把结果集通过 CreateMaterializedViewExecutor 写入 backing table。
+//
+// 实现被推迟到 ExecutionEngine 阶段：Planner 这里只构造计划 + 收集列信息，
+// 不在 Planner 阶段跑子计划（planner 阶段不应产生副作用）。
+PlanNodePtr Planner::PlanCreateMaterializedView(const MaterializedViewStatement& stmt) {
+    // 先递归 plan 出子计划，用于在执行器阶段读取定型列。
+    if (stmt.query) {
+        SelectStatement& mutable_query = const_cast<SelectStatement&>(*stmt.query);
+        PlanSelect(mutable_query);
+    }
+    auto node = std::make_shared<CreateMaterializedViewNode>(
+        stmt.view_name, std::vector<ColumnDefinition>{}, stmt.if_not_exists);
+    if (stmt.query) {
+        node->children.push_back(PlanSelect(*stmt.query));
+    }
+    // 60_view_trigger: 在 catalog 中登记 MaterializedViewInfo，让后续
+    // SELECT * FROM mv 通过 TryExpandView 找到 backing table。
+    // query_text 写原始 SELECT 的 ToString()，供 REFRESH 时 Planner 再次 plan。
+    // 实际物化（建表 + 数据填充）由 MaterializedViewExecutor 在执行期完成。
+    if (catalog_ != nullptr && !catalog_->HasMaterializedView(stmt.view_name)) {
+        SystemCatalog::MaterializedViewInfo mv;
+        mv.view_name = stmt.view_name;
+        mv.backing_table = SystemCatalog::MaterializedViewBackingTable(stmt.view_name);
+        mv.columns.clear();
+        mv.query_text = stmt.query ? stmt.query->ToString() : "";
+        catalog_->CreateMaterializedView(mv);
+    }
+    return node;
+}
+
+PlanNodePtr Planner::PlanAlterMaterializedView(const AlterMaterializedViewStatement& stmt) {
+    auto node = std::make_shared<AlterMaterializedViewNode>(stmt.view_name);
+    // REFRESH 路径需要重新执行 SELECT；先从 catalog 拿原始 SELECT 文本，解析回 AST，
+    // 再 plan 一遍挂到 children[0] 上。
+    if (catalog_) {
+        const auto* info = catalog_->GetMaterializedView(stmt.view_name);
+        if (info != nullptr && !info->query_text.empty()) {
+            try {
+                Lexer lexer(info->query_text);
+                std::vector<Token> tokens = lexer.Tokenize();
+                if (tokens.empty() || tokens.back().type != TokenType::END_OF_FILE) {
+                    tokens.emplace_back(TokenType::END_OF_FILE, "", 0, 0);
+                }
+                Parser parser(std::move(tokens));
+                StatementPtr parsed = parser.Parse();
+                if (parsed && parsed->GetType() == NodeType::SELECT_STMT) {
+                    auto sel = std::static_pointer_cast<SelectStatement>(parsed);
+                    PlanNodePtr sub = PlanSelect(*sel);
+                    if (sub) node->children.push_back(sub);
+                }
+            } catch (...) {
+                // 解析失败时回退为 no-op 子计划；执行期会触发异常。
+            }
+        }
+    }
+    return node;
 }
 
 PlanNodePtr Planner::PlanDropView(const DropViewStatement& stmt) {
@@ -801,6 +1115,8 @@ PlanNodePtr Planner::PlanCreateTrigger(const CreateTriggerStatement& stmt) {
         def.timing = stmt.timing;
         def.event = stmt.event;
         def.table_name = stmt.table_name;
+        // 60_view_trigger: FOR EACH ROW vs STATEMENT。
+        def.for_each_row = stmt.for_each_row;
         def.assignments = stmt.assignments;
         catalog_->CreateTrigger(def);
     }
@@ -836,6 +1152,56 @@ PlanNodePtr Planner::PlanDropFunction(const DropFunctionStatement& stmt) {
     auto n = std::make_shared<DropObjectNode>(
         DropObjectNode::Kind::FUNCTION, stmt.function_name, stmt.if_exists);
     return n;
+}
+
+// ============ 59_procs (Category 8)：PROCEDURE / CALL ============
+
+PlanNodePtr Planner::PlanCreateProcedure(const CreateProcedureStatement& stmt) {
+    if (catalog_) {
+        SystemCatalog::ProcedureDefinition def;
+        def.procedure_name = stmt.procedure_name;
+        def.parameters = stmt.parameters;
+        def.body_statements = stmt.body_statements;
+        catalog_->CreateProcedure(def);
+    }
+    return std::make_shared<CreateProcedureNode>(stmt.procedure_name);
+}
+
+PlanNodePtr Planner::PlanDropProcedure(const DropProcedureStatement& stmt) {
+    if (catalog_) {
+        catalog_->DropProcedure(stmt.procedure_name, stmt.if_exists);
+    }
+    auto n = std::make_shared<DropObjectNode>(
+        DropObjectNode::Kind::PROCEDURE, stmt.procedure_name, stmt.if_exists);
+    return n;
+}
+
+PlanNodePtr Planner::PlanCall(const CallStatement& stmt) {
+    // 实参里的子表达式可能含 SUBQUERY；递归 plan 一遍以让子查询具备
+    // subquery_plan。CallStatement::arguments 内部元素是 shared_ptr<Expr>，
+    // 通过 const_cast 解除 const 让 PlanSubqueriesInExpr 可以改写 subquery_plan。
+    std::vector<ExprPtr> args = stmt.arguments;
+    for (auto& a : args) PlanSubqueriesInExpr(a);
+    return std::make_shared<CallNode>(stmt.procedure_name, args);
+}
+
+// ============ 53_ddl: SCHEMA / SEQUENCE ============
+
+PlanNodePtr Planner::PlanCreateSchema(const CreateSchemaStatement& stmt) {
+    return std::make_shared<CreateSchemaNode>(stmt.schema_name, stmt.if_not_exists);
+}
+
+PlanNodePtr Planner::PlanDropSchema(const DropSchemaStatement& stmt) {
+    return std::make_shared<DropSchemaNode>(stmt.schema_name, stmt.if_exists);
+}
+
+PlanNodePtr Planner::PlanCreateSequence(const CreateSequenceStatement& stmt) {
+    return std::make_shared<CreateSequenceNode>(
+        stmt.sequence_name, stmt.start_value, stmt.increment, stmt.if_not_exists);
+}
+
+PlanNodePtr Planner::PlanDropSequence(const DropSequenceStatement& stmt) {
+    return std::make_shared<DropSequenceNode>(stmt.sequence_name, stmt.if_exists);
 }
 
 // ============ 46_meta: EXPLAIN / SHOW ============
@@ -878,6 +1244,11 @@ PlanNodePtr Planner::PlanShow(const ShowStatement& stmt) {
 // 视图展开：把 SELECT FROM view_name 改写为 derived_table（视图 SELECT）。
 // 注意：仅在 from_table 命中视图且无 JOIN 时做整体替换；后续要扩展带 JOIN
 // 的视图时可继续在本函数中处理。
+//
+// 60_view_trigger (Category 9):
+//   - 物化视图命中时：直接把 from_table 改为 backing table 名（"__mv_<view_name>"）；
+//     后端 SeqScanExecutor 会扫这张真实表。视图别名 / WHERE / SELECT list 不变。
+//   - 普通视图命中时：与历史行为一致，把视图 SELECT 复制为 derived_table。
 bool Planner::TryExpandView(SelectStatement& stmt) {
     if (!catalog_) return false;
     if (stmt.from_table.empty()) return false;
@@ -885,6 +1256,14 @@ bool Planner::TryExpandView(SelectStatement& stmt) {
     if (!stmt.joins.empty()) return false;
     // 必须存在 FROM table（不能是 derived_table 的占位）。
     if (stmt.derived_table) return false;
+    // 60_view_trigger: 物化视图优先（直接扫 backing table）。
+    const SystemCatalog::MaterializedViewInfo* mv =
+        catalog_->LookupMaterializedView(stmt.from_table);
+    if (mv != nullptr) {
+        stmt.from_table = mv->backing_table;
+        // 不修改 derived_table —— SeqScanExecutor 看到普通表名后照常扫堆。
+        return true;
+    }
     const SystemCatalog::ViewDefinition* view = catalog_->LookupView(stmt.from_table);
     if (view == nullptr || view->query == nullptr) return false;
     // 把视图的 SELECT 复制为 derived_table，并把 from_table 替换为视图别名
@@ -954,6 +1333,88 @@ void Planner::MarkUdfCallsInSelect(const SelectStatement& stmt) const {
         auto ce = const_cast<ExprPtr&>(it.expr);
         MarkUdfCallsInExpr(ce);
     }
+}
+
+// ---- 60_funcs: GROUPING SETS / ROLLUP / CUBE 展开 ----
+//
+// 输入：stmt（用户 SELECT，含 grouping_sets 字段）；
+//       scan_input（已建好的 FROM + JOIN + WHERE 子计划）。
+//
+// 展开策略：为每个 grouping set 构造一个"等价 SELECT"：
+//   - SELECT list 中的"分组列引用"若不在该 set 中，替换为 NULL 字面量；
+//   - 非分组列位置（一般是聚合函数调用 / 字面量 / 标量函数）保持原样；
+//   - group_by = 该 set 本身；
+//   - having 复制到子 SELECT 内（对每个 grouping set 独立应用）；
+//   - 不复制 ORDER BY / LIMIT（外层再处理）。
+// 然后把每个子 SELECT 递归 PlanSelect，再把它们 UNION ALL 起来。
+//
+// 收集分组列：把每个 grouping set 里的 ColumnRefExpr 列名收集到一个 set，
+// 用作"该 select list 位置是否是分组列"的判定。
+PlanNodePtr Planner::PlanGroupingSets(const SelectStatement& stmt, PlanNodePtr scan_input) {
+    // 1) 收集所有 grouping set 中出现的列名（作为"分组列"判定集合）。
+    //    限定为 ColumnRefExpr（更复杂的列表达式不展开为 set 维度）。
+    std::set<std::string> group_col_names;
+    for (const auto& gs : stmt.grouping_sets) {
+        for (const auto& e : gs) {
+            if (e && e->GetType() == NodeType::COLUMN_REF_EXPR) {
+                auto cr = std::static_pointer_cast<ColumnRefExpr>(e);
+                group_col_names.insert(cr->column_name);
+            }
+        }
+    }
+
+    // 2) 为每个 grouping set 构造合成 SELECT 并规划为子计划。
+    std::vector<PlanNodePtr> sub_plans;
+    for (const auto& gs : stmt.grouping_sets) {
+        std::set<std::string> in_this_set;
+        for (const auto& e : gs) {
+            if (e && e->GetType() == NodeType::COLUMN_REF_EXPR) {
+                auto cr = std::static_pointer_cast<ColumnRefExpr>(e);
+                in_this_set.insert(cr->column_name);
+            }
+        }
+
+        SelectStatement inner;
+        inner.from_table = stmt.from_table;
+        inner.from_table_alias = stmt.from_table_alias;
+        inner.joins = stmt.joins;
+        inner.where_clause = stmt.where_clause;
+        inner.having_clause = stmt.having_clause;
+        inner.select_aliases = stmt.select_aliases;
+
+        for (const auto& e : stmt.select_list) {
+            if (e && e->GetType() == NodeType::COLUMN_REF_EXPR) {
+                auto cr = std::static_pointer_cast<ColumnRefExpr>(e);
+                if (group_col_names.count(cr->column_name)) {
+                    if (in_this_set.count(cr->column_name)) {
+                        inner.select_list.push_back(e);
+                    } else {
+                        // 该 set 不含此分组列 → 替换为 NULL
+                        inner.select_list.push_back(
+                            std::make_shared<LiteralExpr>(LiteralType::NULL_VALUE, "NULL"));
+                    }
+                    continue;
+                }
+            }
+            inner.select_list.push_back(e);
+        }
+        inner.group_by = gs;
+
+        PlanNodePtr sub = PlanSelect(inner);
+        sub_plans.push_back(sub);
+    }
+
+    // 3) UNION ALL 合并所有子计划。SetOpNode 左孩子为第一个 plan，
+    //    右孩子逐个链接（与既有 SetOperation 计划一致）。
+    if (sub_plans.empty()) return nullptr;
+    PlanNodePtr result = sub_plans[0];
+    for (size_t i = 1; i < sub_plans.size(); ++i) {
+        auto sop = std::make_shared<SetOpNode>(SetOpNode::Kind::UNION_ALL);
+        sop->children.push_back(result);
+        sop->children.push_back(sub_plans[i]);
+        result = sop;
+    }
+    return result;
 }
 
 }  // namespace sqlcompiler

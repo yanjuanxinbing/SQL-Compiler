@@ -2,8 +2,6 @@
 
 #include "execution/ExpressionEvaluator.h"
 
-#include <iostream>
-
 namespace sqlcompiler {
 
 namespace {
@@ -126,16 +124,86 @@ void TriggerExecutor::FireBefore(SystemCatalog* catalog,
 }
 
 void TriggerExecutor::FireAfter(SystemCatalog* catalog,
+                                ExecutionContext* context,
                                 const std::string& table_name,
-                                TriggerEvent event) {
+                                TriggerEvent event,
+                                const std::unordered_map<std::string, size_t>& column_index_map,
+                                const std::vector<Value>* old_row,
+                                const std::vector<Value>* new_row) {
     if (catalog == nullptr) return;
     auto triggers = catalog->LookupTriggers(table_name, TriggerTiming::AFTER, event);
     if (triggers.empty()) return;
+
     for (const auto* t : triggers) {
         if (t == nullptr) continue;
-        // AFTER 触发器本期视为 no-op；只输出触发器名称便于调试。
-        std::cout << "trigger fired: " << t->trigger_name << std::endl;
+        // 60_view_trigger: STATEMENT 级触发器只在每条 DML 的第一次调用时执行。
+        // key 由 trigger_name + table_name + event 构成；通过 context->MarkStatementFired
+        // 在第一次插入成功时返回 false（未 fire），后续返回 true。
+        if (!t->for_each_row) {
+            std::string key = "AFTER:" + table_name + ":" + std::to_string(static_cast<int>(event)) + ":" + t->trigger_name;
+            if (context != nullptr && context->MarkStatementFired(key)) {
+                continue;  // 已经 fire 过
+            }
+        }
+
+        // 60_view_trigger: 评估 AFTER 触发器的 body (assignments) 并把副作用写入
+        // session_log_。不修改表行（行已落盘）。
+        std::unordered_map<std::string, Value> frame;
+        // 构造 frame: NEW.col / OLD.col 同 BEFORE 触发器。
+        for (const auto& kv : column_index_map) {
+            const std::string& key = kv.first;
+            size_t idx = kv.second;
+            auto dot = key.find('.');
+            std::string col;
+            if (dot == std::string::npos) {
+                col = key;
+            } else {
+                col = key.substr(dot + 1);
+            }
+            if (new_row != nullptr && idx < new_row->size()) {
+                frame["NEW." + col] = (*new_row)[idx];
+                frame[col] = (*new_row)[idx];
+            }
+            if (old_row != nullptr && idx < old_row->size()) {
+                frame["OLD." + col] = (*old_row)[idx];
+            } else {
+                frame["OLD." + col] = Value::MakeNull();
+            }
+        }
+
+        std::unordered_map<std::string, size_t> empty_cmap;
+        ExpressionEvaluator eval(empty_cmap, context, &frame);
+        for (const auto& asg : t->assignments) {
+            std::string q, col;
+            if (!ParseTriggerLhs(asg.first, &q, &col)) continue;
+            if (asg.second == nullptr) continue;
+            try {
+                Value v = eval.Evaluate(asg.second, Tuple());
+                // AFTER 触发器：保留 NEW.col 写入但仅作用到 session_log_。
+                // 简化语义：把 SET 目标 col 的最终值附加到 session_log_。
+                if (context != nullptr && !col.empty()) {
+                    std::string session_key = "@" + col;
+                    context->SetSessionVar(session_key, v);
+                    // 同时存为带触发器前缀的命名空间，避免不同触发器覆盖。
+                    context->SetSessionVar("@" + t->trigger_name + "." + col, v);
+                }
+            } catch (const std::exception&) {
+                // 单条 assignment 失败不影响其他 assignment；保持 AFTER 副作用可恢复。
+            }
+        }
     }
+}
+
+void TriggerExecutor::ResetStatementFireState(ExecutionContext* context) {
+    if (context == nullptr) return;
+    context->ClearStatementFired();
+}
+
+const std::unordered_map<std::string, Value>& TriggerExecutor::SessionLog(
+    const ExecutionContext* context) {
+    static const std::unordered_map<std::string, Value> kEmpty;
+    if (context == nullptr) return kEmpty;
+    return context->GetSessionLog();
 }
 
 }  // namespace sqlcompiler

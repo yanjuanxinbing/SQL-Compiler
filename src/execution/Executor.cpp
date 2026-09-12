@@ -53,6 +53,12 @@ void ExecutionContext::PopCteOverride(const std::string& name) {
     it->second.pop_back();
 }
 
+Value ExecutionContext::GetSessionVar(const std::string& name) const {
+    auto it = session_log_.find(name);
+    if (it == session_log_.end()) return Value::MakeNull();
+    return it->second;
+}
+
 Executor::Executor(ExecutionContext* context) : context_(context) {
 }
 

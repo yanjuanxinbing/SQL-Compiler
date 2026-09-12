@@ -32,6 +32,9 @@ bool SemanticAnalyzer::AnalyzeInternal(const StatementPtr& statement, bool& ok) 
         case NodeType::DELETE_STMT:
             ok &= AnalyzeDelete(*std::static_pointer_cast<DeleteStatement>(statement));
             break;
+        case NodeType::MERGE_STMT:
+            ok &= AnalyzeMerge(*std::static_pointer_cast<MergeStatement>(statement));
+            break;
         case NodeType::CREATE_TABLE_STMT:
             ok &= AnalyzeCreateTable(*std::static_pointer_cast<CreateTableStatement>(statement));
             break;
@@ -64,10 +67,22 @@ bool SemanticAnalyzer::AnalyzeInternal(const StatementPtr& statement, bool& ok) 
         case NodeType::RELEASE_SAVEPOINT_STMT:
         case NodeType::CREATE_VIEW_STMT:
         case NodeType::DROP_VIEW_STMT:
+        // 60_view_trigger: 物化视图 / 物化视图 ALTER 走 no-op 语义校验。
+        case NodeType::CREATE_MATERIALIZED_VIEW_STMT:
+        case NodeType::ALTER_MATERIALIZED_VIEW_STMT:
         case NodeType::CREATE_TRIGGER_STMT:
         case NodeType::DROP_TRIGGER_STMT:
         case NodeType::CREATE_FUNCTION_STMT:
         case NodeType::DROP_FUNCTION_STMT:
+        // ---- 59_procs (Category 8)：PROCEDURE / CALL ----
+        case NodeType::CREATE_PROCEDURE_STMT:
+        case NodeType::DROP_PROCEDURE_STMT:
+        case NodeType::CALL_STMT:
+        // ---- 53_ddl: SCHEMA / SEQUENCE ----
+        case NodeType::CREATE_SCHEMA_STMT:
+        case NodeType::DROP_SCHEMA_STMT:
+        case NodeType::CREATE_SEQUENCE_STMT:
+        case NodeType::DROP_SEQUENCE_STMT:
             break;
         // ---- 46_meta: EXPLAIN / SHOW ----
         // EXPLAIN：递归分析 inner，错误一并累积到 ok。
@@ -250,10 +265,13 @@ bool SemanticAnalyzer::AnalyzeSelect(const SelectStatement& stmt) {
     // 视图：若 from_table 在 catalog 中已注册为视图，跳过表存在性检查；
     // 否则按正常表检查。视图对应的列下标在执行期由 planner 翻译为子查询。
     bool from_is_view = false;
+    bool from_is_mv = false;
     if (!stmt.from_table.empty() && catalog_ != nullptr) {
         from_is_view = catalog_->HasView(stmt.from_table);
+        // 60_view_trigger: 物化视图也跳过表存在性检查（planner 会替换为 backing table）。
+        from_is_mv = catalog_->HasMaterializedView(stmt.from_table);
     }
-    if (!stmt.from_table.empty() && !from_is_view) {
+    if (!stmt.from_table.empty() && !from_is_view && !from_is_mv) {
         ok &= CheckTableExists(stmt.from_table);
     }
 
@@ -271,6 +289,34 @@ bool SemanticAnalyzer::AnalyzeSelect(const SelectStatement& stmt) {
         }
     }
     for (auto& j : stmt.joins) {
+        // 55_query: LATERAL 派生表 join —— 不在 catalog 中查表存在性；
+        // 改为注册其 alias 作为「虚拟表」，并把内部子查询的 select list / 别名
+        // 收集为该虚拟表的列，让外层 `sub.col` 与 `m` 等引用通过。
+        if (j.is_lateral) {
+            std::string derived_alias = !j.table_alias.empty() ? j.table_alias : j.table_name;
+            TableInfo ti;
+            ti.table_name = derived_alias;
+            if (j.lateral_subquery) {
+                const auto& sl = j.lateral_subquery->select_list;
+                const auto& sa = j.lateral_subquery->select_aliases;
+                for (size_t i = 0; i < sl.size(); ++i) {
+                    ColumnInfo ci;
+                    if (i < sa.size() && !sa[i].empty()) {
+                        ci.name = sa[i];
+                    } else if (sl[i] && sl[i]->GetType() == NodeType::COLUMN_REF_EXPR) {
+                        ci.name = std::static_pointer_cast<ColumnRefExpr>(sl[i])->column_name;
+                    } else {
+                        ci.name = "col" + std::to_string(i);
+                    }
+                    ci.data_type = "VARCHAR";
+                    ti.columns.push_back(std::move(ci));
+                }
+            }
+            symbol_table_.AddTable(ti);
+            real_tables.push_back(derived_alias);
+            table_aliases.emplace_back(derived_alias, derived_alias);
+            continue;
+        }
         bool join_is_view = (catalog_ != nullptr) && catalog_->HasView(j.table_name);
         if (!join_is_view) {
             ok &= CheckTableExists(j.table_name);
@@ -282,7 +328,30 @@ bool SemanticAnalyzer::AnalyzeSelect(const SelectStatement& stmt) {
         }
     }
     // 没有 FROM 的查询（如 SELECT 1）：跳过 table/column 检查
-    if (stmt.from_table.empty()) return ok;
+    if (stmt.from_table.empty() && stmt.values_rows.empty()) return ok;
+
+    // 55_query: VALUES 派生表注册为虚拟表，让 `t.id` / `id` 列引用通过。
+    if (!stmt.values_rows.empty()) {
+        TableInfo ti;
+        ti.table_name = stmt.derived_alias;
+        size_t ncols = stmt.values_column_aliases.empty()
+                          ? (stmt.values_rows.empty() ? 0 : stmt.values_rows[0].size())
+                          : stmt.values_column_aliases.size();
+        for (size_t i = 0; i < ncols; ++i) {
+            ColumnInfo ci;
+            if (i < stmt.values_column_aliases.size() &&
+                !stmt.values_column_aliases[i].empty()) {
+                ci.name = stmt.values_column_aliases[i];
+            } else {
+                ci.name = "col" + std::to_string(i);
+            }
+            ci.data_type = "VARCHAR";
+            ti.columns.push_back(std::move(ci));
+        }
+        symbol_table_.AddTable(ti);
+        real_tables.push_back(stmt.derived_alias);
+        table_aliases.emplace_back(stmt.derived_alias, stmt.derived_alias);
+    }
 
     // SELECT 列表项按从左到右处理，靠后的项可引用靠前定义的别名。
     std::vector<std::string> visible_aliases;
@@ -332,12 +401,35 @@ bool SemanticAnalyzer::AnalyzeSelect(const SelectStatement& stmt) {
 }
 
 bool SemanticAnalyzer::AnalyzeInsert(const InsertStatement& stmt) {
-    bool ok = CheckTableExists(stmt.table_name);
-    const TableInfo* info = symbol_table_.GetTable(stmt.table_name);
-    if (!info) return false;
+    // 60_view_trigger: INSERT INTO view_name —— 视图被识别为可写视图（单表 SELECT
+    // 且 from_table 命中 catalog 中已存在的表）。语义层允许这种改写，跳过对 view
+    // 自身的"table not found"检查，由 Planner 在后续路径上把 target 替换为底层表。
+    bool ok = true;
+    bool target_is_view = false;
+    std::string resolved_target = stmt.table_name;
+    if (catalog_ != nullptr) {
+        const SystemCatalog::ViewDefinition* v = catalog_->LookupView(stmt.table_name);
+        if (v != nullptr && v->query != nullptr && v->query->joins.empty() &&
+            !v->query->from_table.empty()) {
+            target_is_view = true;
+            resolved_target = v->query->from_table;
+        }
+    }
+    if (!target_is_view) {
+        ok = CheckTableExists(stmt.table_name);
+    }
+    const TableInfo* info = symbol_table_.GetTable(resolved_target);
+    if (!info) {
+        // 视图已注册但底层表未找到 —— 抛错保持原行为。
+        if (target_is_view) {
+            AddError("view underlying table not found: " + resolved_target);
+            return false;
+        }
+        return false;
+    }
     int expected = static_cast<int>(info->columns.size());
     for (auto& cn : stmt.columns) {
-        ok &= CheckColumnExists(stmt.table_name, cn);
+        ok &= CheckColumnExists(resolved_target, cn);
     }
     int actual_cols = static_cast<int>(stmt.columns.size());
     if (actual_cols == 0) actual_cols = expected;
@@ -370,6 +462,17 @@ bool SemanticAnalyzer::AnalyzeInsert(const InsertStatement& stmt) {
             ok &= CheckExpression(kv.second, stmt.table_name);
         }
     }
+    // 54_dml: REPLACE INTO 不支持 INSERT ... SELECT 数据源；当前解析路径已仅
+    // 允许 VALUES 形式（见 Parser.cpp 中 KEYWORD_REPLACE 分支）。
+    if (stmt.is_replace && stmt.query) {
+        AddError("REPLACE INTO is not supported with INSERT ... SELECT");
+        ok = false;
+    }
+    // 54_dml: RETURNING 表达式校验 —— 在目标表上下文中求值；
+    // 接受 ColumnRef / 函数 / 字面量等。
+    for (const auto& e : stmt.returning_exprs) {
+        ok &= CheckExpression(e, stmt.table_name);
+    }
     return ok;
 }
 
@@ -380,12 +483,86 @@ bool SemanticAnalyzer::AnalyzeUpdate(const UpdateStatement& stmt) {
         ok &= CheckExpression(kv.second, stmt.table_name);
     }
     if (stmt.where_clause) ok &= CheckExpression(stmt.where_clause, stmt.table_name);
+    // 54_dml: UPDATE ... FROM —— 校验 from_sources 中的表存在；WHERE 中的列引用
+    // 解析由 ExpressionEvaluator 在执行期通过 combined cmap 兜底。
+    for (const auto& src : stmt.from_sources) {
+        ok &= CheckTableExists(src.table_name);
+    }
+    // 54_dml: RETURNING 表达式校验
+    for (const auto& e : stmt.returning_exprs) {
+        ok &= CheckExpression(e, stmt.table_name);
+    }
     return ok;
 }
 
 bool SemanticAnalyzer::AnalyzeDelete(const DeleteStatement& stmt) {
     bool ok = CheckTableExists(stmt.table_name);
     if (stmt.where_clause) ok &= CheckExpression(stmt.where_clause, stmt.table_name);
+    // 54_dml: RETURNING 表达式校验
+    for (const auto& e : stmt.returning_exprs) {
+        ok &= CheckExpression(e, stmt.table_name);
+    }
+    return ok;
+}
+
+bool SemanticAnalyzer::AnalyzeMerge(const MergeStatement& stmt) {
+    bool ok = true;
+    ok &= CheckTableExists(stmt.target_table);
+    // 收集源表信息（用于 ON / SET / INSERT 的跨表列解析）。
+    TableInfo source_info_dummy;
+    const TableInfo* source_info = nullptr;
+    std::vector<std::string> tables_for_check;
+    SemanticAnalyzer::TableAliasMap aliases;
+    tables_for_check.push_back(stmt.target_table);
+    aliases.push_back({stmt.target_table, stmt.target_table});
+    if (!stmt.target_alias.empty() && stmt.target_alias != stmt.target_table) {
+        aliases.push_back({stmt.target_alias, stmt.target_table});
+    }
+    if (stmt.source_query) {
+        // 派生表：递归校验内层 SELECT。
+        ok &= AnalyzeSelect(const_cast<SelectStatement&>(*stmt.source_query));
+        // 用派生表的 alias 作为 "表名" —— 但 catalog 找不到该别名。
+        // 我们仍把 source_alias 加入 tables_for_check，并允许任意列引用通过
+        // （即 CheckExpressionMulti 在该别名上不会校验列存在性）。
+        tables_for_check.push_back(stmt.source_alias);
+        aliases.push_back({stmt.source_alias, stmt.source_alias});
+    } else if (!stmt.source_table.empty()) {
+        ok &= CheckTableExists(stmt.source_table);
+        source_info = symbol_table_.GetTable(stmt.source_table);
+        tables_for_check.push_back(stmt.source_table);
+        aliases.push_back({stmt.source_table, stmt.source_table});
+        if (!stmt.source_alias.empty() && stmt.source_alias != stmt.source_table) {
+            aliases.push_back({stmt.source_alias, stmt.source_table});
+        }
+    } else {
+        AddError("MERGE requires a source (table or subquery)");
+        ok = false;
+    }
+    // 跨表 ON / SET / VALUES：用 CheckExpressionMulti 在 (target + source) 集合上
+    // 校验。target_alias / source_alias 作为额外别名。
+    if (stmt.on_condition) {
+        ok &= CheckExpressionMulti(stmt.on_condition, tables_for_check, aliases);
+    }
+    if (stmt.has_matched_update) {
+        for (const auto& kv : stmt.matched_assignments) {
+            ok &= CheckColumnExists(stmt.target_table, kv.first);
+            ok &= CheckExpressionMulti(kv.second, tables_for_check, aliases);
+        }
+    }
+    if (stmt.has_not_matched_insert) {
+        for (const auto& cn : stmt.insert_columns) {
+            ok &= CheckColumnExists(stmt.target_table, cn);
+        }
+        // INSERT VALUES 引用 source 列，必须走跨表校验。
+        if (source_info || !stmt.source_query) {
+            ok &= CheckExpressionMulti(stmt.insert_values.empty() ? nullptr : stmt.insert_values.front(),
+                                       tables_for_check, aliases);
+            for (size_t i = 0; i < stmt.insert_values.size(); ++i) {
+                ok &= CheckExpressionMulti(stmt.insert_values[i], tables_for_check, aliases);
+            }
+        }
+    }
+    (void)source_info_dummy;
     return ok;
 }
 
@@ -413,9 +590,12 @@ bool SemanticAnalyzer::AnalyzeCreateTable(const CreateTableStatement& stmt) {
         for (char c : stmt.columns[i].data_type)
             up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
         if (up != "INT" && up != "INTEGER" && up != "BIGINT" &&
-            up != "FLOAT" && up != "DOUBLE" && up != "DECIMAL" &&
+            up != "FLOAT" && up != "DOUBLE" && up != "DECIMAL" && up != "NUMERIC" &&
+            up != "REAL" && up != "SMALLINT" && up != "TINYINT" &&
             up != "VARCHAR" && up != "CHAR" && up != "TEXT" && up != "STRING" &&
-            up != "DATE" && up != "TIMESTAMP") {
+            up != "DATE" && up != "TIMESTAMP" && up != "TIME" &&
+            up != "BOOLEAN" && up != "BOOL" &&
+            up != "JSON" && up != "UUID") {
             AddError("unsupported column type: " + stmt.columns[i].data_type);
             ok = false;
         }
@@ -432,6 +612,60 @@ bool SemanticAnalyzer::AnalyzeCreateTable(const CreateTableStatement& stmt) {
                 ok = false;
             }
         }
+    }
+    // 58_constraints: 表级 CHECK(expr) 与列级 CHECK(expr) 的列引用必须落
+    // 在本表的列定义里。注意此刻 symbol_table_ 还没加入本表（语义分析在
+    // catalog 注册之前跑），所以不能直接调用 CheckExpressionMulti；这里
+    // 用本表的列名集合做就地校验。命名约束的名字仅用于错误消息展示，
+    // 不做唯一性校验以减少阻断面。
+    auto check_local_expr = [&](const ExprPtr& expr) -> bool {
+        if (!expr) return true;
+        std::function<bool(const ExprPtr&)> walk = [&](const ExprPtr& e) -> bool {
+            if (!e) return true;
+            switch (e->GetType()) {
+                case NodeType::LITERAL_EXPR:
+                    return true;
+                case NodeType::COLUMN_REF_EXPR: {
+                    auto cr = std::static_pointer_cast<ColumnRefExpr>(e);
+                    bool found = false;
+                    for (const auto& cd : stmt.columns) {
+                        if (cd.column_name == cr->column_name) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        AddError("CHECK references unknown column: " +
+                                 cr->column_name);
+                        return false;
+                    }
+                    return true;
+                }
+                case NodeType::BINARY_EXPR: {
+                    auto be = std::static_pointer_cast<BinaryExpr>(e);
+                    return walk(be->left) && walk(be->right);
+                }
+                case NodeType::UNARY_EXPR: {
+                    auto ue = std::static_pointer_cast<UnaryExpr>(e);
+                    return walk(ue->operand);
+                }
+                case NodeType::FUNCTION_CALL_EXPR: {
+                    auto fc = std::static_pointer_cast<FunctionCallExpr>(e);
+                    bool r = true;
+                    for (auto& a : fc->arguments) r &= walk(a);
+                    return r;
+                }
+                default:
+                    return true;
+            }
+        };
+        return walk(expr);
+    };
+    for (const auto& tc : stmt.table_checks) {
+        ok &= check_local_expr(tc.expr);
+    }
+    for (const auto& cd : stmt.columns) {
+        ok &= check_local_expr(cd.check_expr);
     }
     return ok;
 }

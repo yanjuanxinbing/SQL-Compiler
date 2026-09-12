@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <random>
 #include <functional>
 #include <memory>
 #include <regex>
@@ -51,17 +52,25 @@ bool IsFalse(const Value& v) {
 }
 
 // =============================================================================
-// 模式匹配支持面（44_pattern_match）
-//   - SQL 标准 LIKE   : '%' 任意序列、'_' 单字符；默认以 '\\' 作为转义字符，
-//                       也可通过 LikeExprNode 的 has_escape/escape_char 自定义。
-//   - ILIKE           : 同 LIKE，但先对输入和模式做 ASCII 大小写折叠再匹配。
-//   - REGEXP / RLIKE  : POSIX ERE 风格的正则子串匹配（默认不锚定 ^/$）；
+// 模式匹配支持面（44_pattern_match / 56_pattern）
+//
+//   - SIMILAR TO       : SQL:1999 模式语法（see TranslateSqlLikeToEre）
+//   - LIKE             : SQL 标准 LIKE，'%' 任意序列、'_' 单字符；默认以 '\\'
+//                       作为转义字符，也可通过 LikeExprNode 的 has_escape/
+//                       escape_char 自定义。
+//   - ILIKE            : 同 LIKE，但先对输入和模式做 ASCII 大小写折叠再匹配。
+//   - REGEXP / RLIKE   : POSIX ERE 风格的正则子串匹配（默认不锚定 ^/$）；
 //                       模式按 <regex> 在每行即时编译（pattern 表达式非字面量
 //                       时无法预编译，统一在运行时编译一次以保持简单）。
-//   - 错误处理        : REGEXP 模式非法时抛出 RuntimeError，
+//                       ERE 单词字符类 `\d \D \s \S \w \W` 走 TranslateEreWordClasses
+//                       转译为对应字符类（std::regex 的 ECMAScript 也支持这些，
+//                       但我们的转译在两种语法下结果一致，并提供后备保证）。
+//
+//   - 错误处理        : REGEXP/SIMILAR TO 模式非法时抛出 RuntimeError，
 //                       文案为 "Error: invalid regex pattern: <reason>"。
+//
 // 旧 `BinaryOperator::LIKE` 路径复用 MatchLikePattern（保留 '\\' 默认转义），
-// 行为对 00–43 测试零变更。新运算符和 ESCAPE 子句全部走 LikeExprNode。
+// 行为对 00–55 测试零变更。新运算符和 ESCAPE 子句全部走 LikeExprNode。
 // =============================================================================
 
 // SQL LIKE pattern matching: '%' matches any sequence, '_' matches one char.
@@ -133,6 +142,99 @@ bool MatchLikePatternEscaped(const std::string& s, const std::string& p, char es
     }
     while (j < p.size() && p[j] == '%') ++j;
     return j == p.size();
+}
+
+// 56_pattern: SQL:1999 SIMILAR TO 模式 → POSIX ERE。
+//
+// 输入: SQL pattern（保留 LIKE 通配符 % / _ 与 ERE 元字符 . * + ? [] () | ^ $ {}）。
+// 输出: 可直接喂给 std::regex（ECMAScript 语法与 ERE 在这些元字符上语义相近）的
+//       ERE 等价字符串。
+//
+// 算法：单次扫描 pattern，遇到：
+//   - escape + 任意字符   : 把后一个字符视为字面量；若它同时是 ERE 元字符，
+//                            在前面再加 '\' 以保证 ERE 把它当字面量读。
+//                            例（esc='\\'）: `\\.` → ERE 里的 `\\.`（字面量 '.'）；
+//                                            `\\%` → ERE 里的 `%`（字面量 '%'）。
+//   - '%'                  : 输出 '.*'
+//   - '_'                  : 输出 '.'
+//   - 其他（ERE 元字符 / 普通字符）: 原样输出 —— SQL:1999 让 . * + ? | () []
+//                                    ^ $ {} 在 SIMILAR TO 中按 ERE 元字符
+//                                    解释；SQL 标准本身不把它们视为字面量。
+//
+// 注：SQL 标准的 SIMILAR TO 不要求锚定 ^/$（与 REGEXP/RLIKE 一致），因此
+//     翻译结果不做任何锚定处理。
+std::string TranslateSqlLikeToEre(const std::string& p, char esc) {
+    std::string out;
+    out.reserve(p.size() * 2);
+    auto is_ere_metachar = [](char c) -> bool {
+        switch (c) {
+            case '.': case '*': case '+': case '?':
+            case '|': case '(': case ')':
+            case '[': case ']': case '{': case '}':
+            case '^': case '$': case '\\':
+                return true;
+            default:
+                return false;
+        }
+    };
+    auto emit_literal = [&](char c) {
+        if (is_ere_metachar(c)) out.push_back('\\');
+        out.push_back(c);
+    };
+    for (size_t i = 0; i < p.size(); ++i) {
+        char c = p[i];
+        if (c == esc) {
+            // SQL 转义：后一个字符视为字面量。若已是模式末尾，则保留 esc 自身。
+            if (i + 1 < p.size()) {
+                emit_literal(p[i + 1]);
+                ++i;
+            } else {
+                emit_literal(c);
+            }
+            continue;
+        }
+        if (c == '%') { out += ".*"; continue; }
+        if (c == '_') { out += ".";  continue; }
+        // ERE 元字符或普通字符：原样输出。SQL 标准让 ERE 元字符在 SIMILAR
+        // TO 模式中按 ERE 元字符解释，因此不做额外转义。
+        out.push_back(c);
+    }
+    return out;
+}
+
+// 56_pattern: ERE 单词字符类翻译（保守后援）。
+//
+// std::regex 的 ECMAScript 语法本来就支持 \d \D \s \S \w \W（与 POSIX ERE
+// 行为一致）。我们仍对输入 pattern 做一次扫描：当遇到 \<wordchar> 形式时，
+// 替换为显式字符类（\d → [0-9] 等），目的：
+//   1) 与 POSIX ERE 语义对齐（即便 ECMAScript 后端被换成其他引擎也能正常工作）；
+//   2) 保持语义文档化。
+// 注意只翻译 \d \D \s \S \w \W 这六个单词类；其他 \<x>（如 \. \* \( 等）不动，
+// 以免破坏已有的转义语义。
+std::string TranslateEreWordClasses(const std::string& p) {
+    std::string out;
+    out.reserve(p.size() * 2);
+    for (size_t i = 0; i < p.size(); ++i) {
+        if (p[i] == '\\' && i + 1 < p.size()) {
+            char nx = p[i + 1];
+            switch (nx) {
+                case 'd': out += "[0-9]";              ++i; continue;
+                case 'D': out += "[^0-9]";             ++i; continue;
+                case 's': out += "[ \t\n\r\f\v]";      ++i; continue;
+                case 'S': out += "[^ \t\n\r\f\v]";     ++i; continue;
+                case 'w': out += "[A-Za-z0-9_]";       ++i; continue;
+                case 'W': out += "[^A-Za-z0-9_]";      ++i; continue;
+                default:
+                    // 其他 \<x> 原样保留（含 \\ \. \* \( 等）。
+                    out.push_back(p[i]);
+                    out.push_back(nx);
+                    ++i;
+                    continue;
+            }
+        }
+        out.push_back(p[i]);
+    }
+    return out;
 }
 
 // ASCII 小写折叠（仅 A-Z）。
@@ -268,7 +370,8 @@ bool ParseDateString(const std::string& s, int* year, int* month, int* day) {
 
 ExpressionEvaluator::ExpressionEvaluator(
     const std::unordered_map<std::string, size_t>& column_index_map)
-    : column_index_map_(column_index_map) {
+    : column_index_map_(column_index_map), ctx_(nullptr) {
+    // 1-arg constructor：ctx/outer_bind/proc_locals 均为 nullptr。
 }
 
 ExpressionEvaluator::ExpressionEvaluator(
@@ -278,6 +381,10 @@ ExpressionEvaluator::ExpressionEvaluator(
     : column_index_map_(column_index_map), ctx_(ctx), outer_bind_(outer_bind) {
     // 调用方未显式提供 outer_bind 时，回退到 ExecutionContext 上的绑定（相关子查询传播）。
     if (!outer_bind_ && ctx_) outer_bind_ = ctx_->GetOuterBind();
+    // 59_procs (Category 8): 同样回退到 procedure 当前局部变量绑定。
+    // proc_locals 优先级低于 outer_bind：当 outer_bind 为空时，列引用优先
+    // 解析为 procedure 局部变量；否则按 outer_bind 解析。
+    if (!proc_locals_ && ctx_) proc_locals_ = ctx_->GetProcLocals();
 }
 
 Value ExpressionEvaluator::Evaluate(const ExprPtr& expr, const Tuple& tuple) const {
@@ -316,6 +423,9 @@ Value ExpressionEvaluator::Evaluate(const ExprPtr& expr, const Tuple& tuple) con
             // 这里返回一个零值（NULL）。正常路径上 INTERVAL 总是作为
             // INTERVAL_ADD / INTERVAL_SUB 的右操作数被消费。
             return EvaluateInterval(*static_cast<const IntervalExprNode*>(expr.get()), tuple);
+        case NodeType::NEXTVAL_EXPR:
+            // 53_ddl: NEXTVAL FOR sequence_name —— 原子推进并返回当前值。
+            return EvaluateNextval(*static_cast<const NextvalExpr*>(expr.get()));
         default:
             return Value::MakeNull();
     }
@@ -371,6 +481,11 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
     bool qualifier_is_outer = false;
     if (!expr.table_name.empty() && ctx_) {
         const std::unordered_set<std::string>* inner_tables = ctx_->GetInnerTables();
+        if (!inner_tables) {
+            // 55_query: LATERAL 路径下 ApplyExecutor 会注册「lateral inner tables」，
+            // 即使 EvaluateSubquery 没被调用，evaluator 也能识别哪些表名属于右子计划。
+            inner_tables = ctx_->GetLateralInnerTables();
+        }
         if (inner_tables && inner_tables->find(expr.table_name) == inner_tables->end()) {
             qualifier_is_outer = true;
         }
@@ -389,9 +504,12 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
             for (char c : kv.first) kc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
             if (kc == lc) return kv.second;
         }
-        // 限定列确认是外层引用，但 outer_bind 里没记录——保持 NULL 语义，
-        // 不再回退到裸列名（否则可能误命中内层同名列）。
-        return Value::MakeNull();
+        // 55_query: LATERAL 派生表别名（如 `sub`）不属于外层表也不属于内层表，
+        // 但在 outer_bind 里也没记录——它对应的是 Apply 右子计划的输出列。
+        // 这种情况下应回退到 column_index_map_ 的常规 cmap 查找。
+        // 若外层表别名（如 `t1` 在 LATERAL subquery 内的 from_table）也未在
+        // outer_bind 中（极少见的"用户引用了 outer 的列但 subquery 不引用"情形），
+        // 同样需要回退。
     }
     if (!expr.table_name.empty()) {
         std::string qkey = expr.table_name + "." + expr.column_name;
@@ -425,6 +543,13 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
                 for (char c : kv.first) kc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
                 if (kc == lc) return kv.second;
             }
+        }
+        // 59_procs (Category 8): procedure 局部变量回退。在 outer_bind
+        // 未命中时，若当前处于 CALL 上下文，ColumnRef 可解析为 procedure
+        // 局部变量名（参数或 DECLARE 变量）。
+        if (proc_locals_) {
+            auto pl = proc_locals_->find(expr.column_name);
+            if (pl != proc_locals_->end()) return pl->second;
         }
         return Value::MakeNull();
     }
@@ -888,6 +1013,38 @@ Value ExpressionEvaluator::EvaluateFunctionCall(const FunctionCallExpr& expr,
                       tm.tm_hour, tm.tm_min, tm.tm_sec);
         return Value::MakeVarchar(buf);
     }
+    // ---- 60_funcs: 标量函数 GREATEST / LEAST / RAND / RANDOM ----
+    // GREATEST(a, b, ...) 与 LEAST(a, b, ...) 至少 1 个参数；
+    // 任一参数为 NULL 时整体返回 NULL（PostgreSQL / 标准 SQL 语义）。
+    if (name == "GREATEST") {
+        if (expr.arguments.empty()) return Value::MakeNull();
+        Value best = Evaluate(expr.arguments[0], tuple);
+        if (best.IsNull()) return Value::MakeNull();
+        for (size_t i = 1; i < expr.arguments.size(); ++i) {
+            Value v = Evaluate(expr.arguments[i], tuple);
+            if (v.IsNull()) return Value::MakeNull();
+            if (Value::Compare(v, best) > 0) best = v;
+        }
+        return best;
+    }
+    if (name == "LEAST") {
+        if (expr.arguments.empty()) return Value::MakeNull();
+        Value best = Evaluate(expr.arguments[0], tuple);
+        if (best.IsNull()) return Value::MakeNull();
+        for (size_t i = 1; i < expr.arguments.size(); ++i) {
+            Value v = Evaluate(expr.arguments[i], tuple);
+            if (v.IsNull()) return Value::MakeNull();
+            if (Value::Compare(v, best) < 0) best = v;
+        }
+        return best;
+    }
+    // RAND() / RANDOM() —— 返回 [0, 1) 区间 FLOAT。
+    // 使用 thread_local mt19937_64，保证同一 SELECT 内多次调用得到的值不同。
+    if (name == "RAND" || name == "RANDOM") {
+        thread_local std::mt19937_64 rng{std::random_device{}()};
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+        return Value::MakeFloat(dist(rng));
+    }
     // ---- 40_txn_view_udf：UDF 调用 ----
     // 当内置函数未命中且 ExecutionContext 中存在 catalog 时，尝试按 catalog
     // 注册的用户自定义函数求值。把实参值代入参数名（同名替换），然后调用
@@ -951,8 +1108,16 @@ bool SqlCompare(const Value& l, const std::string& op, const Value& r) {
 // 用一个 unordered_set 方便 O(1) 命中判断（限定列 ref 是否属于本层）。
 void CollectInnerTableNames(const SelectStatement& sub,
                             std::unordered_set<std::string>& out) {
-    if (!sub.from_table.empty()) {
+    // 55_query: LATERAL 子查询时 from_table 不参与 inner_tables：用户的内层
+    // FROM 表名与外层同名时（例如 `FROM t1, LATERAL (SELECT ... FROM t1 t2 ...)`
+    // 中 `t1.val` 期望引用外层），不应把内层 t1 视为屏蔽外层 t1 的标识符。
+    // 仅 from_table_alias（以及 joins / derived_alias）作为内层有效表名。
+    if (!sub.is_lateral && !sub.from_table.empty()) {
         out.insert(sub.from_table);
+        if (!sub.from_table_alias.empty()) out.insert(sub.from_table_alias);
+    } else if (sub.is_lateral) {
+        // LATERAL：仍然把 from_table_alias 作为内部别名纳入（防止别名撞 outer 表名
+        // 时反向解析），但 from_table 自身留给 outer_bind。
         if (!sub.from_table_alias.empty()) out.insert(sub.from_table_alias);
     }
     for (const auto& j : sub.joins) {
@@ -1219,16 +1384,20 @@ Value ExpressionEvaluator::EvaluateUpsertValuesRef(const UpsertValuesRefExpr& ex
     return it->second;
 }
 
-// 44_pattern_match: 统一处理 LIKE / ILIKE / REGEXP / RLIKE（含可选 ESCAPE）。
+// 44_pattern_match / 56_pattern: 统一处理 LIKE / ILIKE / REGEXP / RLIKE / SIMILAR TO
+// （含可选 ESCAPE）。
 //
 // 设计取舍：
 //   - LIKE / ILIKE：使用本文件的 MatchLikePatternEscaped（按 escape_char
 //     转义）。ILIKE 在匹配前对两侧做 ASCII 小写折叠；REGEXP 不受 escape_char
 //     影响（C++ <regex> 自身支持 '\' 转义）。
 //   - REGEXP / RLIKE：pattern 通常是字面量，但在通用 AST 上无法保证；统一
-//     在运行时每行编译一次 std::regex（regex::ECMAScript + 关闭 implicit
-//     锚定符合 POSIX ERE 的语义）。失败时抛 RuntimeError，文案
-//     `Error: invalid regex pattern: <what()>` 满足测试期望。
+//     在运行时编译一次 std::regex（regex::ECMAScript）。\d \D \s \S \w \W 这
+//     六个 ERE 单词字符类在编译前由 TranslateEreWordClasses 转译为显式字符类
+//     （std::regex ECMAScript 自身也支持，但显式化跨引擎更稳）。失败抛
+//     RuntimeError，文案 `Error: invalid regex pattern: <what()>` 满足测试期望。
+//   - SIMILAR TO：先把 SQL pattern 经 TranslateSqlLikeToEre 翻译成 ERE，再走
+//     与 REGEXP 相同的编译路径。ESCAPE 子句在 SQL 通配符（%/ _）层面生效。
 Value ExpressionEvaluator::EvaluateLike(const LikeExprNode& expr,
                                         const Tuple& tuple) const {
     Value l = Evaluate(expr.operand, tuple);
@@ -1256,12 +1425,25 @@ Value ExpressionEvaluator::EvaluateLike(const LikeExprNode& expr,
         case LikeExprNode::Kind::RLIKE: {
             // ECMAScript + 非显式 '^' 锚定 → 子串匹配；POSIX ERE 的 '^'/'$'
             // 在 ECMAScript 下同样按位置断言，因此 metacharacter 要求可达成。
+            std::string ere = TranslateEreWordClasses(p);
             try {
-                std::regex re(p, std::regex::ECMAScript | std::regex::optimize);
+                std::regex re(ere, std::regex::ECMAScript | std::regex::optimize);
                 return MakeBool(std::regex_search(s, re));
             } catch (const std::regex_error& e) {
                 // FormatError 对 RUNTIME 阶段跳过 "[Runtime]" 前缀，main.cpp
                 // 再补 "Error: "。最终输出为 "Error: invalid regex pattern: <what()>"。
+                throw CompilerException(ErrorStage::RUNTIME,
+                    std::string("invalid regex pattern: ") + e.what());
+            }
+        }
+        case LikeExprNode::Kind::SIMILAR_TO: {
+            // 56_pattern: SQL pattern → ERE → std::regex。
+            std::string ere = TranslateSqlLikeToEre(p, esc);
+            std::string ere_with_wc = TranslateEreWordClasses(ere);
+            try {
+                std::regex re(ere_with_wc, std::regex::ECMAScript | std::regex::optimize);
+                return MakeBool(std::regex_search(s, re));
+            } catch (const std::regex_error& e) {
                 throw CompilerException(ErrorStage::RUNTIME,
                     std::string("invalid regex pattern: ") + e.what());
             }
@@ -1306,6 +1488,21 @@ Value ExpressionEvaluator::EvaluateInterval(const IntervalExprNode& expr,
     (void)tuple;
     (void)expr;
     return Value::MakeNull();
+}
+
+// 53_ddl: NEXTVAL FOR sequence_name —— 推进并返回当前值。
+// 在 ctx_ 为空或 catalog 为空时退化为 NULL；序列不存在抛 SEMANTIC 错误。
+Value ExpressionEvaluator::EvaluateNextval(const NextvalExpr& expr) const {
+    if (ctx_ == nullptr) return Value::MakeNull();
+    SystemCatalog* catalog = ctx_->GetCatalog();
+    if (catalog == nullptr) return Value::MakeNull();
+    int64_t v = 0;
+    if (!catalog->NextSequence(expr.sequence_name, &v)) {
+        throw CompilerException(
+            ErrorStage::SEMANTIC,
+            "sequence does not exist: " + expr.sequence_name);
+    }
+    return Value::MakeInt(static_cast<int32_t>(v));
 }
 
 }  // namespace sqlcompiler

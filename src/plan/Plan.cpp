@@ -150,6 +150,18 @@ std::string NodeBodyToString(const PlanNode& node, int depth) {
             oss << ")";
             break;
         }
+        case PlanNodeType::VALUES: {
+            auto& n = static_cast<const ValuesNode&>(node);
+            oss << "Values(" << n.derived_alias << ", "
+                << n.rows.size() << " rows)";
+            break;
+        }
+        case PlanNodeType::APPLY: {
+            auto& n = static_cast<const ApplyNode&>(node);
+            oss << "Apply("
+                << (n.is_left_outer ? "LEFT_OUTER" : "CROSS") << ")";
+            break;
+        }
     }
     oss << "\n";
     for (auto& child : node.children) {
@@ -337,9 +349,16 @@ std::string DeleteNode::ToString() const {
 
 CreateTableNode::CreateTableNode(std::string table_name, std::vector<ColumnDefinition> columns,
                                  std::vector<std::vector<std::string>> primary_keys,
+                                 std::vector<std::vector<std::string>> unique_constraints,
+                                 std::vector<ForeignKeyDef> foreign_keys,
+                                 std::vector<TableCheckDef> table_checks,
                                  bool if_not_exists)
     : table_name(std::move(table_name)), columns(std::move(columns)),
-      primary_keys(std::move(primary_keys)), if_not_exists(if_not_exists) {
+      primary_keys(std::move(primary_keys)),
+      unique_constraints(std::move(unique_constraints)),
+      foreign_keys(std::move(foreign_keys)),
+      table_checks(std::move(table_checks)),
+      if_not_exists(if_not_exists) {
 }
 
 PlanNodeType CreateTableNode::GetType() const {
@@ -555,6 +574,30 @@ std::string CreateFunctionNode::ToString() const {
     return "CreateFunction(" + function_name + ")\n";
 }
 
+// ============ 59_procs (Category 8) ============
+
+CreateProcedureNode::CreateProcedureNode(std::string procedure_name)
+    : procedure_name(std::move(procedure_name)) {
+}
+PlanNodeType CreateProcedureNode::GetType() const { return PlanNodeType::CREATE_PROCEDURE; }
+std::string CreateProcedureNode::ToString() const {
+    return "CreateProcedure(" + procedure_name + ")\n";
+}
+
+CallNode::CallNode(std::string procedure_name, std::vector<ExprPtr> arguments)
+    : procedure_name(std::move(procedure_name)), arguments(std::move(arguments)) {
+}
+PlanNodeType CallNode::GetType() const { return PlanNodeType::CALL; }
+std::string CallNode::ToString() const {
+    std::string out = "Call(" + procedure_name + "(";
+    for (size_t i = 0; i < arguments.size(); ++i) {
+        if (i) out += ", ";
+        out += arguments[i] ? arguments[i]->ToString() : "?";
+    }
+    out += "))\n";
+    return out;
+}
+
 DropObjectNode::DropObjectNode(Kind kind, std::string object_name, bool if_exists)
     : kind(kind), object_name(std::move(object_name)), if_exists(if_exists) {
 }
@@ -565,6 +608,7 @@ std::string DropObjectNode::ToString() const {
         case Kind::VIEW:     kn = "VIEW"; break;
         case Kind::TRIGGER:  kn = "TRIGGER"; break;
         case Kind::FUNCTION: kn = "FUNCTION"; break;
+        case Kind::PROCEDURE: kn = "PROCEDURE"; break;
     }
     std::string out = "Drop";
     out += kn;
@@ -646,6 +690,134 @@ ReleaseSavepointNode::ReleaseSavepointNode(std::string name)
 PlanNodeType ReleaseSavepointNode::GetType() const { return PlanNodeType::RELEASE_SP; }
 std::string ReleaseSavepointNode::ToString() const {
     return "ReleaseSavepoint(" + savepoint_name + ")\n";
+}
+
+// ============ 53_ddl: SCHEMA / SEQUENCE ============
+
+CreateSchemaNode::CreateSchemaNode(std::string name, bool if_not_exists)
+    : schema_name(std::move(name)), if_not_exists(if_not_exists) {}
+PlanNodeType CreateSchemaNode::GetType() const {
+    return PlanNodeType::CREATE_SCHEMA;
+}
+std::string CreateSchemaNode::ToString() const {
+    return "CreateSchema(" + schema_name + ")\n";
+}
+
+DropSchemaNode::DropSchemaNode(std::string name, bool if_exists)
+    : schema_name(std::move(name)), if_exists(if_exists) {}
+PlanNodeType DropSchemaNode::GetType() const {
+    return PlanNodeType::DROP_SCHEMA;
+}
+std::string DropSchemaNode::ToString() const {
+    return "DropSchema(" + schema_name + ")\n";
+}
+
+CreateSequenceNode::CreateSequenceNode(std::string name, int64_t start_value,
+                                       int64_t increment, bool if_not_exists)
+    : sequence_name(std::move(name)), start_value(start_value),
+      increment(increment), if_not_exists(if_not_exists) {}
+PlanNodeType CreateSequenceNode::GetType() const {
+    return PlanNodeType::CREATE_SEQUENCE;
+}
+std::string CreateSequenceNode::ToString() const {
+    return "CreateSequence(" + sequence_name + ")\n";
+}
+
+DropSequenceNode::DropSequenceNode(std::string name, bool if_exists)
+    : sequence_name(std::move(name)), if_exists(if_exists) {}
+PlanNodeType DropSequenceNode::GetType() const {
+    return PlanNodeType::DROP_SEQUENCE;
+}
+std::string DropSequenceNode::ToString() const {
+    return "DropSequence(" + sequence_name + ")\n";
+}
+
+// ============ 60_view_trigger (Category 9)：物化视图节点 ============
+
+CreateMaterializedViewNode::CreateMaterializedViewNode(std::string view_name,
+                                                       std::vector<ColumnDefinition> columns,
+                                                       bool if_not_exists)
+    : view_name(std::move(view_name)), columns(std::move(columns)),
+      if_not_exists(if_not_exists) {}
+PlanNodeType CreateMaterializedViewNode::GetType() const {
+    return PlanNodeType::CREATE_MATERIALIZED_VIEW;
+}
+std::string CreateMaterializedViewNode::ToString() const {
+    std::ostringstream oss;
+    oss << "CreateMaterializedView(" << view_name << ", cols=[";
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (i) oss << ", ";
+        oss << columns[i].column_name << ":" << columns[i].data_type;
+    }
+    oss << "])\n";
+    return oss.str();
+}
+
+AlterMaterializedViewNode::AlterMaterializedViewNode(std::string view_name)
+    : view_name(std::move(view_name)) {}
+PlanNodeType AlterMaterializedViewNode::GetType() const {
+    return PlanNodeType::ALTER_MATERIALIZED_VIEW;
+}
+std::string AlterMaterializedViewNode::ToString() const {
+    return "AlterMaterializedView(" + view_name + " REFRESH)\n";
+}
+
+// ============ 54_dml: UPDATE FROM / MERGE ============
+
+UpdateFromNode::UpdateFromNode(std::string table_name,
+                               std::vector<std::pair<std::string, ExprPtr>> assignments)
+    : table_name(std::move(table_name)), assignments(std::move(assignments)) {
+}
+PlanNodeType UpdateFromNode::GetType() const { return PlanNodeType::UPDATE_FROM; }
+std::string UpdateFromNode::ToString() const {
+    std::ostringstream oss;
+    oss << "UpdateFrom(" << table_name << ", "
+        << assignments.size() << " assigns)\n";
+    return oss.str();
+}
+
+MergeNode::MergeNode(std::string target_table)
+    : target_table(std::move(target_table)) {
+}
+PlanNodeType MergeNode::GetType() const { return PlanNodeType::MERGE; }
+std::string MergeNode::ToString() const {
+    std::ostringstream oss;
+    oss << "Merge(target=" << target_table
+        << ", source=" << source_table << ")\n";
+    return oss.str();
+}
+
+// ============ 55_query: VALUES / APPLY ============
+
+ValuesNode::ValuesNode(std::vector<std::vector<ExprPtr>> rows,
+                       std::vector<std::string> column_aliases,
+                       std::string derived_alias)
+    : rows(std::move(rows)),
+      column_aliases(std::move(column_aliases)),
+      derived_alias(std::move(derived_alias)) {
+}
+PlanNodeType ValuesNode::GetType() const { return PlanNodeType::VALUES; }
+std::string ValuesNode::ToString() const {
+    std::ostringstream oss;
+    oss << "Values(" << derived_alias << ", "
+        << rows.size() << " rows)\n";
+    return oss.str();
+}
+
+ApplyNode::ApplyNode(bool is_left_outer, std::string lateral_alias,
+                     std::vector<std::string> lateral_inner_tables)
+    : is_left_outer(is_left_outer), lateral_alias(std::move(lateral_alias)),
+      lateral_inner_tables(std::move(lateral_inner_tables)) {
+}
+PlanNodeType ApplyNode::GetType() const { return PlanNodeType::APPLY; }
+std::string ApplyNode::ToString() const {
+    std::ostringstream oss;
+    oss << "Apply(" << (is_left_outer ? "LEFT_OUTER" : "CROSS")
+        << ", alias=" << lateral_alias << ")\n";
+    for (auto& ch : children) {
+        if (ch) oss << NodeBodyToString(*ch, 1);
+    }
+    return oss.str();
 }
 
 }  // namespace sqlcompiler

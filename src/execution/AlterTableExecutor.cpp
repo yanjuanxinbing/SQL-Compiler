@@ -75,6 +75,8 @@ ColumnInfo MakeColumnInfo(const ColumnDefinition& cd) {
     // 没显式覆盖，但语法上要保留），因此把 AST 上的表达式一并搬运过去。
     ci.check_expr = cd.check_expr;
     ci.default_expr = cd.default_expr;
+    // 58_constraints: 命名 CHECK 约束在 ADD/MODIFY 路径上同样保留。
+    ci.constraint_name = cd.constraint_name;
     return ci;
 }
 
@@ -322,6 +324,43 @@ void AlterTableExecutor::Init() {
             added_values.assign(new_info.columns.size(), Value::MakeNull());
             break;
         }
+        case AlterAction::RENAME_COLUMN: {
+            // 53_ddl: 列重命名 —— 仅修改 schema，不重写行字节。
+            // 因为 TableHeap 的行字节布局是按"位置"序列化（不含列名），
+            // 修改 ColumnInfo.name 已足够让后续 SELECT 用新列名查表。
+            const std::string& old_name = node_->rename_column_old_name;
+            const std::string& new_name = node_->rename_column_new_name;
+            if (old_name.empty() || new_name.empty()) {
+                throw CompilerException(ErrorStage::SEMANTIC,
+                    "RENAME COLUMN requires both old and new column names");
+            }
+            if (old_name == new_name) {
+                return;  // no-op
+            }
+            int target_idx = -1;
+            for (size_t i = 0; i < new_info.columns.size(); ++i) {
+                if (new_info.columns[i].name == old_name) {
+                    target_idx = static_cast<int>(i);
+                    break;
+                }
+            }
+            if (target_idx < 0) {
+                throw CompilerException(ErrorStage::SEMANTIC,
+                    "column not found: " + old_name);
+            }
+            // 防御：new_name 已存在则报错。
+            for (const auto& c : new_info.columns) {
+                if (c.name == new_name) {
+                    throw CompilerException(ErrorStage::SEMANTIC,
+                        "column already exists: " + new_name);
+                }
+            }
+            new_info.columns[target_idx].name = new_name;
+            // 不需要 keep_map/rewrite；调用方识别"无行重写"路径。
+            keep_map.clear();
+            added_values.clear();
+            break;
+        }
         case AlterAction::DROP_COLUMN: {
             const std::string& drop_name = node_->drop_column_name;
             int drop_idx = -1;
@@ -411,16 +450,18 @@ void AlterTableExecutor::Init() {
         new_char_lengths.push_back(c.char_length);
     }
 
-    if (node_->action == AlterAction::RENAME_TO) {
-        // RENAME 不需要重写行字节，但仍然走同一目录更新路径，把 table_heaps_、
-        // sys_tables 记录全部迁移到新键。
+    if (node_->action == AlterAction::RENAME_TO ||
+        node_->action == AlterAction::RENAME_COLUMN) {
+        // RENAME 类不需要重写行字节，但仍然走同一目录更新路径。
+        //   - RENAME_TO 把 table_heaps_、sys_tables 记录迁移到新键。
+        //   - RENAME_COLUMN 仅修改 ColumnInfo.name；sys_tables blob 也要更新。
         // Phase B：让 catalog 内部 sys_tables 写入带上当前事务。
         catalog->SetActiveTransaction(context_->GetTransaction());
         bool ok = catalog->UpdateTableSchema(table_name, new_info);
         catalog->SetActiveTransaction(nullptr);
         if (!ok) {
             throw CompilerException(ErrorStage::SEMANTIC,
-                                    "failed to rename table in catalog");
+                                    "failed to update table schema in catalog");
         }
         return;
     }

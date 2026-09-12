@@ -225,8 +225,9 @@ void WindowExecutor::ComputeFrame(const WindowSpec& spec,
                                   size_t* out_start,
                                   size_t* out_end) const {
     size_t n = partition.ordered_indices.size();
-    auto bound_to_pos = [&](WindowFrame::BoundKind kind, const ExprPtr& expr,
-                            bool is_start) -> size_t {
+    // ---- 60_funcs: ROWS 路径（按行位置）----
+    auto rows_bound_to_pos = [&](WindowFrame::BoundKind kind, const ExprPtr& expr,
+                                 bool is_start) -> size_t {
         switch (kind) {
             case WindowFrame::BoundKind::UNBOUNDED_PRECEDING: return 0;
             case WindowFrame::BoundKind::UNBOUNDED_FOLLOWING: return n - 1;
@@ -269,9 +270,80 @@ void WindowExecutor::ComputeFrame(const WindowSpec& spec,
         }
         return;
     }
-    *out_start = bound_to_pos(spec.frame.kind1, spec.frame.expr1, true);
-    *out_end = bound_to_pos(spec.frame.kind2, spec.frame.expr2, false);
-    if (*out_start > *out_end) std::swap(*out_start, *out_end);
+    if (spec.frame.is_rows) {
+        // ROWS BETWEEN：按行位置偏移
+        *out_start = rows_bound_to_pos(spec.frame.kind1, spec.frame.expr1, true);
+        *out_end = rows_bound_to_pos(spec.frame.kind2, spec.frame.expr2, false);
+        if (*out_start > *out_end) std::swap(*out_start, *out_end);
+        return;
+    }
+
+    // ---- 60_funcs: RANGE BETWEEN（按 ORDER BY 列值偏移）----
+    // RANGE 语义：n PRECEDING / FOLLOWING 中的 n 是 ORDER BY 列值上的偏移量
+    // （不是行数）。要求 ORDER BY 只有 1 列；当前实现取首列作为 frame 基准。
+    // 边界值以双精度表示（INTEGER 转 double）；非数值列返回 0。
+    if (spec.order_by.empty()) {
+        // 无 ORDER BY 时 RANGE 退化为全部分区
+        *out_start = 0;
+        *out_end = n - 1;
+        return;
+    }
+    ExpressionEvaluator eval(column_index_map_, context_, nullptr);
+    const Tuple& cur_t = materialized_[partition.ordered_indices[current_pos]];
+    auto eval_off = [&](WindowFrame::BoundKind kind, const ExprPtr& expr,
+                        bool is_start) -> double {
+        switch (kind) {
+            case WindowFrame::BoundKind::UNBOUNDED_PRECEDING:
+                return is_start ? -1e300 : 0.0;  // unused on end side
+            case WindowFrame::BoundKind::UNBOUNDED_FOLLOWING:
+                return is_start ? 0.0 : 1e300;
+            case WindowFrame::BoundKind::CURRENT_ROW:
+                return 0.0;
+            case WindowFrame::BoundKind::EXPR_PRECEDING:
+            case WindowFrame::BoundKind::EXPR_FOLLOWING: {
+                double off = 1.0;
+                if (expr) {
+                    Value v = eval.Evaluate(expr, cur_t);
+                    if (!v.IsNull()) {
+                        if (v.GetType() == ValueType::INTEGER) off = static_cast<double>(v.AsInt());
+                        else if (v.GetType() == ValueType::FLOAT) off = v.AsFloat();
+                        else off = 0.0;
+                    } else {
+                        off = 0.0;
+                    }
+                }
+                return (kind == WindowFrame::BoundKind::EXPR_PRECEDING) ? -off : off;
+            }
+        }
+        return 0.0;
+    };
+    // 取当前行在首列 ORDER BY 上的值
+    Value cur_key = eval.Evaluate(spec.order_by[0].expr, cur_t);
+    double cur_key_d = 0.0;
+    if (!cur_key.IsNull()) {
+        if (cur_key.GetType() == ValueType::INTEGER) cur_key_d = static_cast<double>(cur_key.AsInt());
+        else if (cur_key.GetType() == ValueType::FLOAT) cur_key_d = cur_key.AsFloat();
+    }
+    double start_off = eval_off(spec.frame.kind1, spec.frame.expr1, true);
+    double end_off   = eval_off(spec.frame.kind2, spec.frame.expr2, false);
+    double lo_val = cur_key_d + start_off;
+    double hi_val = cur_key_d + end_off;
+    if (lo_val > hi_val) std::swap(lo_val, hi_val);
+    // 在 partition.ordered_indices 中按当前 sort 顺序扫描，找 frame 范围
+    size_t s_idx = current_pos;
+    size_t e_idx = current_pos;
+    for (size_t i = 0; i < n; ++i) {
+        Value v = eval.Evaluate(spec.order_by[0].expr, materialized_[partition.ordered_indices[i]]);
+        double vd = 0.0;
+        if (!v.IsNull()) {
+            if (v.GetType() == ValueType::INTEGER) vd = static_cast<double>(v.AsInt());
+            else if (v.GetType() == ValueType::FLOAT) vd = v.AsFloat();
+        }
+        if (vd >= lo_val && i < s_idx) s_idx = i;
+        if (vd <= hi_val && i > e_idx) e_idx = i;
+    }
+    *out_start = s_idx;
+    *out_end = e_idx;
 }
 
 Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
@@ -545,14 +617,44 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
             def = eval.Evaluate(args[2], materialized_[partition.ordered_indices[pos]]);
         }
         if (args.empty()) return def;
-        int64_t target = (name == "LAG")
-            ? static_cast<int64_t>(pos) - offset
-            : static_cast<int64_t>(pos) + offset;
+        // 60_funcs: IGNORE NULLS —— 沿 LAG/LEAD 方向跳过 NULL 值。
+        // spec.ignore_nulls 由 ParseOverClause 透传。
+        int64_t step = (name == "LAG") ? -1 : 1;
+        int64_t target = static_cast<int64_t>(pos) + step * offset;
+        if (spec.ignore_nulls) {
+            // 沿 step 方向最多扫到分区边界（避免无穷循环）
+            int64_t guard = 0;
+            while (target >= 0 && target < static_cast<int64_t>(n) && guard < static_cast<int64_t>(n)) {
+                Value v = eval.Evaluate(args[0], materialized_[partition.ordered_indices[static_cast<size_t>(target)]]);
+                if (!v.IsNull()) return v;
+                target += step;
+                ++guard;
+            }
+            return def;
+        }
         if (target < 0 || target >= static_cast<int64_t>(n)) return def;
         return eval.Evaluate(args[0], materialized_[partition.ordered_indices[static_cast<size_t>(target)]]);
     }
     if (name == "FIRST_VALUE" || name == "LAST_VALUE") {
         if (args.empty()) return Value::MakeNull();
+        // 60_funcs: IGNORE NULLS —— 在帧内（frame_start..frame_end）从边界出发
+        // 找到第一个非 NULL 值；FIRST_VALUE 从 frame_start，LAST_VALUE 从 frame_end。
+        if (spec.ignore_nulls) {
+            if (name == "LAST_VALUE") {
+                for (size_t i = frame_end + 1; i-- > frame_start; ) {
+                    if (i >= frame_end + 1) continue;
+                    Value v = eval.Evaluate(args[0], materialized_[partition.ordered_indices[i]]);
+                    if (!v.IsNull()) return v;
+                }
+                return Value::MakeNull();
+            } else {
+                for (size_t i = frame_start; i <= frame_end; ++i) {
+                    Value v = eval.Evaluate(args[0], materialized_[partition.ordered_indices[i]]);
+                    if (!v.IsNull()) return v;
+                }
+                return Value::MakeNull();
+            }
+        }
         // FIRST_VALUE/LAST_VALUE over the frame
         size_t s = frame_start, e = frame_end;
         if (name == "LAST_VALUE") {
@@ -562,6 +664,30 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
             return eval.Evaluate(args[0], materialized_[partition.ordered_indices[e]]);
         }
         return eval.Evaluate(args[0], materialized_[partition.ordered_indices[s]]);
+    }
+    // ---- 60_funcs: NTH_VALUE(expr, n) ----
+    // 返回帧内第 n 行（1-based）的 expr 值；n 越界返回 NULL。
+    // IGNORE NULLS 时把 NULL 计入"跳过"，仅对非 NULL 行按 1-based 计数。
+    if (name == "NTH_VALUE") {
+        if (args.size() < 2) return Value::MakeNull();
+        Value nv = eval.Evaluate(args[1], materialized_[partition.ordered_indices[pos]]);
+        if (nv.IsNull()) return Value::MakeNull();
+        int64_t n_target = (nv.GetType() == ValueType::FLOAT)
+            ? static_cast<int64_t>(nv.AsFloat()) : nv.AsInt();
+        if (n_target < 1) return Value::MakeNull();
+        if (spec.ignore_nulls) {
+            int64_t seen = 0;
+            for (size_t i = frame_start; i <= frame_end; ++i) {
+                Value v = eval.Evaluate(args[0], materialized_[partition.ordered_indices[i]]);
+                if (v.IsNull()) continue;
+                ++seen;
+                if (seen == n_target) return v;
+            }
+            return Value::MakeNull();
+        }
+        int64_t idx = static_cast<int64_t>(frame_start) + n_target - 1;
+        if (idx > static_cast<int64_t>(frame_end)) return Value::MakeNull();
+        return eval.Evaluate(args[0], materialized_[partition.ordered_indices[static_cast<size_t>(idx)]]);
     }
 
     return Value::MakeNull();
