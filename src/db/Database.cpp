@@ -9,11 +9,14 @@
 #include "txn/LogManager.h"
 #include "txn/RecoveryManager.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <system_error>
 
 namespace sqlcompiler {
@@ -58,7 +61,8 @@ bool HandleCrashAfterUndoSteps(const std::string& sql, int* n_out) {
 
 }  // namespace
 
-Database::Database(const std::string& db_file, size_t buffer_pool_size)
+Database::Database(const std::string& db_file, size_t buffer_pool_size,
+                   int bg_flush_ms)
     : is_new_database_(false) {
     // 1) 将路径规范化为绝对路径，避免后续 cwd 变化导致路径失效
     std::error_code ec;
@@ -169,6 +173,13 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size)
         // 不写也没有正确性问题（恢复时 ReadAll 会得到空）。
         recovery_->Checkpoint();
     }
+
+    // E5：可选地启动后台异步刷脏线程（仅在 bg_flush_ms > 0 时开启，默认关闭）。
+    // 放最后——确保恢复/目录/执行引擎全部就绪后线程才开始触碰脏页与 WAL。
+    if (bg_flush_ms > 0 && buffer_pool_manager_ != nullptr) {
+        buffer_pool_manager_->StartBackgroundFlush(
+            std::chrono::milliseconds(bg_flush_ms));
+    }
 }
 
 Database::~Database() {
@@ -176,6 +187,24 @@ Database::~Database() {
 }
 
 ExecutionResult Database::ExecuteSQL(const std::string& sql) {
+    // \stats —— 输出存储子系统诊断信息（缓冲池/页分配/替换日志）。
+    // 需在通用 \crash 处理之前识别。
+    if (IsCrashDebugCommand(sql)) {
+        size_t i = 0;
+        while (i < sql.size() && (sql[i] == ' ' || sql[i] == '\t')) ++i;
+        if (sql.compare(i, 6, "\\stats") == 0) {
+            bool is_stats = (i + 6 >= sql.size()) ||
+                            (sql[i + 6] == ' ' || sql[i + 6] == '\t' ||
+                             sql[i + 6] == ';' || sql[i + 6] == '\r' ||
+                             sql[i + 6] == '\n');
+            if (is_stats) {
+                ExecutionResult ok;
+                ok.success = true;
+                ok.message = GetStorageStats();
+                return ok;
+            }
+        }
+    }
     // Phase C 调试命令：\crash_after_undo_steps N —— 让 Rollback 在撤销 N 步后
     // 立即 _Exit(1)。必须在通用 \crash 之前识别（否则通用路径会先 _Exit）。
     if (IsCrashDebugCommand(sql)) {
@@ -310,6 +339,8 @@ std::vector<ExecutionResult> Database::ExecuteScript(const std::string& sql_scri
 
 void Database::Shutdown() {
     // Phase B：先 flush bufferpool，然后写 CHECKPOINT + 同步 WAL。
+    // E5：先停后台刷脏线程（join），避免其与随后的 FlushAllPages / Checkpoint / Sync 竞态。
+    if (buffer_pool_manager_) buffer_pool_manager_->StopBackgroundFlush();
     if (buffer_pool_manager_) buffer_pool_manager_->FlushAllPages();
     if (recovery_) recovery_->Checkpoint();
     if (log_manager_) {
@@ -343,6 +374,61 @@ void Database::MaybeCrashAfterSuccess() {
         }
         expected = crash_after_n_statements_.load();
     }
+}
+
+std::string Database::GetStorageStats() const {
+    std::ostringstream oss;
+    oss << "--- storage stats ---\n";
+    if (buffer_pool_manager_ == nullptr || disk_manager_ == nullptr) {
+        oss << "(not initialized)\n";
+        return oss.str();
+    }
+    const BufferPoolStats& st = buffer_pool_manager_->GetStats();
+    const auto& log = buffer_pool_manager_->GetReplacementLog();
+    const long long hits = st.hit_count;
+    const long long misses = st.miss_count;
+    const long long repl = st.replacement_count;
+    const double hit_ratio = (hits + misses) > 0
+                                 ? (100.0 * hits) / (hits + misses)
+                                 : 0.0;
+    oss << "buffer pool frames   : "
+        << buffer_pool_manager_->GetPoolSize() << "\n";
+    oss << "buffer memory        : "
+        << buffer_pool_manager_->GetMemoryUsageBytes() << " B / "
+        << buffer_pool_manager_->GetMemoryCapBytes() << " B  ("
+        << buffer_pool_manager_->GetMemoryUsageFrames() << "/"
+        << buffer_pool_manager_->GetPoolSize() << " frames)\n";
+    oss << "hits / misses / repl : " << hits << " / " << misses
+        << " / " << repl << "\n";
+    oss << "dirty writebacks     : " << st.writeback_count << "\n";
+    oss << "hit ratio            : " << std::fixed << std::setprecision(2)
+        << hit_ratio << "%\n";
+    oss << "disk pages / free    : "
+        << disk_manager_->GetNumPages() << " / "
+        << disk_manager_->GetNumFreePages() << "\n";
+    oss << "disk reads / writes  : "
+        << disk_manager_->GetIOReadCount() << " / "
+        << disk_manager_->GetIOWriteCount() << "\n";
+    oss << "background flush     : "
+        << (buffer_pool_manager_->IsBackgroundFlushEnabled()
+                ? "every " +
+                      std::to_string(
+                          buffer_pool_manager_->GetBackgroundFlushInterval().count()) +
+                      "ms, ticks=" +
+                      std::to_string(buffer_pool_manager_->GetBackgroundFlushTicks())
+                : "disabled")
+        << "\n";
+    const size_t cap = BufferPoolManager::GetReplacementLogCapacity();
+    const size_t shown = std::min<size_t>(log.size(), 20);
+    oss << "replacement log (" << log.size() << " recent, cap " << cap
+        << "):\n";
+    for (size_t k = log.size() - shown; k < log.size(); ++k) {
+        const auto& e = log[k];
+        oss << "    evict=pid " << e.evicted_page_id
+            << "   loaded=pid " << e.loaded_page_id
+            << (e.evicted_was_dirty ? "   [dirty]" : "") << "\n";
+    }
+    return oss.str();
 }
 
 }  // namespace sqlcompiler
