@@ -17,12 +17,10 @@
 #include "catalog/SystemCatalog.h"
 #include "common/Error.h"
 #include "execution/ConstraintChecker.h"
-#include "execution/ExecutionEngine.h"
 #include "execution/ExpressionEvaluator.h"
 #include "execution/IndexMaintenance.h"
 
 #include <unordered_map>
-#include <unordered_set>
 
 namespace sqlcompiler {
 

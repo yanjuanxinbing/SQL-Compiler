@@ -43,7 +43,7 @@ Page* BufferPoolManager::GetPage(page_id_t page_id) {
         return &pages_[frame_id];
     }
     int frame_id = -1;
-    if (!FindFreeFrame(&frame_id)) {
+    if (!FindFreeFrame(&frame_id, page_id)) {
         return nullptr;
     }
     disk_manager_->ReadPage(page_id, pages_[frame_id].GetData());
@@ -61,10 +61,19 @@ Page* BufferPoolManager::GetPage(page_id_t page_id) {
 
 Page* BufferPoolManager::NewPage(page_id_t* page_id) {
     int frame_id = -1;
-    if (!FindFreeFrame(&frame_id)) {
+    // NewPage 调用时 page_id 尚未分配，因此先取一个 frame 占位并把替换日志
+    // 的 loaded_page_id 暂时记为 INVALID_PAGE_ID；分配完新 pid 后再
+    // PatchLastReplacementLog 补填，保持替换日志语义自洽。
+    if (!FindFreeFrame(&frame_id, INVALID_PAGE_ID)) {
         return nullptr;
     }
     page_id_t new_pid = disk_manager_->AllocatePage();
+    if (new_pid == INVALID_PAGE_ID) {
+        // 分配失败：把 frame 退回 free_list_，让外部看起来像"什么都没发生"。
+        free_list_.push_back(frame_id);
+        return nullptr;
+    }
+    PatchLastReplacementLog(new_pid);
     pages_[frame_id].ResetMemory();
     pages_[frame_id].SetPageId(new_pid);
     pages_[frame_id].IncPinCount();  // pin = 1
@@ -172,10 +181,12 @@ const std::vector<ReplacementLogEntry>& BufferPoolManager::GetReplacementLog() c
     return replacement_log_;
 }
 
-bool BufferPoolManager::FindFreeFrame(int* frame_id) {
+bool BufferPoolManager::FindFreeFrame(int* frame_id, page_id_t to_load) {
     if (!free_list_.empty()) {
         int fid = free_list_.back();
         free_list_.pop_back();
+        // free_list_ 路径不淘汰任何页，不写 replacement_log_，
+        // 这样可以避免日志被"无意义"的换入事件污染。
         if (frame_id) *frame_id = fid;
         return true;
     }
@@ -200,11 +211,20 @@ bool BufferPoolManager::FindFreeFrame(int* frame_id) {
     ReplacementLogEntry entry;
     entry.evicted_page_id = evicted_pid;
     entry.evicted_was_dirty = evicted_dirty;
-    entry.loaded_page_id = INVALID_PAGE_ID;  // filled by caller
+    // 直接由调用方提供 to_load，避免过去那种 "filled by caller" 但没人来填
+    // 的死代码。NewPage 路径若一时拿不到 pid，会传 INVALID_PAGE_ID 并在
+    // AllocatePage 之后调用 PatchLastReplacementLog 补填。
+    entry.loaded_page_id = to_load;
     replacement_log_.push_back(entry);
     ++stats_.replacement_count;
     if (frame_id) *frame_id = victim;
     return true;
+}
+
+void BufferPoolManager::PatchLastReplacementLog(page_id_t loaded_page_id) {
+    // 仅有真正的"换出→换入"事件才记录日志；free_list_ 取出的帧不会留下条目。
+    if (replacement_log_.empty()) return;
+    replacement_log_.back().loaded_page_id = loaded_page_id;
 }
 
 }  // namespace sqlcompiler

@@ -8,10 +8,8 @@
 
 #include "common/Error.h"
 #include "execution/ConstraintChecker.h"
-#include "execution/ExecutionEngine.h"
 #include "execution/ExpressionEvaluator.h"
 #include "execution/IndexMaintenance.h"
-#include "execution/InsertExecutor.h"
 
 #include <cctype>
 #include <unordered_map>

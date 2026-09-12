@@ -1,7 +1,5 @@
 #include "execution/ApplyExecutor.h"
 
-#include "plan/Plan.h"
-
 #include <unordered_set>
 
 namespace sqlcompiler {

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <vector>
 #include <cctype>
+#include <fstream>
+#include <sstream>
 
 #include "ast/AST.h"
 #include "db/Database.h"
@@ -299,10 +301,98 @@ void PrintResult(const sqlcompiler::ExecutionResult& result) {
               << (result.rows.size() == 1 ? " row)" : " rows)") << std::endl;
 }
 
+// 把 .sql 脚本里的全部语句按 ';' 切分，逐条交给 Database 执行。
+// 失败时打印错误并继续（与 REPL 行为一致），不中断后续语句。
+// 返回 true 表示文件被成功打开（即使里面所有语句都失败）。
+//
+// 切分策略：与 REPL 复用 HasCompleteStatement() —— 逐字符累积到 buffer，
+// 当 buffer 出现"语句已完整"信号时整段 trim 后执行、清空 buffer 继续。
+// 文本末尾若没有 ';'，会作为最后一条语句兜底执行。
+//
+// 复杂度：HasCompleteStatement 自身是 O(|buffer|)，整体 O(N²)。对教学用的
+// 脚本（KB 级）足够快；工业级可换成单趟扫描的 statement splitter。
+bool RunScriptFile(sqlcompiler::Database* database, const std::string& path) {
+    std::ifstream in(path);
+    if (!in) {
+        std::cerr << "Error: cannot open script file '" << path << "'" << std::endl;
+        return false;
+    }
+    std::stringstream ss;
+    ss << in.rdbuf();
+    std::string content = ss.str();
+
+    auto run_one = [&](const std::string& buf) -> bool {
+        size_t a = buf.find_first_not_of(" \t\r\n");
+        size_t b = buf.find_last_not_of(" \t\r\n");
+        if (a == std::string::npos) return false;
+        std::string trimmed = buf.substr(a, b - a + 1);
+        if (trimmed.empty() || IsOnlyCommentsOrWhitespace(trimmed)) return false;
+        auto result = database->ExecuteSQL(trimmed);
+        PrintResult(result);
+        return true;
+    };
+
+    std::string buffer;
+    size_t statements_run = 0;
+    for (size_t i = 0; i < content.size(); ++i) {
+        buffer.push_back(content[i]);
+        if (HasCompleteStatement(buffer)) {
+            if (run_one(buffer)) ++statements_run;
+            buffer.clear();
+        }
+    }
+    // 兜底：文件末尾可能没有 ';'，把残留 buffer 也跑掉。
+    if (!buffer.empty()) {
+        if (run_one(buffer)) ++statements_run;
+    }
+    std::cout << "[script] " << path << ": ran " << statements_run
+              << " statement(s)" << std::endl;
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string db_file = (argc > 1) ? argv[1] : "sqlcompiler.db";
+    // ---- 参数解析 ----
+    // 优先级：
+    //   1) `-f <file>` / `--file <file>` / `--source <file>` / `-f=<file>`
+    //      → 批量执行该脚本文件后退出（不进入 REPL）。可与 DB 文件混用。
+    //   2) 否则第一个非 flag 参数视为数据库文件路径（向后兼容旧行为）。
+    //   3) 都没有就用默认 "sqlcompiler.db"。
+    std::string db_file = "sqlcompiler.db";
+    std::vector<std::string> script_files;  // 多个 -f 依次执行
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto take_next = [&](const std::string& flag) -> std::string {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: " << flag << " requires a file argument"
+                          << std::endl;
+                std::exit(2);
+            }
+            return argv[++i];
+        };
+        if (a == "-f" || a == "--file" || a == "--source") {
+            script_files.push_back(take_next(a));
+        } else if (a.rfind("-f=", 0) == 0) {
+            script_files.push_back(a.substr(3));
+        } else if (a == "-h" || a == "--help") {
+            std::cout << "Usage: sqlcompiler [db_file] [-f script.sql ...]\n"
+                      << "  db_file         Path to the database file "
+                      << "(default: sqlcompiler.db)\n"
+                      << "  -f <file>       Run <file> as a SQL script, then "
+                      << "exit (repeatable)\n"
+                      << "  --file, --source   Aliases for -f\n"
+                      << "Inside the REPL you can also run: .source <file> "
+                      << "(or .read <file>)\n";
+            return 0;
+        } else if (!a.empty() && a[0] == '-') {
+            std::cerr << "Error: unknown option '" << a << "'" << std::endl;
+            return 2;
+        } else {
+            // 第一个非 flag 参数 → 数据库文件
+            db_file = a;
+        }
+    }
 
     sqlcompiler::Database* database = nullptr;
     try {
@@ -315,6 +405,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // ---- 批处理模式：跑完脚本直接退出 ----
+    // REPL 帮助信息在 REPL 内打印；批处理模式只输出脚本自身的执行结果。
+    if (!script_files.empty()) {
+        int rc = 0;
+        for (const auto& f : script_files) {
+            if (!RunScriptFile(database, f)) rc = 1;
+        }
+        database->Shutdown();
+        delete database;
+        return rc;
+    }
+
     std::string line;
     std::string sql;
     std::cout << "sqlcompiler> " << std::flush;
@@ -322,6 +424,8 @@ int main(int argc, char** argv) {
     // 启动 banner 之前已在外层输出"sqlcompiler> "，这里再追加一行避免覆盖 prompt。
     std::cout << "Meta-commands: \\.tokens, \\.ast, \\.plan "
               << " (show last statement's debug info)" << std::endl;
+    std::cout << "Meta-commands: .source <file>  (or .read <file>) - "
+              << "load and execute SQL script" << std::endl;
     std::cout << "sqlcompiler> " << std::flush;
     while (std::getline(std::cin, line)) {
         // ---- Phase 1.5: 元命令就地处理 ----
@@ -351,6 +455,28 @@ int main(int argc, char** argv) {
             if (trimmed_cmd == R"(\.plan)") {
                 PrintPlan(database->LastPlan());
                 std::cout << "sqlcompiler> " << std::flush;
+                continue;
+            }
+            // 脚本加载元命令：`.source <file>` / `.read <file>` / 同名带反斜杠。
+            // 接受两种风格（带或不带前导 `\`）以贴合 MySQL/PostgreSQL 习惯。
+            auto try_source = [&](const std::string& trigger) -> bool {
+                if (trimmed_cmd.rfind(trigger, 0) != 0) return false;
+                std::string rest = trimmed_cmd.substr(trigger.size());
+                size_t ra = rest.find_first_not_of(" \t\r\n");
+                size_t rb = rest.find_last_not_of(" \t\r\n");
+                if (ra == std::string::npos) {
+                    std::cerr << "Error: " << trigger
+                              << " requires a file argument" << std::endl;
+                    std::cout << "sqlcompiler> " << std::flush;
+                    return true;
+                }
+                std::string path = rest.substr(ra, rb - ra + 1);
+                RunScriptFile(database, path);
+                std::cout << "sqlcompiler> " << std::flush;
+                return true;
+            };
+            if (try_source(".source ") || try_source(".read ") ||
+                try_source("\\.source ") || try_source("\\.read ")) {
                 continue;
             }
         }

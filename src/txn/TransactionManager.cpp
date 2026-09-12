@@ -31,7 +31,6 @@
 #include <cstring>
 #include <iostream>
 
-#include "common/Error.h"
 #include "storage/DiskManager.h"
 #include "storage/Page.h"
 #include "txn/LogManager.h"

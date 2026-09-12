@@ -96,9 +96,23 @@ private:
     // Phase B：可空；非空时 FlushPage / FlushAllDirtyPages 走 LSN 检查。
     LogManager* log_manager_ = nullptr;
 
-    // 找到一个可用帧：优先从free_list_取空闲帧，否则调用replacer_->Victim()淘汰一页；
-    // 若淘汰的页为脏页需先写回磁盘。成功返回true并写入frame_id
-    bool FindFreeFrame(int* frame_id);
+    // 找到一个可用帧：优先从 free_list_ 取空闲帧，否则调用 replacer_->Victim()
+    // 淘汰一页；若淘汰的页为脏页需先写回磁盘。成功返回 true 并写入 *frame_id。
+    // 同时把一条 ReplacementLogEntry 追加到 replacement_log_。
+    //
+    // to_load：调用方即将换入该帧的 page_id（GetPage 是请求加载的 page_id；
+    //          NewPage 是 DiskManager 刚分配的新 page_id）。该值会原样写入
+    //          ReplacementLogEntry.loaded_page_id，便于外部观测"换入什么页"。
+    //          若调用方尚未决定 page_id（例如 NewPage 的 pid 在分配后才得到），
+    //          可以传 INVALID_PAGE_ID，并在之后用 PatchLastReplacementLog()
+    //          补填。
+    bool FindFreeFrame(int* frame_id, page_id_t to_load);
+
+    // 补填最近一次 FindFreeFrame 写入的 ReplacementLogEntry.loaded_page_id。
+    // 适用于调用方在 FindFreeFrame 之后才确定 page_id 的场景（如 NewPage 先
+    // 拿到 frame 再调 DiskManager::AllocatePage 的旧路径）。无副作用时
+    // （日志为空）安全 no-op。
+    void PatchLastReplacementLog(page_id_t loaded_page_id);
 };
 
 }  // namespace sqlcompiler

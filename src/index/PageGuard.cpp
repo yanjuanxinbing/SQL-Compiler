@@ -1,7 +1,5 @@
 #include "index/PageGuard.h"
 
-#include <utility>
-
 namespace sqlcompiler {
 
 PageGuard::PageGuard(BufferPoolManager* bpm, Page* page, page_id_t page_id)

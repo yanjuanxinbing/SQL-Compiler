@@ -13,7 +13,6 @@
 #include "catalog/SystemCatalog.h"
 #include "catalog/IndexInfo.h"
 
-#include <sstream>
 #include <utility>
 
 namespace sqlcompiler {
