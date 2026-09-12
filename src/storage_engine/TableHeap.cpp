@@ -3,6 +3,7 @@
 #include <cstring>
 #include <unordered_set>
 
+#include "index/PageGuard.h"
 #include "storage/Page.h"
 #include "txn/LogManager.h"
 #include "txn/LogRecord.h"
@@ -102,13 +103,13 @@ TableHeap::TableHeap(BufferPoolManager* buffer_pool_manager, page_id_t first_pag
 }
 
 TableHeap* TableHeap::Create(BufferPoolManager* buffer_pool_manager) {
-    page_id_t pid = INVALID_PAGE_ID;
-    Page* page = buffer_pool_manager->NewPage(&pid);
-    if (!page) return nullptr;
-    InitEmptyPageHeader(page->GetData());
-    page->SetDirty(true);
-    buffer_pool_manager->UnpinPage(pid, true);
-    return new TableHeap(buffer_pool_manager, pid);
+    // 用 RAII 句柄持有新页：作用域结束时自动 unpin（脏），杜绝裸 GetPage/UnpinPage
+    // 成对遗漏导致的 pin 泄漏（泄漏表现为缓冲池逐渐耗尽，极难定位）。
+    PageGuard guard = PageGuard::New(buffer_pool_manager);
+    if (!guard.Valid()) return nullptr;
+    InitEmptyPageHeader(guard.Data());
+    guard.MarkDirty();
+    return new TableHeap(buffer_pool_manager, guard.PageId());
 }
 
 TableHeap* TableHeap::Open(BufferPoolManager* buffer_pool_manager, page_id_t first_page_id) {
@@ -121,13 +122,13 @@ page_id_t TableHeap::GetFirstPageId() const {
 
 bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
                                  const std::vector<ValueType>& column_types) {
-    Page* page = buffer_pool_manager_->GetPage(page_id);
-    if (!page) return false;
-    char* data = page->GetData();
+    PageGuard guard = PageGuard::Fetch(buffer_pool_manager_, page_id);
+    if (!guard.Valid()) return false;
+    char* data = guard.Data();
     int32_t next_pid, slot_count, free_off;
     ReadPageHeader(data, next_pid, slot_count, free_off);
     bool header_fixed = NormalizePageHeader(data, next_pid, slot_count, free_off);
-    if (header_fixed) page->SetDirty(true);
+    if (header_fixed) guard.MarkDirty();
 
     std::vector<char> serialized = tuple.Serialize(column_types);
     int32_t len = static_cast<int32_t>(serialized.size());
@@ -135,7 +136,7 @@ bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
     // Need room for: new slot entry (kSlotBytes) + record bytes
     int32_t slot_dir_end = kHeaderBytes + (slot_count + 1) * kSlotBytes;
     if (slot_dir_end > free_off || len > free_off - slot_dir_end) {
-        buffer_pool_manager_->UnpinPage(page_id, header_fixed);
+        if (header_fixed) guard.MarkDirty();
         return false;
     }
 
@@ -157,7 +158,7 @@ bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
     }
     WriteSlot(data, slot_count, new_off, len);
     WritePageHeader(data, next_pid, slot_count + 1, new_off);
-    page->SetDirty(true);
+    guard.MarkDirty();
 
     // Phase B：写 WAL（UPDATE 记录；before/after 都是 PAGE_SIZE 字节）。
     if (log_manager_ != nullptr) {
@@ -168,7 +169,7 @@ bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
         rec.before_image_ = std::move(before_image);
         rec.after_image_.assign(data, data + PAGE_SIZE);
         lsn_t lsn = log_manager_->AppendRecord(std::move(rec));
-        page->SetPageLsn(lsn);
+        guard.SetPageLsn(lsn);
         // Phase C：回填 in-memory undo 记录的 LSN。
         if (active_txn_ != nullptr && active_txn_->IsActive()) {
             active_txn_->SetLastUndoLSN(lsn);
@@ -178,7 +179,6 @@ bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
         rid->page_id = page_id;
         rid->slot_num = slot_count;
     }
-    buffer_pool_manager_->UnpinPage(page_id, true);
     return true;
 }
 
@@ -193,31 +193,31 @@ bool TableHeap::InsertTuple(const Tuple& tuple, RID* rid,
         if (InsertIntoPage(pid, tuple, rid, column_types)) {
             return true;
         }
-        // Walk to next page in chain
-        Page* page = buffer_pool_manager_->GetPage(pid);
-        if (!page) return false;
-        int32_t next_pid, slot_count, free_off;
-        ReadPageHeader(page->GetData(), next_pid, slot_count, free_off);
-        buffer_pool_manager_->UnpinPage(pid, false);
+        // Walk to next page in chain（用 RAII 句柄读页头后立即释放）
+        page_id_t next_pid = INVALID_PAGE_ID;
+        {
+            PageGuard guard = PageGuard::Fetch(buffer_pool_manager_, pid);
+            if (!guard.Valid()) return false;
+            int32_t slot_count, free_off;
+            ReadPageHeader(guard.Data(), next_pid, slot_count, free_off);
+        }
         prev_pid = pid;
         if (next_pid == pid) break;
         pid = next_pid;
     }
     // Allocate a new page and link from prev page
-    page_id_t new_pid = INVALID_PAGE_ID;
-    Page* new_page = buffer_pool_manager_->NewPage(&new_pid);
-    if (!new_page) return false;
-    InitEmptyPageHeader(new_page->GetData());
-    new_page->SetDirty(true);
-    buffer_pool_manager_->UnpinPage(new_pid, true);
+    PageGuard new_guard = PageGuard::New(buffer_pool_manager_);
+    if (!new_guard.Valid()) return false;
+    InitEmptyPageHeader(new_guard.Data());
+    new_guard.MarkDirty();
+    page_id_t new_pid = new_guard.PageId();
     if (prev_pid != INVALID_PAGE_ID) {
-        Page* prev = buffer_pool_manager_->GetPage(prev_pid);
-        if (prev) {
+        PageGuard prev = PageGuard::Fetch(buffer_pool_manager_, prev_pid);
+        if (prev.Valid()) {
             int32_t next_pid, slot_count, free_off;
-            ReadPageHeader(prev->GetData(), next_pid, slot_count, free_off);
-            WritePageHeader(prev->GetData(), new_pid, slot_count, free_off);
-            prev->SetDirty(true);
-            buffer_pool_manager_->UnpinPage(prev_pid, true);
+            ReadPageHeader(prev.Data(), next_pid, slot_count, free_off);
+            WritePageHeader(prev.Data(), new_pid, slot_count, free_off);
+            prev.MarkDirty();
         }
     } else {
         first_page_id_ = new_pid;
@@ -228,19 +228,17 @@ bool TableHeap::InsertTuple(const Tuple& tuple, RID* rid,
 bool TableHeap::GetTuple(const RID& rid, Tuple* tuple,
                           const std::vector<ValueType>& column_types) {
     if (!rid.IsValid()) return false;
-    Page* page = buffer_pool_manager_->GetPage(rid.page_id);
-    if (!page) return false;
-    char* data = page->GetData();
+    PageGuard guard = PageGuard::Fetch(buffer_pool_manager_, rid.page_id);
+    if (!guard.Valid()) return false;
+    char* data = guard.Data();
     int32_t next_pid, slot_count, free_off;
     ReadPageHeader(data, next_pid, slot_count, free_off);
     if (rid.slot_num < 0 || rid.slot_num >= slot_count) {
-        buffer_pool_manager_->UnpinPage(rid.page_id, false);
         return false;
     }
     int32_t off, len;
     ReadSlot(data, rid.slot_num, off, len);
     if (IsTombstone(len)) {
-        buffer_pool_manager_->UnpinPage(rid.page_id, false);
         return false;
     }
     // 防御性边界校验：slot 中的 (off, len) 必须完整落在数据区内。
@@ -248,26 +246,23 @@ bool TableHeap::GetTuple(const RID& rid, Tuple* tuple,
     // 避免 Tuple::Deserialize 读到页外内存而崩溃。
     if (off < kHeaderBytes || len <= 0 ||
         off > static_cast<int32_t>(PAGE_SIZE) - len) {
-        buffer_pool_manager_->UnpinPage(rid.page_id, false);
         return false;
     }
     if (tuple) {
         *tuple = Tuple::Deserialize(data + off, column_types);
         tuple->SetRid(rid);
     }
-    buffer_pool_manager_->UnpinPage(rid.page_id, false);
     return true;
 }
 
 bool TableHeap::DeleteTuple(const RID& rid) {
     if (!rid.IsValid()) return false;
-    Page* page = buffer_pool_manager_->GetPage(rid.page_id);
-    if (!page) return false;
-    char* data = page->GetData();
+    PageGuard guard = PageGuard::Fetch(buffer_pool_manager_, rid.page_id);
+    if (!guard.Valid()) return false;
+    char* data = guard.Data();
     int32_t next_pid, slot_count, free_off;
     ReadPageHeader(data, next_pid, slot_count, free_off);
     if (rid.slot_num < 0 || rid.slot_num >= slot_count) {
-        buffer_pool_manager_->UnpinPage(rid.page_id, false);
         return false;
     }
     // Phase A：写之前抓整页 before-image。
@@ -281,7 +276,7 @@ bool TableHeap::DeleteTuple(const RID& rid) {
         before_image.assign(data, data + PAGE_SIZE);
     }
     WriteSlot(data, rid.slot_num, 0, static_cast<int32_t>(kTombstone));
-    page->SetDirty(true);
+    guard.MarkDirty();
 
     // Phase B：写 UPDATE 记录（before = 原 page，after = 带墓碑的 page）。
     if (log_manager_ != nullptr) {
@@ -292,39 +287,35 @@ bool TableHeap::DeleteTuple(const RID& rid) {
         rec.before_image_ = std::move(before_image);
         rec.after_image_.assign(data, data + PAGE_SIZE);
         lsn_t lsn = log_manager_->AppendRecord(std::move(rec));
-        page->SetPageLsn(lsn);
+        guard.SetPageLsn(lsn);
         // Phase C：回填 in-memory undo 记录的 LSN。
         if (active_txn_ != nullptr && active_txn_->IsActive()) {
             active_txn_->SetLastUndoLSN(lsn);
         }
     }
-    buffer_pool_manager_->UnpinPage(rid.page_id, true);
     return true;
 }
 
 bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple,
                              const std::vector<ValueType>& column_types) {
     if (!rid.IsValid()) return false;
-    Page* page = buffer_pool_manager_->GetPage(rid.page_id);
-    if (!page) return false;
-    char* data = page->GetData();
+    PageGuard guard = PageGuard::Fetch(buffer_pool_manager_, rid.page_id);
+    if (!guard.Valid()) return false;
+    char* data = guard.Data();
     int32_t next_pid, slot_count, free_off;
     ReadPageHeader(data, next_pid, slot_count, free_off);
     if (rid.slot_num < 0 || rid.slot_num >= slot_count) {
-        buffer_pool_manager_->UnpinPage(rid.page_id, false);
         return false;
     }
     int32_t off, len;
     ReadSlot(data, rid.slot_num, off, len);
     if (IsTombstone(len) || off < 0 || len < 0 ||
         off + len > static_cast<int32_t>(PAGE_SIZE)) {
-        buffer_pool_manager_->UnpinPage(rid.page_id, false);
         return false;
     }
     std::vector<char> serialized = new_tuple.Serialize(column_types);
     int32_t new_len = static_cast<int32_t>(serialized.size());
     if (new_len == 0) {
-        buffer_pool_manager_->UnpinPage(rid.page_id, false);
         return false;
     }
     // Phase A：写之前抓整页 before-image（即使后续走 relocate 路径，
@@ -344,7 +335,7 @@ bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple,
         }
         std::memcpy(data + off, serialized.data(), new_len);
         WriteSlot(data, rid.slot_num, off, new_len);
-        page->SetDirty(true);
+        guard.MarkDirty();
 
         // Phase B：写 UPDATE 记录（in-place，before/after 都在同一页）。
         if (log_manager_ != nullptr) {
@@ -355,16 +346,14 @@ bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple,
             rec.before_image_ = std::move(before_image);
             rec.after_image_.assign(data, data + PAGE_SIZE);
             lsn_t lsn = log_manager_->AppendRecord(std::move(rec));
-            page->SetPageLsn(lsn);
+            guard.SetPageLsn(lsn);
             // Phase C：回填 in-memory undo 记录的 LSN。
             if (active_txn_ != nullptr && active_txn_->IsActive()) {
                 active_txn_->SetLastUndoLSN(lsn);
             }
         }
-        buffer_pool_manager_->UnpinPage(rid.page_id, true);
         return true;
     }
-    buffer_pool_manager_->UnpinPage(rid.page_id, false);
     // Cannot grow in place — delete and reinsert
     // 关键：DeleteTuple 和 InsertTuple 各自会写自己的 WAL 记录；这里不再单独追加。
     DeleteTuple(rid);
@@ -378,23 +367,25 @@ void TableHeap::ClearAll() {
     if (pid == INVALID_PAGE_ID) return;
 
     // Find first page header
-    Page* first = buffer_pool_manager_->GetPage(pid);
-    if (!first) return;
-    char* first_data = first->GetData();
-    int32_t next_pid, slot_count, free_off;
-    ReadPageHeader(first_data, next_pid, slot_count, free_off);
-    buffer_pool_manager_->UnpinPage(pid, false);
+    page_id_t next_pid = INVALID_PAGE_ID;
+    {
+        PageGuard guard = PageGuard::Fetch(buffer_pool_manager_, pid);
+        if (!guard.Valid()) return;
+        int32_t slot_count, free_off;
+        ReadPageHeader(guard.Data(), next_pid, slot_count, free_off);
+    }
 
     // Free overflow pages
     page_id_t cur = next_pid;
     while (cur != INVALID_PAGE_ID && cur >= 0) {
-        Page* p = buffer_pool_manager_->GetPage(cur);
-        if (!p) return;
-        int32_t nnext, ns, nf;
-        ReadPageHeader(p->GetData(), nnext, ns, nf);
-        buffer_pool_manager_->UnpinPage(cur, false);
         page_id_t victim = cur;
-        cur = nnext;
+        {
+            PageGuard guard = PageGuard::Fetch(buffer_pool_manager_, cur);
+            if (!guard.Valid()) return;
+            int32_t nnext, ns, nf;
+            ReadPageHeader(guard.Data(), nnext, ns, nf);
+            cur = nnext;
+        }  // guard 作用域结束：页已 unpin，pin==0，允许 DeletePage
         if (!buffer_pool_manager_->DeletePage(victim)) {
             // DeletePage failed (probably pinned); bail out — the table is
             // still partially cleared, but tombstones on overflow pages
@@ -405,11 +396,10 @@ void TableHeap::ClearAll() {
     }
 
     // Reset first page header to empty
-    Page* head = buffer_pool_manager_->GetPage(first_page_id_);
-    if (!head) return;
-    InitEmptyPageHeader(head->GetData());
-    head->SetDirty(true);
-    buffer_pool_manager_->UnpinPage(first_page_id_, true);
+    PageGuard head = PageGuard::Fetch(buffer_pool_manager_, first_page_id_);
+    if (!head.Valid()) return;
+    InitEmptyPageHeader(head.Data());
+    head.MarkDirty();
 }
 
 bool TableHeap::FindNextRid(RID current, RID* next) {
@@ -422,14 +412,14 @@ bool TableHeap::FindNextRid(RID current, RID* next) {
             // 已经访问过这个页面，next_pid 形成环
             return false;
         }
-        Page* page = buffer_pool_manager_->GetPage(pid);
-        if (!page) return false;
-        char* data = page->GetData();
+        PageGuard guard = PageGuard::Fetch(buffer_pool_manager_, pid);
+        if (!guard.Valid()) return false;
+        char* data = guard.Data();
         int32_t next_pid, slot_count, free_off;
         ReadPageHeader(data, next_pid, slot_count, free_off);
         bool header_fixed =
             NormalizePageHeader(data, next_pid, slot_count, free_off);
-        if (header_fixed) page->SetDirty(true);
+        if (header_fixed) guard.MarkDirty();
         while (slot_num < slot_count) {
             int32_t off, len;
             ReadSlot(data, slot_num, off, len);
@@ -438,12 +428,12 @@ bool TableHeap::FindNextRid(RID current, RID* next) {
                     next->page_id = pid;
                     next->slot_num = slot_num;
                 }
-                buffer_pool_manager_->UnpinPage(pid, header_fixed);
+                if (header_fixed) guard.MarkDirty();
                 return true;
             }
             ++slot_num;
         }
-        buffer_pool_manager_->UnpinPage(pid, header_fixed);
+        if (header_fixed) guard.MarkDirty();
         // next_pid 越界保护
         if (next_pid < 0) return false;
         pid = next_pid;

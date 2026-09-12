@@ -25,7 +25,8 @@ class RecoveryManager;
 class Database {
 public:
     // db_file: 数据文件路径（不存在则创建新库）；buffer_pool_size: 缓冲池可容纳的页数
-    explicit Database(const std::string& db_file, size_t buffer_pool_size = 64);
+    explicit Database(const std::string& db_file, size_t buffer_pool_size = 64,
+                      int bg_flush_ms = 0);
     ~Database();
 
     // 执行一条SQL语句，内部完成 词法->语法->语义->计划->优化->执行 全流程，
@@ -50,6 +51,11 @@ public:
     // 注入一次「立即崩溃」。由 \crash 调试命令触发；让 49_acid_recovery
     // 之类的测试在不重启进程的前提下也保留 main.cpp 的退出路径不变。
     void TriggerCrashNow();
+
+    // 生成存储子系统诊断信息字符串（由 \stats 命令触发）。
+    // 输出缓冲池命中/缺失/替换统计、命中率、磁盘页数与近期页替换日志，
+    // 满足指导书「页级读写、缓存命中统计、页替换日志输出」的要求。
+    std::string GetStorageStats() const;
 
 private:
     std::unique_ptr<DiskManager> disk_manager_;

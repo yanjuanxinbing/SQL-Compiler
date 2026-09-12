@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <vector>
 #include <cctype>
+#include <cstdlib>
 
 #include "db/Database.h"
 
@@ -199,9 +200,30 @@ void PrintResult(const sqlcompiler::ExecutionResult& result) {
 int main(int argc, char** argv) {
     std::string db_file = (argc > 1) ? argv[1] : "sqlcompiler.db";
 
+    // E5：允许通过环境变量 SQLCOMPILER_BG_FLUSH_MS 开启后台异步刷脏（默认关闭）。
+    // 仅用于演示/调优；不设置时行为与旧版完全一致。
+    int bg_flush_ms = 0;
+    if (const char* env = std::getenv("SQLCOMPILER_BG_FLUSH_MS")) {
+        bg_flush_ms = std::atoi(env);
+        if (bg_flush_ms < 0) bg_flush_ms = 0;
+    }
+
+    // E6：允许通过环境变量 SQLCOMPILER_BUFFER_MEMORY 以字节指定缓冲池内存上限，
+    // 内部换算为帧数（不足一页按一页）。未设置时用默认 64 帧（256 KB），
+    // 与旧版逐字节一致。仅是内存调优开关，不改变任何执行语义。
+    constexpr size_t kDefaultBufferFrames = 64;
+    size_t buffer_frames = kDefaultBufferFrames;
+    if (const char* env = std::getenv("SQLCOMPILER_BUFFER_MEMORY")) {
+        long long mem_bytes = std::atoll(env);
+        if (mem_bytes > 0) {
+            buffer_frames = sqlcompiler::BufferPoolManager::FramesForBytes(
+                static_cast<size_t>(mem_bytes));
+        }
+    }
+
     sqlcompiler::Database* database = nullptr;
     try {
-        database = new sqlcompiler::Database(db_file);
+        database = new sqlcompiler::Database(db_file, buffer_frames, bg_flush_ms);
     } catch (const std::exception& e) {
         std::cerr << "Failed to open database '" << db_file << "': " << e.what()
                   << std::endl;

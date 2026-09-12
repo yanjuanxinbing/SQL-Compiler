@@ -56,3 +56,12 @@ target_include_directories(sqlcompiler_lib PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # 主程序可执行文件
 add_executable(sqlcompiler ${CMAKE_SOURCE_DIR}/src/main.cpp)
 target_link_libraries(sqlcompiler PRIVATE sqlcompiler_lib)
+
+# ---- 存储子系统单元测试 ----
+# 独立目标，链接静态库 sqlcompiler_lib，验证页式存储/缓存/替换策略的正确性。
+file(GLOB_RECURSE STORAGE_UT_SOURCES ${CMAKE_SOURCE_DIR}/tests/storage/*.cpp)
+if(STORAGE_UT_SOURCES)
+    add_executable(storage_ut ${STORAGE_UT_SOURCES})
+    target_link_libraries(storage_ut PRIVATE sqlcompiler_lib)
+    target_include_directories(storage_ut PRIVATE ${CMAKE_SOURCE_DIR}/include)
+endif()

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <shared_mutex>
 
 namespace sqlcompiler {
 
@@ -36,6 +37,20 @@ public:
     uint64_t GetPageLsn() const { return page_lsn_; }
     void SetPageLsn(uint64_t lsn) { page_lsn_ = lsn; }
 
+    // ---- E4：页级读写锁（latch） ----
+    // 每个物理帧带一把读写锁（std::shared_mutex），支持共享读 / 独占写两种访问。
+    // 它保护「页数据 data_ 的并发访问」：多线程可持读锁共享读同一帧，写修改须持
+    // 写锁独占。锁由 RAII 句柄（PageReadGuard / PageWriteGuard）在访问期间持有，
+    // 不直接由 Page 自锁（GetData 保持无锁裸访问，向后兼容单线程路径）。
+    // 锁序（防死锁）：全局 latch_（BPM）→ 页级锁；持页锁期间绝不允许再请求全局
+    // latch_。Guard 释放顺序固定为「先释放页锁，再调用 BPM::UnpinPage」。
+    void RLatch() { latch_.lock_shared(); }
+    void RUnlatch() { latch_.unlock_shared(); }
+    void WLatch() { latch_.lock(); }
+    void WUnlatch() { latch_.unlock(); }
+    std::shared_mutex& GetLatch() { return latch_; }
+    const std::shared_mutex& GetLatch() const { return latch_; }
+
     // 重置页内容与元信息为初始状态，供缓冲池复用该帧时调用
     void ResetMemory();
 
@@ -47,6 +62,8 @@ private:
     // Phase B：当前帧对应 page 上一次被任何 log record 写入时的 LSN。
     // ResetMemory 中归零表示「这是全新页，未参与过 redo」。
     uint64_t page_lsn_ = 0;
+    // E4：页级读写锁。与 data_ 独立存在，不参与 ResetMemory（锁不随帧内容清零）。
+    std::shared_mutex latch_;
 };
 
 }  // namespace sqlcompiler

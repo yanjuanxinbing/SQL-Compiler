@@ -1,3 +1,7 @@
 /build
 /.vscode
 /tests/tmp
+# runtime artifacts
+sqlcompiler.db*
+*.bin.crc
+*.bin.fpl
