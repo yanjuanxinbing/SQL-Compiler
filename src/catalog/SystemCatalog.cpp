@@ -305,6 +305,14 @@ void SystemCatalog::SetActiveTransaction(Transaction* txn) {
     if (index_heap_) index_heap_->SetActiveTransaction(txn);
 }
 
+// MVCC 快照隔离：对全部表的堆做惰性真空回收。
+void SystemCatalog::VacuumAll(int64_t oldest_active_csn) {
+    if (oldest_active_csn <= 0) return;
+    for (auto& kv : table_heaps_) {
+        if (kv.second) kv.second->Vacuum(oldest_active_csn);
+    }
+}
+
 SystemCatalog::~SystemCatalog() {
 }
 

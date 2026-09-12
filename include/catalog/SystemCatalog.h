@@ -76,6 +76,10 @@ public:
     // 获取某张表对应的数据存储堆，供执行引擎读写记录；表不存在返回nullptr
     TableHeap* GetTableHeap(const std::string& table_name);
 
+    // MVCC 快照隔离：对全部表的堆做惰性真空回收（回收 begin_csn < 最老活动快照
+    // 的非 head 旧版本槽位）。以最老活动快照为界防误删仍可能被读取的版本。
+    void VacuumAll(int64_t oldest_active_csn);
+
     // 提供内存态元数据视图，供语义分析/计划生成阶段复用（避免与编译器模块重复实现）
     SymbolTable& GetSymbolTable();
 

@@ -111,4 +111,19 @@ bool ReleaseSavepointExecutor::Next(Tuple* tuple) {
     return false;
 }
 
+SetIsolationExecutor::SetIsolationExecutor(ExecutionContext* context, IsolationLevel level)
+    : Executor(context), level_(level) {}
+
+void SetIsolationExecutor::Init() {
+    // 写入会话默认隔离级别，下一次 BEGIN 采样进新事务。
+    TransactionManager* mgr = context_ ? context_->GetTransactionManager() : nullptr;
+    if (mgr == nullptr) return;
+    mgr->SetIsolationLevel(level_);
+}
+
+bool SetIsolationExecutor::Next(Tuple* tuple) {
+    (void)tuple;
+    return false;
+}
+
 }  // namespace sqlcompiler

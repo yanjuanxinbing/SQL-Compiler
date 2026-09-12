@@ -63,4 +63,13 @@ private:
     std::string name_;
 };
 
+class SetIsolationExecutor : public Executor {
+public:
+    SetIsolationExecutor(ExecutionContext* context, IsolationLevel level);
+    void Init() override;
+    bool Next(Tuple* tuple) override;
+private:
+    IsolationLevel level_;
+};
+
 }  // namespace sqlcompiler

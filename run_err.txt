@@ -1,0 +1,2 @@
+[mvcc] snapshot write conflict for txn 9; aborting by first-committer-wins
+[mvcc] snapshot write conflict for txn 3; aborting by first-committer-wins

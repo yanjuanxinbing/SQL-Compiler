@@ -648,4 +648,10 @@ std::string ReleaseSavepointNode::ToString() const {
     return "ReleaseSavepoint(" + savepoint_name + ")\n";
 }
 
+SetIsolationNode::SetIsolationNode(IsolationLevel level) : isolation_level(level) {}
+PlanNodeType SetIsolationNode::GetType() const { return PlanNodeType::SET_ISOLATION; }
+std::string SetIsolationNode::ToString() const {
+    return "SetIsolation()\n";
+}
+
 }  // namespace sqlcompiler

@@ -6,6 +6,7 @@
 
 #include "ast/AST.h"
 #include "storage_engine/Value.h"
+#include "txn/Transaction.h"
 
 namespace sqlcompiler {
 
@@ -50,6 +51,7 @@ enum class PlanNodeType {
     SAVEPOINT,         // SAVEPOINT name
     ROLLBACK_TO_SP,    // ROLLBACK TO name
     RELEASE_SP,        // RELEASE SAVEPOINT name
+    SET_ISOLATION,     // SET TRANSACTION ISOLATION LEVEL ...
 
     // ---- 46_meta: 元命令 ----
     EXPLAIN,       // EXPLAIN [ANALYZE] <statement> —— 把 inner 的计划树打印成文本
@@ -564,6 +566,17 @@ public:
     std::string ToString() const override;
 
     std::string savepoint_name;
+};
+
+// SET TRANSACTION ISOLATION LEVEL ...
+class SetIsolationNode : public PlanNode {
+public:
+    explicit SetIsolationNode(IsolationLevel level);
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
+
+    IsolationLevel isolation_level = IsolationLevel::kSerializable;
 };
 
 // SHOW 节点：kind 决定执行器从 catalog 拉什么数据填充结果集。

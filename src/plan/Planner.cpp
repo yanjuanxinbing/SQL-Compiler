@@ -176,6 +176,8 @@ PlanNodePtr Planner::CreatePlan(const StatementPtr& statement) {
             return PlanSavepoint(*std::static_pointer_cast<SavepointStatement>(statement));
         case NodeType::RELEASE_SAVEPOINT_STMT:
             return PlanReleaseSavepoint(*std::static_pointer_cast<ReleaseSavepointStatement>(statement));
+        case NodeType::SET_ISOLATION_STMT:
+            return PlanSetIsolation(*std::static_pointer_cast<SetIsolationStatement>(statement));
         case NodeType::CREATE_VIEW_STMT:
             return PlanCreateView(*std::static_pointer_cast<CreateViewStatement>(statement));
         case NodeType::DROP_VIEW_STMT:
@@ -767,6 +769,12 @@ PlanNodePtr Planner::PlanReleaseSavepoint(const ReleaseSavepointStatement& stmt)
     // Phase A 测试覆盖了 SAVEPOINT / ROLLBACK TO sp，由 BeginTxnNode/Rollback
     // 路径合流；单独的 ROLLBACK TO 仅在 48_acid_undo 测试里需要，先支持之。
     return std::make_shared<ReleaseSavepointNode>(stmt.savepoint_name);
+}
+
+// SET TRANSACTION ISOLATION LEVEL ...
+PlanNodePtr Planner::PlanSetIsolation(const SetIsolationStatement& stmt) {
+    return std::make_shared<SetIsolationNode>(
+        static_cast<IsolationLevel>(stmt.isolation_level));
 }
 
 // 新增：PlanRollbackTo —— 由 parser 检测 "ROLLBACK TO" 关键字后调用。

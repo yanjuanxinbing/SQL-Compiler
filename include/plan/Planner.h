@@ -37,6 +37,7 @@ private:
     PlanNodePtr PlanRollback(const RollbackStatement& stmt);
     PlanNodePtr PlanSavepoint(const SavepointStatement& stmt);
     PlanNodePtr PlanReleaseSavepoint(const ReleaseSavepointStatement& stmt);
+    PlanNodePtr PlanSetIsolation(const SetIsolationStatement& stmt);
     PlanNodePtr PlanRollbackTo(const RollbackToStatement& stmt);
     PlanNodePtr PlanCreateView(const CreateViewStatement& stmt);
     PlanNodePtr PlanDropView(const DropViewStatement& stmt);

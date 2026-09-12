@@ -27,8 +27,12 @@
 #include "storage/LRUKReplacer.h"
 #include "storage/ClockReplacer.h"
 #include "storage/PageAllocator.h"
+#include "storage/OsModuleOptimizations.h"
+#include "storage/LockManager.h"
 #include "storage/Page.h"
 #include "index/PageGuard.h"
+#include "db/Database.h"
+#include "index/BPlusTree.h"
 
 using namespace sqlcompiler;
 
@@ -1256,6 +1260,740 @@ static void TestRobustnessFixes() {
     RemoveFile(path3); RemoveFile(path3 + ".crc"); RemoveFile(path3 + ".fpl");
 }
 
+// 优化整合层正确性校验（不校验性能，性能由 RunBenchmarks 单独输出）：
+//   * Stage1：osopt::Crc32 与基准 LegacyCrc32 结果一致（含全 0 页，验证哨兵安全）；
+//   * Stage2：优化版 LruSet 与基准孪生在同一访问序列下状态一致。
+static void TestOptimizations() {
+    // Stage1 CRC 一致性
+    {
+        const size_t N = 64;
+        std::vector<char> buf(N * 4096);
+        for (size_t p = 0; p < N; ++p) {
+            for (size_t i = 0; i < 4096; ++i) {
+                buf[p * 4096 + i] = static_cast<char>((p * 31 + i) & 0xFF);
+            }
+        }
+        for (size_t p = 0; p < N; ++p) {
+            const char* d = &buf[p * 4096];
+            CHECK(osopt::Crc32(d, 4096) == osopt::LegacyCrc32(d, 4096));
+        }
+        // 全 0 页：CRC 应非 0（0 用作「无记录」哨兵的前提）。
+        std::vector<char> zero(4096, 0);
+        CHECK(osopt::Crc32(zero.data(), 4096) != 0);
+    }
+    // Stage2 LruSet 状态一致（同序列优化版==基线版）
+    {
+        constexpr int kFrames = 64;
+        osopt::LruSet fast, legacy;
+        for (int i = 0; i < kFrames; ++i) {
+            fast.Unpin(i);
+            osopt::LruSetLegacyUnpin(legacy, i);
+        }
+        for (int step = 0; step < 3000; ++step) {
+            int id = step % kFrames;
+            if (step % 3 == 0) {
+                fast.Pin(id);
+                osopt::LruSetLegacyPin(legacy, id);
+            } else if (step % 3 == 1) {
+                fast.Unpin(id);
+                osopt::LruSetLegacyUnpin(legacy, id);
+            } else {
+                int vf = -1, vl = -1;
+                bool rf = fast.Victim(&vf);
+                bool rl = legacy.Victim(&vl);
+                CHECK(rf == rl && (!rf || vf == vl));
+                if (rf) {
+                    fast.Unpin(vf);
+                    osopt::LruSetLegacyUnpin(legacy, vf);
+                }
+            }
+        }
+        CHECK(fast.Size() == legacy.Size());
+    }
+}
+
+// T2 多连接并发事务：会话原子性验证
+//   两个会话并发向「独立表」与「同一表」各插 N/组不同行的行，全部 autocommit。
+//   在缓冲池全局锁（D7 serialize frames）下，断言：每表行数精确等于期望值，
+//   证明每个会话的插入互不丢失、互不串扰（每会话 txn 原子性成立）。
+//   注：并发写同一页时由缓冲池锁精确串行化，结果与顺序执行等价 —— 本测试
+//   断言的是「正确性」，不是并发吞吐（吞吐是 T3 目标）。
+static void TestConcurrentSessions() {
+    const std::string path = "storage_ut_session.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto sA = db.CreateSession();
+        auto sB = db.CreateSession();
+        CHECK(sA != nullptr && sB != nullptr);
+        // 建表（单线程，避免并发 DDL）。
+        CHECK(db.ExecuteSQL("CREATE TABLE t(a INT)", sA.get()).success);
+        CHECK(db.ExecuteSQL("CREATE TABLE u(a INT)", sB.get()).success);
+
+        const int N = 200;
+
+        // (1) 独立表并发：A→t，B→u。
+        std::atomic<int> start{0};
+        auto workerA = [&] {
+            while (start.load() != 1) {}
+            for (int i = 0; i < N; ++i) {
+                db.ExecuteSQL("INSERT INTO t VALUES(" + std::to_string(i) + ")", sA.get());
+            }
+        };
+        auto workerB = [&] {
+            while (start.load() != 1) {}
+            for (int i = 0; i < N; ++i) {
+                db.ExecuteSQL("INSERT INTO u VALUES(" + std::to_string(i) + ")", sB.get());
+            }
+        };
+        std::thread ta(workerA), tb(workerB);
+        start.store(1);
+        ta.join();
+        tb.join();
+        auto rt = db.ExecuteSQL("SELECT a FROM t", sA.get());
+        auto ru = db.ExecuteSQL("SELECT a FROM u", sB.get());
+        CHECK(rt.success && ru.success);
+        CHECK(rt.rows.size() == static_cast<size_t>(N));
+        CHECK(ru.rows.size() == static_cast<size_t>(N));
+
+        // (2) 同一表并发：A 与 B 各插不同区间（0..N, N..2N），期望 2N 行。
+        CHECK(db.ExecuteSQL("CREATE TABLE s(a INT)", sA.get()).success);
+        std::atomic<int> start2{0};
+        auto workerC = [&] {
+            while (start2.load() != 1) {}
+            for (int i = 0; i < N; ++i) {
+                db.ExecuteSQL("INSERT INTO s VALUES(" + std::to_string(i + 0) + ")", sA.get());
+            }
+        };
+        auto workerD = [&] {
+            while (start2.load() != 1) {}
+            for (int i = 0; i < N; ++i) {
+                db.ExecuteSQL("INSERT INTO s VALUES(" + std::to_string(i + N) + ")", sB.get());
+            }
+        };
+        std::thread tc(workerC), td(workerD);
+        start2.store(1);
+        tc.join();
+        td.join();
+        auto rs = db.ExecuteSQL("SELECT a FROM s", sA.get());
+        CHECK(rs.success && rs.rows.size() == static_cast<size_t>(2 * N));
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// T2：事务级 S/X 锁管理器 + 等待图死锁检测 + 超时。
+static void TestLockManager() {
+    LockManager lm;
+
+    // (1) 同资源多 S 共享可叠加；X 与任何冲突。
+    CHECK(lm.LockShared(1, 100) == LockResult::kGranted);
+    CHECK(lm.LockShared(2, 100) == LockResult::kGranted);              // S-S 兼容
+    CHECK(lm.IsLockHeld(1, 100) && lm.IsLockHeld(2, 100));
+    CHECK(lm.TryLockExclusive(3, 100) == LockResult::kWouldBlock);     // S-X 冲突
+    lm.UnlockAll(1);
+    lm.UnlockAll(2);
+
+    // (2) X 互斥；释放后允许后继。
+    CHECK(lm.LockExclusive(3, 200) == LockResult::kGranted);
+    CHECK(lm.TryLockShared(4, 200) == LockResult::kWouldBlock);        // X-S
+    CHECK(lm.TryLockExclusive(5, 200) == LockResult::kWouldBlock);     // X-X
+    lm.Unlock(3, 200);
+    CHECK(lm.TryLockShared(4, 200) == LockResult::kGranted);
+    lm.UnlockAll(4);
+    lm.UnlockAll(5);
+
+    // (3) 死锁检测：1 持 A、2 持 B；2 等 A（WouldBlock）后再让 1 等 B -> 成环，
+    //     由发起者 1 作为 victim 得到 kDeadlock。
+    {
+        LockManager lm2;
+        CHECK(lm2.LockExclusive(1, 10) == LockResult::kGranted);
+        CHECK(lm2.LockExclusive(2, 20) == LockResult::kGranted);
+        CHECK(lm2.TryLockExclusive(2, 10) == LockResult::kWouldBlock);  // 2 -> 1
+        CHECK(lm2.TryLockExclusive(1, 20) == LockResult::kDeadlock);    // 1 -> 2，环
+        lm2.UnlockAll(1);
+        lm2.UnlockAll(2);
+    }
+
+    // (4) 超时：阻塞等待超过 wait_ms 返回 kTimeout。
+    {
+        LockManager lm3;
+        CHECK(lm3.LockExclusive(1, 30) == LockResult::kGranted);
+        auto t0 = std::chrono::steady_clock::now();
+        LockResult r = lm3.LockExclusive(2, 30, 100);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+        CHECK(r == LockResult::kTimeout);
+        CHECK(ms >= 95 && ms <= 3000);
+        lm3.UnlockAll(1);
+        lm3.UnlockAll(2);
+    }
+
+    // (5) 阻塞式授予：线程 B 阻塞等 X，线程 A 释放后被唤醒授予。
+    {
+        LockManager lm4;
+        CHECK(lm4.LockExclusive(1, 40) == LockResult::kGranted);
+        std::atomic<int> result{0};
+        std::thread t([&] {
+            result = static_cast<int>(lm4.LockExclusive(2, 40));  // 阻塞
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        lm4.Unlock(1, 40);  // 释放，唤醒 B
+        t.join();
+        CHECK(result == static_cast<int>(LockResult::kGranted));
+        CHECK(lm4.IsLockHeld(2, 40));
+        lm4.UnlockAll(2);
+    }
+}
+
+// T2 隔离级别：行级锁在读/写路径的持有期。READ COMMITTED 行 S 锁语句末释放，
+// SERIALIZABLE 行 S 锁（与读谓词）持有到提交。用「并发写到同一行是否被阻塞」
+// 这一可观察行为验证两种隔离级别截然不同的读锁持有期，全程确定性、无长等待。
+static void TestIsolationLevels() {
+    const std::string path = "storage_ut_iso.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto sA = db.CreateSession();
+        auto sB = db.CreateSession();
+        CHECK(sA != nullptr && sB != nullptr);
+
+        // 隔离级别按会话独立设置；BEGIN 时采样进新事务。
+        auto* mgA = sA->GetTransactionManager();
+        auto* mgB = sB->GetTransactionManager();
+        CHECK(mgA != nullptr && mgB != nullptr);
+
+        CHECK(db.ExecuteSQL("CREATE TABLE t(a INT PRIMARY KEY)", sA.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO t VALUES (1)", sA.get()).success);
+
+        // ---- (1) READ COMMITTED：行读锁在语句结束即释放 ----
+        // A 在显式事务里 SELECT（取得行 S 锁，随语句结束释放）；A 仍活跃，但
+        // RC 不注册读谓词、行 S 锁已放，B 可立即对同一行 UPDATE（取 X 锁）。
+        mgA->SetIsolationLevel(IsolationLevel::kReadCommitted);
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        auto sr = db.ExecuteSQL("SELECT a FROM t", sA.get());
+        CHECK(sr.success);
+        CHECK(db.ExecuteSQL("BEGIN", sB.get()).success);
+        auto uw = db.ExecuteSQL("UPDATE t SET a = 100 WHERE a = 1", sB.get());
+        CHECK(uw.success);   // A 的读锁已随语句结束释放，B 立即获得写锁
+        CHECK(db.ExecuteSQL("COMMIT", sB.get()).success);
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+
+        // ---- (2) SERIALIZABLE：行读锁与读谓词持有到提交，阻塞并发写 ----
+        // A 在显式事务里 SELECT 后仍持有行 S 锁（不提交）；B 的 UPDATE 想取同一
+        // 行的 X 锁，必须等 A 提交释放后才能进行。通过「A 提交前 B 一直未完成」
+        // 观察锁仍在。
+        mgA->SetIsolationLevel(IsolationLevel::kSerializable);
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        sr = db.ExecuteSQL("SELECT a FROM t", sA.get());
+        CHECK(sr.success);
+
+        std::atomic<int> b_done{0};
+        ExecutionResult rb;
+        std::thread bwrite([&] {
+            rb = db.ExecuteSQL("BEGIN", sB.get());
+            if (!rb.success) { b_done = 1; return; }
+            auto r = db.ExecuteSQL("UPDATE t SET a = 200 WHERE a = 100", sB.get());
+            rb = r;
+            if (r.success) db.ExecuteSQL("COMMIT", sB.get());
+            b_done = 1;
+        });
+        // 给 B 的线程足够时间启动并进入锁等待；SERIALIZABLE 下它必须被 A 的
+        // 行读锁（X 与 S 冲突）挡住，因此期间不应完成。
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        CHECK(!b_done.load());
+        // A 提交并释放锁后，B 的 UPDATE 获得写锁并成功完成。
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+        bwrite.join();
+        CHECK(b_done.load());
+        CHECK(rb.success);
+        CHECK(db.ExecuteSQL("SELECT COUNT(*) FROM t", sA.get()).success);
+
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// SET TRANSACTION ISOLATION LEVEL ...：从 SQL 层设置会话默认隔离级别，
+// 下一次 BEGIN 采样进新事务；非法级别报语法错误。
+static void TestSetIsolationStatement() {
+    const std::string path = "storage_ut_setiso.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto s = db.CreateSession();
+        auto* mg = s->GetTransactionManager();
+        CHECK(mg != nullptr);
+
+        // SET 写入会话默认值
+        CHECK(db.ExecuteSQL("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", s.get()).success);
+        CHECK(mg->GetIsolationLevel() == IsolationLevel::kReadCommitted);
+        // BEGIN 采样：新事务携与会话一致
+        CHECK(db.ExecuteSQL("BEGIN", s.get()).success);
+        Transaction* txn = mg->GetCurrentTransaction();
+        CHECK(txn != nullptr);
+        CHECK(txn->GetIsolationLevel() == IsolationLevel::kReadCommitted);
+        CHECK(db.ExecuteSQL("COMMIT", s.get()).success);
+
+        // 非法级别 → 语法错误
+        CHECK(db.ExecuteSQL("SET TRANSACTION ISOLATION LEVEL X", s.get()).success == false);
+        // 未 BEGIN 时也可反复设置
+        CHECK(db.ExecuteSQL("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", s.get()).success);
+        CHECK(mg->GetIsolationLevel() == IsolationLevel::kSerializable);
+        CHECK(db.ExecuteSQL("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED", s.get()).success);
+        CHECK(mg->GetIsolationLevel() == IsolationLevel::kReadUncommitted);
+
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// 行级锁资源 id 编码：符号位标记行锁，保证与表锁（非负首页页号）数值不相交。
+static void TestRowLockEncoding() {
+    CHECK(RowResourceId(5, 7) < 0);                                  // 行锁恒为负
+    CHECK(RowResourceId(5, 7) == RowResourceId(5, 7));               // 确定性
+    CHECK(RowResourceId(5, 7) != RowResourceId(5, 8));               // 槽位区分
+    CHECK(RowResourceId(5, 7) != RowResourceId(6, 7));               // 页号区分
+    CHECK(RowResourceId(0, 7) != 7);                                 // (页0,槽7) 不与 表首页7 撞车
+    CHECK(RowResourceId(0, 0) != 0);                                 // (页0,槽0) 不与 表首页0 撞车
+}
+
+// 行锁层：用 RID 编码的负 id 走同一套 LockManager，验证 S-S 兼容 / X 冲突 /
+// 跨行独立 / IsLockHeld / Unlock 与 UnlockAll。
+static void TestRowLockTier() {
+    LockManager lm;
+    const int64_t r1 = RowResourceId(1, 0);  // 行(页1, 槽0)
+    const int64_t r2 = RowResourceId(1, 1);  // 行(页1, 槽1)
+
+    // S-S 兼容：两个事务可同时共享读同一行
+    CHECK(lm.TryLockShared(100, r1) == LockResult::kGranted);
+    CHECK(lm.TryLockShared(102, r1) == LockResult::kGranted);
+    CHECK(lm.IsLockHeld(100, r1));
+    CHECK(lm.IsLockHeld(102, r1));
+    // X 与该行的 S 冲突
+    CHECK(lm.TryLockExclusive(103, r1) == LockResult::kWouldBlock);
+    // 不同行互不影响：对 r2 取 X
+    CHECK(lm.TryLockExclusive(104, r2) == LockResult::kGranted);
+    CHECK(lm.TryLockShared(105, r2) == LockResult::kWouldBlock);   // r2 已有 X
+    // 释放 r2 后 S 可得
+    lm.Unlock(104, r2);
+    CHECK(lm.TryLockShared(105, r2) == LockResult::kGranted);
+    lm.Unlock(105, r2);
+    // 释放一个 S 后 X 仍被另一 S 挡住，全部释放后才授予
+    lm.Unlock(100, r1);
+    CHECK(lm.TryLockExclusive(103, r1) == LockResult::kWouldBlock);
+    lm.Unlock(102, r1);
+    CHECK(lm.TryLockExclusive(103, r1) == LockResult::kGranted);
+    lm.UnlockAll(103);
+    CHECK(!lm.IsLockHeld(103, r1));
+}
+
+// B+Tree 并发：多线程并发 Insert（各自写入独立键段）+ 一个持续 LowerBound 扫描
+// 线程，验证树级 rw_lock_（写独占 / 扫描持共享锁）能防撕裂读与数据丢失。取消表
+// 级锁后，这是索引并发的第一道防线。
+static void TestBPlusTreeConcurrency() {
+    const std::string path = "storage_ut_btree.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(128, &dm);  // 足够帧，避免写入期触发淘汰打扰扫描
+        std::vector<ValueType> schema = {ValueType::INTEGER};
+        auto tree = BPlusTree::Create(&bpm, schema, /*is_unique=*/false);
+        CHECK(tree != nullptr);
+
+        const int kThreads = 4;
+        const int kPerThread = 150;
+        std::vector<std::thread> writers;
+        for (int t = 0; t < kThreads; ++t) {
+            writers.emplace_back([&, t] {
+                for (int i = 0; i < kPerThread; ++i) {
+                    int key = t * kPerThread + i;
+                    RID rid;
+                    rid.page_id = key + 1;
+                    rid.slot_num = 0;
+                    tree->Insert(IndexKey({Value::MakeInt(key)}), rid);
+                }
+            });
+        }
+        // 并发扫描：写线程运行期间持续做 LowerBound 遍历，只要求不崩溃、不撕裂。
+        std::atomic<bool> stop{false};
+        std::thread scanner([&] {
+            int guard = 0;
+            while (!stop.load() && guard++ < 200000) {
+                auto cur = tree->LowerBound(IndexKey({Value::MakeInt(0)}));
+                IndexKey k; RID r;
+                while (cur && cur->Next(&k, &r)) {}
+            }
+        });
+        for (auto& th : writers) th.join();
+        stop.store(true);
+        scanner.join();
+
+        // 写入全部完成后：非唯一树无重键，应恰好 kThreads*kPerThread 条且无重复。
+        std::set<int> seen;
+        int count = 0;
+        auto cur = tree->Begin();
+        IndexKey k; RID r;
+        while (cur && cur->Next(&k, &r)) {
+            ++count;
+            seen.insert(k.values[0].AsInt());
+        }
+        CHECK(count == kThreads * kPerThread);
+        CHECK(static_cast<int>(seen.size()) == kThreads * kPerThread);
+
+        tree->Destroy(&bpm, tree->GetRootPageId());
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// 全面行级并发：两个 READ COMMITTED 事务同表不同行并发写【不互斥】（行级并发，
+// 非表级）；同表同行使行锁阻塞至持有者提交。验证取消表锁后行锁真正承担并发隔离。
+static void TestRowLevelConcurrency() {
+    const std::string path = "storage_ut_rowlevel.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto sA = db.CreateSession();
+        auto sB = db.CreateSession();
+        auto* mgA = sA->GetTransactionManager();
+        auto* mgB = sB->GetTransactionManager();
+        CHECK(mgA != nullptr && mgB != nullptr);
+        mgA->SetIsolationLevel(IsolationLevel::kReadCommitted);
+        mgB->SetIsolationLevel(IsolationLevel::kReadCommitted);
+        ExecutionResult rb;
+
+        CHECK(db.ExecuteSQL("CREATE TABLE r(id INT PRIMARY KEY, v INT)", sA.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO r VALUES (1,10),(2,20)", sA.get()).success);
+
+        // A 持第一行的写锁（主键等值 UPDATE 走索引扫描，只锁该行），不提交。
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        CHECK(db.ExecuteSQL("UPDATE r SET v = 11 WHERE id = 1", sA.get()).success);
+
+        // ---- 不同行(2)：B 不应被 A 的行/表锁互斥 → A 未提交也能很快完成 ----
+        std::atomic<int> b_row2_done{0};
+        ExecutionResult r2;
+        std::thread w2([&] {
+            rb = db.ExecuteSQL("BEGIN", sB.get());
+            if (!rb.success) { b_row2_done = 1; return; }
+            auto r = db.ExecuteSQL("UPDATE r SET v = 21 WHERE id = 2", sB.get());
+            r2 = r;
+            if (r.success) db.ExecuteSQL("COMMIT", sB.get());
+            b_row2_done = 1;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        CHECK(b_row2_done.load());   // 不同行走行级并发，无需等 A 提交
+        w2.join();
+        CHECK(r2.success);
+
+        // ---- 同一行(1)：B 被 A 的行 X 锁挡住，A 提交后才完成 ----
+        std::atomic<int> b_row1_done{0};
+        ExecutionResult r1;
+        std::thread w1([&] {
+            rb = db.ExecuteSQL("BEGIN", sB.get());
+            if (!rb.success) { b_row1_done = 1; return; }
+            auto r = db.ExecuteSQL("UPDATE r SET v = 12 WHERE id = 1", sB.get());
+            r1 = r;
+            if (r.success) db.ExecuteSQL("COMMIT", sB.get());
+            b_row1_done = 1;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        CHECK(!b_row1_done.load());  // 同行走行锁互斥，B 被阻塞
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+        w1.join();
+        CHECK(b_row1_done.load());
+        CHECK(r1.success);
+
+        CHECK(db.ExecuteSQL("COMMIT", sB.get()).success);
+        auto chk = db.ExecuteSQL("SELECT id, v FROM r ORDER BY id", sA.get());
+        CHECK(chk.success);
+        // 期望：row1 -> v=12（B 后写覆盖），row2 -> v=21
+        CHECK(chk.rows.size() == 2);
+
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// SERIALIZABLE 谓词锁防幻读：A 全表扫描注册覆盖全范围的读谓词后不提交；B 向
+// 该范围插入新键被 A 的谓词挡住，直到 A 提交才放行。
+static void TestSerializablePredicatePhantom() {
+    const std::string path = "storage_ut_phantom.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto sA = db.CreateSession();
+        auto sB = db.CreateSession();
+        auto* mgA = sA->GetTransactionManager();
+        auto* mgB = sB->GetTransactionManager();
+        CHECK(mgA != nullptr && mgB != nullptr);
+        mgA->SetIsolationLevel(IsolationLevel::kSerializable);
+
+        CHECK(db.ExecuteSQL("CREATE TABLE p(id INT PRIMARY KEY)", sA.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO p VALUES (1),(2),(3)", sA.get()).success);
+
+        // A 全表扫描 → 注册覆盖全范围的读谓词（持有到提交）
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        auto sr = db.ExecuteSQL("SELECT id FROM p", sA.get());
+        CHECK(sr.success);
+
+        // B 在 A 扫描范围内插入新键（5）：命中 A 的读谓词，必须阻塞到 A 提交，
+        // 否则 A 重扫会产生幻读。
+        std::atomic<int> b_done{0};
+        ExecutionResult rb;
+        std::thread bw([&] {
+            rb = db.ExecuteSQL("BEGIN", sB.get());
+            if (!rb.success) { b_done = 1; return; }
+            auto r = db.ExecuteSQL("INSERT INTO p VALUES (5)", sB.get());
+            rb = r;
+            if (r.success) db.ExecuteSQL("COMMIT", sB.get());
+            b_done = 1;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        CHECK(!b_done.load());   // B 被 A 读谓词挡住
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+        bw.join();
+        CHECK(b_done.load());
+        CHECK(rb.success);
+        CHECK(db.ExecuteSQL("SELECT COUNT(*) FROM p", sA.get()).success);
+
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// MVCC 快照隔离（kSnapshot）：可重复读 / 免阻塞读 / 写者串行（无丢失更新）。
+// * 可重复读：A 在同一快照下两次读一致，看不到 B 在两次读之间提交的更新。
+// * 免阻塞读：A 快照读不被 B 未提交的写阻塞（快照读者不取读锁）。
+// * 写者串行：两事务对同一行更新，靠各自新扫描的基 + 行 X 锁，末提交者正确覆盖。
+static void TestSnapshotIsolation() {
+    const std::string path = "storage_ut_snapshot.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto sA = db.CreateSession();
+        auto sB = db.CreateSession();
+        auto* mgA = sA->GetTransactionManager();
+        auto* mgB = sB->GetTransactionManager();
+        CHECK(mgA != nullptr && mgB != nullptr);
+        mgA->SetIsolationLevel(IsolationLevel::kSnapshot);
+        mgB->SetIsolationLevel(IsolationLevel::kSnapshot);
+
+        // 取 SELECT 结果中指定 id 的 v 值；找不到返回 -999。
+        auto val_of = [](const ExecutionResult& r, int id, int pos) -> int {
+            for (const auto& t : r.rows) {
+                if (t.GetValue(0).AsInt() == id) return t.GetValue(pos).AsInt();
+            }
+            return -999;
+        };
+
+        CHECK(db.ExecuteSQL("CREATE TABLE s(id INT PRIMARY KEY, v INT)", sA.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO s VALUES (1,10),(2,20),(3,30)", sA.get()).success);
+
+        // ---- 可重复读：A 快照读到 (1,10)；B 提交对 id=1 的更新后，A 重读仍见 10 ----
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        auto ra = db.ExecuteSQL("SELECT id, v FROM s ORDER BY id", sA.get());
+        CHECK(ra.success);
+        CHECK(val_of(ra, 1, 1) == 10);
+
+        CHECK(db.ExecuteSQL("BEGIN", sB.get()).success);
+        CHECK(db.ExecuteSQL("UPDATE s SET v = 100 WHERE id = 1", sB.get()).success);
+        CHECK(db.ExecuteSQL("COMMIT", sB.get()).success);
+
+        // A 重读：快照隔离下看不到 B 提交的新值，仍见旧值 10。
+        auto ra2 = db.ExecuteSQL("SELECT id, v FROM s ORDER BY id", sA.get());
+        CHECK(ra2.success);
+        CHECK(val_of(ra2, 1, 1) == 10);
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+
+        // B 提交的更新在新事务（新快照，水位 >= B 的提交）中应可见（已是历史事实）。
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        auto rb = db.ExecuteSQL("SELECT id, v FROM s WHERE id = 1", sA.get());
+        CHECK(rb.success);
+        CHECK(val_of(rb, 1, 1) == 100);
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+
+        // ---- 免阻塞读：B 持未提交更新（行 X 锁），A 快照读不被阻塞 ----
+        CHECK(db.ExecuteSQL("BEGIN", sB.get()).success);
+        CHECK(db.ExecuteSQL("UPDATE s SET v = 200 WHERE id = 2", sB.get()).success);
+        // A 快照读应立即返回旧值 20，不因 B 未提交的写而等待。
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        auto ra3 = db.ExecuteSQL("SELECT id, v FROM s WHERE id = 2", sA.get());
+        CHECK(ra3.success);
+        CHECK(val_of(ra3, 2, 1) == 20);
+        db.ExecuteSQL("COMMIT", sA.get());
+        CHECK(db.ExecuteSQL("COMMIT", sB.get()).success);
+
+        // ---- 写者 FCW：B 基于 A 提交前读取的陈旧基改写同一行 → B 在提交时被
+        // first-committer-wins 判定为输家而中止；A 的提交保留。 ----
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        CHECK(db.ExecuteSQL("UPDATE s SET v = 300 WHERE id = 3", sA.get()).success);
+        std::atomic<int> b_done{0};
+        ExecutionResult rb2;
+        std::thread wb([&] {
+            rb2 = db.ExecuteSQL("BEGIN", sB.get());
+            if (!rb2.success) { b_done = 1; return; }
+            rb2 = db.ExecuteSQL("UPDATE s SET v = 310 WHERE id = 3", sB.get());
+            // B 的 UPDATE 语句本身能完成（写者被行 X 锁串行），但 COMMIT 时 FCW
+            // 判冲突会转成回滚，最终 B 的 v=310 不落盘。
+            if (rb2.success) db.ExecuteSQL("COMMIT", sB.get());
+            b_done = 1;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        CHECK(!b_done.load());  // B 被 A 的行 X 锁挡住
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+        wb.join();
+        CHECK(b_done.load());
+        CHECK(rb2.success);  // UPDATE 语句成功（写锁等待后完成）；FCW 在 COMMIT 时中止 B
+        // 新事务读 id=3：应见 A 提交的 v=300（B 的冲突更新被回滚，不落盘）。
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        auto rf = db.ExecuteSQL("SELECT id, v FROM s WHERE id = 3", sA.get());
+        CHECK(rf.success);
+        CHECK(val_of(rf, 3, 1) == 300);
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// 快照 DELETE 的 first-committer-wins：B 基于 E 快照读到的旧值删行，而该行在
+// B 的 E 快照之后已被 A 提交改写——B 的 DELETE 应被 FCW 中止（行保留，A 的值落盘）。
+static void TestSnapshotDeleteFcw() {
+    const std::string path = "storage_ut_snapshot_del.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto sA = db.CreateSession();
+        auto sB = db.CreateSession();
+        auto* mgA = sA->GetTransactionManager();
+        auto* mgB = sB->GetTransactionManager();
+        CHECK(mgA != nullptr && mgB != nullptr);
+        mgA->SetIsolationLevel(IsolationLevel::kSnapshot);
+        mgB->SetIsolationLevel(IsolationLevel::kSnapshot);
+
+        auto val_of = [](const ExecutionResult& r, int id, int pos) -> int {
+            for (const auto& t : r.rows) {
+                if (t.GetValue(0).AsInt() == id) return t.GetValue(pos).AsInt();
+            }
+            return -999;
+        };
+        auto count_rows = [](const ExecutionResult& r) { return static_cast<int>(r.rows.size()); };
+
+        CHECK(db.ExecuteSQL("CREATE TABLE d(id INT PRIMARY KEY, v INT)", sA.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO d VALUES (1,10),(2,20),(3,30)", sA.get()).success);
+
+        // A 改写 id=3（v=300），持行 X 锁不提交；B 快照 DELETE id=3 应阻塞。
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        CHECK(db.ExecuteSQL("UPDATE d SET v = 300 WHERE id = 3", sA.get()).success);
+        std::atomic<int> b_done{0};
+        ExecutionResult rb;
+        std::thread wb([&] {
+            rb = db.ExecuteSQL("BEGIN", sB.get());
+            if (!rb.success) { b_done = 1; return; }
+            auto rd = db.ExecuteSQL("DELETE FROM d WHERE id = 3", sB.get());
+            if (rd.success) db.ExecuteSQL("COMMIT", sB.get());
+            b_done = 1;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        CHECK(!b_done.load());  // B 被 A 的行 X 锁挡住
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+        wb.join();
+        CHECK(b_done.load());
+        CHECK(rb.success);  // DELETE 语句本身成功；FCW 在 COMMIT 时中止 B
+        // B 的删除应被回滚：id=3 仍存在，且值为 A 提交的 300。
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        auto rf = db.ExecuteSQL("SELECT id, v FROM d", sA.get());
+        CHECK(rf.success);
+        std::printf("[DBG-del] rows=%zu\n", rf.rows.size());
+        for (const auto& t : rf.rows)
+            std::printf("[DBG-del]  id=%s v=%s\n", t.GetValue(0).ToString().c_str(),
+                        t.GetValue(1).ToString().c_str());
+        auto rf2 = db.ExecuteSQL("SELECT id, v FROM d WHERE id = 3", sA.get());
+        CHECK(rf2.success);
+        std::printf("[DBG-del-idx] rows=%zu\n", rf2.rows.size());
+        // B 的删除被回滚：id=1,2 仍在，且 id=3 存在并保持 A 提交的值 300。
+        CHECK(count_rows(rf) == 3);
+        CHECK(val_of(rf, 3, 1) == 300);
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// 快照 UPSERT（冲突改写路径复用 UpdateTuple）的 first-committer-wins：
+// B 的主键冲突改写基于 E 快照旧值，而该行在 B 的快照后已被 A 提交改写——B 应被中止。
+static void TestSnapshotUpsertFcw() {
+    const std::string path = "storage_ut_snapshot_upsert.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto sA = db.CreateSession();
+        auto sB = db.CreateSession();
+        auto* mgA = sA->GetTransactionManager();
+        auto* mgB = sB->GetTransactionManager();
+        CHECK(mgA != nullptr && mgB != nullptr);
+        mgA->SetIsolationLevel(IsolationLevel::kSnapshot);
+        mgB->SetIsolationLevel(IsolationLevel::kSnapshot);
+
+        auto val_of = [](const ExecutionResult& r, int id, int pos) -> int {
+            for (const auto& t : r.rows) {
+                if (t.GetValue(0).AsInt() == id) return t.GetValue(pos).AsInt();
+            }
+            return -999;
+        };
+
+        CHECK(db.ExecuteSQL("CREATE TABLE u(id INT PRIMARY KEY, v INT)", sA.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO u VALUES (1,10),(2,20)", sA.get()).success);
+
+        // A 改写 id=1（v=100），持行 X 锁不提交；B 的快照 UPSERT 命中 id=1 应阻塞。
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        CHECK(db.ExecuteSQL("UPDATE u SET v = 100 WHERE id = 1", sA.get()).success);
+        std::atomic<int> b_done{0};
+        ExecutionResult rb;
+        std::thread wb([&] {
+            rb = db.ExecuteSQL("BEGIN", sB.get());
+            if (!rb.success) { b_done = 1; return; }
+            auto ru = db.ExecuteSQL(
+                "INSERT INTO u VALUES (1, 999) ON DUPLICATE KEY UPDATE v = 999", sB.get());
+            if (ru.success) db.ExecuteSQL("COMMIT", sB.get());
+            b_done = 1;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        CHECK(!b_done.load());  // B 被 A 的行 X 锁挡住
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+        wb.join();
+        CHECK(b_done.load());
+        CHECK(rb.success);  // UPSERT 语句本身成功；FCW 在 COMMIT 时中止 B
+        // B 的改写应被回滚：id=1 应为 A 提交的 v=100。
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        auto rf = db.ExecuteSQL("SELECT id, v FROM u WHERE id = 1", sA.get());
+        CHECK(rf.success);
+        CHECK(val_of(rf, 1, 1) == 100);
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
 int main() {
     TestDiskManager();
     TestFreePagePersistence();
@@ -1276,13 +2014,30 @@ int main() {
     TestPageRWLock();
     TestBufferPoolMemory();
     TestRobustnessFixes();
+    TestOptimizations();
+    TestConcurrentSessions();
+    TestLockManager();
+    TestIsolationLevels();
+    TestSnapshotIsolation();
+    TestSnapshotDeleteFcw();
+    TestSnapshotUpsertFcw();
+    TestSetIsolationStatement();
+    TestRowLockEncoding();
+    TestRowLockTier();
+    TestRowLevelConcurrency();
+    TestBPlusTreeConcurrency();
+    TestSerializablePredicatePhantom();
 
     std::printf("\n======== Storage UT ========\n");
     std::printf("checks: %d   fails: %d\n", g_checks, g_fails);
     if (g_fails == 0) {
         std::printf("RESULT: PASS\n");
-        return 0;
+    } else {
+        std::printf("RESULT: FAIL\n");
     }
-    std::printf("RESULT: FAIL\n");
-    return 1;
+
+    // 性能基准：记录各阶段「优化前 vs 优化后」指标（仅输出，不做性能断言）。
+    osopt::RunBenchmarks();
+
+    return g_fails == 0 ? 0 : 1;
 }

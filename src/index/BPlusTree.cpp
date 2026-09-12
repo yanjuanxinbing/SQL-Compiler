@@ -399,9 +399,10 @@ page_id_t BPlusTree::LeftmostLeafPage() const {
 // ============================================================================
 
 bool BPlusTree::Insert(const IndexKey& key, const RID& rid) {
+    std::unique_lock<std::shared_mutex> u(rw_lock_);
     std::vector<char> key_bytes = SerializeKey(key, key_schema_);
     if (key_bytes.size() > kMaxKeyBytes) return false;
-    if (is_unique_ && FindFirst(key).IsValid()) return false;
+    if (is_unique_ && FindFirstUnlocked(key).IsValid()) return false;
 
     // 预留量按「本次要插入的键」计算，而不是按最大可能键长，
     // 这样定长小键（如 INT 主键）仍能接近填满页面。
@@ -722,6 +723,11 @@ bool BPlusTree::SplitRoot() {
 // ============================================================================
 
 RID BPlusTree::FindFirst(const IndexKey& key) const {
+    std::shared_lock<std::shared_mutex> s(rw_lock_);
+    return FindFirstUnlocked(key);
+}
+
+RID BPlusTree::FindFirstUnlocked(const IndexKey& key) const {
     // RID{} 是 {-1, -1}，在 (key, rid) 全序里等价于 -inf，因此下降会落到
     // 该键的第一条记录所在的叶子。
     const RID min_rid;
@@ -754,6 +760,7 @@ RID BPlusTree::FindFirst(const IndexKey& key) const {
 }
 
 bool BPlusTree::Delete(const IndexKey& key, const RID& rid) {
+    std::unique_lock<std::shared_mutex> u(rw_lock_);
     page_id_t leaf_pid = FindLeafPage(key, rid);
     if (leaf_pid < 0) return false;
 
@@ -844,6 +851,9 @@ bool BPlusTree::Cursor::Next(IndexKey* key, RID* rid) {
 }
 
 std::unique_ptr<BPlusTree::Cursor> BPlusTree::LowerBound(const IndexKey& key) const {
+    // 树级共享锁在「下降取叶子」之前就取好，并伴随游标整体生命周期持有，
+    // 使 FindLeafPage 的页读取与后续 Next 全程免受并发 Insert/Delete 改写。
+    std::shared_lock<std::shared_mutex> guard(rw_lock_);
     const RID min_rid;
     page_id_t leaf_pid = FindLeafPage(key, min_rid);
     if (leaf_pid < 0) return nullptr;
@@ -857,13 +867,18 @@ std::unique_ptr<BPlusTree::Cursor> BPlusTree::LowerBound(const IndexKey& key) co
         ++idx;
     }
     // 若本页所有键都小于目标，游标停在页尾，Next() 会自动跨到下一页
-    return std::make_unique<Cursor>(this, leaf_pid, idx);
+    auto c = std::make_unique<Cursor>(this, leaf_pid, idx);
+    c->TakeScanLock(std::move(guard));
+    return c;
 }
 
 std::unique_ptr<BPlusTree::Cursor> BPlusTree::Begin() const {
+    std::shared_lock<std::shared_mutex> guard(rw_lock_);
     page_id_t pid = LeftmostLeafPage();
     if (pid < 0) return nullptr;
-    return std::make_unique<Cursor>(this, pid, 0);
+    auto c = std::make_unique<Cursor>(this, pid, 0);
+    c->TakeScanLock(std::move(guard));
+    return c;
 }
 
 }  // namespace sqlcompiler

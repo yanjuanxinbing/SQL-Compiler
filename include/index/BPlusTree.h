@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <shared_mutex>
 #include <utility>
 #include <vector>
 
@@ -77,6 +78,12 @@ public:
         // 取出当前项并前进；到末尾返回 false。
         bool Next(IndexKey* key, RID* rid);
 
+        // 把一棵 B+Tree 的共享锁移交给本游标，使其跨整个扫描生命周期持有。
+        // 由 BPlusTree::LowerBound / Begin 在下降之前先取好锁、定位叶子后移交。
+        void TakeScanLock(std::shared_lock<std::shared_mutex>&& lk) {
+            scan_lock_ = std::move(lk);
+        }
+
     private:
         bool LoadLeaf(page_id_t pid);
 
@@ -86,6 +93,8 @@ public:
         // 当前叶子页的物化内容。一次读入、逐条产出，避免每次 Next 都重解页面。
         std::vector<std::pair<IndexKey, RID>> entries_;
         page_id_t next_leaf_ = INVALID_PAGE_ID;
+        // 树级共享锁：扫描期间持有，防止并发 Insert/Delete 改写叶子页导致 torn read。
+        std::shared_lock<std::shared_mutex> scan_lock_;
     };
 
     // 定位到第一个 >= key 的位置
@@ -100,6 +109,10 @@ private:
     // 节点父指针」的一致性风险；而插入采用下降途中预分裂，压根不需要回溯父节点。
     page_id_t FindLeafPage(const IndexKey& key, const RID& rid) const;
     page_id_t LeftmostLeafPage() const;
+
+    // FindFirst 的内部实现，不加锁；由持有锁的调用方（FindFirst 持共享锁、
+    // Insert 持独占锁）在锁内调用。
+    RID FindFirstUnlocked(const IndexKey& key) const;
 
     // 分裂 parent 的孩子 child，并把分隔键插入 parent。
     // 前置条件：parent 已由调用方保证有足够空间容纳一个分隔键（预分裂不变式）。
@@ -116,6 +129,11 @@ private:
     page_id_t root_page_id_;
     Transaction* active_txn_ = nullptr;
     LogManager* log_manager_ = nullptr;  // Phase B：可选 WAL 写出器
+    // 树级读写锁：Insert/Delete 独占，FindFirst/LowerBound/Begin(游标) 共享。
+    // 取消表级锁后由它保证 B+Tree 并发读写安全。代价是粗粒度——同一棵树的写
+    // 彼此串行、长扫描会阻塞该树写入；正确的页级锁耦合（latch crabbing）列为
+    // 后续可选项，本阶段不做。
+    mutable std::shared_mutex rw_lock_;
 };
 
 }  // namespace sqlcompiler

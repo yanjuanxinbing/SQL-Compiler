@@ -32,19 +32,62 @@
 #include <iostream>
 
 #include "common/Error.h"
+#include "index/PageGuard.h"
 #include "storage/DiskManager.h"
+#include "storage/LockManager.h"
 #include "storage/Page.h"
+#include "storage_engine/MvccRecord.h"
+#include "txn/CommitTracker.h"
 #include "txn/LogManager.h"
 #include "txn/LogRecord.h"
 
 namespace sqlcompiler {
 
-TransactionManager::TransactionManager() = default;
+namespace {
+// 与 TableHeap 一致的 slotted-page 布局（用于 MVCC 提交时重读/回填版本头）。
+constexpr int32_t kHdrBytes = 16;
+constexpr int32_t kSlotBytes = 8;
+constexpr uint32_t kTomb = 0xFFFFFFFFu;
+
+inline int32_t ReadI32(const char* data, size_t off) {
+    int32_t v;
+    std::memcpy(&v, data + off, sizeof(int32_t));
+    return v;
+}
+
+void ReadPageHeader(const char* data, int32_t& next_pid, int32_t& slot_count,
+                    int32_t& free_off) {
+    next_pid = ReadI32(data, 0);
+    slot_count = ReadI32(data, 4);
+    free_off = ReadI32(data, 8);
+}
+
+void ReadSlot(const char* data, int slot_num, int32_t& off, int32_t& len) {
+    size_t o = static_cast<size_t>(kHdrBytes + slot_num * kSlotBytes);
+    off = ReadI32(data, o);
+    len = ReadI32(data, o + 4);
+}
+
+bool IsTombstone(int32_t len) { return static_cast<uint32_t>(len) == kTomb; }
+}  // namespace
+
+TransactionManager::TransactionManager(TxnIdSequencer* shared_sequencer)
+    : seq_(shared_sequencer ? shared_sequencer : &own_seq_) {}
 
 Transaction* TransactionManager::Begin() {
     ++current_txn_depth_;
     if (current_txn_ == nullptr) {
-        current_txn_ = new Transaction(next_txn_id_++);
+        // txn_id 取自 seq_：共享序列器（并发会话）下全局唯一，独占时等价旧行为。
+        current_txn_ = new Transaction(seq_->Next());
+        // 采样本会话默认隔离级别到新事务，供执行层决定表锁持有期。
+        current_txn_->SetIsolationLevel(default_isolation_);
+        // MVCC 快照隔离：快照模式在 BEGIN 时捕获稳定的提交水位 S，全事务不变；
+        // 并向共享 CommitTracker 登记活动快照（Vacuum 以最老活动快照为界回收）。
+        if (default_isolation_ == IsolationLevel::kSnapshot && commit_tracker_ != nullptr) {
+            int64_t csn = commit_tracker_->CurrentCSN();
+            current_txn_->SetSnapshotCsn(csn);
+            commit_tracker_->RegisterSnapshot(csn);
+        }
     }
     return current_txn_;
 }
@@ -67,11 +110,23 @@ void TransactionManager::Commit() {
         --current_txn_depth_;
         return;
     }
+    Transaction* txn = current_txn_;
+    // MVCC 快照隔离：kSnapshot 最外层提交前先做 first-committer-wins 冲突检测。
+    // 若写集牙刷的 head 已被「已提交的其他事务」改写，则本事务是输家——回滚并中止。
+    const bool snapshot_commit =
+        (txn->GetIsolationLevel() == IsolationLevel::kSnapshot);
+    if (snapshot_commit && SnapshotWriteConflict(txn)) {
+        std::cerr << "[mvcc] snapshot write conflict for txn "
+                  << txn->GetTxnId() << "; aborting by first-committer-wins"
+                  << std::endl;
+        Rollback();
+        return;
+    }
     // Phase B：写 COMMIT 记录 + Flush WAL + 落盘 dirty pages。
     if (log_manager_ != nullptr) {
         LogRecord rec;
         rec.type_ = LogRecordType::COMMIT;
-        rec.txn_id_ = current_txn_->GetTxnId();
+        rec.txn_id_ = txn->GetTxnId();
         log_manager_->AppendRecord(std::move(rec));
         try {
             log_manager_->Flush();
@@ -89,9 +144,22 @@ void TransactionManager::Commit() {
             // 落盘失败时同样吞掉，避免把已 COMMIT 的事务回退。
         }
     }
+    // MVCC 快照隔离：提交成功，向共享 CommitTracker 分配本事务 CSN 并回填版本头；
+    // 注销活动快照登记。
+    if (snapshot_commit && commit_tracker_ != nullptr) {
+        const int64_t csn = commit_tracker_->Commit(txn->GetTxnId());
+        BackfillVersionCsn(txn, csn);
+        commit_tracker_->UnregisterSnapshot(txn->GetSnapshotCsn());
+        txn->ClearWriteSet();
+        txn->ClearVersionSlots();
+    }
+    // 最外层提交：释放本事务持有的全部表锁（含 SERIALIZABLE 读锁），再清 txn。
+    if (lock_manager_ != nullptr && txn != nullptr) {
+        lock_manager_->UnlockAll(txn->GetTxnId());
+    }
     // 最外层提交：清空 undo 日志并释放 txn。
-    current_txn_->MarkCommitted();
-    delete current_txn_;
+    txn->MarkCommitted();
+    delete txn;
     current_txn_ = nullptr;
     current_txn_depth_ = 0;
 }
@@ -152,6 +220,9 @@ void TransactionManager::Rollback() {
     // 立即 _Exit(1)，模拟崩溃在 rollback 中途发生。
     for (size_t i = total; i-- > 0; ) {
         const auto& rec = undo_log[i];
+        std::cerr << "[DBG-rb] txn=" << txn->GetTxnId()
+                  << " undo page=" << rec.page_id
+                  << " bi_size=" << rec.before_image.size() << std::endl;
         // 1) 把 page 恢复到 before-image。
         if (buffer_pool_manager_ != nullptr) {
             Page* page = buffer_pool_manager_->GetPage(rec.page_id);
@@ -232,6 +303,15 @@ void TransactionManager::Rollback() {
     }
 
     txn->MarkAborted();
+    // MVCC 快照隔离：登记中止（其写出的版本对读者不可见）；注销活动快照登记。
+    if (txn->GetIsolationLevel() == IsolationLevel::kSnapshot && commit_tracker_ != nullptr) {
+        commit_tracker_->Abort(txn->GetTxnId());
+        commit_tracker_->UnregisterSnapshot(txn->GetSnapshotCsn());
+    }
+    // 回滚完成后释放本事务持有的全部表锁。
+    if (lock_manager_ != nullptr) {
+        lock_manager_->UnlockAll(txn->GetTxnId());
+    }
     delete txn;
     current_txn_ = nullptr;
     current_txn_depth_ = 0;
@@ -386,11 +466,117 @@ void TransactionManager::ReleaseSavepoint(const std::string& name) {
 
 void TransactionManager::ResetForShutdown() {
     if (current_txn_ != nullptr) {
+        // MVCC 快照隔离：注销活动快照登记，避免悬挂登记污染 Vacuum 地板。
+        if (commit_tracker_ != nullptr &&
+            current_txn_->GetIsolationLevel() == IsolationLevel::kSnapshot) {
+            commit_tracker_->UnregisterSnapshot(current_txn_->GetSnapshotCsn());
+        }
         current_txn_->MarkAborted();
         delete current_txn_;
         current_txn_ = nullptr;
     }
     current_txn_depth_ = 0;
+}
+
+// =============================================================================
+//  MVCC 快照隔离：first-committer-wins 冲突检测 + 提交 CSN 回填。
+// =============================================================================
+
+// 重读 txn 写集中每行，做 first-committer-wins 冲突检测：
+// 若本事务写在 head 上的版本「被替代」的版本（即 head.prev 指向的版本）来自一个
+// 与写集基不同的、且已提交的其他事务，则本事务是输家（写基于陈旧数据），中止。
+// 纯 INSERT（无基）不判定；自写跳过；未提交的替代写者（另一活动写者）视为命中共享，
+// 在对方提交前不中止。
+bool TransactionManager::SnapshotWriteConflict(const Transaction* txn) {
+    if (commit_tracker_ == nullptr || buffer_pool_manager_ == nullptr) return false;
+    const auto& ws = txn->GetWriteSet();
+    for (const auto& e : ws) {
+        if (e.base_begin_xid == 0 && e.base_begin_csn == 0) continue;  // 纯 INSERT
+        RID rid = e.rid;
+        if (!rid.IsValid()) continue;
+        // 读 head 版本头。
+        PageReadGuard guard =
+            PageReadGuard::Fetch(buffer_pool_manager_, rid.page_id);
+        if (!guard.Valid()) continue;
+        const char* data = guard.Data();
+        int32_t next_pid, slot_count, free_off;
+        ReadPageHeader(data, next_pid, slot_count, free_off);
+        if (rid.slot_num < 0 || rid.slot_num >= slot_count) continue;
+        int32_t off, len;
+        ReadSlot(data, rid.slot_num, off, len);
+        if (IsTombstone(len)) continue;
+        MvccRecordHeader h;
+        if (!ReadMvccHeader(data + off, &h)) continue;  // legacy 行：无链，不判定
+
+        int64_t displaced_xid = 0;  // 本事务写的版本所替代的版本写者
+        if (h.begin_xid == txn->GetTxnId()) {
+            // head 是本事务的版本。head.prev = 它替代的版本。
+            if (h.prev_page_id == INVALID_PAGE_ID) continue;  // 纯自写新行，无替代
+            const page_id_t pv = h.prev_page_id;
+            const int32_t ps = h.prev_slot_num;
+            const char* pd = nullptr;
+            int32_t pslot_count, pnext, pfree;
+            if (pv == rid.page_id) {
+                pd = data;
+            } else {
+                guard.Release();
+                PageReadGuard pg = PageReadGuard::Fetch(buffer_pool_manager_, pv);
+                if (!pg.Valid()) continue;
+                guard = std::move(pg);
+                pd = guard.Data();
+            }
+            ReadPageHeader(pd, pnext, pslot_count, pfree);
+            if (ps < 0 || ps >= pslot_count) continue;
+            int32_t po, pl;
+            ReadSlot(pd, ps, po, pl);
+            MvccRecordHeader pv_hdr;
+            if (IsTombstone(pl) || !ReadMvccHeader(pd + po, &pv_hdr)) continue;
+            displaced_xid = pv_hdr.begin_xid;
+            if (displaced_xid == e.base_begin_xid) continue;  // 正基于它更新，无冲突
+            // 替代版本写者已提交且不同于基 → 冲突。
+            int64_t dcsn = 0;
+            if (commit_tracker_->LookupCommitted(displaced_xid, &dcsn)) return true;
+            // 替代写者未提交：命中共享（另一活动写者），在其提交前不中止。
+            continue;
+        } else {
+            // head 不是本事务（另一写者压在本事务版本之上）——行 X 锁已串行化写者，
+            // 通常不会发生；防御性：若该写者已提交且非基，判冲突。
+            if (h.begin_xid == e.base_begin_xid) continue;
+            int64_t hcsn = 0;
+            if (commit_tracker_->LookupCommitted(h.begin_xid, &hcsn)) return true;
+            continue;
+        }
+    }
+    return false;
+}
+
+// 提交拿到 CSN 后，逐槽位回填版本头：
+//   * is_end==false 的新版本 → 置 begin_csn = csn（本事务写者的提交序）；
+//   * is_end==true 的被替代/删除旧版本 → 置 end_csn = csn（使它失效的提交序）。
+void TransactionManager::BackfillVersionCsn(Transaction* txn, int64_t csn) {
+    if (buffer_pool_manager_ == nullptr) return;
+    const auto& slots = txn->GetVersionSlots();
+    for (const auto& ref : slots) {
+        PageWriteGuard guard =
+            PageWriteGuard::Fetch(buffer_pool_manager_, ref.page_id);
+        if (!guard.Valid()) continue;
+        char* data = guard.Data();
+        int32_t next_pid, slot_count, free_off;
+        ReadPageHeader(data, next_pid, slot_count, free_off);
+        if (ref.slot_num < 0 || ref.slot_num >= slot_count) continue;
+        int32_t off, len;
+        ReadSlot(data, ref.slot_num, off, len);
+        if (IsTombstone(len)) continue;
+        MvccRecordHeader h;
+        if (!ReadMvccHeader(data + off, &h)) continue;
+        if (ref.is_end) {
+            if (h.end_csn == 0) h.end_csn = csn;
+        } else {
+            if (h.begin_csn == 0) h.begin_csn = csn;
+        }
+        WriteMvccHeader(data + off, h);
+        guard.MarkDirty();
+    }
 }
 
 }  // namespace sqlcompiler

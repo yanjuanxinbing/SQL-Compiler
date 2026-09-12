@@ -46,6 +46,13 @@ std::string TokenTypeToString(TokenType type) {
         case TokenType::KEYWORD_ASC:       return "KEYWORD_ASC";
         case TokenType::KEYWORD_BEGIN:     return "KEYWORD_BEGIN";
         case TokenType::KEYWORD_TRANSACTION: return "KEYWORD_TRANSACTION";
+        case TokenType::KEYWORD_ISOLATION: return "KEYWORD_ISOLATION";
+        case TokenType::KEYWORD_LEVEL:    return "KEYWORD_LEVEL";
+        case TokenType::KEYWORD_READ:     return "KEYWORD_READ";
+        case TokenType::KEYWORD_COMMITTED: return "KEYWORD_COMMITTED";
+        case TokenType::KEYWORD_UNCOMMITTED: return "KEYWORD_UNCOMMITTED";
+        case TokenType::KEYWORD_SERIALIZABLE: return "KEYWORD_SERIALIZABLE";
+        case TokenType::KEYWORD_SNAPSHOT:   return "KEYWORD_SNAPSHOT";
         case TokenType::KEYWORD_COMMIT:    return "KEYWORD_COMMIT";
         case TokenType::KEYWORD_ROLLBACK:  return "KEYWORD_ROLLBACK";
         case TokenType::KEYWORD_SAVEPOINT: return "KEYWORD_SAVEPOINT";

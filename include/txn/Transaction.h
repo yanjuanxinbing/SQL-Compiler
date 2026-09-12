@@ -7,9 +7,25 @@
 #include <vector>
 
 #include "storage/BufferPoolManager.h"
+#include "storage_engine/Tuple.h"  // 快照隔离：write_set_ / 版本引用需要 RID
 #include "txn/LogRecord.h"  // Phase C：UndoRecord 需要 lsn_t
 
 namespace sqlcompiler {
+
+// 事务隔离级别（T2：READ UNCOMMITTED / READ COMMITTED / SERIALIZABLE；后续
+// 追加 MVCC SNAPSHOT）。由事务管理器在 BEGIN 时从会话默认值采样。
+//   * kSerializable      —— 行 S/X 锁 + 读谓词持有到 Commit/Rollback，防幻读。
+//   * kReadCommitted     —— 行写锁持有到 Commit；行读锁语句末释放。
+//   * kReadUncommitted   —— 不加读锁（可读到未提交写），写锁照常。
+//   * kSnapshot          —— MVCC 快照隔离：读者免读锁、捕获稳定快照，只能看到
+//                          截至快照时刻已提交的版本；写者沿用行 X 锁串行，提交时
+//                          first-committer-wins 检测并中止输家。
+enum class IsolationLevel {
+    kSerializable,
+    kReadCommitted,
+    kReadUncommitted,
+    kSnapshot,
+};
 
 // 事务（Phase A：在内存中持有 undo log）。
 //
@@ -108,6 +124,68 @@ public:
     void MarkCommitted() { active_ = false; }
     void MarkAborted() { active_ = false; }
 
+    // T2 隔离级别：BEGIN 时由事务管理器采样写入；执行层据此决定锁持有期。
+    IsolationLevel GetIsolationLevel() const { return isolation_level_; }
+    void SetIsolationLevel(IsolationLevel lv) { isolation_level_ = lv; }
+
+    // ---- MVCC 快照隔离：快照 CSN + 写集 + 待回填版本 + 快照读基 ----
+    // 快照读基条目（聚合便于按 RID 查询）。
+    struct SnapshotRead {
+        RID rid;
+        int64_t begin_xid;
+        int64_t begin_csn;
+    };
+    // 快照水位：BEGIN 时从共享 CommitTracker 捕获，整事务固定不变。
+    int64_t GetSnapshotCsn() const { return snapshot_csn_; }
+    void SetSnapshotCsn(int64_t csn) { snapshot_csn_ = csn; }
+
+    // 快照读基：读者在快照模式下读到某行的可见版本时登记其 (begin_xid, begin_csn)，
+    // 供该行后续 UPDATE 的 first-committer-wins 基比较。
+    void RecordSnapshotRead(const RID& rid, int64_t begin_xid, int64_t begin_csn) {
+        for (auto& sr : snapshot_reads_) {
+            if (sr.rid == rid) { sr.begin_xid = begin_xid; sr.begin_csn = begin_csn; return; }
+        }
+        snapshot_reads_.push_back({rid, begin_xid, begin_csn});
+    }
+    // 取出并清除某行的快照读基（UPDATE 写前取用后移除）。
+    bool TakeSnapshotRead(const RID& rid, int64_t* begin_xid, int64_t* begin_csn) {
+        for (size_t i = 0; i < snapshot_reads_.size(); ++i) {
+            if (snapshot_reads_[i].rid == rid) {
+                if (begin_xid) *begin_xid = snapshot_reads_[i].begin_xid;
+                if (begin_csn) *begin_csn = snapshot_reads_[i].begin_csn;
+                snapshot_reads_.erase(snapshot_reads_.begin() + i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 写集：快照写者写一条记录时登记 (RID, base_begin_xid, base_begin_csn)。
+    // 提交时 first-committer-wins 据此重读 head，若被已提交的其他事务改写则中止本事务。
+    struct WriteSetEntry {
+        RID rid;
+        int64_t base_begin_xid;
+        int64_t base_begin_csn;
+    };
+    void AddToWriteSet(const RID& rid, int64_t base_begin_xid, int64_t base_begin_csn) {
+        write_set_.push_back({rid, base_begin_xid, base_begin_csn});
+    }
+    const std::vector<WriteSetEntry>& GetWriteSet() const { return write_set_; }
+    void ClearWriteSet() { write_set_.clear(); }
+
+    // 待回填版本：本事务写出的版本槽位（新版本回填 begin_csn，被替代/删除的旧
+    // 版本回填 end_csn），提交拿到 CSN 后由 TransactionManager 逐槽位回填。
+    struct VersionSlotRef {
+        page_id_t page_id;
+        int32_t   slot_num;
+        bool      is_end;  // true=回填 end_csn；false=回填 begin_csn
+    };
+    void AddVersionSlot(page_id_t pid, int32_t slot, bool is_end) {
+        version_slots_.push_back({pid, slot, is_end});
+    }
+    const std::vector<VersionSlotRef>& GetVersionSlots() const { return version_slots_; }
+    void ClearVersionSlots() { version_slots_.clear(); }
+
     // 查询最近同名保存点的 undo_log_offset；找不到返回 0。
     // TransactionManager 在 ROLLBACK TO 时用此值确定「应用逆序 undo 的区间」。
     size_t GetSavepointOffset(const std::string& name) const;
@@ -118,9 +196,16 @@ public:
 private:
     int64_t txn_id_;
     bool active_ = true;
+    // T2 隔离级别，默认可串行化（正确性优先）。
+    IsolationLevel isolation_level_ = IsolationLevel::kSerializable;
     std::vector<UndoRecord> undo_log_;
     // 保存点栈。栈顶即当前（最近）的保存点。
     std::vector<Savepoint> savepoints_;
+    // ---- MVCC 快照隔离状态 ----
+    int64_t snapshot_csn_ = 0;                 // BEGIN 时捕获的快照水位（kSnapshot）
+    std::vector<SnapshotRead> snapshot_reads_; // 快照读基（行 -> 可见版本写者）
+    std::vector<WriteSetEntry> write_set_;     // 写集（first-committer-wins 输入）
+    std::vector<VersionSlotRef> version_slots_; // 待提交回填 CSN 的版本槽位
 };
 
 }  // namespace sqlcompiler

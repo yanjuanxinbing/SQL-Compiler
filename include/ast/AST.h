@@ -44,6 +44,7 @@ enum class NodeType {
     ROLLBACK_TO_STMT,       // 48_acid_undo: ROLLBACK TO name
     SAVEPOINT_STMT,
     RELEASE_SAVEPOINT_STMT,
+    SET_ISOLATION_STMT,     // SET TRANSACTION ISOLATION LEVEL ...
     CREATE_VIEW_STMT,
     DROP_VIEW_STMT,
     CREATE_TRIGGER_STMT,
@@ -718,6 +719,21 @@ public:
     std::string ToString() const override;
 
     std::string savepoint_name;
+};
+
+// SET TRANSACTION ISOLATION LEVEL
+//   READ COMMITTED | READ UNCOMMITTED | SERIALIZABLE
+// isolation_level 存 IsolationLevel 枚举的整值
+//   （kSerializable=0 / kReadCommitted=1 / kReadUncommitted=2）。
+// 用 int 而非直接引入 txn/Transaction.h，避免 AST.h 的传递依赖变重。
+class SetIsolationStatement : public Statement {
+public:
+    SetIsolationStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    int isolation_level = 0;  // IsolationLevel 的整值
 };
 
 // CREATE VIEW name AS <select> —— 视图定义保存在 catalog 中。

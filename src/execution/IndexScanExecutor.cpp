@@ -2,6 +2,10 @@
 
 #include "execution/ConstraintChecker.h"
 #include "execution/ExpressionEvaluator.h"
+#include "txn/Transaction.h"
+#include "txn/TransactionManager.h"
+
+#include <stdexcept>
 
 namespace sqlcompiler {
 
@@ -18,6 +22,17 @@ void IndexScanExecutor::Init() {
     tree_ = catalog->GetIndexTree(node_->index_name);
     const TableInfo* info = catalog->GetTable(node_->table_name);
     if (info != nullptr) column_types_ = BuildColumnTypes(*info);
+    // MVCC 快照隔离：kSnapshot 下把本事务快照水位与共享 CommitTracker 挂到堆上，
+    // 回表 GetTuple 按快照过滤版本（免读锁）。
+    if (table_heap_ != nullptr) {
+        Transaction* txn = context_->GetTransaction();
+        TransactionManager* mgr = context_->GetTransactionManager();
+        if (txn != nullptr && txn->IsActive() &&
+            txn->GetIsolationLevel() == IsolationLevel::kSnapshot &&
+            mgr != nullptr && mgr->GetCommitTracker() != nullptr) {
+            table_heap_->SetSnapshot(txn->GetSnapshotCsn(), mgr->GetCommitTracker());
+        }
+    }
     if (tree_ == nullptr) return;
 
     if (node_->low_key.empty()) {
@@ -58,6 +73,15 @@ bool IndexScanExecutor::Next(Tuple* tuple) {
             if (v.IsNull() || v.AsInt() == 0) continue;
         }
         if (tuple != nullptr) *tuple = std::move(t);
+        // T2 行级读锁：显式事务内逐行取 S 锁（READ COMMITTED 登记、语句末释放）。
+        auto rl = context_->AcquireRowReadLock(t.GetRid());
+        if (rl == ExecutionContext::RowLockResult::kDeadlock ||
+            rl == ExecutionContext::RowLockResult::kTimeout) {
+            throw std::runtime_error(
+                rl == ExecutionContext::RowLockResult::kDeadlock
+                    ? "isolation deadlock on row read (statement aborted)"
+                    : "isolation row lock wait timed out (statement aborted)");
+        }
         return true;
     }
     return false;

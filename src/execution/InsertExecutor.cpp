@@ -7,6 +7,7 @@
 #include "execution/ExpressionEvaluator.h"
 #include "execution/TriggerExecutor.h"
 
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -193,6 +194,15 @@ bool InsertExecutor::InsertRow(const std::vector<Value>& row_values_in) {
         for (size_t i = 0; i < t.ColumnCount(); ++i) {
             row_snapshot.push_back(t.GetValue(i));
         }
+        // SERIALIZABLE 谓词写前检查（防幻读）：堆写入前确认无其他事务读谓词覆盖本键。
+        auto pr = context_->CheckSerializablePredicate(table_name_, row_snapshot);
+        if (pr == ExecutionContext::RowLockResult::kDeadlock ||
+            pr == ExecutionContext::RowLockResult::kTimeout) {
+            throw std::runtime_error(
+                pr == ExecutionContext::RowLockResult::kDeadlock
+                    ? "isolation deadlock on predicate (statement aborted)"
+                    : "isolation predicate lock wait timed out (statement aborted)");
+        }
         ValidateRowConstraints(context_->GetCatalog(), *info, heap,
                                row_snapshot, nullptr, context_);
         CheckUniqueIndexes(context_->GetCatalog(), *info, row_snapshot, nullptr);
@@ -205,6 +215,15 @@ bool InsertExecutor::InsertRow(const std::vector<Value>& row_values_in) {
             "INSERT failed (no space?)");
     }
     heap->SetActiveTransaction(nullptr);
+    // T2 行级写锁：新行取得 X 锁（持有到提交，Commit/Rollback 释放）。
+    auto rl = context_->AcquireRowWriteLock(rid);
+    if (rl == ExecutionContext::RowLockResult::kDeadlock ||
+        rl == ExecutionContext::RowLockResult::kTimeout) {
+        throw std::runtime_error(
+            rl == ExecutionContext::RowLockResult::kDeadlock
+                ? "isolation deadlock on row write (statement aborted)"
+                : "isolation row lock wait timed out (statement aborted)");
+    }
     InsertIntoIndexes(context_->GetCatalog(), *info, t.GetValues(), rid,
                       context_->GetTransaction());
     // AFTER INSERT 触发器：仅日志（按任务文档约定保留为 no-op）。

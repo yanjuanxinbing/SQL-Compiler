@@ -28,6 +28,10 @@
 #include "execution/UpdateExecutor.h"
 #include "execution/UpsertExecutor.h"
 #include "execution/WindowExecutor.h"
+#include "catalog/IndexInfo.h"
+#include "plan/Plan.h"
+#include "storage/LockManager.h"
+#include "txn/Transaction.h"
 #include "txn/TransactionManager.h"
 
 #include <functional>
@@ -36,6 +40,33 @@
 namespace sqlcompiler {
 
 namespace {
+
+// T2 隔离级别：表锁等待超时（毫秒）。超时仍未获锁则返回 kTimeout 并中止本语句。
+// 选一个「远超单条 SQL 正常执行时间」但仍能在死锁时及时回收的折中值。
+constexpr int kIsolationLockWaitMs = 5000;
+
+// T2：语句结束后处理 READ COMMITTED 的语句级行读锁。
+// 规则：仅当「活动显式事务 + 注入 LockManager + 隔离级别为 READ COMMITTED」时，
+// 本语句取得的行 S 锁需要在此释放；SERIALIZABLE 的行读锁与所有行写锁持有到提交，
+// 由 Commit/Rollback 的 UnlockAll 回收，这里只清空登记（避免残留）。成功与异常
+// 路径都调用本函数，确保不泄漏。
+void ReleaseRowReadLocks(ExecutionContext* ctx) {
+    if (ctx == nullptr) return;
+    Transaction* txn = ctx->GetTransaction();
+    TransactionManager* mgr = ctx->GetTransactionManager();
+    if (txn == nullptr || mgr == nullptr) {
+        ctx->ClearRowReadLocks();
+        return;
+    }
+    LockManager* lm = mgr->GetLockManager();
+    if (lm == nullptr || !txn->IsActive() ||
+        txn->GetIsolationLevel() != IsolationLevel::kReadCommitted) {
+        ctx->ClearRowReadLocks();
+        return;
+    }
+    for (int64_t r : ctx->GetRowReadLocks()) lm->Unlock(txn->GetTxnId(), r);
+    ctx->ClearRowReadLocks();
+}
 
 std::string FindScanTableName(const PlanNodePtr& node) {
     if (!node) return "";
@@ -50,6 +81,55 @@ std::string FindScanTableName(const PlanNodePtr& node) {
         if (!t.empty()) return t;
     }
     return "";
+}
+
+// 是否为结构变更（DDL）语句：这些指令在语句边界保留表级独占锁。DML 与只读
+// 语句已下放到行级并发，不在此列。
+static bool IsDdlStmt(const PlanNodePtr& node) {
+    if (!node) return false;
+    switch (node->GetType()) {
+        case PlanNodeType::TRUNCATE_TABLE:
+        case PlanNodeType::ALTER_TABLE:
+        case PlanNodeType::DROP_TABLE:
+        case PlanNodeType::CREATE_INDEX:
+        case PlanNodeType::DROP_INDEX:
+        case PlanNodeType::CREATE_TABLE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// DDL 语句锁定的目标表名；返回空串表示无需加表锁（如 CREATE TABLE 建新表）。
+static std::string DdlTableNameOf(SystemCatalog* catalog, const PlanNodePtr& node) {
+    if (!node) return "";
+    switch (node->GetType()) {
+        case PlanNodeType::TRUNCATE_TABLE:
+            return std::static_pointer_cast<TruncateTableNode>(node)->table_name;
+        case PlanNodeType::ALTER_TABLE:
+            return std::static_pointer_cast<AlterTableNode>(node)->table_name;
+        case PlanNodeType::DROP_TABLE:
+            return std::static_pointer_cast<DropTableNode>(node)->table_name;
+        case PlanNodeType::CREATE_INDEX:
+            return std::static_pointer_cast<CreateIndexNode>(node)->table_name;
+        case PlanNodeType::DROP_INDEX: {
+            const IndexInfo* ii = (catalog != nullptr)
+                ? catalog->GetIndex(std::static_pointer_cast<DropIndexNode>(node)->index_name)
+                : nullptr;
+            return (ii != nullptr) ? ii->table_name : "";
+        }
+        default:
+            return "";
+    }
+}
+
+// 表名 -> 锁资源 id：用表堆首页页号作为稳定、跨会话一致的资源键。
+// 表不存在（如派生表占位 / CTE 别名）返回 -1，调用方据此跳过加锁。
+static int64_t TableResourceId(SystemCatalog* catalog, const std::string& name) {
+    if (catalog == nullptr || name.empty()) return -1;
+    TableHeap* heap = catalog->GetTableHeap(name);
+    if (heap == nullptr) return -1;
+    return static_cast<int64_t>(heap->GetFirstPageId());
 }
 
 // 收集计划中所有 (real_table, alias) 扫描节点。DFS 前序保证对于左深 JoinNode 树，
@@ -71,6 +151,61 @@ std::vector<std::pair<std::string, std::string>> CollectScanTableNames(
         names.insert(names.end(), sub.begin(), sub.end());
     }
     return names;
+}
+
+// SERIALIZABLE 读谓词信息：某真实表及其主键读谓词（is_full 表示全表覆盖，
+// 否则为有界区间 [lo, hi]）。用于在读前注册谓词锁以闭合幻读窗口。
+struct ScanPredicateInfo {
+    std::string table;
+    bool is_full = true;
+    IndexKey lo;
+    IndexKey hi;
+};
+
+// 遍历计划收集被扫描的真实表，按扫描形态确定谓词：
+//   SEQ_SCAN 或无界 INDEX_SCAN → 全表（is_full=true）；任何一处全表覆盖即视为全表。
+//   仅当该表全部扫描均为有界 INDEX_SCAN（low_key/high_key 均非空）才用区间。
+static std::vector<ScanPredicateInfo> CollectScanPredicates(const PlanNodePtr& node) {
+    std::unordered_map<std::string, int> seen;  // table -> 1=range, 2=full
+    std::unordered_map<std::string, IndexKey> lo_map, hi_map;
+    std::function<void(const PlanNodePtr&)> walk = [&](const PlanNodePtr& n) {
+        if (!n) return;
+        if (n->GetType() == PlanNodeType::SEQ_SCAN) {
+            auto s = std::static_pointer_cast<SeqScanNode>(n);
+            if (!s->table_name.empty()) seen[s->table_name] = 2;
+        } else if (n->GetType() == PlanNodeType::INDEX_SCAN) {
+            auto s = std::static_pointer_cast<IndexScanNode>(n);
+            if (!s->table_name.empty()) {
+                const bool bounded = !s->low_key.empty() && !s->high_key.empty();
+                auto it = seen.find(s->table_name);
+                if (it == seen.end()) {
+                    if (bounded) {
+                        seen.emplace(s->table_name, 1);
+                        lo_map[s->table_name] = IndexKey(s->low_key);
+                        hi_map[s->table_name] = IndexKey(s->high_key);
+                    } else {
+                        seen.emplace(s->table_name, 2);
+                    }
+                } else if (it->second == 1 && !bounded) {
+                    it->second = 2;
+                }
+            }
+        }
+        for (auto& c : n->children) walk(c);
+    };
+    walk(node);
+    std::vector<ScanPredicateInfo> out;
+    for (auto& kv : seen) {
+        ScanPredicateInfo info;
+        info.table = kv.first;
+        info.is_full = (kv.second == 2);
+        if (!info.is_full) {
+            info.lo = lo_map[kv.first];
+            info.hi = hi_map[kv.first];
+        }
+        out.push_back(std::move(info));
+    }
+    return out;
 }
 
 // 将 vector<string> 形式 (仅有表名) 适配到新签名；用作纯单表路径的兼容入口。
@@ -308,15 +443,73 @@ ExecutionResult ExecutionEngine::Execute(const PlanNodePtr& plan) {
     if (txn_manager_ != nullptr) {
         ctx.SetTransaction(txn_manager_->GetCurrentTransaction());
     }
-    return ExecuteSubplan(plan, &ctx);
+    // T2：READ COMMITTED 的语句级行读锁在语句结束（含异常）后统一释放。
+    try {
+        ExecutionResult result = ExecuteSubplan(plan, &ctx);
+        ReleaseRowReadLocks(&ctx);
+        return result;
+    } catch (...) {
+        ReleaseRowReadLocks(&ctx);
+        throw;
+    }
 }
 
-ExecutionResult ExecutionEngine::ExecuteSubplan(const PlanNodePtr& plan, ExecutionContext* ctx) {
+ExecutionResult ExecutionEngine::ExecuteSubplan(const PlanNodePtr& plan,
+                                                ExecutionContext* ctx) {
     ExecutionResult result;
     if (!plan || !ctx) return result;
+    // ---- 隔离级别：语句边界只保留 DDL 的表级独占锁 ----
+    // 仅当存在「活动显式事务」且注入了共享 LockManager 时启用；自动提交
+    // （无事务）与未注入锁管理器（单连接旧行为）路径完全不加锁，保持兼容。
+    Transaction* txn = ctx->GetTransaction();
+    TransactionManager* mgr = ctx->GetTransactionManager();
+    LockManager* lm = (mgr != nullptr) ? mgr->GetLockManager() : nullptr;
+    const bool lock_enabled = (txn != nullptr && txn->IsActive() && lm != nullptr);
+    const IsolationLevel iso =
+        (txn != nullptr)
+            ? txn->GetIsolationLevel()
+            : IsolationLevel::kSerializable;
+    // DML（INSERT/UPSERT/UPDATE/DELETE）与只读语句不再对整表取锁：并发访问
+    // 下放到行级 S/X 锁（逻辑隔离）+ B+Tree 树锁 / TableHeap write_mutex_ /
+    // BufferPool 页锁（物理安全）+ SERIALIZABLE 谓词锁（防幻读）。
+    // 仅 DDL（结构变更）保留表级 X 锁，持有到提交。
+    int64_t ddl_lock_res = -1;
+    bool ddl_lock_held = false;
+    if (lock_enabled && IsDdlStmt(plan)) {
+        ddl_lock_res = TableResourceId(ctx->GetCatalog(), DdlTableNameOf(ctx->GetCatalog(), plan));
+        if (ddl_lock_res >= 0) {
+            LockResult lr = lm->LockExclusive(txn->GetTxnId(), ddl_lock_res,
+                                              kIsolationLockWaitMs);
+            if (lr == LockResult::kDeadlock || lr == LockResult::kTimeout) {
+                result.success = false;
+                result.message =
+                    std::string("isolation ") +
+                    (lr == LockResult::kDeadlock
+                         ? "deadlock detected (statement aborted)"
+                         : "lock wait timeout (statement aborted)");
+                return result;
+            }
+            ddl_lock_held = true;
+        }
+    }
+
+    // SERIALIZABLE：在读前为被扫描的真实表注册主键读谓词，闭合幻读窗口
+    //（其他事务向该范围插入/删除命中键时会与我们冲突）。读谓词持有到提交，
+    // 由 Commit/Rollback 的 UnlockAll 一并释放。
+    if (lock_enabled && iso == IsolationLevel::kSerializable) {
+        for (const auto& p : CollectScanPredicates(plan)) {
+            int64_t r = TableResourceId(ctx->GetCatalog(), p.table);
+            if (r < 0) continue;  // 派生表/CTE 别名，非真实表
+            lm->AcquireReadPredicate(txn->GetTxnId(), r, p.is_full, p.lo, p.hi);
+        }
+    }
+
     try {
         auto root = BuildExecutor(plan, ctx);
         if (!root) {
+            // 构建失败：释放本语句已获取的 DDL 表锁。
+            if (ddl_lock_held && lm != nullptr)
+                lm->Unlock(txn->GetTxnId(), ddl_lock_res);
             result.success = false;
             result.message = "failed to build executor";
             return result;
@@ -351,13 +544,23 @@ ExecutionResult ExecutionEngine::ExecuteSubplan(const PlanNodePtr& plan, Executi
                 result.rows.push_back(std::move(t));
             }
         }
+        // 语句成功：释放 READ COMMITTED 的语句级行读锁。此处在 ExecuteSubplan
+        // 内（而非仅 Execute）执行，因为 Session 路径也直接调用本函数，若只在
+        // Execute 释放，跨会话的 READ COMMITTED 读锁会漏放并死锁。
+        ReleaseRowReadLocks(ctx);
         if (!is_query) {
             result.message = "OK";
         }
     } catch (const CompilerException& e) {
+        ReleaseRowReadLocks(ctx);
+        if (ddl_lock_held && lm != nullptr)
+            lm->Unlock(txn->GetTxnId(), ddl_lock_res);
         result.success = false;
         result.message = FormatError(e);
     } catch (const std::exception& e) {
+        ReleaseRowReadLocks(ctx);
+        if (ddl_lock_held && lm != nullptr)
+            lm->Unlock(txn->GetTxnId(), ddl_lock_res);
         result.success = false;
         result.message = std::string("error: ") + e.what();
     }
@@ -826,6 +1029,10 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
         case PlanNodeType::RELEASE_SP: {
             auto n = std::static_pointer_cast<ReleaseSavepointNode>(plan_node);
             return std::make_unique<ReleaseSavepointExecutor>(context, n->savepoint_name);
+        }
+        case PlanNodeType::SET_ISOLATION: {
+            auto n = std::static_pointer_cast<SetIsolationNode>(plan_node);
+            return std::make_unique<SetIsolationExecutor>(context, n->isolation_level);
         }
         case PlanNodeType::CREATE_VIEW:
             return std::make_unique<NoOpExecutor>(context);

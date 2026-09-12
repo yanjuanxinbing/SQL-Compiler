@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mutex>
 #include <vector>
 
 #include "storage/BufferPoolManager.h"
@@ -10,6 +11,7 @@ namespace sqlcompiler {
 // Phase A 前向声明。
 class Transaction;
 class LogManager;
+class CommitTracker;
 
 // TableHeap：将一张表组织为一组数据页的集合（堆文件结构，页与页之间通过
 // 页头中的next_page_id串联成链表），页内建议采用"槽位目录（slot directory）"
@@ -70,6 +72,21 @@ public:
     void SetLogManager(LogManager* lm) { log_manager_ = lm; }
     LogManager* GetLogManager() const { return log_manager_; }
 
+    // ---- MVCC 快照隔离：读物化快照边界 ----
+    // 快照扫描在 Init 时调用：把快照水位 S（>=0）与共享 CommitTracker 挂到本堆上，
+    // 之后的 GetTuple/Iterator 按该快照过滤版本。csn < 0 或无 tracker = 非快照模式，
+    // 采用现有锁基读（只读 head / legacy）。注意：本堆跨会话共享，并发下不同会话
+    // 切换快照是「约」的，由上层串行化。
+    void SetSnapshot(int64_t csn, CommitTracker* tracker) {
+        snapshot_csn_ = csn;
+        commit_tracker_ = tracker;
+    }
+    int64_t GetSnapshotCsn() const { return snapshot_csn_; }
+
+    // 惰性真空回收：回收所有 begin_csn < oldest_active_csn 的「已被替代/删除」
+    // 非 head 旧版本槽位（写墓碑）。以最老活动快照为界，避免误删仍可能被读取的版本。
+    void Vacuum(int64_t oldest_active_csn);
+
     // 顺序扫描迭代器，供SeqScanExecutor使用
     class Iterator {
     public:
@@ -91,6 +108,16 @@ private:
     page_id_t first_page_id_;
     Transaction* active_txn_ = nullptr;
     LogManager* log_manager_ = nullptr;  // Phase B：可选 WAL 写出器
+    // MVCC 快照隔离：csn < 0 或无 tracker = 非快照（现有锁基读）。
+    int64_t snapshot_csn_ = -1;
+    CommitTracker* commit_tracker_ = nullptr;
+    // T2 并发写串行化互斥量：InsertTuple 的「找页->判满->新建页->链接->插入」
+    // 是一段跨多次缓冲池访问的 check-then-act 序列，单独靠锁页/缓冲池全局锁只能
+    // 串行化单次帧访问，无法阻止两个会话同时扩展同一尾部页导致链表分叉、丢行。
+    // 用 per-table 互斥量把这整段序列串行化，使并发写与顺序执行结果等价（正确性
+    // 优先于吞吐）。递归锁因为 UpdateTuple 增长路径会再嵌套调用 DeleteTuple/
+    // InsertTuple。是「约」的：本实现把写粒度假定为「每表一次只一个写者」。
+    mutable std::recursive_mutex write_mutex_;
 
     // 尝试在给定页内插入记录（写入槽位目录+记录内容），页空间不足返回false
     bool InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
@@ -99,6 +126,10 @@ private:
     // 定位current之后下一个存在有效（未删除）记录的RID，写入next，
     // 供Iterator::HasNext()/Next()使用；到达堆文件末尾返回false
     bool FindNextRid(RID current, RID* next);
+
+    // MVCC：判断 (pid, slot) 是否被任意一处的「非墓碑、有 MVCC 头」版本引为
+    // prev（即它是某个更旧版本，而非稳定 head）。快照扫描据此跳过旧版本 slot。
+    bool IsReferencedAsPrev(page_id_t pid, int32_t slot) const;
 };
 
 }  // namespace sqlcompiler

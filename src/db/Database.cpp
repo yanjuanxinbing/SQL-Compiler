@@ -7,6 +7,7 @@
 #include "plan/Planner.h"
 #include "semantic/SemanticAnalyzer.h"
 #include "txn/LogManager.h"
+#include "txn/CommitTracker.h"
 #include "txn/RecoveryManager.h"
 
 #include <algorithm>
@@ -127,10 +128,18 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size,
     // 否则等到第一条 UPDATE 之前 LogManager 的 next_lsn_ 仍是 1，但
     // durable_lsn_=0，会让「page_lsn==1 > durable_lsn==0」永远成立，触发不必要的 flush。
 
-    txn_manager_ = std::make_unique<TransactionManager>();
+    // 默认会话与后续所有会话共享 txn_seq_，保证并发下 txn_id 全局唯一。
+    txn_manager_ = std::make_unique<TransactionManager>(&txn_seq_);
     txn_manager_->SetBufferPoolManager(buffer_pool_manager_.get());
     txn_manager_->SetLogManager(log_manager_.get());
     txn_manager_->SetDiskManager(disk_manager_.get());
+    // 事务级锁管理器：跨会话共享，供隔离级别实现使用（锁粒度 = 表首页页号）。
+    lock_manager_ = std::make_unique<LockManager>();
+    txn_manager_->SetLockManager(lock_manager_.get());
+    // MVCC 快照隔离：跨会话共享的提交跟踪器（CSN 分配 + 可见性判定）。
+    // 复刻 LockManager 的注入模式——默认会话与所有 CreateSession 会话注入同一实例。
+    commit_tracker_ = std::make_unique<CommitTracker>();
+    txn_manager_->SetCommitTracker(commit_tracker_.get());
 
     catalog_ = std::make_unique<SystemCatalog>(buffer_pool_manager_.get());
     // 把 LogManager 注入 catalog 中的 TableHeap，让 CREATE TABLE / INDEX
@@ -186,7 +195,40 @@ Database::~Database() {
     Shutdown();
 }
 
+// 默认会话：等价于旧的单连接入口。
 ExecutionResult Database::ExecuteSQL(const std::string& sql) {
+    return ExecuteSQLImpl(sql, txn_manager_.get());
+}
+
+// 会话感知执行：在指定会话的 TransactionManager 上执行，使多会话并发时
+// 各自持有独立的「当前事务/嵌套深度」。
+ExecutionResult Database::ExecuteSQL(const std::string& sql, Session* session) {
+    TransactionManager* txn_mgr = txn_manager_.get();
+    if (session != nullptr) {
+        txn_mgr = session->GetTransactionManager();
+        if (txn_mgr == nullptr) txn_mgr = txn_manager_.get();
+    }
+    return ExecuteSQLImpl(sql, txn_mgr);
+}
+
+// 新建会话：独立 TransactionManager + 共享资源（缓冲池/WAL/目录/全局 id 序列）。
+std::shared_ptr<Session> Database::CreateSession() {
+    auto mgr = std::make_unique<TransactionManager>(&txn_seq_);
+    mgr->SetBufferPoolManager(buffer_pool_manager_.get());
+    mgr->SetLogManager(log_manager_.get());
+    mgr->SetDiskManager(disk_manager_.get());
+    // 注入跨会话共享的锁管理器：多个会话的显式事务在计划执行边界协调同一组表锁，
+    // 实现隔离级别与死锁回收。早于本方法之前已建好的默认会话也已注入。
+    mgr->SetLockManager(lock_manager_.get());
+    // MVCC 快照隔离：跨会话共享的提交跟踪器（默认会话在上面的构造函数内已注入）。
+    mgr->SetCommitTracker(commit_tracker_.get());
+    auto session = std::make_shared<Session>(std::move(mgr));
+    sessions_.push_back(session);
+    return session;
+}
+
+ExecutionResult Database::ExecuteSQLImpl(const std::string& sql,
+                                         TransactionManager* txn_mgr) {
     // \stats —— 输出存储子系统诊断信息（缓冲池/页分配/替换日志）。
     // 需在通用 \crash 处理之前识别。
     if (IsCrashDebugCommand(sql)) {
@@ -210,8 +252,8 @@ ExecutionResult Database::ExecuteSQL(const std::string& sql) {
     if (IsCrashDebugCommand(sql)) {
         int n = 0;
         if (HandleCrashAfterUndoSteps(sql, &n)) {
-            if (txn_manager_ != nullptr) {
-                txn_manager_->SetCrashAfterUndoSteps(n);
+            if (txn_mgr != nullptr) {
+                txn_mgr->SetCrashAfterUndoSteps(n);
                 std::cerr << "[crash-after-undo-steps] armed; will _Exit(1) "
                           << "after " << n << " undo step(s) during Rollback"
                           << std::endl;
@@ -249,13 +291,13 @@ ExecutionResult Database::ExecuteSQL(const std::string& sql) {
             statement->GetType() == NodeType::ROLLBACK_TO_STMT ||
             statement->GetType() == NodeType::RELEASE_SAVEPOINT_STMT;
         const bool need_autocommit =
-            !is_read_only && txn_manager_ != nullptr &&
-            txn_manager_->GetCurrentDepth() == 0;
+            !is_read_only && txn_mgr != nullptr &&
+            txn_mgr->GetCurrentDepth() == 0;
         Transaction* autocommit_txn = nullptr;
         if (need_autocommit) {
-            autocommit_txn = txn_manager_->Begin();
+            autocommit_txn = txn_mgr->Begin();
             // Phase B：写 BEGIN 记录，让 redo 阶段看到一致的事务边界。
-            txn_manager_->LogBegin(autocommit_txn);
+            txn_mgr->LogBegin(autocommit_txn);
         }
         try {
             SemanticAnalyzer analyzer(catalog_.get(), catalog_->GetSymbolTable());
@@ -267,8 +309,8 @@ ExecutionResult Database::ExecuteSQL(const std::string& sql) {
                 }
                 result.success = false;
                 result.message = "semantic error: " + msg;
-                if (need_autocommit && txn_manager_ != nullptr) {
-                    txn_manager_->Rollback();
+                if (need_autocommit && txn_mgr != nullptr) {
+                    txn_mgr->Rollback();
                 }
                 return result;
             }
@@ -276,22 +318,40 @@ ExecutionResult Database::ExecuteSQL(const std::string& sql) {
             auto plan = planner.CreatePlan(statement);
             Optimizer optimizer(catalog_.get());
             plan = optimizer.Optimize(plan);
-            auto exec_result = execution_engine_->Execute(plan);
+            // 会话感知：若走会话，重建一个绑定『本会话 txn_manager』的执行上下文
+            // 再跑同一棵计划，让 DML 算子抓到正确的 undo 上下文；否则走引擎默认路径。
+            const bool session_exec = (txn_mgr != nullptr && txn_mgr != txn_manager_.get());
+            ExecutionResult exec_result;
+            if (session_exec) {
+                ExecutionContext session_ctx(catalog_.get(), txn_mgr);
+                session_ctx.SetTransaction(txn_mgr->GetCurrentTransaction());
+                exec_result = execution_engine_->ExecuteSubplan(plan, &session_ctx);
+            } else {
+                exec_result = execution_engine_->Execute(plan);
+            }
             if (exec_result.success && buffer_pool_manager_) {
                 buffer_pool_manager_->FlushAllPages();
             }
-            if (need_autocommit && txn_manager_ != nullptr) {
+            if (need_autocommit && txn_mgr != nullptr) {
                 if (exec_result.success) {
-                    txn_manager_->Commit();
+                    txn_mgr->Commit();
                     MaybeCrashAfterSuccess();
                 } else {
-                    txn_manager_->Rollback();
+                    txn_mgr->Rollback();
                 }
+            }
+            // MVCC 快照隔离：低频惰性真空——每完成 kVacuumInterval 条成功后，
+            // 以「最老活动快照」为界回收一次全表旧版本槽位（惰性无害，乘客低）。
+            constexpr int kVacuumInterval = 100;
+            if (++vacuum_statement_counter_ >= kVacuumInterval &&
+                commit_tracker_ != nullptr && catalog_ != nullptr) {
+                vacuum_statement_counter_ = 0;
+                catalog_->VacuumAll(commit_tracker_->OldestActiveSnapshot());
             }
             return exec_result;
         } catch (...) {
-            if (need_autocommit && txn_manager_ != nullptr) {
-                txn_manager_->Rollback();
+            if (need_autocommit && txn_mgr != nullptr) {
+                txn_mgr->Rollback();
             }
             throw;
         }
@@ -342,6 +402,13 @@ void Database::Shutdown() {
     // E5：先停后台刷脏线程（join），避免其与随后的 FlushAllPages / Checkpoint / Sync 竞态。
     if (buffer_pool_manager_) buffer_pool_manager_->StopBackgroundFlush();
     if (buffer_pool_manager_) buffer_pool_manager_->FlushAllPages();
+    // 重置所有会话（含默认）的悬挂事务，避免 txn 句柄在析构时残留。
+    if (txn_manager_) txn_manager_->ResetForShutdown();
+    for (auto& s : sessions_) {
+        if (s && s->GetTransactionManager()) {
+            s->GetTransactionManager()->ResetForShutdown();
+        }
+    }
     if (recovery_) recovery_->Checkpoint();
     if (log_manager_) {
         try { log_manager_->Flush(); } catch (...) {}

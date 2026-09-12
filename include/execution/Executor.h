@@ -86,6 +86,27 @@ public:
     void SetTransaction(Transaction* txn) { txn_ = txn; }
     Transaction* GetTransaction() const { return txn_; }
 
+    // ---- T2 隔离级别：本语句已取得、需按 READ COMMITTED 语句末释放的行读锁 ----
+    // 执行算子（SeqScan/IndexScan）在逐行取得 S 锁时若处于 READ COMMITTED 则登记；
+    // SERIALIZABLE 的行读锁持有到提交（由 Commit/Rollback 的 UnlockAll 释放），
+    // 无需登记。外层 Execute() 在语句结束/异常路径上据此统一回收。
+    void RecordRowReadLock(int64_t rid) { statement_row_read_locks_.push_back(rid); }
+    const std::vector<int64_t>& GetRowReadLocks() const { return statement_row_read_locks_; }
+    void ClearRowReadLocks() { statement_row_read_locks_.clear(); }
+
+    // T2 行级锁获取结果：kOk=已取得；kUnused=未启用（自动提交/无锁管理器/无效RID）；
+    // kDeadlock/kTimeout=冲突，调用方应中止本语句。
+    enum class RowLockResult { kOk, kUnused, kDeadlock, kTimeout };
+    // 行级共享锁（读表逐行）：仅在显式事务+注入 LockManager 且非 READ UNCOMMITTED 时取；
+    // READ COMMITTED 登记到本语句行读锁，语句末由外层 Execute() 释放；SERIALIZABLE 持有到提交。
+    RowLockResult AcquireRowReadLock(const RID& rid);
+    // 行级独占锁（写表逐行）：所有隔离级别在显式事务内都取，持有到提交（Commit/Rollback 释放）。
+    RowLockResult AcquireRowWriteLock(const RID& rid);
+    // SERIALIZABLE 谓词写前检查：以该表主键建键，若有其他活动事务的读谓词覆盖该
+    // 键则阻塞（或 kDeadlock/kTimeout）。仅 SERIALIZABLE 显式事务启用，其余返回 kUnused。
+    RowLockResult CheckSerializablePredicate(const std::string& table_name,
+                                             const std::vector<Value>& row);
+
 private:
     SystemCatalog* catalog_;
     std::unordered_map<std::string, CteMaterialization> cte_results_;
@@ -102,6 +123,8 @@ private:
     Transaction* txn_ = nullptr;
     // Phase A：所属事务管理器（由 ExecutionEngine 在构造 ctx 时注入）。
     TransactionManager* txn_manager_ = nullptr;
+    // T2：当前语句已取得、需按 READ COMMITTED 语句末释放的行读锁。
+    std::vector<int64_t> statement_row_read_locks_;
 };
 
 // 执行算子基类，采用火山模型（Volcano / Iterator Model）：

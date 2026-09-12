@@ -18,6 +18,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include "txn/Transaction.h"
+#include "txn/TransactionManager.h"
+
 namespace sqlcompiler {
 
 namespace {
@@ -212,6 +215,15 @@ void UpsertExecutor::InsertCandidateRow(std::vector<Value>& row_values) {
         for (size_t i = 0; i < t.ColumnCount(); ++i) {
             row_snapshot.push_back(t.GetValue(i));
         }
+        // SERIALIZABLE 谓词写前检查（防幻读）。
+        auto pr = context_->CheckSerializablePredicate(table_name_, row_snapshot);
+        if (pr == ExecutionContext::RowLockResult::kDeadlock ||
+            pr == ExecutionContext::RowLockResult::kTimeout) {
+            throw std::runtime_error(
+                pr == ExecutionContext::RowLockResult::kDeadlock
+                    ? "isolation deadlock on predicate (statement aborted)"
+                    : "isolation predicate lock wait timed out (statement aborted)");
+        }
         ValidateRowConstraints(context_->GetCatalog(), *info, heap,
                                row_snapshot, nullptr, context_);
         CheckUniqueIndexes(context_->GetCatalog(), *info, row_snapshot, nullptr);
@@ -239,8 +251,27 @@ void UpsertExecutor::UpdateConflictingRow(const std::vector<Value>& candidate_va
         throw CompilerException(ErrorStage::SEMANTIC, "table heap missing: " + table_name_);
     }
 
+    Transaction* txn = context_->GetTransaction();
+    // Phase A：把当前事务挂到堆上。必须在「读行取快照读基」之前就绪，否则
+    // GetTuple 的 RecordSnapshotRead（供 first-committer-wins 用）不会记录，
+    // UpdateTuple 会退化为以物理 head 为基，导致冲突检测失效。
+    if (txn != nullptr) heap->SetActiveTransaction(txn);
+
+    // MVCC 快照隔离：读冲突行前把本事务快照水位与共享 CommitTracker 挂到堆上，
+    // GetTuple 按快照过滤版本并记录快照读基（供 first-committer-wins 用）。否则
+    // 会读到他人未提交的 head，RecordSnapshotRead 也记录不到正确 base。
+    if (txn != nullptr && txn->GetIsolationLevel() == IsolationLevel::kSnapshot) {
+        TransactionManager* mgr = context_->GetTransactionManager();
+        CommitTracker* tracker =
+            (mgr != nullptr) ? mgr->GetCommitTracker() : nullptr;
+        if (tracker != nullptr) {
+            heap->SetSnapshot(txn->GetSnapshotCsn(), tracker);
+        }
+    }
+
     Tuple cur;
     if (!heap->GetTuple(existing_rid, &cur, column_types_)) {
+        if (txn != nullptr) heap->SetActiveTransaction(nullptr);
         throw CompilerException(ErrorStage::SEMANTIC,
             "ON DUPLICATE KEY UPDATE: failed to read existing row");
     }
@@ -280,14 +311,32 @@ void UpsertExecutor::UpdateConflictingRow(const std::vector<Value>& candidate_va
         for (size_t i = 0; i < new_t.ColumnCount(); ++i) {
             row_snapshot.push_back(new_t.GetValue(i));
         }
+        // SERIALIZABLE 谓词写前检查（防幻读）。
+        auto pr = context_->CheckSerializablePredicate(table_name_, row_snapshot);
+        if (pr == ExecutionContext::RowLockResult::kDeadlock ||
+            pr == ExecutionContext::RowLockResult::kTimeout) {
+            throw std::runtime_error(
+                pr == ExecutionContext::RowLockResult::kDeadlock
+                    ? "isolation deadlock on predicate (statement aborted)"
+                    : "isolation predicate lock wait timed out (statement aborted)");
+        }
         ValidateRowConstraints(context_->GetCatalog(), *info, heap,
                                row_snapshot, &existing_rid, context_);
         CheckUniqueIndexes(context_->GetCatalog(), *info, row_snapshot, &existing_rid);
     }
-    // Phase A：把当前事务挂到堆/索引上。
-    Transaction* txn = context_->GetTransaction();
+    // 事务已提前挂到堆上（读行时已记录快照读基）。UpdateTuple 这里直接抓 undo。
+    // T2 行级写锁：改写该行前取 X 锁（持有到提交，Commit/Rollback 释放），
+    // 与 UpdateExecutor/DeleteExecutor 的写路径串行化，保证 FCW base 不被并发写绕开。
     DeleteFromIndexes(context_->GetCatalog(), *info, cur.GetValues(), existing_rid, txn);
-    heap->SetActiveTransaction(txn);
+    auto wl = context_->AcquireRowWriteLock(existing_rid);
+    if (wl == ExecutionContext::RowLockResult::kDeadlock ||
+        wl == ExecutionContext::RowLockResult::kTimeout) {
+        heap->SetActiveTransaction(nullptr);
+        throw std::runtime_error(
+            wl == ExecutionContext::RowLockResult::kDeadlock
+                ? "isolation deadlock on row write (statement aborted)"
+                : "isolation row lock wait timed out (statement aborted)");
+    }
     bool ok = heap->UpdateTuple(existing_rid, new_t, column_types_);
     heap->SetActiveTransaction(nullptr);
     if (ok) {
@@ -296,6 +345,7 @@ void UpsertExecutor::UpdateConflictingRow(const std::vector<Value>& candidate_va
     } else {
         // 写堆失败：把刚摘掉的旧键放回去，避免索引凭空少一条
         InsertIntoIndexes(context_->GetCatalog(), *info, cur.GetValues(), existing_rid, txn);
+        heap->SetActiveTransaction(nullptr);
         throw CompilerException(ErrorStage::SEMANTIC,
             "ON DUPLICATE KEY UPDATE: heap write failed");
     }

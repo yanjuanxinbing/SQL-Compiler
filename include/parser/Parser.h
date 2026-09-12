@@ -50,6 +50,7 @@ private:
     StatementPtr ParseRollbackStatement();
     StatementPtr ParseSavepointStatement();
     StatementPtr ParseReleaseSavepointStatement();
+    StatementPtr ParseSetIsolationStatement();
     StatementPtr ParseCreateViewStatement();
     StatementPtr ParseDropViewStatement();
     StatementPtr ParseCreateTriggerStatement();

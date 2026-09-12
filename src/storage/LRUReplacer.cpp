@@ -15,13 +15,13 @@ void LRUReplacer::Pin(int frame_id) {
     position_map_.erase(it);
 }
 
+// Stage2（2026-09-12）：Unpin 由「find+operator[] 两次哈希」改为「emplace 单次
+// 哈希直接取回迭代器」，削减缓存替换热路径的哈希访问。
 void LRUReplacer::Unpin(int frame_id) {
     auto it = position_map_.find(frame_id);
     if (it != position_map_.end()) return;  // already in the list
     lru_list_.push_back(frame_id);
-    auto inserted = lru_list_.end();
-    --inserted;
-    position_map_[frame_id] = inserted;
+    position_map_.emplace(frame_id, --lru_list_.end());
 }
 
 bool LRUReplacer::Victim(int* frame_id) {

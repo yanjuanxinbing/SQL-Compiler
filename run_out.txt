@@ -1,0 +1,16 @@
+FAIL  C:\Users\Lenovo\Desktop\SQL-Compiler\tests\storage\storage_ut.cpp:1923  [count_rows(rf) == 1]
+FAIL  C:\Users\Lenovo\Desktop\SQL-Compiler\tests\storage\storage_ut.cpp:1924  [val_of(rf, 3, 1) == 300]
+FAIL  C:\Users\Lenovo\Desktop\SQL-Compiler\tests\storage\storage_ut.cpp:1972  [!b_done.load()]
+FAIL  C:\Users\Lenovo\Desktop\SQL-Compiler\tests\storage\storage_ut.cpp:1981  [val_of(rf, 1, 1) == 100]
+
+======== Storage UT ========
+checks: 6657   fails: 4
+RESULT: FAIL
+==== OS 模块性能对比基准（优化前 vs 优化后）====
+[Stage1] CRC 吞吐   : 优化(261.1 MB/s)  vs  基线(263.8 MB/s)
+        一致性      : PASS   (收益=消除惰性建表竞态/编译期表中初始化)
+[Stage2] LRU 吞吐    : 优化(2.2 M ops/s)  vs  基线(2.0 M ops/s)  加速 1.08x
+        状态一致    : PASS
+[Stage3] 分配遍历    : 优化(64.0 次访问/次分配)  vs  基线(128.0 次)
+        减少        : 50.0%
+==== 基准结束 ====

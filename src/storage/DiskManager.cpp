@@ -11,6 +11,9 @@
 #include <unistd.h>  // fileno, fsync
 #endif
 
+// Stage1（2026-09-12）：CRC32 改由 osopt 常量表实现，消除惰性建表竞态与首调用延迟。
+#include "storage/OsModuleOptimizations.h"
+
 namespace sqlcompiler {
 
 namespace {
@@ -71,29 +74,6 @@ inline uint32_t GetU64(const char* p) {
     uint64_t v;
     std::memcpy(&v, p, 8);
     return v;
-}
-
-// 标准 CRC-32/ISO-HDLC（IEEE 802.3，多项式 0xEDB88320），表驱动。
-// 注意：对全 0 的 PAGE_SIZE 缓冲其值非 0，因此 0 可安全用作「无记录」哨兵。
-uint32_t Crc32(const char* data, size_t len) {
-    static uint32_t s_table[256] = {0};
-    static bool s_init = false;
-    if (!s_init) {
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; ++k) {
-                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            }
-            s_table[i] = c;
-        }
-        s_init = true;
-    }
-    const unsigned char* p = reinterpret_cast<const unsigned char*>(data);
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; ++i) {
-        crc = s_table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
-    }
-    return crc ^ 0xFFFFFFFFu;
 }
 
 }  // namespace
@@ -178,7 +158,7 @@ void DiskManager::ReadPage(page_id_t page_id, char* data) {
     // 匹配失败说明磁盘内容已损坏（位翻转/部分写），上抛以走统一 I/O 错误通道。
     uint32_t stored = 0;
     if (GetPageCrc(page_id, &stored)) {
-        if (Crc32(data, PAGE_SIZE) != stored) {
+        if (osopt::Crc32(data, PAGE_SIZE) != stored) {
             throw std::runtime_error("page CRC mismatch: page " +
                                      std::to_string(page_id));
         }
@@ -428,7 +408,7 @@ void DiskManager::SetPageCrc(page_id_t page_id, const char* data) {
     size_t idx = static_cast<size_t>(page_id);
     EnsureCrcFile(idx + 1);
     if (crc_ == nullptr) return;  // 无法持久化 CRC：跳过（降级）
-    uint32_t crc = Crc32(data, PAGE_SIZE);
+    uint32_t crc = osopt::Crc32(data, PAGE_SIZE);
     pcrc_[idx] = crc;
     std::fseek(crc_, static_cast<long>(idx * 4), SEEK_SET);
     std::fwrite(reinterpret_cast<const char*>(&crc), 4, 1, crc_);

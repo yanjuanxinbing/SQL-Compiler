@@ -130,6 +130,13 @@ const std::unordered_map<std::string, TokenType>& KeywordTable() {
         // 40_txn_view_udf: 事务 / 视图 / 触发器 / UDF 关键字
         {"BEGIN",     TokenType::KEYWORD_BEGIN},
         {"TRANSACTION", TokenType::KEYWORD_TRANSACTION},
+        {"ISOLATION", TokenType::KEYWORD_ISOLATION},
+        {"LEVEL",        TokenType::KEYWORD_LEVEL},
+        {"READ",         TokenType::KEYWORD_READ},
+        {"COMMITTED",    TokenType::KEYWORD_COMMITTED},
+        {"UNCOMMITTED",  TokenType::KEYWORD_UNCOMMITTED},
+        {"SERIALIZABLE", TokenType::KEYWORD_SERIALIZABLE},
+        {"SNAPSHOT",   TokenType::KEYWORD_SNAPSHOT},
         {"COMMIT",    TokenType::KEYWORD_COMMIT},
         {"ROLLBACK",  TokenType::KEYWORD_ROLLBACK},
         {"SAVEPOINT", TokenType::KEYWORD_SAVEPOINT},

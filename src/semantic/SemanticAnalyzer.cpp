@@ -62,6 +62,7 @@ bool SemanticAnalyzer::AnalyzeInternal(const StatementPtr& statement, bool& ok) 
         case NodeType::ROLLBACK_TO_STMT:
         case NodeType::SAVEPOINT_STMT:
         case NodeType::RELEASE_SAVEPOINT_STMT:
+        case NodeType::SET_ISOLATION_STMT:
         case NodeType::CREATE_VIEW_STMT:
         case NodeType::DROP_VIEW_STMT:
         case NodeType::CREATE_TRIGGER_STMT:
