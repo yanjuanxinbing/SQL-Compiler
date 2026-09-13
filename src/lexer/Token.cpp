@@ -122,6 +122,7 @@ std::string TokenTypeToString(TokenType type) {
         case TokenType::OP_MINUS:          return "OP_MINUS";
         case TokenType::OP_STAR:           return "OP_STAR";
         case TokenType::OP_SLASH:          return "OP_SLASH";
+        case TokenType::OP_MODULO:         return "OP_MODULO";
         case TokenType::OP_CONCAT:         return "OP_CONCAT";
         case TokenType::LEFT_PAREN:        return "LEFT_PAREN";
         case TokenType::RIGHT_PAREN:       return "RIGHT_PAREN";

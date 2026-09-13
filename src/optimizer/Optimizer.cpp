@@ -120,6 +120,13 @@ void CollectColumns(const ExprPtr& e, ColumnUsage& out) {
 bool CanPushIntoScan(const ExprPtr& c, const SeqScanNode* scan,
                      SystemCatalog* catalog) {
     if (!c) return false;
+    // 派生表 / 视图占位 SeqScan：table_name == table_alias 且 children 非空。
+    // 它在执行期会被整个子计划替换，scan->predicate 会被吞掉，所以不能下推。
+    // 否则外层 WHERE d.s > 100 这种基于派生表列的过滤会静默丢失。
+    if (!scan->table_alias.empty() && scan->table_alias == scan->table_name &&
+        !scan->children.empty()) {
+        return false;
+    }
     ColumnUsage u;
     CollectColumns(c, u);
     if (u.has_subquery_or_window) return false;

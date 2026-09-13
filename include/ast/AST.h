@@ -180,6 +180,7 @@ enum class BinaryOperator {
     SUB,
     MUL,
     DIV,
+    MOD,
     CONCAT,
     EQUAL,
     NOT_EQUAL,

@@ -527,6 +527,7 @@ Token Lexer::ScanOperatorOrSymbol() {
         case '-': return Token(TokenType::OP_MINUS, "-", start_line, start_col);
         case '*': return Token(TokenType::OP_STAR, "*", start_line, start_col);
         case '/': return Token(TokenType::OP_SLASH, "/", start_line, start_col);
+        case '%': return Token(TokenType::OP_MODULO, "%", start_line, start_col);
         case '(': return Token(TokenType::LEFT_PAREN, "(", start_line, start_col);
         case ')': return Token(TokenType::RIGHT_PAREN, ")", start_line, start_col);
         case ',': return Token(TokenType::COMMA, ",", start_line, start_col);

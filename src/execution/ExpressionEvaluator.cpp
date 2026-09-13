@@ -623,6 +623,23 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
             if (rv == 0) return Value::MakeNull();
             return Value::MakeInt(l.AsInt() / rv);
         }
+        case BinaryOperator::MOD: {
+            // SQL MOD：除数为 0 返回 NULL；余数符号跟随被除数（与 SQL 标准 MOD 一致，
+            // 区别于 C/C++ 的 % 跟随左操作数；这里采用与函数式 MOD 相同的语义）。
+            if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
+                double rv = ToDouble(r);
+                if (rv == 0.0) return Value::MakeNull();
+                double lv = ToDouble(l);
+                double r2 = lv - std::floor(lv / rv) * rv;
+                return Value::MakeFloat(r2);
+            }
+            int32_t rv = r.AsInt();
+            if (rv == 0) return Value::MakeNull();
+            int32_t lv = l.AsInt();
+            // C++ % 的符号跟随左操作数；与 SQL MOD 语义一致。
+            return Value::MakeInt(lv % rv);
+        }
         case BinaryOperator::CONCAT: {
             // SQL标准：任一操作数为NULL则结果为NULL；非字符串操作数按其文本形式连接
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
@@ -869,6 +886,17 @@ Value ExpressionEvaluator::EvaluateFunctionCall(const FunctionCallExpr& expr,
         if (a.IsNull() || b.IsNull()) return a;  // NULLIF(a, NULL) 返回 a；NULLIF(NULL, b) 返回 NULL
         return Value::Compare(a, b) == 0 ? Value::MakeNull() : a;
     }
+    // IIF(cond, thenValue, elseValue) — SQL Server/Access 风格的简写。
+    // 三值逻辑：cond 为 TRUE -> 求 thenValue；cond 为 FALSE/NULL -> 求 elseValue。
+    // 短路求值：未选中的分支不会被求值。
+    if (name == "IIF") {
+        if (expr.arguments.size() != 3) return Value::MakeNull();
+        Value cond = Evaluate(expr.arguments[0], tuple);
+        if (!cond.IsNull() && IsTruthy(cond)) {
+            return Evaluate(expr.arguments[1], tuple);
+        }
+        return Evaluate(expr.arguments[2], tuple);
+    }
     // ---- 字符串函数 ----
     if (name == "UPPER") {
         if (expr.arguments.size() != 1) return Value::MakeNull();
@@ -945,6 +973,21 @@ Value ExpressionEvaluator::EvaluateFunctionCall(const FunctionCallExpr& expr,
             pos = hit + from.size();
         }
         return Value::MakeVarchar(std::move(out));
+    }
+    // INSTR(haystack, needle) / POSITION(needle IN haystack)
+    // Oracle/MySQL 语义：返回 needle 在 haystack 中首次出现的位置（1-based）。
+    // 任一参数为 NULL -> NULL；needle 为空串 -> 1；needle 未找到 -> 0。
+    if (name == "INSTR" || name == "POSITION") {
+        if (expr.arguments.size() != 2) return Value::MakeNull();
+        Value h = Evaluate(expr.arguments[0], tuple);
+        Value n = Evaluate(expr.arguments[1], tuple);
+        if (h.IsNull() || n.IsNull()) return Value::MakeNull();
+        const std::string hs = h.ToString();
+        const std::string nd = n.ToString();
+        if (nd.empty()) return Value::MakeInt(1);
+        size_t pos = hs.find(nd);
+        if (pos == std::string::npos) return Value::MakeInt(0);
+        return Value::MakeInt(static_cast<int32_t>(pos + 1));
     }
     // ---- 数学函数 ----
     if (name == "ROUND") {

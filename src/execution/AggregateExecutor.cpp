@@ -202,6 +202,31 @@ ExprPtr SubstituteAggregates(const ExprPtr& expr, const Value& state_value) {
             nf->is_distinct = f->is_distinct;
             return nf;
         }
+        // CASE WHEN / 搜索式 CASE：递归替换 subject / 每个 when_expr / 每个
+        // then_expr / else_expr。否则 CASE WHEN SUM(x) > N 这类聚合调用无法被
+        // 替换为字面量，导致 ExpressionEvaluator 求值时返回 NULL。
+        case NodeType::CASE_EXPR: {
+            auto c = std::static_pointer_cast<CaseExprNode>(expr);
+            auto nc = std::make_shared<CaseExprNode>();
+            nc->subject = SubstituteAggregates(c->subject, state_value);
+            nc->whens.reserve(c->whens.size());
+            for (const auto& w : c->whens) {
+                CaseWhen nw;
+                nw.when_expr = SubstituteAggregates(w.when_expr, state_value);
+                nw.then_expr = SubstituteAggregates(w.then_expr, state_value);
+                nc->whens.push_back(std::move(nw));
+            }
+            nc->else_expr = SubstituteAggregates(c->else_expr, state_value);
+            return nc;
+        }
+        // CAST(expr AS type)：递归替换 expr。Fixes CAST(SUM(x) AS INT) 等。
+        case NodeType::CAST_EXPR: {
+            auto c = std::static_pointer_cast<CastExprNode>(expr);
+            auto nc = std::make_shared<CastExprNode>(
+                SubstituteAggregates(c->expr, state_value), c->target_type);
+            nc->char_length = c->char_length;
+            return nc;
+        }
         default:
             return expr;
     }

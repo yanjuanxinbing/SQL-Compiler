@@ -25,6 +25,7 @@ const char* BinaryOpToString(BinaryOperator op) {
         case BinaryOperator::SUB:            return "-";
         case BinaryOperator::MUL:            return "*";
         case BinaryOperator::DIV:            return "/";
+        case BinaryOperator::MOD:            return "%";
         case BinaryOperator::EQUAL:          return "=";
         case BinaryOperator::NOT_EQUAL:      return "<>";
         case BinaryOperator::LESS:           return "<";

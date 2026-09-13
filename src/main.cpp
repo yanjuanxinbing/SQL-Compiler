@@ -305,9 +305,12 @@ void PrintResult(const sqlcompiler::ExecutionResult& result) {
 // 失败时打印错误并继续（与 REPL 行为一致），不中断后续语句。
 // 返回 true 表示文件被成功打开（即使里面所有语句都失败）。
 //
-// 切分策略：与 REPL 复用 HasCompleteStatement() —— 逐字符累积到 buffer，
-// 当 buffer 出现"语句已完整"信号时整段 trim 后执行、清空 buffer 继续。
-// 文本末尾若没有 ';'，会作为最后一条语句兜底执行。
+// 切分策略：按行扫描（行内仍走 HasCompleteStatement 检测 ';'）。这样能让
+// `.tables` / `.exit` / `\.tokens` 等不带 ';' 的元命令/调试命令被识别为
+// 行边界,而不是被错误拼到下一条 SQL 之后——之前的实现会把 `.tables\nINSERT`
+// 整体交给解析器,因 `.` 报错而**静默丢弃**后续 INSERT 的数据(行数显示 OK
+// 但表里少一条)。现在把元命令作为独立 ExecuteSQL 调用执行,失败仅影响该行,
+// 不再污染相邻 SQL,与 REPL 的"累加器非空时不处理元命令"语义一致。
 //
 // 复杂度：HasCompleteStatement 自身是 O(|buffer|)，整体 O(N²)。对教学用的
 // 脚本（KB 级）足够快；工业级可换成单趟扫描的 statement splitter。
@@ -334,17 +337,49 @@ bool RunScriptFile(sqlcompiler::Database* database, const std::string& path) {
 
     std::string buffer;
     size_t statements_run = 0;
-    for (size_t i = 0; i < content.size(); ++i) {
-        buffer.push_back(content[i]);
+    auto flush_sql_buffer = [&]() {
+        if (buffer.empty()) return false;
+        bool ran = run_one(buffer);
+        buffer.clear();
+        return ran;
+    };
+
+    // 按行处理：把 `.tables` / `\.tokens` 等以 '.' 或 '\\' 开头的行识别为
+    // 元命令/调试命令边界（仅当 SQL 累加器为空或只含注释/空白时——与 REPL
+    // "累加器非空时不处理元命令"语义对齐,避免误把多行 SQL 中的同名行截断）。
+    std::istringstream line_stream(content);
+    std::string line;
+    while (std::getline(line_stream, line)) {
+        size_t a = line.find_first_not_of(" \t\r\n");
+        size_t b = line.find_last_not_of(" \t\r\n");
+        std::string trimmed_line =
+            (a == std::string::npos) ? std::string()
+                                       : line.substr(a, b - a + 1);
+        const bool is_meta_command =
+            !trimmed_line.empty() &&
+            (trimmed_line.front() == '.' || trimmed_line.front() == '\\');
+        const bool buffer_has_content =
+            !buffer.empty() && !IsOnlyCommentsOrWhitespace(buffer);
+
+        if (is_meta_command && !buffer_has_content) {
+            // 元命令边界：先清空 SQL buffer（一般已是空），再独立执行这一行。
+            // 即使 `.tables` 之类未识别而报错，也只影响本行,不会污染后续 SQL。
+            // 注意：'\' 开头会被 Database::ExecuteSQL 当作 \crash 调试指令
+            // (Database.cpp IsCrashDebugCommand),遇到未知 \xxx 直接 _Exit(1);
+            // 这是 Phase B 调试注入的设计,保持原行为,不在 RunScriptFile 兜底。
+            (void)flush_sql_buffer();
+            if (run_one(line)) ++statements_run;
+            continue;
+        }
+
+        buffer += line;
+        buffer += "\n";
         if (HasCompleteStatement(buffer)) {
-            if (run_one(buffer)) ++statements_run;
-            buffer.clear();
+            if (flush_sql_buffer()) ++statements_run;
         }
     }
-    // 兜底：文件末尾可能没有 ';'，把残留 buffer 也跑掉。
-    if (!buffer.empty()) {
-        if (run_one(buffer)) ++statements_run;
-    }
+    // 兜底：文件末尾若残留 buffer（无 ';'），也跑掉。
+    if (flush_sql_buffer()) ++statements_run;
     std::cout << "[script] " << path << ": ran " << statements_run
               << " statement(s)" << std::endl;
     return true;
@@ -442,6 +477,17 @@ int main(int argc, char** argv) {
             std::string trimmed_cmd =
                 (ca == std::string::npos) ? std::string()
                                           : cmd.substr(ca, cb - ca + 1);
+            // 2b: 未识别的以 '.' / '\\' 开头的行(典型如 .tables / .schema)
+            // 也作为独立的 ExecuteSQL 调用执行 —— 仅触发当行的语法错误,
+            // 不会污染 sql 累加器,让下一行 INSERT 等独立处理。否则
+            // `.tables\nINSERT INTO nosuch ...;` 会被 Lexer 整体解析,
+            // 在 '.' 处报 Syntax,而 INSERT 的 TableNotFound 被吞掉。
+            // 已知 \xxx 会被 Database::IsCrashDebugCommand 当作 \crash
+            // 调试指令 _Exit(1),保持原行为,不在 REPL 兜底。
+            //
+            // 顺序：先匹配已识别的元命令(\.tokens / \.ast / \.plan /
+            // .source / .read 等),否则以 '.' / '\' 开头的行回退到单行
+            // ExecuteSQL,避免误把已识别的调试命令当未知元命令丢给 parser。
             if (trimmed_cmd == R"(\.tokens)") {
                 PrintTokens(database->LastTokens());
                 std::cout << "sqlcompiler> " << std::flush;
@@ -477,6 +523,22 @@ int main(int argc, char** argv) {
             };
             if (try_source(".source ") || try_source(".read ") ||
                 try_source("\\.source ") || try_source("\\.read ")) {
+                continue;
+            }
+            // 兜底：未识别的以 '.' / '\\' 开头的行——独立 ExecuteSQL,失败仅影响当行。
+            auto run_single_line = [&](const std::string& single_line) {
+                size_t a = single_line.find_first_not_of(" \t\r\n");
+                size_t b = single_line.find_last_not_of(" \t\r\n");
+                if (a == std::string::npos) return;
+                std::string trimmed = single_line.substr(a, b - a + 1);
+                if (trimmed.empty() || IsOnlyCommentsOrWhitespace(trimmed)) return;
+                auto result = database->ExecuteSQL(trimmed);
+                PrintResult(result);
+            };
+            if (!trimmed_cmd.empty() &&
+                (trimmed_cmd.front() == '.' || trimmed_cmd.front() == '\\')) {
+                run_single_line(cmd);
+                std::cout << "sqlcompiler> " << std::flush;
                 continue;
             }
         }

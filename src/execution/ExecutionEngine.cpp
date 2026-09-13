@@ -59,6 +59,42 @@ std::string FindScanTableName(const PlanNodePtr& node) {
     return "";
 }
 
+// 移除 AST 节点 ToString() 添加的最外层一对括号。
+// 仅当 s 以 '(' 开头、以 ')' 结尾,且开括号在到达末尾之前已平衡(意味着末尾
+// 的 ')' 正是开括号的配对)时才剥离。BinaryExpr / LikeExprNode 的 ToString()
+// 为 SQL 重解析加了外层括号,直接拿来做列标题视觉上多余:
+//   "(17 % 5)"      -> "17 % 5"
+//   "((a + b) * c)" -> "(a + b) * c"  (内部括号保留以维持运算优先级语义)
+//   "NOT ((a>5))"   -> "NOT ((a>5))"  (不以 '(' 开头,保留原样)
+std::string StripOuterParens(const std::string& s) {
+    if (s.size() < 2 || s.front() != '(' || s.back() != ')') return s;
+    int depth = 0;
+    for (size_t i = 0; i + 1 < s.size(); ++i) {
+        if (s[i] == '(') ++depth;
+        else if (s[i] == ')') --depth;
+        if (depth == 0) return s;  // 外层括号在中途已闭合,不要剥
+    }
+    return s.substr(1, s.size() - 2);
+}
+
+// 派生无别名表达式的列标题。
+//   - LiteralExpr / ColumnRefExpr / FunctionCallExpr: 直接用 ToString(),
+//     与现有行为一致(42、3.14、'hello'、NULL、COUNT、MOD 等)。
+//   - 其它节点(BinaryExpr / UnaryExpr / LikeExprNode / CAST / CASE 等):
+//     去掉 ToString() 为 SQL 重解析而添加的最外层括号对,让
+//     (17 % 5) → 17 % 5、(a + b) → a + b, 风格与字面量列标题保持一致。
+std::string ExprDisplayLabel(const ExprPtr& e) {
+    if (!e) return "?";
+    switch (e->GetType()) {
+        case NodeType::LITERAL_EXPR:
+        case NodeType::COLUMN_REF_EXPR:
+        case NodeType::FUNCTION_CALL_EXPR:
+            return e->ToString();
+        default:
+            return StripOuterParens(e->ToString());
+    }
+}
+
 // 收集计划中所有 (real_table, alias) 扫描节点。DFS 前序保证对于左深 JoinNode 树，
 // 收集顺序与 JoinExecutor 拼接 (left || right) 后的元组列序一致：左侧子树全部在右侧子树之前。
 std::vector<std::pair<std::string, std::string>> CollectScanTableNames(
@@ -478,14 +514,9 @@ ExecutionResult ExecutionEngine::ExecuteSubplan(const PlanNodePtr& plan, Executi
                             names.push_back(aliases[i]);
                             continue;
                         }
-                        const auto& e = exprs[i];
-                        if (e && e->GetType() == NodeType::COLUMN_REF_EXPR) {
-                            names.push_back(std::static_pointer_cast<ColumnRefExpr>(e)->column_name);
-                        } else if (e) {
-                            names.push_back(e->ToString());
-                        } else {
-                            names.push_back("?");
-                        }
+                        // ExprDisplayLabel 替代原始 ToString(): 让 (17 % 5) →
+                        // 17 % 5, 与字面量列标题风格一致。
+                        names.push_back(ExprDisplayLabel(exprs[i]));
                     }
                 };
                 switch (plan->GetType()) {
@@ -630,6 +661,10 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
                     } else if (e && e->GetType() == NodeType::FUNCTION_CALL_EXPR) {
                         cmap[std::static_pointer_cast<FunctionCallExpr>(e)->function_name] = i;
                     }
+                    // Planner::RewriteAggregateRefs 用 "agg_<index>" 作为列名
+                    // （避免同名不同参聚合混淆）；这里同步登记，让 HAVING/ORDER BY
+                    // 重写后的 ColumnRefExpr 能定位到正确的 slot。
+                    cmap[std::string("agg_") + std::to_string(i)] = i;
                 }
             } else {
                 cmap = BuildCombinedColumnIndexMapWithDerived(catalog_, plan_node, CollectScanTableNames(plan_node));
@@ -673,9 +708,16 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             // If child is an Aggregate, the aggregate already produced tuples
             // matching the SELECT list; pass through unchanged.
             if (plan_node->children[0]->GetType() == PlanNodeType::AGGREGATE) {
+                // 新路径：AggregateNode.aggregate_exprs 可能比 SELECT list 长（容纳
+                // HAVING/ORDER BY 独占的聚合调用），但本路径仍直接透传：HAVING 的
+                // FilterNode 和 ORDER BY 的 SortNode 都基于 extended 长度构造 cmap
+                // （见 BuildExecutor 的 FILTER / SORT 分支），位置 0..K-1 直接对
+                // 应 aggregate_exprs 里的项。DISTINCT 用前 n->columns.size() 列做
+                // 去重，由于 PlanSelect 把 SELECT list 放在 extended 头部，
+                // output_indices 的 SELECT 项就位于前 N 列，去重语义自然正确。
+                // 因此不需要在 ProjectNode 阶段做切片（SliceExecutor 会被插入但无
+                // 实际效果），直接透传即可。
                 if (n->is_distinct) {
-                    // AggregateExecutor 的输出列数 == aggregate_exprs 数，
-                    // 没有 underlying 追加；DISTINCT 仍按全部列参与去重。
                     return wrap(std::make_unique<DistinctExecutor>(context, std::move(child),
                                                                    n->columns.size()));
                 }
@@ -758,6 +800,10 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
                     if (i < agg->aliases.size() && !agg->aliases[i].empty()) {
                         out[agg->aliases[i]] = i;
                     }
+                    // Planner::RewriteAggregateRefs 用 "agg_<index>" 作为列名；
+                    // 这里同步登记，让 ORDER BY 重写后的 ColumnRefExpr 能定位
+                    // 到正确的 slot（即使按名字的聚合有同名冲突也能区分）。
+                    out[std::string("agg_") + std::to_string(i)] = i;
                 }
             };
 
@@ -1316,7 +1362,7 @@ std::vector<std::string> ExecutionEngine::DeriveOutputColumnNames(const PlanNode
                 auto wf = std::static_pointer_cast<WindowFuncNode>(e);
                 names.push_back(wf->function_name);
             } else if (e) {
-                names.push_back(e->ToString());
+                names.push_back(ExprDisplayLabel(e));
             } else {
                 names.push_back("?");
             }
@@ -1339,7 +1385,7 @@ std::vector<std::string> ExecutionEngine::DeriveOutputColumnNames(const PlanNode
                 auto fc = std::static_pointer_cast<FunctionCallExpr>(e);
                 names.push_back(fc->function_name);
             } else if (e) {
-                names.push_back(e->ToString());
+                names.push_back(ExprDisplayLabel(e));
             } else {
                 names.push_back("?");
             }
@@ -1397,7 +1443,8 @@ std::vector<std::string> ExecutionEngine::DeriveOutputColumnNames(const PlanNode
             }
             names.push_back(fc->function_name);
         } else if (e) {
-            names.push_back(e->ToString());
+            // 替代原始 ToString(): 让 (17 % 5) → 17 % 5, 与字面量列标题风格一致。
+            names.push_back(ExprDisplayLabel(e));
         } else {
             names.push_back("?");
         }

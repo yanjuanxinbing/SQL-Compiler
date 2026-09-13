@@ -50,6 +50,24 @@ bool ContainsAggregateExpr(const ExprPtr& e) {
             }
             return false;
         }
+        // CASE WHEN / CAST(...) 可能包裹聚合函数调用 (例如
+        // `CASE WHEN SUM(v) > N THEN ...` 或 `CAST(SUM(v) AS INT)`)。
+        // 必须递归检查，否则 `SelectHasAggregate` 会误判为「无聚合」，
+        // 导致不构造 AggregateNode，按行执行 SUM 出现 3 行 NULL 等错误。
+        case NodeType::CASE_EXPR: {
+            auto c = std::static_pointer_cast<CaseExprNode>(e);
+            if (ContainsAggregateExpr(c->subject)) return true;
+            for (const auto& w : c->whens) {
+                if (ContainsAggregateExpr(w.when_expr)) return true;
+                if (ContainsAggregateExpr(w.then_expr)) return true;
+            }
+            if (ContainsAggregateExpr(c->else_expr)) return true;
+            return false;
+        }
+        case NodeType::CAST_EXPR: {
+            auto c = std::static_pointer_cast<CastExprNode>(e);
+            return ContainsAggregateExpr(c->expr);
+        }
     }
     return false;
 }
@@ -94,6 +112,122 @@ bool SelectHasWindowFunc(const SelectStatement& stmt) {
     return false;
 }
 
+// 判定 expr 是否是聚合函数调用。供 CollectAggregatesInExpr 和 RewriteAggregateRefs
+// 共用；与 AggregateExecutor::IsAggregateFunc 保持一致（60_funcs 同款集合）。
+namespace {
+
+std::string UpperName(const std::string& s) {
+    std::string r;
+    r.reserve(s.size());
+    for (char c : s) r.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    return r;
+}
+
+// 在本文件中复用：IsAggregateFuncName 定义于下方（第 ~1650 行），这里给出
+// 内部版本以便匿名命名空间中的 helper 可以直接调用而不依赖前向声明。
+bool IsAggregateFuncNameLocal(const std::string& fn_upper) {
+    return fn_upper == "COUNT" || fn_upper == "SUM" || fn_upper == "AVG" ||
+           fn_upper == "MIN" || fn_upper == "MAX" ||
+           fn_upper == "STDDEV" || fn_upper == "STDDEV_POP" || fn_upper == "STDDEV_SAMP" ||
+           fn_upper == "VARIANCE" || fn_upper == "VAR_POP" || fn_upper == "VAR_SAMP" ||
+           fn_upper == "MEDIAN" ||
+           fn_upper == "STRING_AGG" || fn_upper == "GROUP_CONCAT" ||
+           fn_upper == "PERCENTILE_CONT" || fn_upper == "PERCENTILE_DISC";
+}
+
+// 把 `expr` 中的聚合函数调用收集到一个 vector。深度优先；若 expr 自身就是聚合
+// 调用，则返回 {expr}。仅收集最浅层的聚合调用（不含已包含的子表达式中聚合，
+// 由调用方递归遍历）。
+std::vector<ExprPtr> CollectTopLevelAggregates(const ExprPtr& expr) {
+    std::vector<ExprPtr> out;
+    if (!expr) return out;
+    if (expr->GetType() == NodeType::FUNCTION_CALL_EXPR) {
+        auto f = std::static_pointer_cast<FunctionCallExpr>(expr);
+        std::string name = UpperName(f->function_name);
+        if (IsAggregateFuncNameLocal(name)) {
+            out.push_back(expr);
+            return out;
+        }
+        for (auto& a : f->arguments) {
+            auto sub = CollectTopLevelAggregates(a);
+            out.insert(out.end(), sub.begin(), sub.end());
+        }
+        return out;
+    }
+    // 二元/一元/CASE/CAST 内部可能嵌套聚合调用，递归扫描。
+    switch (expr->GetType()) {
+        case NodeType::BINARY_EXPR: {
+            auto b = std::static_pointer_cast<BinaryExpr>(expr);
+            auto l = CollectTopLevelAggregates(b->left);
+            auto r = CollectTopLevelAggregates(b->right);
+            out.insert(out.end(), l.begin(), l.end());
+            out.insert(out.end(), r.begin(), r.end());
+            break;
+        }
+        case NodeType::UNARY_EXPR: {
+            auto u = std::static_pointer_cast<UnaryExpr>(expr);
+            auto s = CollectTopLevelAggregates(u->operand);
+            out.insert(out.end(), s.begin(), s.end());
+            break;
+        }
+        case NodeType::CASE_EXPR: {
+            auto c = std::static_pointer_cast<CaseExprNode>(expr);
+            auto s = CollectTopLevelAggregates(c->subject);
+            out.insert(out.end(), s.begin(), s.end());
+            for (const auto& w : c->whens) {
+                auto wsub = CollectTopLevelAggregates(w.when_expr);
+                out.insert(out.end(), wsub.begin(), wsub.end());
+                auto tsub = CollectTopLevelAggregates(w.then_expr);
+                out.insert(out.end(), tsub.begin(), tsub.end());
+            }
+            auto e = CollectTopLevelAggregates(c->else_expr);
+            out.insert(out.end(), e.begin(), e.end());
+            break;
+        }
+        case NodeType::CAST_EXPR: {
+            auto c = std::static_pointer_cast<CastExprNode>(expr);
+            auto s = CollectTopLevelAggregates(c->expr);
+            out.insert(out.end(), s.begin(), s.end());
+            break;
+        }
+        default:
+            break;
+    }
+    return out;
+}
+
+// 比较两个聚合函数调用是否结构上等价（同名 + 参数个数一致 + 每个参数 ToString 相等）。
+// HAVING/ORDER BY 重写时用来在同一名字下区分多个聚合调用（如 SUM(a) vs SUM(b)）。
+bool AggregateCallsEqual(const FunctionCallExpr& a, const FunctionCallExpr& b) {
+    if (UpperName(a.function_name) != UpperName(b.function_name)) return false;
+    if (a.arguments.size() != b.arguments.size()) return false;
+    if (a.is_distinct != b.is_distinct) return false;
+    for (size_t i = 0; i < a.arguments.size(); ++i) {
+        std::string sa = a.arguments[i] ? a.arguments[i]->ToString() : "";
+        std::string sb = b.arguments[i] ? b.arguments[i]->ToString() : "";
+        if (sa != sb) return false;
+    }
+    return true;
+}
+
+// 在 aggregate_exprs 中查找与 f 结构等价的聚合调用。
+// 若找到多个（结构相同），返回第一个；若一个都找不到，返回 npos。
+size_t FindMatchingAggregate(const FunctionCallExpr& f,
+                             const std::vector<ExprPtr>& aggregate_exprs) {
+    for (size_t i = 0; i < aggregate_exprs.size(); ++i) {
+        const auto& ae = aggregate_exprs[i];
+        if (!ae || ae->GetType() != NodeType::FUNCTION_CALL_EXPR) continue;
+        auto af = std::static_pointer_cast<FunctionCallExpr>(ae);
+        if (IsAggregateFuncNameLocal(UpperName(af->function_name)) &&
+            AggregateCallsEqual(f, *af)) {
+            return i;
+        }
+    }
+    return static_cast<size_t>(-1);
+}
+
+}  // namespace
+
 // Rewrite aggregate function calls in `expr` to ColumnRef pointing at the
 // position of the matching expression in `aggregate_exprs`.
 ExprPtr RewriteAggregateRefs(const ExprPtr& expr,
@@ -116,34 +250,73 @@ ExprPtr RewriteAggregateRefs(const ExprPtr& expr,
         }
         case NodeType::FUNCTION_CALL_EXPR: {
             auto f = std::static_pointer_cast<FunctionCallExpr>(expr);
-            std::string name;
-            for (char c : f->function_name) name.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-            if (name == "COUNT" || name == "SUM" || name == "AVG" ||
-                name == "MIN" || name == "MAX" ||
-                // 60_funcs: HAVING 中也可能引用 STDDEV/MEDIAN 等聚合
-                name == "STDDEV" || name == "STDDEV_POP" || name == "STDDEV_SAMP" ||
-                name == "VARIANCE" || name == "VAR_POP" || name == "VAR_SAMP" ||
-                name == "MEDIAN" ||
-                name == "STRING_AGG" || name == "GROUP_CONCAT" ||
-                name == "PERCENTILE_CONT" || name == "PERCENTILE_DISC") {
-                // Find matching aggregate in aggregate_exprs by name
-                for (size_t i = 0; i < aggregate_exprs.size(); ++i) {
-                    const auto& ae = aggregate_exprs[i];
-                    if (ae && ae->GetType() == NodeType::FUNCTION_CALL_EXPR) {
-                        auto af = std::static_pointer_cast<FunctionCallExpr>(ae);
-                        std::string aname;
-                        for (char c : af->function_name) aname.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-                        if (aname == name) {
-                            return std::make_shared<ColumnRefExpr>("", name);
-                        }
-                    }
-                }
-                return std::make_shared<ColumnRefExpr>("", name);
+            std::string name = UpperName(f->function_name);
+            if (IsAggregateFuncNameLocal(name)) {
+                // 结构化匹配：找同名且参数等价的聚合，避免 SUM(a) vs SUM(b) 冲突。
+                // 重写后的 ColumnRefExpr 用 "agg_<index>" 作为列名（不可与用户
+                // 列名冲突），ExecutionEngine 在 HAVING/ORDER BY 的 cmap 里同时
+                // 注册 function_name 和 "agg_<index>" 两个键，使两种 lookup 都能命中。
+                size_t idx = FindMatchingAggregate(*f, aggregate_exprs);
+                std::string slot = (idx == static_cast<size_t>(-1))
+                                       ? std::string("agg_") + name
+                                       : std::string("agg_") + std::to_string(idx);
+                return std::make_shared<ColumnRefExpr>("", slot);
             }
-            return expr;
+            // 非聚合函数调用：递归子参数（COALESCE/IIF 等可能嵌套聚合）。
+            std::vector<ExprPtr> new_args;
+            new_args.reserve(f->arguments.size());
+            for (auto& a : f->arguments) {
+                new_args.push_back(RewriteAggregateRefs(a, aggregate_exprs));
+            }
+            auto nf = std::make_shared<FunctionCallExpr>(f->function_name, new_args);
+            nf->is_distinct = f->is_distinct;
+            return nf;
+        }
+        // CASE WHEN：递归替换 subject / 每个 when_expr / each then_expr /
+        // else_expr 内部的聚合调用。
+        case NodeType::CASE_EXPR: {
+            auto c = std::static_pointer_cast<CaseExprNode>(expr);
+            auto nc = std::make_shared<CaseExprNode>();
+            nc->subject = RewriteAggregateRefs(c->subject, aggregate_exprs);
+            nc->whens.reserve(c->whens.size());
+            for (const auto& w : c->whens) {
+                CaseWhen nw;
+                nw.when_expr = RewriteAggregateRefs(w.when_expr, aggregate_exprs);
+                nw.then_expr = RewriteAggregateRefs(w.then_expr, aggregate_exprs);
+                nc->whens.push_back(std::move(nw));
+            }
+            nc->else_expr = RewriteAggregateRefs(c->else_expr, aggregate_exprs);
+            return nc;
+        }
+        // CAST(expr AS type)：递归替换内部聚合调用。
+        case NodeType::CAST_EXPR: {
+            auto c = std::static_pointer_cast<CastExprNode>(expr);
+            auto nc = std::make_shared<CastExprNode>(
+                RewriteAggregateRefs(c->expr, aggregate_exprs), c->target_type);
+            nc->char_length = c->char_length;
+            return nc;
         }
     }
     return expr;
+}
+
+// 在 expr 中找出"扩展聚合列表里还没有的"聚合调用 —— 用于 PlanSelect 把
+// HAVING/ORDER BY 独有的聚合追加进 extended aggregate_exprs。
+std::vector<ExprPtr> CollectUniqueAggregates(const ExprPtr& expr,
+                                             const std::vector<ExprPtr>& existing) {
+    std::vector<ExprPtr> out;
+    if (!expr) return out;
+    auto found = CollectTopLevelAggregates(expr);
+    for (auto& f : found) {
+        auto fc = std::static_pointer_cast<FunctionCallExpr>(f);
+        size_t idx = FindMatchingAggregate(*fc, existing);
+        size_t out_idx = FindMatchingAggregate(*fc, out);
+        if (idx == static_cast<size_t>(-1) &&
+            out_idx == static_cast<size_t>(-1)) {
+            out.push_back(f);
+        }
+    }
+    return out;
 }
 
 }  // namespace
@@ -471,19 +644,40 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
     // Aggregate: needed when GROUP BY present OR SELECT/HAVING uses aggregate functions
     bool needs_agg = !stmt.group_by.empty() || SelectHasAggregate(stmt);
     if (needs_agg) {
-        // aggregate_exprs = the SELECT list expressions (AggregateExecutor produces
-        // one Tuple per group with values matching the SELECT list)
+        // ---- 扩展聚合列表 (extended aggregate_exprs) ----
+        // 旧实现直接用 select_list 作为 aggregate_exprs，所以 HAVING/ORDER BY
+        // 引用了不在 SELECT 里的聚合时，AggregateExecutor 输出 tuple 里没有对应
+        // slot，导致 HAVING 重写后的 ColumnRefExpr 找不到值、ORDER BY 直接 NULL。
+        //
+        // 新实现：aggregate_exprs = select_list ∪ HAVING/ORDER BY 中额外出现的聚合调用。
+        // PlanSelect 把 SELECT list 放在头部、extras 追加在尾部，因此：
+        //   - DISTINCT（ProjectNode over Aggregate / Filter-Aggregate）按 SELECT
+        //     list 大小取前 N 列做去重，前 N 列恰好是 SELECT 值，语义正确。
+        //   - HAVING 的 FilterNode / ORDER BY 的 SortNode 直接消费 extended tuple，
+        //     其 cmap 用 "agg_<index>" / 函数名映射到 aggregate_exprs 的位置。
+        std::vector<ExprPtr> extended_aggs = stmt.select_list;
+        if (stmt.having_clause) {
+            auto extras = CollectUniqueAggregates(stmt.having_clause, extended_aggs);
+            extended_aggs.insert(extended_aggs.end(), extras.begin(), extras.end());
+        }
+        for (const auto& ob : stmt.order_by) {
+            auto extras = CollectUniqueAggregates(ob.expr, extended_aggs);
+            extended_aggs.insert(extended_aggs.end(), extras.begin(), extras.end());
+        }
+
         auto agg = std::make_shared<AggregateNode>(
-            stmt.group_by, stmt.select_list, stmt.select_aliases);
+            stmt.group_by, std::move(extended_aggs), stmt.select_aliases);
         if (current) agg->children.push_back(current);
         current = agg;
     }
     // HAVING (applied to Aggregate output)
     if (stmt.having_clause && needs_agg) {
         // Rewrite aggregate function calls in HAVING predicate into ColumnRef
-        // pointing at the corresponding position in the aggregate output tuple.
+        // pointing at the corresponding position in the (extended) aggregate output tuple.
+        // 此时 AggregateNode 已经持有 extended_aggs，复用之。
         std::vector<ExprPtr> aggs;
-        for (const auto& e : stmt.select_list) aggs.push_back(e);
+        auto agg_node = std::static_pointer_cast<AggregateNode>(current);
+        for (const auto& e : agg_node->aggregate_exprs) aggs.push_back(e);
         auto having = RewriteAggregateRefs(stmt.having_clause, aggs);
         auto f = std::make_shared<FilterNode>(having);
         f->children.push_back(current);
@@ -503,7 +697,34 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
     }
     // ORDER BY (构建于 Project 之后，引用别名时即可见)
     if (!stmt.order_by.empty()) {
-        auto s = std::make_shared<SortNode>(stmt.order_by);
+        // 若底层包含 AggregateNode 且 ORDER BY 直接引用聚合函数，需要把
+        // 聚合调用替换为对 AggregateNode 输出 tuple 的 ColumnRef 引用；
+        // 否则 ExpressionEvaluator 收到原始 SUM(...)/COUNT(...) 等会返回 NULL。
+        std::vector<OrderByItem> order_items = stmt.order_by;
+        std::vector<ExprPtr> aggs_for_order;
+        if (needs_agg) {
+            // 收集 (extended) aggregate_exprs 用于重写 ORDER BY 表达式。
+            // AggregateNode 在 SELECT 列表块之前已经构造；这里再次沿 plan 链向上找。
+            auto p = current;
+            while (p) {
+                if (p->GetType() == PlanNodeType::AGGREGATE) {
+                    auto an = std::static_pointer_cast<AggregateNode>(p);
+                    for (const auto& e : an->aggregate_exprs) aggs_for_order.push_back(e);
+                    break;
+                }
+                // Project/Filter/Wrapper 之上时，沿 children[0] 继续向上。
+                if (p->children.empty()) break;
+                p = p->children[0];
+            }
+            if (!aggs_for_order.empty()) {
+                for (auto& ob : order_items) {
+                    if (ob.expr) {
+                        ob.expr = RewriteAggregateRefs(ob.expr, aggs_for_order);
+                    }
+                }
+            }
+        }
+        auto s = std::make_shared<SortNode>(std::move(order_items));
         if (current) s->children.push_back(current);
         current = s;
     }
@@ -1590,6 +1811,7 @@ std::string InferExprTypeImpl(const Expr* raw,
                 case BinaryOperator::SUB:
                 case BinaryOperator::MUL:
                 case BinaryOperator::DIV:
+                case BinaryOperator::MOD:
                     // 任一侧是 FLOAT -> FLOAT；否则 INT。
                     if (lt == kFloat || rt == kFloat) return kFloat;
                     if (lt == kVarchar || rt == kVarchar) return kVarchar;

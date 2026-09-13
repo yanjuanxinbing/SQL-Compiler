@@ -2174,8 +2174,10 @@ ExprPtr Parser::ParseAdditiveExpr() {
 
 ExprPtr Parser::ParseMultiplicativeExpr() {
     ExprPtr left = ParseUnaryExpr();
-    while (Check(TokenType::OP_STAR) || Check(TokenType::OP_SLASH)) {
-        BinaryOperator op = Check(TokenType::OP_STAR) ? BinaryOperator::MUL : BinaryOperator::DIV;
+    while (Check(TokenType::OP_STAR) || Check(TokenType::OP_SLASH) || Check(TokenType::OP_MODULO)) {
+        BinaryOperator op = Check(TokenType::OP_STAR)   ? BinaryOperator::MUL
+                          : Check(TokenType::OP_SLASH)  ? BinaryOperator::DIV
+                                                         : BinaryOperator::MOD;
         Advance();
         ExprPtr right = ParseUnaryExpr();
         left = std::make_shared<BinaryExpr>(op, left, right);
