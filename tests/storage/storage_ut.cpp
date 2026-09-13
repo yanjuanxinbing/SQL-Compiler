@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <set>
 #include <memory>
 #include <mutex>
@@ -33,6 +34,10 @@
 #include "index/PageGuard.h"
 #include "db/Database.h"
 #include "index/BPlusTree.h"
+#include "storage_engine/TableHeap.h"
+#include "storage_engine/MvccRecord.h"
+#include "txn/CommitTracker.h"
+#include "txn/LogManager.h"
 
 using namespace sqlcompiler;
 
@@ -1595,6 +1600,241 @@ static void TestRowLockTier() {
     CHECK(!lm.IsLockHeld(103, r1));
 }
 
+// 行级锁升级（v2）：大量行 X 锁在阈值后收敛为表级 X 锁——
+//   * 升级成功：行锁全部释放、表锁持有、IsTableEscalated=true；
+//   * 升级失败（他事务持冲突行/表锁）：kWouldBlock，回退逐行持锁（正确性不变）；
+//   * 多粒度互斥：表 X 与任意行锁冲突；表 S 与行 X 冲突、与行 S 兼容。
+static void TestRowLockEscalation() {
+    LockManager lm;
+    const int64_t tab = 1000;
+
+    // (1) 模拟 ExecutionContext 驱动：逐行取 X 锁 + 登记归属，达到阈值后升级。
+    const int kRows = 200;
+    const int64_t first_row = RowResourceId(1, 0);
+    for (int i = 0; i < kRows; ++i) {
+        int64_t r = RowResourceId(1, i);
+        CHECK(lm.LockExclusive(1, r, 0) == LockResult::kGranted);
+        lm.RegisterRowGroup(r, tab);
+    }
+    CHECK(lm.CountRowLocks(1, tab) == static_cast<size_t>(kRows));
+    CHECK(lm.TryEscalateTable(1, tab, LockMode::kExclusive) == LockResult::kGranted);
+
+    // 升级后：表级 X 锁持有、全部行锁释放、升级标记生效。
+    CHECK(lm.IsTableEscalated(1, tab));
+    CHECK(lm.IsLockHeld(1, tab));
+    CHECK(lm.CountRowLocks(1, tab) == 0);
+    CHECK(!lm.IsLockHeld(1, first_row));
+
+    // 升级幂等：再次调用直接成功（不重复加锁/释放）。
+    CHECK(lm.TryEscalateTable(1, tab, LockMode::kExclusive) == LockResult::kGranted);
+
+    // (2) 多粒度互斥：他事务对已登记行/表资源的访问被表 X 挡住。
+    CHECK(lm.TryLockShared(2, first_row) == LockResult::kWouldBlock);  // 表X vs 行S
+    CHECK(lm.TryLockExclusive(2, tab) == LockResult::kWouldBlock);     // 表X vs 表X
+    CHECK(lm.TryLockShared(2, tab) == LockResult::kWouldBlock);        // 表X vs 表S
+
+    // (3) 升级失败回退：txn3 持行 S 锁 → txn4 无法把表升级为 X；释放后可升级。
+    const int64_t tab2 = 2000;
+    const int64_t r1 = RowResourceId(2, 0);
+    const int64_t r2 = RowResourceId(2, 1);
+    CHECK(lm.LockShared(3, r1, 0) == LockResult::kGranted);
+    lm.RegisterRowGroup(r1, tab2);
+    CHECK(lm.LockExclusive(4, r2, 0) == LockResult::kGranted);
+    lm.RegisterRowGroup(r2, tab2);
+    CHECK(lm.TryEscalateTable(4, tab2, LockMode::kExclusive) == LockResult::kWouldBlock);
+    CHECK(lm.IsLockHeld(4, r2));   // 升级失败 → txn4 保留逐行锁，正确性不受影响
+    lm.UnlockAll(3);               // txn3 释放行 S 锁后升级可行
+    CHECK(lm.TryEscalateTable(4, tab2, LockMode::kExclusive) == LockResult::kGranted);
+    CHECK(lm.IsTableEscalated(4, tab2));
+    CHECK(!lm.IsLockHeld(4, r2));  // 行锁已被表锁替换
+
+    // (4) 表级 S 锁：与行 S 兼容、与行 X 冲突（多粒度冲突矩阵的另一半）。
+    const int64_t tab3 = 3000;
+    const int64_t s1 = RowResourceId(3, 0);
+    CHECK(lm.LockShared(5, s1, 0) == LockResult::kGranted);
+    lm.RegisterRowGroup(s1, tab3);
+    CHECK(lm.TryEscalateTable(5, tab3, LockMode::kShared) == LockResult::kGranted);
+    CHECK(lm.IsTableEscalated(5, tab3));
+    CHECK(lm.TryLockShared(6, s1) == LockResult::kGranted);        // 表S vs 行S 兼容
+    lm.UnlockAll(6);
+    CHECK(lm.TryLockExclusive(6, s1) == LockResult::kWouldBlock);  // 表S vs 行X 冲突
+
+    // (5) 清理：UnlockAll 撤销升级标记与表锁。
+    lm.UnlockAll(1);
+    CHECK(!lm.IsTableEscalated(1, tab));
+    CHECK(!lm.IsLockHeld(1, tab));
+    lm.UnlockAll(4);
+    lm.UnlockAll(5);
+    lm.UnlockAll(6);
+}
+
+// 自适应锁升级（v3）：固定阈值 128 改为按表规模与冲突采样动态求阈值——
+//   * 小表（<256 行）提前升级：64 行表在持有 32 行锁（过半）时即升级（<128）；
+//   * 大表（>=4096 行）延后升级：10000 行表到 256 行锁才升级（128 时不升）；
+//   * 冲突采样降阈：升级因他人持行锁失败（kWouldBlock）后阈值减半，冲突消解后
+//     立即以更少持锁数再次升级成功。
+static void TestAdaptiveLockEscalation() {
+    // (1) 阈值函数单元断言。
+    CHECK(LockManager::ComputeEscalationThreshold(64, 0) == 32);      // 小表提前
+    CHECK(LockManager::ComputeEscalationThreshold(200, 0) == 100);    // 小表提前
+    CHECK(LockManager::ComputeEscalationThreshold(300, 0) == 128);    // 中型表基准
+    CHECK(LockManager::ComputeEscalationThreshold(10000, 0) == 256);  // 大表延后
+    CHECK(LockManager::ComputeEscalationThreshold(64, 1) == 16);      // 冲突降阈
+    CHECK(LockManager::ComputeEscalationThreshold(10000, 1) == 128);  // 大表冲突也降
+    CHECK(LockManager::ComputeEscalationThreshold(8, 0) == 8);        // 下限
+    CHECK(LockManager::ComputeEscalationThreshold(4, 5) == 8);        // 下限不破
+
+    LockManager lm;
+
+    // (2) 小表提前升级：64 行表（预登记模拟已填充），txn21 更新这些行 →
+    //     持有 32 行锁（过半）时即升级，无需等到固定 128。
+    const int64_t small_tab = 4100;
+    const int kSmall = 64;
+    for (int i = 0; i < kSmall; ++i) lm.RegisterRowGroup(RowResourceId(1, i), small_tab);
+    CHECK(lm.GetRegisteredRowCount(small_tab) == static_cast<size_t>(kSmall));
+    int escalated_at = -1;
+    for (int i = 0; i < kSmall && escalated_at < 0; ++i) {
+        int64_t r = RowResourceId(1, i);
+        CHECK(lm.LockExclusive(21, r, 0) == LockResult::kGranted);
+        lm.RegisterRowGroup(r, small_tab);  // 已登记行 → 幂等，registered 保持 64
+        const size_t thr = LockManager::ComputeEscalationThreshold(
+            lm.GetRegisteredRowCount(small_tab), lm.GetTableConflictCount(small_tab));
+        if (lm.CountRowLocks(21, small_tab) >= thr) {
+            if (lm.TryEscalateTable(21, small_tab, LockMode::kExclusive) ==
+                LockResult::kGranted) {
+                escalated_at = i + 1;
+            }
+        }
+    }
+    CHECK(escalated_at == 32);  // 提前：过半即升级（固定阈值 128 时此处不升）
+    CHECK(lm.IsTableEscalated(21, small_tab));
+    lm.UnlockAll(21);
+
+    // (3) 大表延后升级：10000 行表（预登记），txn22 新写 256 行——
+    //     128 行锁时仍不升级（固定阈值本会升级），到 256 行才升。
+    const int64_t big_tab = 4200;
+    for (int i = 0; i < 10000; ++i) lm.RegisterRowGroup(RowResourceId(2, i), big_tab);
+    CHECK(lm.GetRegisteredRowCount(big_tab) == 10000);
+    int big_escalated = -1;
+    for (int i = 0; i < 256; ++i) {
+        int64_t r = RowResourceId(2, 10000 + i);
+        CHECK(lm.LockExclusive(22, r, 0) == LockResult::kGranted);
+        lm.RegisterRowGroup(r, big_tab);
+        if (big_escalated < 0) {
+            const size_t thr = LockManager::ComputeEscalationThreshold(
+                lm.GetRegisteredRowCount(big_tab), lm.GetTableConflictCount(big_tab));
+            if (lm.CountRowLocks(22, big_tab) >= thr) {
+                if (lm.TryEscalateTable(22, big_tab, LockMode::kExclusive) ==
+                    LockResult::kGranted) {
+                    big_escalated = i + 1;
+                }
+            }
+        }
+        if (i == 127) CHECK(!lm.IsTableEscalated(22, big_tab));  // 128 行锁仍不升级
+    }
+    CHECK(big_escalated == 256);  // 延后：到 256 行才升级
+    CHECK(lm.IsTableEscalated(22, big_tab));
+    lm.UnlockAll(22);
+
+    // (4) 冲突采样降阈：64 行小表（thr=32）。txn23 持 10 行 X 锁；txn24 写到第 32 行时
+    //     升级失败（kWouldBlock）→ 冲突采样 +1，阈值降为 16；txn23 释放后，
+    //     txn24 下一次行写即升级成功。
+    const int64_t hot_tab = 4300;
+    for (int i = 0; i < 64; ++i) lm.RegisterRowGroup(RowResourceId(3, i), hot_tab);
+    for (int i = 0; i < 10; ++i) {
+        int64_t r = RowResourceId(3, i);
+        CHECK(lm.LockExclusive(23, r, 0) == LockResult::kGranted);
+        lm.RegisterRowGroup(r, hot_tab);
+    }
+    int hot_escalated = -1;
+    for (int i = 10; i < 42; ++i) {
+        int64_t r = RowResourceId(3, i);
+        CHECK(lm.LockExclusive(24, r, 0) == LockResult::kGranted);
+        lm.RegisterRowGroup(r, hot_tab);
+        const size_t thr = LockManager::ComputeEscalationThreshold(
+            lm.GetRegisteredRowCount(hot_tab), lm.GetTableConflictCount(hot_tab));
+        if (lm.CountRowLocks(24, hot_tab) >= thr) {
+            if (lm.TryEscalateTable(24, hot_tab, LockMode::kExclusive) ==
+                LockResult::kGranted) {
+                hot_escalated = i + 1;
+            }
+        }
+    }
+    CHECK(hot_escalated < 0);                              // txn23 释放前升级持续失败
+    CHECK(lm.GetTableConflictCount(hot_tab) >= 1);         // 冲突已采样
+    CHECK(LockManager::ComputeEscalationThreshold(
+              lm.GetRegisteredRowCount(hot_tab),
+              lm.GetTableConflictCount(hot_tab)) == 16);   // 阈值已降半
+    lm.UnlockAll(23);  // txn23 提交/回滚释放行锁
+    // txn24 再写 1 行后立即重试升级 → 冲突消解，成功。
+    int64_t rnext = RowResourceId(3, 42);
+    CHECK(lm.LockExclusive(24, rnext, 0) == LockResult::kGranted);
+    lm.RegisterRowGroup(rnext, hot_tab);
+    CHECK(lm.TryEscalateTable(24, hot_tab, LockMode::kExclusive) == LockResult::kGranted);
+    CHECK(lm.IsTableEscalated(24, hot_tab));
+    lm.UnlockAll(24);
+    lm.UnlockAll(23);
+}
+
+// 谓词锁区间继承与合并（v2）：同事务同表谓词做集合规约——
+//   * 区间重叠 → 合并为并集（条目数收敛到不重叠最小区间数）；
+//   * 已持全表谓词 → 子谓词被父谓词覆盖，丢弃；
+//   * 新谓词全表 → 删除全部区间谓词，只保留全表谓词。
+// 用 CountPredicateLocks 断言条目数收敛，CheckWritePredicate 断言合并后覆盖能力不变。
+static void TestPredicateLockMerge() {
+    LockManager lm;
+    const int64_t tab = 5;
+    const IndexKey k10{std::vector<Value>{Value::MakeInt(10)}};
+    const IndexKey k20{std::vector<Value>{Value::MakeInt(20)}};
+    const IndexKey k15{std::vector<Value>{Value::MakeInt(15)}};
+    const IndexKey k25{std::vector<Value>{Value::MakeInt(25)}};
+    const IndexKey k30{std::vector<Value>{Value::MakeInt(30)}};
+    const IndexKey k40{std::vector<Value>{Value::MakeInt(40)}};
+    const IndexKey k22{std::vector<Value>{Value::MakeInt(22)}};
+    const IndexKey k28{std::vector<Value>{Value::MakeInt(28)}};
+    const IndexKey k35{std::vector<Value>{Value::MakeInt(35)}};
+
+    // (1) 重叠区间合并：[10,20] ∪ [15,25] → [10,25]，条目数收敛到 1。
+    CHECK(lm.AcquireReadPredicate(1, tab, false, k10, k20) == LockResult::kGranted);
+    CHECK(lm.CountPredicateLocks(1, tab) == 1);
+    CHECK(lm.AcquireReadPredicate(1, tab, false, k15, k25) == LockResult::kGranted);
+    CHECK(lm.CountPredicateLocks(1, tab) == 1);
+
+    // (2) 不相交区间保留：[10,25] ∪ [30,40] → 2 条（不可合并）。
+    CHECK(lm.AcquireReadPredicate(1, tab, false, k30, k40) == LockResult::kGranted);
+    CHECK(lm.CountPredicateLocks(1, tab) == 2);
+
+    // (3) 桥接合并：[10,25] ∪ [30,40] ∪ [22,28] → [10,25] 拓宽为 [10,28]，
+    //     与 [30,40] 仍不相交 → 保持 2 条（不产生伪合并）。
+    CHECK(lm.AcquireReadPredicate(1, tab, false, k22, k28) == LockResult::kGranted);
+    CHECK(lm.CountPredicateLocks(1, tab) == 2);
+
+    // (4) 不同事务各自独立：txn2 的区间不并入 txn1。
+    CHECK(lm.AcquireReadPredicate(2, tab, false, k10, k20) == LockResult::kGranted);
+    CHECK(lm.CountPredicateLocks(1, tab) == 2);
+    CHECK(lm.CountPredicateLocks(2, tab) == 1);
+
+    // (5) 全表谓词收敛：txn1 注册 is_full 后，其全部区间谓词被父谓词统一覆盖删除。
+    CHECK(lm.AcquireReadPredicate(1, tab, true, k10, k20) == LockResult::kGranted);
+    CHECK(lm.CountPredicateLocks(1, tab) == 1);
+
+    // (6) 父谓词继承：已持全表谓词后，新区间谓词一律被丢弃（条目数不变）。
+    CHECK(lm.AcquireReadPredicate(1, tab, false, k30, k40) == LockResult::kGranted);
+    CHECK(lm.CountPredicateLocks(1, tab) == 1);
+
+    // (7) 合并后覆盖能力不变：txn2 的 [10,20] 挡住 txn3 对 15 的写；
+    //     txn1 的全表谓词挡住 txn3 对 35 的写（原 [30,40] 之外的键也被覆盖）。
+    CHECK(lm.CheckWritePredicate(3, tab, k15, 100) == LockResult::kTimeout);
+    CHECK(lm.CheckWritePredicate(3, tab, k35, 100) == LockResult::kTimeout);
+    lm.UnlockAll(3);
+
+    // (8) 不同表互不影响：txn1 在表 9 上独立计数。
+    const int64_t tab2 = 9;
+    CHECK(lm.AcquireReadPredicate(1, tab2, false, k10, k20) == LockResult::kGranted);
+    CHECK(lm.CountPredicateLocks(1, tab) == 1);
+    CHECK(lm.CountPredicateLocks(1, tab2) == 1);
+}
+
 // B+Tree 并发：多线程并发 Insert（各自写入独立键段）+ 一个持续 LowerBound 扫描
 // 线程，验证树级 rw_lock_（写独占 / 扫描持共享锁）能防撕裂读与数据丢失。取消表
 // 级锁后，这是索引并发的第一道防线。
@@ -1648,6 +1888,119 @@ static void TestBPlusTreeConcurrency() {
         }
         CHECK(count == kThreads * kPerThread);
         CHECK(static_cast<int>(seen.size()) == kThreads * kPerThread);
+
+        tree->Destroy(&bpm, tree->GetRootPageId());
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// 乐观页级 B+Tree 并发专项（Phase 1）：
+//   1) 小缓冲池（16 帧）+ 大键集（1 万键 → 约 55+ 页）强制「分裂 + 淘汰」同时
+//      发生——验证分裂路径「先 pin 后加闩」（pin 阶段无闩、加闩阶段不碰 BPM）
+//      在淘汰压力下不泄漏 pin、不丢页、不违反锁序；
+//   2) 并发全遍历扫描与写入并行——验证读不阻塞写、冲突靠乐观重启消化；
+//   3) 写完后并发删除（乐观下降 + 目标叶独占写闩 + 版本复核）并行扫描——验证
+//      删除路径与游标版本校验在并发下不重复、不遗漏。
+static void TestOptimisticSplitConcurrency() {
+    const std::string path = "storage_ut_opt_btree.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(16, &dm);
+        std::vector<ValueType> schema = {ValueType::INTEGER};
+        auto tree = BPlusTree::Create(&bpm, schema, /*is_unique=*/false);
+        CHECK(tree != nullptr);
+
+        const int kThreads = 4;
+        const int kPerThread = 2500;
+        std::vector<std::thread> writers;
+        for (int t = 0; t < kThreads; ++t) {
+            writers.emplace_back([&, t] {
+                for (int i = 0; i < kPerThread; ++i) {
+                    int key = t * kPerThread + i;
+                    RID rid;
+                    rid.page_id = key + 1;
+                    rid.slot_num = 0;
+                    tree->Insert(IndexKey({Value::MakeInt(key)}), rid);
+                }
+            });
+        }
+        std::atomic<bool> stop{false};
+        std::thread scanner([&] {
+            int guard = 0;
+            while (!stop.load() && guard++ < 50000) {
+                auto cur = tree->LowerBound(IndexKey({Value::MakeInt(0)}));
+                IndexKey k; RID r;
+                while (cur && cur->Next(&k, &r)) {}
+            }
+        });
+        for (auto& th : writers) th.join();
+        stop.store(true);
+        scanner.join();
+
+        // 插入全部完成后：恰好 kThreads*kPerThread 条且无重复、无缺失
+        std::set<int> seen;
+        int count = 0;
+        auto cur = tree->Begin();
+        IndexKey k; RID r;
+        while (cur && cur->Next(&k, &r)) {
+            ++count;
+            seen.insert(k.values[0].AsInt());
+        }
+        CHECK(count == kThreads * kPerThread);
+        CHECK(static_cast<int>(seen.size()) == kThreads * kPerThread);
+        // 抽样点查：乐观下降 + 版本校验在大量分裂后仍返回正确 (key, rid)
+        for (int key = 0; key < kThreads * kPerThread; key += 97) {
+            RID got = tree->FindFirst(IndexKey({Value::MakeInt(key)}));
+            CHECK(got.page_id == key + 1 && got.slot_num == 0);
+        }
+
+        // ---- 并发删除：每线程删除一段互不重叠的键区间，删除期间并行扫描 ----
+        const int kDeleteThreads = 4;
+        const int kPerDelete = 500;  // 共删 0..1999
+        std::vector<std::thread> deleters;
+        for (int t = 0; t < kDeleteThreads; ++t) {
+            deleters.emplace_back([&, t] {
+                for (int i = 0; i < kPerDelete; ++i) {
+                    int key = t * kPerDelete + i;
+                    RID rid;
+                    rid.page_id = key + 1;
+                    rid.slot_num = 0;
+                    tree->Delete(IndexKey({Value::MakeInt(key)}), rid);
+                }
+            });
+        }
+        std::atomic<bool> stop2{false};
+        std::thread scanner2([&] {
+            int guard = 0;
+            while (!stop2.load() && guard++ < 50000) {
+                auto c2 = tree->Begin();
+                IndexKey k2; RID r2;
+                while (c2 && c2->Next(&k2, &r2)) {}
+            }
+        });
+        for (auto& th : deleters) th.join();
+        stop2.store(true);
+        scanner2.join();
+
+        const int kDeleted = kDeleteThreads * kPerDelete;
+        int count2 = 0;
+        std::set<int> seen2;
+        auto cur2 = tree->Begin();
+        while (cur2 && cur2->Next(&k, &r)) {
+            ++count2;
+            seen2.insert(k.values[0].AsInt());
+        }
+        CHECK(count2 == kThreads * kPerThread - kDeleted);
+        CHECK(static_cast<int>(seen2.size()) == kThreads * kPerThread - kDeleted);
+        for (int key = 0; key < kDeleted; ++key) {
+            CHECK(seen2.find(key) == seen2.end());  // 已删键全部消失
+        }
+        for (int key = kDeleted; key < kThreads * kPerThread; ++key) {
+            CHECK(seen2.find(key) != seen2.end());  // 未删键全部还在
+        }
 
         tree->Destroy(&bpm, tree->GetRootPageId());
     }
@@ -1772,6 +2125,192 @@ static void TestSerializablePredicatePhantom() {
     }
     RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
     RemoveFile(path + ".fpl");
+}
+
+// ---- Phase 4（创新特性 E）：谓词锁区间树 ----
+// 1) 正确性：万级区间 + 全表哨兵下，覆盖/未覆盖键的写检查结果正确；
+// 2) 复杂度：未覆盖键的 stabbing 查询比较次数 << P（O(log P) 而非线性 O(P)）；
+// 3) 事务独立性：某事务注册全表谓词后，他事务的区间谓词不被误删。
+static void TestPredicateIntervalTree() {
+    LockManager lm;
+    const int64_t tab = 77;
+    const int kIntervals = 10000;  // 1 万条区间：txn i 持 [i*1000, i*1000+500]
+    for (int i = 0; i < kIntervals; ++i) {
+        IndexKey lo{std::vector<Value>{Value::MakeInt(i * 1000)}};
+        IndexKey hi{std::vector<Value>{Value::MakeInt(i * 1000 + 500)}};
+        CHECK(lm.AcquireReadPredicate(i + 1, tab, false, lo, hi) ==
+              LockResult::kGranted);
+    }
+    CHECK(lm.CountTotalPredicates(tab) == static_cast<size_t>(kIntervals));
+
+    const int64_t probe = 900000000;  // 不持任何谓词的探测事务
+    const int64_t other = 1234567;    // 他事务：验证全表谓词不误删其区间
+
+    // (1) 覆盖键 → 阻塞（kTimeout）；未覆盖键 → 通过（kGranted）。
+    IndexKey hit{std::vector<Value>{Value::MakeInt(12345)}};  // 在 [12000,12500]
+    IndexKey miss{std::vector<Value>{Value::MakeInt(600)}};   // 在 [500,1000] 之间
+    CHECK(lm.CheckWritePredicate(probe, tab, hit, 1) == LockResult::kTimeout);
+    CHECK(lm.CheckWritePredicate(probe, tab, miss, 1) == LockResult::kGranted);
+
+    // (2) O(log P)：未覆盖键的比较次数远小于 1 万（线性扫描需 ~1 万次判定）。
+    lm.ResetPredicateQueryComparisons();
+    CHECK(lm.CheckWritePredicate(probe, tab, miss, 1) == LockResult::kGranted);
+    const size_t comps = lm.GetPredicateQueryComparisons();
+    CHECK(comps > 0);
+    CHECK(comps < 100);  // log2(1e4) ≈ 14 层，上限给足余量
+
+    // (3) 全表哨兵挡住任意键；且他事务的区间谓词不被误删（is_full 只收敛自己）。
+    CHECK(lm.AcquireReadPredicate(other, tab, true, IndexKey{}, IndexKey{}) ==
+          LockResult::kGranted);
+    CHECK(lm.CheckWritePredicate(probe, tab, miss, 1) == LockResult::kTimeout);
+    lm.UnlockAll(other);  // 移除全表哨兵
+    // 他事务 txn 1 的 [0,500] 应仍在：键 10 仍被挡住。
+    IndexKey hit_low{std::vector<Value>{Value::MakeInt(10)}};
+    CHECK(lm.CheckWritePredicate(probe, tab, hit_low, 1) == LockResult::kTimeout);
+}
+
+// ---- Phase 4（创新特性 F）：WAL 组提交（领导者-跟随者）----
+// 1) 并发 N 次提交：每个提交的 durable 都推进覆盖自己的 COMMIT LSN；
+// 2) 真实 fsync 次数（GetSyncCount）远小于 N——批内共享一次 SyncOs；
+// 3) 对照：串行提交同样次数恰好 N 次 fsync；打印并发节省比（仅输出）。
+static void TestGroupCommit() {
+    const std::string path = "storage_ut_groupcommit.wal";
+    RemoveFile(path);
+    {
+        LogManager lm(path);
+
+        // ---- 并发组提交：32 线程 × 4 次提交 = 128 个 COMMIT ----
+        const int kThreads = 32;
+        const int kPerThread = 4;
+        std::vector<std::thread> workers;
+        std::vector<std::vector<lsn_t>> durable(kThreads);
+        for (int t = 0; t < kThreads; ++t) {
+            workers.emplace_back([&, t] {
+                for (int i = 0; i < kPerThread; ++i) {
+                    LogRecord rec;
+                    rec.type_ = LogRecordType::COMMIT;
+                    rec.txn_id_ = static_cast<int64_t>(t * kPerThread + i) + 1;
+                    const lsn_t commit_lsn = lm.AppendRecord(std::move(rec));
+                    const lsn_t d = lm.GroupCommit(commit_lsn);
+                    durable[t].push_back(d);
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+        const size_t syncs_concurrent = lm.GetSyncCount();
+
+        size_t total_commits = 0;
+        lsn_t max_target = 0;
+        for (const auto& v : durable) {
+            total_commits += v.size();
+            for (lsn_t d : v) {
+                CHECK(d >= 1);
+                max_target = std::max(max_target, d);
+            }
+        }
+        CHECK(total_commits == static_cast<size_t>(kThreads * kPerThread));
+        // 每个 GroupCommit 返回前 durable 已覆盖其 target → 最终 durable 覆盖最大目标。
+        const lsn_t final_durable = lm.durable_lsn();
+        CHECK(final_durable >= max_target);
+        // fsync 次数远小于提交数（128 次提交共享少量 SyncOs）。
+        CHECK(syncs_concurrent >= 1);
+        CHECK(syncs_concurrent < total_commits);
+        CHECK(syncs_concurrent < total_commits / 4);
+
+        // ---- 对照：串行提交同样次数（每次自己当领导者）→ 恰好 1 次提交 1 次 fsync ----
+        const size_t syncs_before_serial = lm.GetSyncCount();
+        for (int i = 0; i < static_cast<int>(total_commits); ++i) {
+            LogRecord rec;
+            rec.type_ = LogRecordType::COMMIT;
+            rec.txn_id_ = 1000000 + i;
+            const lsn_t commit_lsn = lm.AppendRecord(std::move(rec));
+            lm.GroupCommit(commit_lsn);
+        }
+        const size_t syncs_serial = lm.GetSyncCount() - syncs_before_serial;
+        CHECK(syncs_serial == total_commits);  // 串行：每条提交一次 fsync
+
+        std::printf("[Phase4] group-commit: %zu commits, concurrent fsyncs=%zu, "
+                    "serial fsyncs=%zu (%.1fx fewer)\n",
+                    total_commits, syncs_concurrent, syncs_serial,
+                    static_cast<double>(syncs_serial) /
+                        static_cast<double>(syncs_concurrent));
+    }
+    RemoveFile(path);
+}
+
+// ---- Phase 4（创新特性 F）：温度感知刷盘 ----
+// 1) 开启后：全量刷脏只写回冷页（访问数 < 热阈值），热脏页留池（WAL 兜底）；
+// 2) 统计分档：writeback_cold_count / writeback_hot_count 正确；
+// 3) 关闭（默认）：行为与旧版一致，全部写回、全部计入冷档。
+static void TestTemperatureAwareFlush() {
+    const std::string path = "storage_ut_tempflush.bin";
+    RemoveFile(path); RemoveFile(path + ".crc");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm);
+        bpm.SetTemperatureFlushEnabled(true);
+        bpm.SetHotAccessThreshold(4);
+
+        // 造 6 个脏页：3 冷（访问 1 次）+ 3 热（访问 >= 4 次）。
+        std::vector<page_id_t> cold_pids, hot_pids;
+        auto make_dirty = [&](std::vector<page_id_t>& out) {
+            page_id_t pid = INVALID_PAGE_ID;
+            Page* p = bpm.NewPage(&pid);
+            CHECK(p != nullptr);
+            std::memset(p->GetData(), 0xAB, PAGE_SIZE);
+            bpm.UnpinPage(pid, true);  // 标脏
+            out.push_back(pid);
+        };
+        for (int i = 0; i < 3; ++i) make_dirty(cold_pids);
+        for (int i = 0; i < 3; ++i) make_dirty(hot_pids);
+        // 热页升温：GetPage 命中 + 显式累计访问计数（模拟反复访问）。
+        for (page_id_t pid : hot_pids) {
+            Page* p = bpm.GetPage(pid);
+            CHECK(p != nullptr);
+            for (int i = 0; i < 4; ++i) p->RecordAccess();
+            bpm.UnpinPage(pid, false);
+        }
+        // 冷页 NewPage 各计 1 次访问（1 < 阈值 4）→ 温度刷盘只写回冷页。
+
+        bpm.FlushAllDirtyPages();
+        BufferPoolStats st = bpm.GetStats();
+        CHECK(st.writeback_cold_count == 3);
+        CHECK(st.writeback_hot_count == 0);
+        for (page_id_t pid : cold_pids) {
+            Page* p = bpm.GetPage(pid);
+            CHECK(!p->IsDirty());  // 冷页已落盘、清脏
+            bpm.UnpinPage(pid, false);
+        }
+        for (page_id_t pid : hot_pids) {
+            Page* p = bpm.GetPage(pid);
+            CHECK(p->IsDirty());  // 热页仍留池内、保持脏
+            bpm.UnpinPage(pid, false);
+        }
+
+        // 显式刷热页 → 记入热档。
+        for (page_id_t pid : hot_pids) CHECK(bpm.FlushPage(pid));
+        st = bpm.GetStats();
+        CHECK(st.writeback_hot_count == 3);
+        CHECK(st.writeback_count == 6);
+
+        // 关闭温度刷盘（默认）：行为与旧版一致——全写回 + 全记冷档。
+        BufferPoolManager bpm2(64, &dm);
+        std::vector<page_id_t> pids;
+        for (int i = 0; i < 4; ++i) {
+            page_id_t pid = INVALID_PAGE_ID;
+            Page* p = bpm2.NewPage(&pid);
+            CHECK(p != nullptr);
+            for (int j = 0; j < 10; ++j) p->RecordAccess();  // 很热
+            bpm2.UnpinPage(pid, true);
+            pids.push_back(pid);
+        }
+        bpm2.FlushAllDirtyPages();
+        st = bpm2.GetStats();
+        CHECK(st.writeback_count == 4);
+        CHECK(st.writeback_cold_count == 4);  // 关闭时全部归入冷档
+        CHECK(st.writeback_hot_count == 0);
+    }
+    RemoveFile(path); RemoveFile(path + ".crc");
 }
 
 // MVCC 快照隔离（kSnapshot）：可重复读 / 免阻塞读 / 写者串行（无丢失更新）。
@@ -1920,13 +2459,8 @@ static void TestSnapshotDeleteFcw() {
         CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
         auto rf = db.ExecuteSQL("SELECT id, v FROM d", sA.get());
         CHECK(rf.success);
-        std::printf("[DBG-del] rows=%zu\n", rf.rows.size());
-        for (const auto& t : rf.rows)
-            std::printf("[DBG-del]  id=%s v=%s\n", t.GetValue(0).ToString().c_str(),
-                        t.GetValue(1).ToString().c_str());
         auto rf2 = db.ExecuteSQL("SELECT id, v FROM d WHERE id = 3", sA.get());
         CHECK(rf2.success);
-        std::printf("[DBG-del-idx] rows=%zu\n", rf2.rows.size());
         // B 的删除被回滚：id=1,2 仍在，且 id=3 存在并保持 A 提交的值 300。
         CHECK(count_rows(rf) == 3);
         CHECK(val_of(rf, 3, 1) == 300);
@@ -1994,6 +2528,1165 @@ static void TestSnapshotUpsertFcw() {
     RemoveFile(path + ".fpl");
 }
 
+// MVCC 多版本真空后台线程（Database，t3）：开启 bg_vacuum_ms 后，后台线程周期性
+// 以「最老活动快照」为界做全表真空。验证：
+//   * 线程确实被唤醒并执行全表真空（ticks 递增、IsBackgroundVacuumEnabled）；
+//   * 边界正确：旧版本（begin_csn < 老快照）被回收，老快照仍能读到其可见版本
+//     （保护中的版本不被误删，快照语义不破）；
+//   * 真空与前台快照写并发安全，数据正确性不受影响；
+//   * Shutdown 幂等收尾不崩溃。
+static void TestBackgroundVacuumThread() {
+    const std::string path = "storage_ut_bg_vacuum.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64, /*bg_flush_ms=*/0, /*bg_vacuum_ms=*/20);
+        CHECK(db.IsBackgroundVacuumEnabled());
+        auto sA = db.CreateSession();
+        auto sB = db.CreateSession();
+        auto* mgA = sA->GetTransactionManager();
+        auto* mgB = sB->GetTransactionManager();
+        CHECK(mgA != nullptr && mgB != nullptr);
+        mgA->SetIsolationLevel(IsolationLevel::kSnapshot);
+        mgB->SetIsolationLevel(IsolationLevel::kSnapshot);
+
+        auto val_of = [](const ExecutionResult& r, int id, int pos) -> int {
+            for (const auto& t : r.rows) {
+                if (t.GetValue(0).AsInt() == id) return t.GetValue(pos).AsInt();
+            }
+            return -999;
+        };
+
+        CHECK(db.ExecuteSQL("CREATE TABLE v(id INT PRIMARY KEY, v INT)", sB.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO v VALUES (1,10)", sB.get()).success);   // CSN=1
+        CHECK(db.ExecuteSQL("UPDATE v SET v = 20 WHERE id = 1", sB.get()).success);  // CSN=2
+        CHECK(db.ExecuteSQL("UPDATE v SET v = 30 WHERE id = 1", sB.get()).success);  // CSN=3
+
+        // sA 在 CSN=3 处捕获快照并持有（最老活动快照 = 3）。此后 sB 的每次提交都
+        // 生成 begin_csn < 3 的旧版本 → 可被后台真空回收；begin_csn == 3 的版本
+        // 是 sA 快照仍可能读取的边界版本 → 必须保留。
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        CHECK(db.ExecuteSQL("UPDATE v SET v = 40 WHERE id = 1", sB.get()).success);  // CSN=4
+        CHECK(db.ExecuteSQL("UPDATE v SET v = 50 WHERE id = 1", sB.get()).success);  // CSN=5
+
+        // 等待后台真空线程至少执行几轮（每轮扫全表）。
+        long ticks = 0;
+        for (int w = 0; w < 150 && ticks < 3; ++w) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            ticks = db.GetBackgroundVacuumTicks();
+        }
+        CHECK(ticks >= 3);
+
+        // 边界正确性：sA 的快照（S=3）应读到「截至快照时刻的版本 v=30」——
+        // 若真空误删了 begin_csn == 3 的版本，这里会读不到行或读到错误值。
+        auto rf = db.ExecuteSQL("SELECT id, v FROM v", sA.get());
+        CHECK(rf.success);
+        CHECK(val_of(rf, 1, 1) == 30);
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+
+        // 新事务读最新已提交值：真空不影响 head 及后续快照。
+        auto rn = db.ExecuteSQL("SELECT id, v FROM v", sB.get());
+        CHECK(rn.success);
+        CHECK(val_of(rn, 1, 1) == 50);
+
+        db.Shutdown();
+        // 幂等停：已停后再停不应崩溃。
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// TableHeap::Vacuum 的槽位级验证（后台真空线程的核心语义）：连续快照 UPDATE
+// 同一行会累积版本链（旧 head 迁到新 slot）。以「最老活动快照」为界真空后：
+//   * begin_csn < oldest_active_csn 的旧版本槽位被写为墓碑（可回收）；
+//   * begin_csn == oldest_active_csn 的边界版本保留（活动快照仍可能读取）；
+//   * 老读者提交（注销快照）后，剩余旧版本随边界推进被继续回收。
+// 用原始页槽位计数做精确断言（不依赖 SQL 输出）。
+static void TestVacuumReclaimsOldVersions() {
+    const std::string path = "storage_ut_vacuum_reclaim.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm);
+        CommitTracker tracker;
+        TxnIdSequencer seq;
+        TransactionManager txn_mgr(&seq);
+        txn_mgr.SetBufferPoolManager(&bpm);
+        txn_mgr.SetCommitTracker(&tracker);
+        txn_mgr.SetIsolationLevel(IsolationLevel::kSnapshot);
+
+        std::vector<ValueType> schema = {ValueType::INTEGER, ValueType::INTEGER};
+        TableHeap* heap = TableHeap::Create(&bpm);
+        CHECK(heap != nullptr);
+        const page_id_t pid = heap->GetFirstPageId();
+
+        // 在每个快照事务里执行一步写入（INSERT/UPDATE），提交时回填 CSN。
+        auto run_txn = [&](const std::function<void()>& fn) {
+            Transaction* t = txn_mgr.Begin();
+            CHECK(t != nullptr && t->IsActive());
+            heap->SetActiveTransaction(t);
+            heap->SetSnapshot(t->GetSnapshotCsn(), &tracker);
+            fn();
+            txn_mgr.Commit();
+            heap->SetActiveTransaction(nullptr);
+        };
+        // 统计页上「非墓碑」槽位数（head + 未回收旧版本）。
+        auto live_slots = [&]() -> int {
+            Page* p = bpm.GetPage(pid);
+            if (p == nullptr) return -1;
+            const char* d = p->GetData();
+            int32_t sc = 0;
+            std::memcpy(&sc, d + 4, sizeof(int32_t));
+            int live = 0;
+            for (int32_t s = 0; s < sc; ++s) {
+                int32_t len = 0;
+                std::memcpy(&len, d + 16 + 8 * s + 4, sizeof(int32_t));
+                if (static_cast<uint32_t>(len) != 0xFFFFFFFFu) ++live;
+            }
+            bpm.UnpinPage(pid, false);
+            return live;
+        };
+
+        RID rid;
+        run_txn([&] {
+            CHECK(heap->InsertTuple(Tuple({Value::MakeInt(1), Value::MakeInt(10)}),
+                                    &rid, schema));
+        });  // CSN=1：head(begin=1)
+        run_txn([&] {
+            CHECK(heap->UpdateTuple(rid, Tuple({Value::MakeInt(1), Value::MakeInt(20)}),
+                                    schema));
+        });  // CSN=2：v1(begin=1,end=2) + head(begin=2)
+        run_txn([&] {
+            CHECK(heap->UpdateTuple(rid, Tuple({Value::MakeInt(1), Value::MakeInt(30)}),
+                                    schema));
+        });  // 连续快照 UPDATE 同一行会累积版本链（旧 head 迁到新 slot）；但 Phase 2 内联
+        // 真空在写路径上已回收 end_csn <= 低水位的旧版本（每次 UPDATE 的写事务自身
+        // 即活动快照，低水位=上一条已提交 CSN，恰回收上一条旧版本），故堆积被控制在
+        // 1 旧版本 + head（v1 在 CSN=3 的 UPDATE 内联回收，v2 保留）。
+        // CSN=3：v2(begin=2,end=3) + head(begin=3)，v1 已内联回收。
+        CHECK(live_slots() == 2);  // 1 个旧版本 + head，无墓碑
+
+        // 老快照读者（S=3）持有中：真空边界 = 3。
+        tracker.RegisterSnapshot(3);
+        heap->Vacuum(3);
+        // begin_csn(1,2) < 3 → 回收；begin_csn==3 的边界版本保留。
+        CHECK(live_slots() == 1);
+
+        // 快照继续推进：4 次更新产生 begin_csn=3、end=4 的旧版本；老读者未变。
+        run_txn([&] {
+            CHECK(heap->UpdateTuple(rid, Tuple({Value::MakeInt(1), Value::MakeInt(40)}),
+                                    schema));
+        });  // CSN=4：v3(begin=3,end=4) + head(begin=4)
+        CHECK(live_slots() == 2);
+        heap->Vacuum(3);
+        // begin_csn==3 的 v3 仍保留（3 < 3 不成立）。
+        CHECK(live_slots() == 2);
+
+        // 老读者提交：注销快照 3，最老活动快照推进到 4 → v3 可回收。
+        tracker.UnregisterSnapshot(3);
+        CHECK(tracker.OldestActiveSnapshot() == 0);
+        // 无活动快照时真空以 0 为界：整体 no-op（保守安全）。
+        heap->Vacuum(0);
+        CHECK(live_slots() == 2);
+        // 模拟新读者持有 S=4 后再真空：v3(begin=3) < 4 → 回收，只剩 head。
+        tracker.RegisterSnapshot(4);
+        heap->Vacuum(4);
+        CHECK(live_slots() == 1);
+        tracker.UnregisterSnapshot(4);
+
+        // 回收后快照读仍正确：从 head 沿链找到可见版本（v=40）。
+        run_txn([&] {
+            Tuple t;
+            CHECK(heap->GetTuple(rid, &t, schema));
+            CHECK(t.GetValue(1).AsInt() == 40);
+        });
+        delete heap;
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// Phase 2：O(1) 快照水位（低水位缓存）。验证 CommitTracker 的 OldestActiveSnapshot
+// 从「每次 O(N) 扫描活动快照表」变为「O(1) 缓存读 + 最小值注销后惰性重算」：
+//   * 1 万活跃快照下重复读取：值正确、惰性重算计数不增长（读路径不扫描 → O(1)）；
+//   * 注销非最小值：水位不变、不触发重算；
+//   * 注销最小值：惰性重算推进到下一个最小（计数 +1，单调推进）；
+//   * 全部注销 → 0；重新注册更小 CSN（测试边界）→ 水位下降。
+static void TestLowWaterMarkO1() {
+    CommitTracker tracker;
+    // 空集：无活动快照返回 0。
+    CHECK(tracker.OldestActiveSnapshot() == 0);
+    // 注册 10000 个递增 CSN 的活跃快照（模拟 1 万并发快照读者/写者）。
+    const int N = 10000;
+    for (int i = 1; i <= N; ++i) tracker.RegisterSnapshot(i);
+    CHECK(tracker.GetLowWaterMark() == 1);
+    CHECK(tracker.OldestActiveSnapshot() == 1);
+    // 稳定态重复读：值恒为 1，且不触发任何 O(N) 重算（→ O(1) 读缓存）。
+    const int64_t rc_before = tracker.GetLowWaterRecomputeCount();
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 10000; ++i) {
+        CHECK(tracker.OldestActiveSnapshot() == 1);
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    CHECK(tracker.GetLowWaterRecomputeCount() == rc_before);
+    std::printf("[low-water] 10k active snapshots, 10k reads: %lld us, "
+                "recompute_count=%lld (O(1) read cache)\n",
+                static_cast<long long>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
+                        .count()),
+                static_cast<long long>(tracker.GetLowWaterRecomputeCount()));
+    // 对照：模拟旧实现的 O(N) 全表扫描（每次调用遍历 1 万活动快照求最小）。
+    // 用 volatile 防优化；整数扫描是 unordered_map 迭代的「下界」——哈希表迭代
+    // 每项开销更高，故旧实现真实耗时只会更差。
+    auto t2 = std::chrono::steady_clock::now();
+    volatile int64_t sink = 0;
+    for (int r = 0; r < 10000; ++r) {
+        int64_t o = 0;
+        for (int i = 1; i <= N; ++i) {
+            if (o == 0 || i < o) o = i;
+        }
+        sink = o;
+    }
+    auto t3 = std::chrono::steady_clock::now();
+    std::printf("[low-water] legacy O(N) scan x10000: %lld us (对照：N=10k "
+                "时旧实现每次调用都扫全表)\n",
+                static_cast<long long>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2)
+                        .count()));
+    (void)sink;
+    // 注销大量非最小值：水位不变、不重算。
+    for (int i = N; i > 100; --i) tracker.UnregisterSnapshot(i);
+    CHECK(tracker.OldestActiveSnapshot() == 1);
+    CHECK(tracker.GetLowWaterRecomputeCount() == rc_before);
+    // 注销最小值 → 首次读取触发惰性重算，水位推进到 2（单调，只升不降）。
+    tracker.UnregisterSnapshot(1);
+    CHECK(tracker.OldestActiveSnapshot() == 2);
+    CHECK(tracker.GetLowWaterRecomputeCount() == rc_before + 1);
+    // 反复注销最小值：水位逐级推进。
+    tracker.UnregisterSnapshot(2);
+    CHECK(tracker.OldestActiveSnapshot() == 3);
+    tracker.UnregisterSnapshot(3);
+    CHECK(tracker.OldestActiveSnapshot() == 4);
+    // 全部注销 → 0。
+    for (int i = 4; i <= 100; ++i) tracker.UnregisterSnapshot(i);
+    CHECK(tracker.OldestActiveSnapshot() == 0);
+    // 重新注册非递增 CSN（测试边界）：水位按实际最小下降，注销后单调回升。
+    tracker.RegisterSnapshot(50);
+    tracker.RegisterSnapshot(7);
+    CHECK(tracker.OldestActiveSnapshot() == 7);
+    tracker.UnregisterSnapshot(7);
+    CHECK(tracker.OldestActiveSnapshot() == 50);
+    tracker.UnregisterSnapshot(50);
+    CHECK(tracker.OldestActiveSnapshot() == 0);
+    // 同一 CSN 多读者计数：注销一个不触发重算，最后一个注销才推进。
+    tracker.RegisterSnapshot(9);
+    tracker.RegisterSnapshot(9);
+    tracker.RegisterSnapshot(9);
+    const int64_t rc2 = tracker.GetLowWaterRecomputeCount();
+    tracker.UnregisterSnapshot(9);
+    tracker.UnregisterSnapshot(9);
+    CHECK(tracker.OldestActiveSnapshot() == 9);
+    CHECK(tracker.GetLowWaterRecomputeCount() == rc2);  // 计数未归零：缓存仍有效
+    tracker.UnregisterSnapshot(9);
+    CHECK(tracker.OldestActiveSnapshot() == 0);         // 最后一个注销：置空
+}
+
+// Phase 2：写路径内联轻量真空。验证在「长活保护快照」阻挡下版本先堆积、低水位
+// 推进后由 Update 写路径顺带回收（单语句预算 kInlineVacuumBudget=8）：
+//   * 保护快照 S=1 活跃：12 次 UPDATE 旧版本全部堆积（end_csn>1 不可回收），
+//     且老快照 S=5 仍能沿版本链读到其可见版本（v=24）——边界不误删；
+//   * 保护快照离开、新写者快照（低水位=13）推进：一次 UPDATE 内联回收 8 个旧版本
+//     （预算上限），再一次 UPDATE 回收其余旧版本 → 滞后从 12 降到 1（≥ 60%↓）；
+//   * 无显式 Vacuum()/后台线程参与：回收完全由写路径摊薄完成（无后台真空通道）。
+static void TestInlineVacuum() {
+    const std::string path = "storage_ut_inline_vacuum.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm);
+        CommitTracker tracker;
+        TxnIdSequencer seq;
+        TransactionManager txn_mgr(&seq);
+        txn_mgr.SetBufferPoolManager(&bpm);
+        txn_mgr.SetCommitTracker(&tracker);
+        txn_mgr.SetIsolationLevel(IsolationLevel::kSnapshot);
+
+        std::vector<ValueType> schema = {ValueType::INTEGER, ValueType::INTEGER};
+        TableHeap* heap = TableHeap::Create(&bpm);
+        CHECK(heap != nullptr);
+        const page_id_t pid = heap->GetFirstPageId();
+        auto run_txn = [&](const std::function<void()>& fn) {
+            Transaction* t = txn_mgr.Begin();
+            CHECK(t != nullptr && t->IsActive());
+            heap->SetActiveTransaction(t);
+            heap->SetSnapshot(t->GetSnapshotCsn(), &tracker);
+            fn();
+            txn_mgr.Commit();
+            heap->SetActiveTransaction(nullptr);
+        };
+        auto live_slots = [&]() -> int {
+            Page* p = bpm.GetPage(pid);
+            if (p == nullptr) return -1;
+            const char* d = p->GetData();
+            int32_t sc = 0;
+            std::memcpy(&sc, d + 4, sizeof(int32_t));
+            int live = 0;
+            for (int32_t s = 0; s < sc; ++s) {
+                int32_t len = 0;
+                std::memcpy(&len, d + 16 + 8 * s + 4, sizeof(int32_t));
+                if (static_cast<uint32_t>(len) != 0xFFFFFFFFu) ++live;
+            }
+            bpm.UnpinPage(pid, false);
+            return live;
+        };
+
+        RID rid;
+        run_txn([&] {
+            CHECK(heap->InsertTuple(Tuple({Value::MakeInt(1), Value::MakeInt(10)}),
+                                    &rid, schema));
+        });  // CSN=1：head(begin=1)
+        // 长活保护快照 S=1（模拟长事务读）：此后旧版本 end_csn>1 全部不可回收，
+        // 内联真空被低水位（=1）挡在门外 → 版本链如实堆积。
+        tracker.RegisterSnapshot(1);
+        for (int i = 0; i < 12; ++i) {
+            run_txn([&] {
+                CHECK(heap->UpdateTuple(rid,
+                                        Tuple({Value::MakeInt(1), Value::MakeInt(20 + i)}),
+                                        schema));
+            });  // CSN=2..13：v1..v12 全部堆积
+        }
+        CHECK(live_slots() == 13);  // 堆积：v1..v12 + head，内联真空被保护快照挡住
+
+        // 边界安全：老快照 S=5 应读到 v5（值 23）——堆积期间内联真空未误删任何
+        // 活动快照仍需要的版本。注：版本链里 v_k 存的是「第 k 次更新前的旧值」
+        // （迁走的旧 head），故 v5 = 第 4 次更新后的值 20+3 = 23。
+        tracker.RegisterSnapshot(5);
+        heap->SetSnapshot(5, &tracker);
+        {
+            Tuple t;
+            CHECK(heap->GetTuple(rid, &t, schema));
+            CHECK(t.GetValue(1).AsInt() == 23);  // v5 = 20+3
+        }
+        tracker.UnregisterSnapshot(5);
+
+        // 保护快照离开：低水位推进到新写者快照（13）→ 写路径内联真空开始摊薄回收。
+        tracker.UnregisterSnapshot(1);
+        run_txn([&] {
+            CHECK(heap->UpdateTuple(rid, Tuple({Value::MakeInt(1), Value::MakeInt(200)}),
+                                    schema));
+        });  // CSN=14：内联回收 v1..v8（预算上限 8）
+        CHECK(live_slots() == 6);   // 剩余 v9..v12 + v13 + head
+        run_txn([&] {
+            CHECK(heap->UpdateTuple(rid, Tuple({Value::MakeInt(1), Value::MakeInt(300)}),
+                                    schema));
+        });  // CSN=15：内联回收 v9..v12 与 v13
+        CHECK(live_slots() == 2);   // 滞后从 12 → 1（≥ 60%↓），无后台真空参与
+
+        // 回收后快照读仍正确：新事务读到最新值，老版本被墓碑跳过。
+        run_txn([&] {
+            Tuple t;
+            CHECK(heap->GetTuple(rid, &t, schema));
+            CHECK(t.GetValue(1).AsInt() == 300);
+        });
+        delete heap;
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// Phase 3：版本链 O(1) 查询（内存版本索引缓存 + CSN 直判）。
+//   * 命中/重建观测：同一 rid 连续点查 N 次 → 首次重建（builds=1）、其余命中（hits=N-1）；
+//   * 老快照点查正确性：12 次更新后老快照 S=5 读到 v5（值 23），缓存命中路径返回同一值；
+//   * 新写后自愈：再写 1 个版本 → 下次点查重建（builds+1）且读到新值（head 标记不匹配触发）；
+//   * 自读防护：快照写者事务内读自己刚写的 rid → 不走缓存（链走路径处理 self 可见性）。
+static void TestVersionIndexCache() {
+    const std::string path = "storage_ut_veridx.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm);
+        CommitTracker tracker;
+        TxnIdSequencer seq;
+        TransactionManager txn_mgr(&seq);
+        txn_mgr.SetBufferPoolManager(&bpm);
+        txn_mgr.SetCommitTracker(&tracker);
+        txn_mgr.SetIsolationLevel(IsolationLevel::kSnapshot);
+
+        std::vector<ValueType> schema = {ValueType::INTEGER, ValueType::INTEGER};
+        TableHeap* heap = TableHeap::Create(&bpm);
+        CHECK(heap != nullptr);
+        auto run_txn = [&](const std::function<void()>& fn) {
+            Transaction* t = txn_mgr.Begin();
+            CHECK(t != nullptr && t->IsActive());
+            heap->SetActiveTransaction(t);
+            heap->SetSnapshot(t->GetSnapshotCsn(), &tracker);
+            fn();
+            txn_mgr.Commit();
+            heap->SetActiveTransaction(nullptr);
+        };
+
+        RID rid;
+        run_txn([&] {
+            CHECK(heap->InsertTuple(Tuple({Value::MakeInt(1), Value::MakeInt(10)}),
+                                    &rid, schema));
+        });  // CSN=1
+        // 长活保护快照 S=1：挡住内联真空，让版本链如实堆积。
+        tracker.RegisterSnapshot(1);
+        for (int i = 0; i < 12; ++i) {
+            run_txn([&] {
+                CHECK(heap->UpdateTuple(rid,
+                                        Tuple({Value::MakeInt(1), Value::MakeInt(20 + i)}),
+                                        schema));
+            });  // CSN=2..13：v1..v12 全部堆积
+        }
+
+        // 老快照点查：S=5 读到 v5 = 23；首次点查沿链重建缓存。
+        tracker.RegisterSnapshot(5);
+        heap->SetSnapshot(5, &tracker);
+        {
+            Tuple t;
+            CHECK(heap->GetTuple(rid, &t, schema));
+            CHECK(t.GetValue(1).AsInt() == 23);
+        }
+        CHECK(heap->GetVersionIndexBuildCount() == 1);
+        // 连续 9999 次点查 → 全部缓存命中（builds 不再增长）。
+        {
+            Tuple t;
+            for (int i = 0; i < 9999; ++i) {
+                CHECK(heap->GetTuple(rid, &t, schema));
+                CHECK(t.GetValue(1).AsInt() == 23);
+            }
+        }
+        CHECK(heap->GetVersionIndexBuildCount() == 1);
+        CHECK(heap->GetVersionIndexHitCount() == 9999);
+        tracker.UnregisterSnapshot(5);
+
+        // 新写自愈：保护快照离开后写 1 个版本（CSN=14）→ 下次点查 head 标记不匹配，
+        // 重建缓存并读到新值 200。
+        tracker.UnregisterSnapshot(1);
+        run_txn([&] {
+            CHECK(heap->UpdateTuple(rid, Tuple({Value::MakeInt(1), Value::MakeInt(200)}),
+                                    schema));
+        });
+        run_txn([&] {
+            Tuple t2;
+            CHECK(heap->GetTuple(rid, &t2, schema));
+            CHECK(t2.GetValue(1).AsInt() == 200);
+        });
+        CHECK(heap->GetVersionIndexBuildCount() == 2);
+        CHECK(heap->GetVersionIndexHitCount() == 9999);
+
+        // 自读防护：写者事务内读自己刚写的 rid → 链走（self 可见），不命中缓存。
+        {
+            Transaction* tw = txn_mgr.Begin();
+            CHECK(tw != nullptr && tw->IsActive());
+            heap->SetActiveTransaction(tw);
+            heap->SetSnapshot(tw->GetSnapshotCsn(), &tracker);
+            const uint64_t hits_before = heap->GetVersionIndexHitCount();
+            const uint64_t builds_before = heap->GetVersionIndexBuildCount();
+            CHECK(heap->UpdateTuple(rid, Tuple({Value::MakeInt(1), Value::MakeInt(300)}),
+                                    schema));
+            Tuple t3;
+            CHECK(heap->GetTuple(rid, &t3, schema));
+            CHECK(t3.GetValue(1).AsInt() == 300);  // self 看到自己的未提交版本
+            CHECK(heap->GetVersionIndexHitCount() == hits_before);  // 未走缓存命中
+            CHECK(heap->GetVersionIndexBuildCount() == builds_before + 1);  // 链走重建
+            txn_mgr.Rollback();
+            heap->SetActiveTransaction(nullptr);
+        }
+        delete heap;
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// Phase 3（t3）：墓碑槽复用——InsertIntoPage/UpdateTuple 优先复用页内墓碑目录项，
+// 归还目录空间（slot_count 不增长）。验证：
+//   * 非快照：插入 20 行 → 删除 10 行（物理墓碑）→ 再插入 10 行 → slot_count 不变、
+//     复用计数增长、数据读写正确（新增可见、被删不可见）；
+//   * 快照 MVCC：更新链 + Vacuum 墓碑化全部旧版本（链摘除）→ 后续更新迁槽复用墓碑
+//     槽（计数增长、slot_count 不增长），链仍完整、读到最新值。
+static void TestTombstoneSlotReuse() {
+    const std::string path = "storage_ut_tomb_reuse.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm);
+        std::vector<ValueType> schema = {ValueType::INTEGER, ValueType::INTEGER};
+        TableHeap* heap = TableHeap::Create(&bpm);
+        CHECK(heap != nullptr);
+        const page_id_t pid = heap->GetFirstPageId();
+        auto get_slot_count = [&]() -> int32_t {
+            Page* p = bpm.GetPage(pid);
+            if (p == nullptr) return -1;
+            int32_t sc = 0;
+            std::memcpy(&sc, p->GetData() + 4, sizeof(int32_t));
+            bpm.UnpinPage(pid, false);
+            return sc;
+        };
+
+        // (1) 非快照：物理删除产生墓碑，后续插入优先复用墓碑槽。
+        std::vector<RID> rids;
+        for (int i = 0; i < 20; ++i) {
+            RID r;
+            CHECK(heap->InsertTuple(
+                Tuple({Value::MakeInt(i), Value::MakeInt(100 + i)}), &r, schema));
+            rids.push_back(r);
+        }
+        CHECK(get_slot_count() == 20);
+        for (int i = 0; i < 10; ++i) CHECK(heap->DeleteTuple(rids[i]));
+        const uint64_t reuse_before = heap->GetTombstoneReuseCount();
+        for (int i = 0; i < 10; ++i) {
+            CHECK(heap->InsertTuple(
+                Tuple({Value::MakeInt(1000 + i), Value::MakeInt(i)}), nullptr, schema));
+        }
+        // 复用墓碑目录项：slot_count 不增长，复用计数至少 +10。
+        CHECK(get_slot_count() == 20);
+        CHECK(heap->GetTombstoneReuseCount() >= reuse_before + 10);
+        // 数据正确性：20 行可读（10 保留 + 10 新增），被删行（0..9）不可见。
+        {
+            int seen = 0;
+            for (TableHeap::Iterator it = heap->Begin(); it.HasNext();) {
+                Tuple t = it.Next(schema);
+                const int id = t.GetValue(0).AsInt();
+                if (id >= 1000) {
+                    CHECK(id < 1010);
+                    CHECK(t.GetValue(1).AsInt() == id - 1000);
+                } else {
+                    CHECK(id >= 10 && id < 20);
+                    CHECK(t.GetValue(1).AsInt() == 100 + id);
+                }
+                ++seen;
+            }
+            CHECK(seen == 20);
+        }
+
+        // (2) 快照 MVCC：更新链 + Vacuum（含链摘除）→ 墓碑槽被后续更新复用。
+        CommitTracker tracker;
+        TxnIdSequencer seq;
+        TransactionManager txn_mgr(&seq);
+        txn_mgr.SetBufferPoolManager(&bpm);
+        txn_mgr.SetCommitTracker(&tracker);
+        txn_mgr.SetIsolationLevel(IsolationLevel::kSnapshot);
+        auto run_txn = [&](const std::function<void()>& fn) {
+            Transaction* t = txn_mgr.Begin();
+            CHECK(t != nullptr && t->IsActive());
+            heap->SetActiveTransaction(t);
+            heap->SetSnapshot(t->GetSnapshotCsn(), &tracker);
+            fn();
+            txn_mgr.Commit();
+            heap->SetActiveTransaction(nullptr);
+        };
+        // 保护性注册快照 0（low_water=0 → 内联真空 no-op）：更新事务各自持有快照，
+        // 会让写路径内联真空顺带回收上一版本（end_csn <= 低水位），链无法完整堆积。
+        // 注册快照 0 使链按测试假设完整累积（slot_count == 25），验证真空/摘除语义。
+        tracker.RegisterSnapshot(0);
+        RID rid;
+        run_txn([&] {
+            CHECK(heap->InsertTuple(Tuple({Value::MakeInt(1), Value::MakeInt(10)}),
+                                    &rid, schema));
+        });  // CSN=1，head@slot20
+        for (int i = 0; i < 4; ++i) {
+            run_txn([&] {
+                CHECK(heap->UpdateTuple(rid,
+                                        Tuple({Value::MakeInt(1), Value::MakeInt(20 + i)}),
+                                        schema));
+            });  // CSN=2..5：v1..v4 迁槽堆积
+        }
+        CHECK(get_slot_count() == 25);  // 20 基座 + head + v1..v4
+        // 真空回收全部旧版本（边界 = 当前 CSN）→ 4 墓碑 + 链摘除（head.prev 接空）。
+        heap->Vacuum(tracker.CurrentCSN());
+        {
+            Page* p = bpm.GetPage(pid);
+            CHECK(p != nullptr);
+            const char* d = p->GetData();
+            int32_t off = 0, len = 0;
+            std::memcpy(&off, d + 16 + 8 * rid.slot_num, sizeof(int32_t));
+            std::memcpy(&len, d + 16 + 8 * rid.slot_num + 4, sizeof(int32_t));
+            MvccRecordHeader h;
+            CHECK(ReadMvccHeader(d + off, &h));
+            CHECK(h.prev_page_id == INVALID_PAGE_ID);  // 链摘除生效
+            bpm.UnpinPage(pid, false);
+        }
+        const int32_t sc_before = get_slot_count();
+        const uint64_t reuse_mvcc = heap->GetTombstoneReuseCount();
+        run_txn([&] {
+            CHECK(heap->UpdateTuple(rid, Tuple({Value::MakeInt(1), Value::MakeInt(99)}),
+                                    schema));
+        });  // CSN=6：迁旧 head 复用墓碑槽
+        CHECK(heap->GetTombstoneReuseCount() > reuse_mvcc);
+        CHECK(get_slot_count() == sc_before);  // 目录不增长
+        run_txn([&] {
+            Tuple t;
+            CHECK(heap->GetTuple(rid, &t, schema));
+            CHECK(t.GetValue(1).AsInt() == 99);
+        });
+        tracker.UnregisterSnapshot(0);  // 解除保护性快照
+        delete heap;
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// Phase 3（t3）：真空链摘除——回收旧版本时把后继的 prev 接到被回收版本自身的 prev，
+// 墓碑槽不再被任何版本引用、可安全复用。验证：
+//   * 部分真空（边界=3）：只回收 v1/v2 → v3.prev 被接空、head.prev 仍指 v5（未回收段）；
+//   * 老快照 S=4 走链读到 v4（值 22），不受墓碑影响；
+//   * 全量真空：head.prev 被逐跳接空（INVALID），旧版本槽全墓碑；
+//   * 墓碑槽复用：新行插入落进 v1 的墓碑槽（RID 复用 slot1），走链/缓存读仍正确（自愈）。
+static void TestVacuumChainUnlink() {
+    const std::string path = "storage_ut_chain_unlink.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm);
+        CommitTracker tracker;
+        TxnIdSequencer seq;
+        TransactionManager txn_mgr(&seq);
+        txn_mgr.SetBufferPoolManager(&bpm);
+        txn_mgr.SetCommitTracker(&tracker);
+        txn_mgr.SetIsolationLevel(IsolationLevel::kSnapshot);
+
+        std::vector<ValueType> schema = {ValueType::INTEGER, ValueType::INTEGER};
+        TableHeap* heap = TableHeap::Create(&bpm);
+        CHECK(heap != nullptr);
+        const page_id_t pid = heap->GetFirstPageId();
+        auto run_txn = [&](const std::function<void()>& fn) {
+            Transaction* t = txn_mgr.Begin();
+            CHECK(t != nullptr && t->IsActive());
+            heap->SetActiveTransaction(t);
+            heap->SetSnapshot(t->GetSnapshotCsn(), &tracker);
+            fn();
+            txn_mgr.Commit();
+            heap->SetActiveTransaction(nullptr);
+        };
+        // 读任意槽的 MVCC 头 prev；槽位为墓碑/legacy 返回 false。
+        auto slot_prev_of = [&](int32_t slot, int32_t* ppid, int32_t* pslot) -> bool {
+            Page* p = bpm.GetPage(pid);
+            if (p == nullptr) return false;
+            const char* d = p->GetData();
+            int32_t off = 0, len = 0;
+            std::memcpy(&off, d + 16 + 8 * slot, sizeof(int32_t));
+            std::memcpy(&len, d + 16 + 8 * slot + 4, sizeof(int32_t));
+            MvccRecordHeader h;
+            const bool ok = (static_cast<uint32_t>(len) != 0xFFFFFFFFu) &&
+                            ReadMvccHeader(d + off, &h);
+            if (ok) {
+                *ppid = h.prev_page_id;
+                *pslot = h.prev_slot_num;
+            }
+            bpm.UnpinPage(pid, false);
+            return ok;
+        };
+
+        // 建立 6 版本链：insert + 5 次更新 →
+        //   head v6@slot0（值24）→ v5@slot5(23) → v4@slot4(22) → v3@slot3(21)
+        //   → v2@slot2(20) → v1@slot1(10) → INVALID
+        // 保护性注册快照 0：让更新路径的内联真空（低水位=当前事务自身快照，会顺带
+        // 回收 end_csn <= 低水位的旧版本）整体 no-op（low_water=0），保证 5 次更新
+        // 后完整 6 版本链存在，供后续链摘除/老快照读验证。
+        tracker.RegisterSnapshot(0);
+        RID rid;
+        run_txn([&] {
+            CHECK(heap->InsertTuple(Tuple({Value::MakeInt(1), Value::MakeInt(10)}),
+                                    &rid, schema));
+        });  // CSN=1
+        for (int i = 0; i < 5; ++i) {
+            run_txn([&] {
+                CHECK(heap->UpdateTuple(rid,
+                                        Tuple({Value::MakeInt(1), Value::MakeInt(20 + i)}),
+                                        schema));
+            });  // CSN=2..6
+        }
+        CHECK(rid.slot_num == 0);  // 空表首页 slot0
+        // 部分真空：边界 = 3 → 只回收 v1(end=2)、v2(end=3)。
+        heap->Vacuum(3);
+        {
+            int32_t ppid = -1, pslot = -1;
+            CHECK(slot_prev_of(3, &ppid, &pslot));  // v3 存活
+            CHECK(ppid == INVALID_PAGE_ID && pslot == -1);  // 摘除：跳过 v1/v2
+            CHECK(slot_prev_of(0, &ppid, &pslot));          // head 存活
+            CHECK(ppid == pid && pslot == 5);               // head.prev 未动（v5 未回收）
+        }
+        // 老快照 S=4 走链读到 v4（值 22）：head→v5→v4，不触碰墓碑。
+        tracker.RegisterSnapshot(4);
+        heap->SetSnapshot(4, &tracker);
+        {
+            Tuple t;
+            CHECK(heap->GetTuple(rid, &t, schema));
+            CHECK(t.GetValue(1).AsInt() == 22);  // v4 = 20+2
+        }
+        // 连续点查命中版本索引缓存（首次已重建，后续全部命中、零重建）。
+        const uint64_t builds1 = heap->GetVersionIndexBuildCount();
+        {
+            Tuple t;
+            for (int i = 0; i < 100; ++i) {
+                CHECK(heap->GetTuple(rid, &t, schema));
+                CHECK(t.GetValue(1).AsInt() == 22);
+            }
+        }
+        CHECK(heap->GetVersionIndexBuildCount() == builds1);  // 循环内全部命中
+        tracker.UnregisterSnapshot(4);
+
+        // 全量真空（边界 = 当前 CSN=6）→ 剩余 v3..v5 也墓碑化，head.prev 逐跳接空。
+        heap->Vacuum(tracker.CurrentCSN());
+        {
+            int32_t ppid = -1, pslot = -1;
+            CHECK(slot_prev_of(0, &ppid, &pslot));           // head 存活
+            CHECK(ppid == INVALID_PAGE_ID && pslot == -1);   // 链摘除到链尾
+            CHECK(!slot_prev_of(1, &ppid, &pslot));          // v1 槽已是墓碑
+            CHECK(!slot_prev_of(5, &ppid, &pslot));          // v5 槽已是墓碑
+        }
+        // 墓碑槽复用：新快照写者插入新行 → 复用首个墓碑槽 slot1（v1 的旧槽）。
+        RID r2;
+        run_txn([&] {
+            CHECK(heap->InsertTuple(Tuple({Value::MakeInt(2), Value::MakeInt(7)}),
+                                    &r2, schema));
+        });  // CSN=7：复用墓碑槽 slot1
+        CHECK(r2.slot_num == 1);
+        run_txn([&] {
+            Tuple t;
+            CHECK(heap->GetTuple(r2, &t, schema));
+            CHECK(t.GetValue(0).AsInt() == 2 && t.GetValue(1).AsInt() == 7);
+            CHECK(heap->GetTuple(rid, &t, schema));
+            CHECK(t.GetValue(1).AsInt() == 24);  // head v6 最新值
+        });
+        // 缓存自愈：head 标记不匹配（真空摘除改写了 head.prev）→ 重建后读到正确值。
+        CHECK(heap->GetVersionIndexBuildCount() > builds1);  // S=4 段后至少重建一次
+        tracker.UnregisterSnapshot(0);  // 解除保护性快照
+        delete heap;
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// Phase 3（t4）：索引墓碑回收——低频索引真空按低水位回表判定索引条目是否可物理
+// 移除（TableHeap::DecideIndexEntry：槽不可见 / 行已删除且失效水位越过边界 / 头
+// 稳定可见但键已被改写），BPlusTree::Vacuum 整树遍历 + 物理删除。验证：
+//   * 键改写后：旧键条目在「改写对最老快照可见」时被回收、新键条目保留；改写对
+//     最老快照尚不可见（边界 < 头 begin_csn）时旧键条目保守保留（老快照仍需要）；
+//   * 快照逻辑删除：删除 CSN 越过边界后条目被回收；边界未越过时保守保留；
+//   * 墓碑槽复用的完整闭环：索引条目先于堆真空被回收 → 槽墓碑化 → 新行安全复用，
+//     不遗留陈旧别名；新行条目按活性判定保留；
+//   * legacy（无 MVCC 头）行条目：一律保守保留。
+static void TestIndexTombstoneReclaim() {
+    const std::string path = "storage_ut_idx_tomb.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm);
+        CommitTracker tracker;
+        TxnIdSequencer seq;
+        TransactionManager txn_mgr(&seq);
+        txn_mgr.SetBufferPoolManager(&bpm);
+        txn_mgr.SetCommitTracker(&tracker);
+        txn_mgr.SetIsolationLevel(IsolationLevel::kSnapshot);
+
+        std::vector<ValueType> schema = {ValueType::INTEGER, ValueType::INTEGER};
+        TableHeap* heap = TableHeap::Create(&bpm);
+        CHECK(heap != nullptr);
+        auto tree = BPlusTree::Create(&bpm, {ValueType::INTEGER}, /*is_unique=*/false);
+        CHECK(tree != nullptr);
+
+        auto run_txn = [&](const std::function<void()>& fn) {
+            Transaction* t = txn_mgr.Begin();
+            CHECK(t != nullptr && t->IsActive());
+            heap->SetActiveTransaction(t);
+            heap->SetSnapshot(t->GetSnapshotCsn(), &tracker);
+            fn();
+            txn_mgr.Commit();
+            heap->SetActiveTransaction(nullptr);
+        };
+        // 保护性快照 0：写路径内联真空 no-op（low_water=0），版本链/头按测试假设累积。
+        tracker.RegisterSnapshot(0);
+
+        // 以活动快照集合（升序，可含重复）判定条目是否可回收。
+        auto decide = [&](const RID& r, int key, const std::vector<int64_t>& snaps) {
+            return heap->DecideIndexEntry(r, IndexKey({Value::MakeInt(key)}), snaps,
+                                          {0}, schema);
+        };
+        // 收集树中全部条目 (key -> rid)。
+        auto collect = [&]() {
+            std::vector<std::pair<int, RID>> out;
+            auto cur = tree->Begin();
+            IndexKey k;
+            RID r;
+            while (cur->Next(&k, &r)) out.emplace_back(k.values[0].AsInt(), r);
+            return out;
+        };
+        auto count_key = [&](int key) {
+            int n = 0;
+            for (const auto& e : collect()) {
+                if (e.first == key) ++n;
+            }
+            return n;
+        };
+        auto vacuum_with = [&](const std::vector<int64_t>& snaps) {
+            return tree->Vacuum([&](const RID& r, const IndexKey& k) {
+                return heap->DecideIndexEntry(r, k, snaps, {0}, schema) ==
+                       TableHeap::IndexVacuumDecision::kRemove;
+            });
+        };
+
+        // ---- Part A：键改写遗留的旧键条目 ----
+        // CSN=1 插入 (1,10) @slot0（稳定 rid）；CSN=2 同键更新 (1,20)；
+        // CSN=3 键改写 (2,30)：旧条目 (1,rid) 延迟保留 + 新条目 (2,rid)。
+        RID rid;
+        run_txn([&] {
+            CHECK(heap->InsertTuple(Tuple({Value::MakeInt(1), Value::MakeInt(10)}),
+                                    &rid, schema));
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(1)}), rid));
+        });
+        run_txn([&] {
+            CHECK(heap->UpdateTuple(rid, Tuple({Value::MakeInt(1), Value::MakeInt(20)}),
+                                    schema));
+        });  // 同键更新：条目不变
+        run_txn([&] {
+            CHECK(heap->UpdateTuple(rid, Tuple({Value::MakeInt(2), Value::MakeInt(30)}),
+                                    schema));
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(2)}), rid));
+        });  // 键改写：旧条目延迟保留 + 新条目
+        CHECK(rid.slot_num == 0);  // 稳定 rid 不变
+        CHECK(count_key(1) == 1 && count_key(2) == 1);
+
+        // 快照 {2}（最老快照 S=2 尚需要 id=1：其可见版本是 CSN2 的 (1,20)）→ 保守保留。
+        CHECK(decide(rid, 1, {2}) == TableHeap::IndexVacuumDecision::kKeep);
+        CHECK(decide(rid, 2, {2}) == TableHeap::IndexVacuumDecision::kKeep);
+        // 快照 {3}（改写已对最老快照可见）→ 旧键条目可回收、新键条目保留。
+        CHECK(decide(rid, 1, {3}) == TableHeap::IndexVacuumDecision::kRemove);
+        CHECK(decide(rid, 2, {3}) == TableHeap::IndexVacuumDecision::kKeep);
+        // 整树真空：移除旧键条目。
+        CHECK(vacuum_with({3}) == 1);
+        CHECK(count_key(1) == 0 && count_key(2) == 1);
+
+        // ---- Part B：快照逻辑删除的条目回收 ----
+        // CSN=4 删除行：head@slot0 打 end 标记（end_csn=4），条目 (2,rid) 延迟保留。
+        run_txn([&] { CHECK(heap->DeleteTuple(rid)); });
+        CHECK(count_key(2) == 1);
+        CHECK(decide(rid, 2, {3}) == TableHeap::IndexVacuumDecision::kKeep);   // S=3 仍可见
+        CHECK(decide(rid, 2, {4}) == TableHeap::IndexVacuumDecision::kRemove); // 越过边界
+        CHECK(vacuum_with({4}) == 1);
+        CHECK(count_key(2) == 0);
+
+        // ---- Part C：墓碑槽复用闭环 + legacy 保守 ----
+        // 堆真空把 v1/v2/head 全部墓碑化 → 新行插入复用 slot0，不遗留陈旧别名。
+        heap->Vacuum(tracker.CurrentCSN());
+        RID r2;
+        run_txn([&] {
+            CHECK(heap->InsertTuple(Tuple({Value::MakeInt(5), Value::MakeInt(50)}),
+                                    &r2, schema));
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(5)}), r2));
+        });
+        CHECK(r2.slot_num == 0);  // 复用 head 的墓碑槽
+        CHECK(decide(r2, 5, {tracker.CurrentCSN()}) ==
+              TableHeap::IndexVacuumDecision::kKeep);  // 新行活跃：保留
+        run_txn([&] {
+            Tuple t;
+            CHECK(heap->GetTuple(r2, &t, schema));
+            CHECK(t.GetValue(0).AsInt() == 5 && t.GetValue(1).AsInt() == 50);
+        });
+
+        // legacy 行（非快照写，无 MVCC 头）：条目一律保守保留。
+        heap->SetActiveTransaction(nullptr);
+        RID r3;
+        CHECK(heap->InsertTuple(Tuple({Value::MakeInt(3), Value::MakeInt(99)}),
+                                &r3, schema));
+        CHECK(tree->Insert(IndexKey({Value::MakeInt(3)}), r3));
+        const int64_t cur = tracker.CurrentCSN();
+        CHECK(decide(r3, 3, {cur}) == TableHeap::IndexVacuumDecision::kKeep);  // legacy
+        CHECK(vacuum_with({cur}) == 0);  // 无条目可回收
+        CHECK(count_key(3) == 1 && count_key(5) == 1);
+
+        // ---- Part D：改写提交晚于最老活动快照的精确化 ----
+        // 原 (ii) 判据对 head.begin_csn > 最老快照 一律保守 kKeep；精确化后沿版本链
+        // 检查「每个活动快照的可见版本键」——仅在无任何活动快照需要旧键时回收。
+        // CSN=sa 插入 (10,100)；CSN=sb 键改写 (20,200)；CSN=sc 键改写 (30,300)：
+        //   head(30,300)@begin_sc → v(20,200)@begin_sb → v(10,100)@begin_sa
+        RID rd;
+        run_txn([&] {
+            CHECK(heap->InsertTuple(Tuple({Value::MakeInt(10), Value::MakeInt(100)}),
+                                    &rd, schema));
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(10)}), rd));
+        });
+        const int64_t sa = tracker.CurrentCSN();  // (10,100) 的 begin_csn
+        run_txn([&] {
+            CHECK(heap->UpdateTuple(rd, Tuple({Value::MakeInt(20), Value::MakeInt(200)}),
+                                    schema));
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(20)}), rd));
+        });
+        const int64_t sb = tracker.CurrentCSN();  // (20,200) 的 begin_csn
+        run_txn([&] {
+            CHECK(heap->UpdateTuple(rd, Tuple({Value::MakeInt(30), Value::MakeInt(300)}),
+                                    schema));
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(30)}), rd));
+        });
+        const int64_t sc = tracker.CurrentCSN();  // head (30,300) 的 begin_csn
+        CHECK(sa < sb && sb < sc);
+        CHECK(count_key(10) == 1 && count_key(20) == 1 && count_key(30) == 1);
+
+        // 快照 {sb}（oldest=sb < head.begin=sc）：S=sb 的可见版本 = (20,200)，键 20 != 10
+        // → 旧条目 (10,rd) 对全部活动快照不可见 → kRemove（精确化收益：原实现保守 kKeep）。
+        CHECK(decide(rd, 10, {sb}) == TableHeap::IndexVacuumDecision::kRemove);
+        // 同一快照 {sb} 需要 (20,rd)（可见版本键 20 == 条目键）→ kKeep（安全边界）。
+        CHECK(decide(rd, 20, {sb}) == TableHeap::IndexVacuumDecision::kKeep);
+        // 活跃条目 (30,rd)（head 键 == 条目键）无条件 kKeep。
+        CHECK(decide(rd, 30, {sb}) == TableHeap::IndexVacuumDecision::kKeep);
+        // 快照 {sa}：S=sa 的可见版本 = (10,100)，键 10 == 条目键 → 旧条目仍需 → kKeep。
+        CHECK(decide(rd, 10, {sa}) == TableHeap::IndexVacuumDecision::kKeep);
+        // 多快照并存 {sa, sb}：最保守情形（sa 需要旧条目）→ kKeep。
+        CHECK(decide(rd, 10, {sa, sb}) == TableHeap::IndexVacuumDecision::kKeep);
+        // 快照 {sa} 下 (20,rd)：S=sa 可见 (10,100)，键 10 != 20，且 (20,200) 的可见
+        // 区间 [sb, sc) 不含 sa → kRemove。
+        CHECK(decide(rd, 20, {sa}) == TableHeap::IndexVacuumDecision::kRemove);
+        // 整树真空（快照 {sb}）：仅移除 (10,rd) 旧条目。
+        CHECK(vacuum_with({sb}) == 1);
+        CHECK(count_key(10) == 0 && count_key(20) == 1 && count_key(30) == 1);
+
+        tracker.UnregisterSnapshot(0);  // 解除保护性快照
+        delete heap;
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// 索引真空精确化判据 (ii) 的超长版本链完整判定：消除「沿链步进上限 64」的保守
+// kKeep 漏回收。单页容量内构造最长版本链（1 列整数元组：48B 头 + 4B 载荷 +
+// 8B 槽项 = 60B/版本，页空间 4080B → 至多 68 版本），配合老快照让精确化走链
+// 超过 64 步：旧键条目应 kRemove（旧实现步数超限一律 kKeep），仍被老快照需要的
+// 条目必须 kKeep（不误删）。
+static void TestIndexVacuumLongChain() {
+    const std::string path = "storage_ut_idx_longchain.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm);
+        CommitTracker tracker;
+        TxnIdSequencer seq;
+        TransactionManager txn_mgr(&seq);
+        txn_mgr.SetBufferPoolManager(&bpm);
+        txn_mgr.SetCommitTracker(&tracker);
+        txn_mgr.SetIsolationLevel(IsolationLevel::kSnapshot);
+
+        std::vector<ValueType> schema = {ValueType::INTEGER};  // 1 列：最小版本
+        TableHeap* heap = TableHeap::Create(&bpm);
+        CHECK(heap != nullptr);
+        auto tree = BPlusTree::Create(&bpm, {ValueType::INTEGER}, /*is_unique=*/false);
+        CHECK(tree != nullptr);
+
+        auto run_txn = [&](const std::function<void()>& fn) {
+            Transaction* t = txn_mgr.Begin();
+            CHECK(t != nullptr && t->IsActive());
+            heap->SetActiveTransaction(t);
+            heap->SetSnapshot(t->GetSnapshotCsn(), &tracker);
+            fn();
+            txn_mgr.Commit();
+            heap->SetActiveTransaction(nullptr);
+        };
+        // 保护性快照 0：写路径内联真空 no-op（low_water=0），版本链完整累积。
+        tracker.RegisterSnapshot(0);
+
+        auto decide = [&](const RID& r, int key, const std::vector<int64_t>& snaps) {
+            return heap->DecideIndexEntry(r, IndexKey({Value::MakeInt(key)}), snaps,
+                                          {0}, schema);
+        };
+        auto collect = [&]() {
+            std::vector<std::pair<int, RID>> out;
+            auto cur = tree->Begin();
+            IndexKey k;
+            RID r;
+            while (cur->Next(&k, &r)) out.emplace_back(k.values[0].AsInt(), r);
+            return out;
+        };
+        auto count_key = [&](int key) {
+            int n = 0;
+            for (const auto& e : collect()) {
+                if (e.first == key) ++n;
+            }
+            return n;
+        };
+        auto vacuum_with = [&](const std::vector<int64_t>& snaps) {
+            return tree->Vacuum([&](const RID& r, const IndexKey& k) {
+                return heap->DecideIndexEntry(r, k, snaps, {0}, schema) ==
+                       TableHeap::IndexVacuumDecision::kRemove;
+            });
+        };
+
+        // 插入 (100,·) 后连续 66 次键改写 (101..166)：链共 67 版本全部同页，
+        //   head(166)@c66 → v65(165)@c65 → ... → v1(101)@c1 → v0(100)@c0
+        // （67×60B = 4020B ≤ 页空间，RID 稳定不 relocate）。
+        RID rid;
+        std::vector<int64_t> csn;  // csn[i] = v_i 的 begin_csn（第 i 次提交）
+        run_txn([&] {
+            CHECK(heap->InsertTuple(Tuple({Value::MakeInt(100)}), &rid, schema));
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(100)}), rid));
+        });
+        csn.push_back(tracker.CurrentCSN());  // c0
+        for (int k = 1; k <= 66; ++k) {
+            run_txn([&] {
+                CHECK(heap->UpdateTuple(rid, Tuple({Value::MakeInt(100 + k)}), schema));
+                CHECK(tree->Insert(IndexKey({Value::MakeInt(100 + k)}), rid));
+            });
+            csn.push_back(tracker.CurrentCSN());  // ck
+        }
+        CHECK(rid.slot_num == 0);  // 链完整累积，RID 稳定
+        CHECK(csn.size() == 67);
+        CHECK(count_key(100) == 1 && count_key(166) == 1);
+
+        // 快照 {c1}：oldest=c1 < head.begin=c66，精确化走链 65 步（v65..v1）> 64。
+        //   旧条目 (100,rid)：链上无「键==100 且区间含 c1」的版本 → kRemove。
+        //   （旧实现 64 步超限一律 kKeep 漏回收；新实现访问集防环 + 完整走链正确回收。）
+        CHECK(decide(rid, 100, {csn[1]}) == TableHeap::IndexVacuumDecision::kRemove);
+        //   安全边界：快照 {c0} 尚需旧键（S=c0 的可见版本 = v0(100)）→ kKeep。
+        CHECK(decide(rid, 100, {csn[0]}) == TableHeap::IndexVacuumDecision::kKeep);
+        //   可见版本键命中：S=c1 的可见版本 = v1(101) → 条目 (101,rid) kKeep。
+        CHECK(decide(rid, 101, {csn[1]}) == TableHeap::IndexVacuumDecision::kKeep);
+        //   紧邻下界：v2(102) 的可见区间 [c2, c3) 不含 c1 → 条目 (102,rid) kRemove。
+        CHECK(decide(rid, 102, {csn[1]}) == TableHeap::IndexVacuumDecision::kRemove);
+        //   多快照并存 {c0, c1}：最老快照 c0 需要旧键 → kKeep。
+        CHECK(decide(rid, 100, {csn[0], csn[1]}) == TableHeap::IndexVacuumDecision::kKeep);
+        //   活跃条目（head 键 == 条目键）无条件 kKeep。
+        CHECK(decide(rid, 166, {csn[1]}) == TableHeap::IndexVacuumDecision::kKeep);
+
+        // 整树真空（快照 {c1}）：仅保留可见版本键 101 与 head 键 166，
+        // 移除其余 65 条旧键条目（100、102..165）。
+        CHECK(vacuum_with({csn[1]}) == 65);
+        CHECK(count_key(101) == 1 && count_key(166) == 1);
+        CHECK(count_key(100) == 0 && count_key(102) == 0 && count_key(165) == 0);
+
+        tracker.UnregisterSnapshot(0);  // 解除保护性快照
+        delete heap;
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// 二级索引 MVCC 精确可见性（t4）：快照写者的键改写/逻辑删除在非唯一二级索引中
+// 延迟保留旧条目（IndexDeleteDeferred），由 IndexScanExecutor 的回表 + 版本链可见性
+// + 可见版本键重检（InScanBounds）+ RID 去重精确过滤。验证：
+//   * 键改写越界：旧条目 (20,rid2) 延迟保留、新条目 (100,rid2) 就位；区间扫描命中
+//     旧条目，回表后可见版本键=100 越界 -> 键重检过滤（不得返回 id=2）；
+//   * 键改写落在区间内：同一稳定 RID 被新旧条目（如 25/30）重复命中 -> 按 RID 去重，
+//     只返回一次；
+//   * 老快照读者：沿版本链读到改写前的旧版本（键仍落在区间内）-> 键重检通过，正确
+//     返回旧值（不因索引陈旧条目而丢行）；
+//   * 快照逻辑删除：旧条目 (10,rid1) 延迟保留；非快照读者与后续快照读者回表后行不可
+//     见（GetTuple 按 end_xid/版本链过滤）-> 不返回幽灵行。
+static void TestSnapshotIndexScan() {
+    const std::string path = "storage_ut_snapshot_idx.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto sA = db.CreateSession();   // 快照读者（老/新快照）
+        auto sB = db.CreateSession();   // 快照写者
+        auto sC = db.CreateSession();   // 非快照读者（SERIALIZABLE）
+        auto* mgA = sA->GetTransactionManager();
+        auto* mgB = sB->GetTransactionManager();
+        auto* mgC = sC->GetTransactionManager();
+        CHECK(mgA != nullptr && mgB != nullptr && mgC != nullptr);
+        mgA->SetIsolationLevel(IsolationLevel::kSnapshot);
+        mgB->SetIsolationLevel(IsolationLevel::kSnapshot);
+        mgC->SetIsolationLevel(IsolationLevel::kSerializable);
+
+        auto val_of = [](const ExecutionResult& r, int id, int pos) -> int {
+            for (const auto& t : r.rows) {
+                if (t.GetValue(0).AsInt() == id) return t.GetValue(pos).AsInt();
+            }
+            return -999;
+        };
+        auto count_rows = [](const ExecutionResult& r) { return static_cast<int>(r.rows.size()); };
+
+        CHECK(db.ExecuteSQL("CREATE TABLE x(id INT PRIMARY KEY, v INT)", sA.get()).success);
+        CHECK(db.ExecuteSQL("CREATE INDEX idx_x_v ON x(v)", sA.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO x VALUES (1,10),(2,20),(3,30)", sA.get()).success);
+
+        // ---- 老快照读者 A 在初始状态捕获快照，首次按索引扫描 ----
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        auto r0 = db.ExecuteSQL(
+            "SELECT id, v FROM x WHERE v BETWEEN 10 AND 30 ORDER BY id", sA.get());
+        CHECK(r0.success);
+        CHECK(count_rows(r0) == 3);
+        CHECK(val_of(r0, 1, 1) == 10);
+        CHECK(val_of(r0, 2, 1) == 20);
+        CHECK(val_of(r0, 3, 1) == 30);
+
+        // ---- B 键改写：id=2 的 v 20->100（越出扫描区间）、id=3 的 v 30->25（区间内）----
+        CHECK(db.ExecuteSQL("BEGIN", sB.get()).success);
+        CHECK(db.ExecuteSQL("UPDATE x SET v = 100 WHERE v = 20", sB.get()).success);
+        CHECK(db.ExecuteSQL("UPDATE x SET v = 25 WHERE v = 30", sB.get()).success);
+        CHECK(db.ExecuteSQL("COMMIT", sB.get()).success);
+        // 索引现状（快照 + 非唯一 -> 旧条目延迟保留）：
+        //   (10,rid1) (20,rid2旧) (100,rid2新) (25,rid3新) (30,rid3旧)
+
+        // ---- 老快照 A 重读：沿版本链仍见改写前旧版本，键重检通过 ----
+        auto rA = db.ExecuteSQL(
+            "SELECT id, v FROM x WHERE v BETWEEN 10 AND 30 ORDER BY id", sA.get());
+        CHECK(rA.success);
+        CHECK(count_rows(rA) == 3);
+        CHECK(val_of(rA, 1, 1) == 10);
+        CHECK(val_of(rA, 2, 1) == 20);  // 版本链回退：不见 B 的新值
+        CHECK(val_of(rA, 3, 1) == 30);
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+
+        // ---- 新快照读者：键重检过滤越界条目 + RID 去重折叠重复命中 ----
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        auto rN = db.ExecuteSQL(
+            "SELECT id, v FROM x WHERE v BETWEEN 10 AND 30 ORDER BY id", sA.get());
+        CHECK(rN.success);
+        CHECK(count_rows(rN) == 2);
+        CHECK(val_of(rN, 1, 1) == 10);
+        CHECK(val_of(rN, 2, 1) == -999);  // 可见版本键=100 越界，被键重检过滤
+        CHECK(val_of(rN, 3, 1) == 25);
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+
+        // ---- 等值查找同样正确：v=100 走索引能找回 id=2 ----
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        auto rE = db.ExecuteSQL("SELECT id, v FROM x WHERE v = 100", sA.get());
+        CHECK(rE.success);
+        CHECK(count_rows(rE) == 1);
+        CHECK(val_of(rE, 2, 1) == 100);
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+
+        // ---- 快照逻辑删除：B 删除 v=10（id=1），旧条目 (10,rid1) 延迟保留 ----
+        CHECK(db.ExecuteSQL("BEGIN", sB.get()).success);
+        CHECK(db.ExecuteSQL("DELETE FROM x WHERE v = 10", sB.get()).success);
+        CHECK(db.ExecuteSQL("COMMIT", sB.get()).success);
+
+        // 非快照（SERIALIZABLE）读者：不得读到幽灵行。
+        auto rC = db.ExecuteSQL("SELECT id, v FROM x WHERE v = 10", sC.get());
+        CHECK(rC.success);
+        CHECK(count_rows(rC) == 0);
+
+        // 后续新快照读者：删除已提交，同样不可见。
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        auto rD = db.ExecuteSQL("SELECT id, v FROM x WHERE v = 10", sA.get());
+        CHECK(rD.success);
+        CHECK(count_rows(rD) == 0);
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+
+        // 表其余行不受影响：id=1 已删；id=2 的可见键=100 越出 [10,30]。
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        auto rF = db.ExecuteSQL(
+            "SELECT id, v FROM x WHERE v BETWEEN 10 AND 30 ORDER BY id", sA.get());
+        CHECK(rF.success);
+        CHECK(count_rows(rF) == 1);
+        CHECK(val_of(rF, 3, 1) == 25);
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
 int main() {
     TestDiskManager();
     TestFreePagePersistence();
@@ -2021,12 +3714,29 @@ int main() {
     TestSnapshotIsolation();
     TestSnapshotDeleteFcw();
     TestSnapshotUpsertFcw();
+    TestBackgroundVacuumThread();
+    TestVacuumReclaimsOldVersions();
+    TestLowWaterMarkO1();
+    TestInlineVacuum();
+    TestVersionIndexCache();
+    TestSnapshotIndexScan();
+    TestTombstoneSlotReuse();
+    TestVacuumChainUnlink();
+    TestIndexTombstoneReclaim();
+    TestIndexVacuumLongChain();
     TestSetIsolationStatement();
     TestRowLockEncoding();
     TestRowLockTier();
+    TestRowLockEscalation();
+    TestAdaptiveLockEscalation();
+    TestPredicateLockMerge();
     TestRowLevelConcurrency();
     TestBPlusTreeConcurrency();
+    TestOptimisticSplitConcurrency();
     TestSerializablePredicatePhantom();
+    TestPredicateIntervalTree();
+    TestGroupCommit();
+    TestTemperatureAwareFlush();
 
     std::printf("\n======== Storage UT ========\n");
     std::printf("checks: %d   fails: %d\n", g_checks, g_fails);

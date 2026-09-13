@@ -11,7 +11,7 @@ setlocal enabledelayedexpansion
 REM ---- Locate paths --------------------------------------------------
 set "SCRIPT_DIR=%~dp0"
 for %%D in ("%SCRIPT_DIR%..") do set "ROOT_DIR=%%~fD"
-set "BUILD_DIR=%ROOT_DIR%\build\Debug"
+set "BUILD_DIR=%ROOT_DIR%\build"
 set "SQL_DIR=%SCRIPT_DIR%sql"
 set "WORK_DIR=%SCRIPT_DIR%tmp"
 
