@@ -63,7 +63,7 @@ bool HandleCrashAfterUndoSteps(const std::string& sql, int* n_out) {
 }  // namespace
 
 Database::Database(const std::string& db_file, size_t buffer_pool_size,
-                   int bg_flush_ms)
+                   int bg_flush_ms, int bg_vacuum_ms)
     : is_new_database_(false) {
     // 1) 将路径规范化为绝对路径，避免后续 cwd 变化导致路径失效
     std::error_code ec;
@@ -188,6 +188,11 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size,
     if (bg_flush_ms > 0 && buffer_pool_manager_ != nullptr) {
         buffer_pool_manager_->StartBackgroundFlush(
             std::chrono::milliseconds(bg_flush_ms));
+    }
+    // MVCC 低频后台真空线程（仅在 bg_vacuum_ms > 0 时开启，默认关闭）。
+    // 与刷脏线程同样放最后启动：commit_tracker_ / catalog_ 均已就绪。
+    if (bg_vacuum_ms > 0 && commit_tracker_ != nullptr && catalog_ != nullptr) {
+        StartBackgroundVacuum(std::chrono::milliseconds(bg_vacuum_ms));
     }
 }
 
@@ -342,11 +347,13 @@ ExecutionResult Database::ExecuteSQLImpl(const std::string& sql,
             }
             // MVCC 快照隔离：低频惰性真空——每完成 kVacuumInterval 条成功后，
             // 以「最老活动快照」为界回收一次全表旧版本槽位（惰性无害，乘客低）。
+            // Phase 2：常规回收已由写路径内联真空（TableHeap::RunInlineVacuum）
+            // 摊薄完成，此处为「低频兜底」通道；OldestActiveSnapshot 已是 O(1)。
             constexpr int kVacuumInterval = 100;
             if (++vacuum_statement_counter_ >= kVacuumInterval &&
                 commit_tracker_ != nullptr && catalog_ != nullptr) {
                 vacuum_statement_counter_ = 0;
-                catalog_->VacuumAll(commit_tracker_->OldestActiveSnapshot());
+                catalog_->VacuumAll(commit_tracker_->ActiveSnapshotList());
             }
             return exec_result;
         } catch (...) {
@@ -398,6 +405,9 @@ std::vector<ExecutionResult> Database::ExecuteScript(const std::string& sql_scri
 }
 
 void Database::Shutdown() {
+    // MVCC：先停后台真空线程（join），避免其与随后的 FlushAllPages / Checkpoint 竞态
+    //（真空写墓碑脏页若与最终落盘并发，会造成撕裂或顺序颠倒）。
+    StopBackgroundVacuum();
     // Phase B：先 flush bufferpool，然后写 CHECKPOINT + 同步 WAL。
     // E5：先停后台刷脏线程（join），避免其与随后的 FlushAllPages / Checkpoint / Sync 竞态。
     if (buffer_pool_manager_) buffer_pool_manager_->StopBackgroundFlush();
@@ -440,6 +450,70 @@ void Database::MaybeCrashAfterSuccess() {
             return;
         }
         expected = crash_after_n_statements_.load();
+    }
+}
+
+// ---- MVCC 低频后台真空线程 ----
+// 生命周期与 E5 后台刷脏线程一致：Start 幂等、Stop 先把线程移出锁外再 join
+//（避免持锁 join 死锁）；线程循环用 cv wait_for 休眠，Stop 置位后立即唤醒退出。
+
+void Database::StartBackgroundVacuum(std::chrono::milliseconds interval) {
+    if (interval.count() <= 0) return;  // 禁用：保持与旧版逐字节一致
+    std::lock_guard<std::mutex> lock(bg_vacuum_mutex_);
+    if (bg_vacuum_running_) return;  // 已在运行：幂等
+    bg_vacuum_interval_ = interval;
+    bg_vacuum_stop_ = false;
+    bg_vacuum_running_ = true;
+    bg_vacuum_thread_ = std::thread(&Database::BackgroundVacuumLoop, this);
+}
+
+void Database::StopBackgroundVacuum() {
+    std::thread to_join;
+    {
+        std::lock_guard<std::mutex> lock(bg_vacuum_mutex_);
+        if (!bg_vacuum_running_) return;  // 幂等
+        bg_vacuum_stop_ = true;
+        bg_vacuum_running_ = false;
+        to_join = std::move(bg_vacuum_thread_);  // 移出后另行 join，避免持锁 join 死锁
+    }
+    bg_vacuum_cv_.notify_all();
+    if (to_join.joinable()) to_join.join();
+}
+
+bool Database::IsBackgroundVacuumEnabled() const {
+    std::lock_guard<std::mutex> lock(bg_vacuum_mutex_);
+    return bg_vacuum_running_;
+}
+
+long Database::GetBackgroundVacuumTicks() const {
+    return bg_vacuum_ticks_.load();
+}
+
+// 后台循环：每隔 interval 以「最老活动快照」为界对全部表做一次惰性多版本真空。
+// 关键（保持正确性与既有锁序）：
+//   * 只回收 begin_csn < oldest_active_snapshot 的旧版本槽位（写墓碑），绝不动仍
+//     在活动快照可见范围内的版本 → 与前台快照读/写者安全共存；
+//   * TableHeap::Vacuum 内部持有 per-table write_mutex_ 与页写锁，与前台 DML 写
+//     路径互斥，不撕裂；期间不触碰 BPM 全局锁（Vacuum 只在页锁作用域内访帧），
+//     不会与前台页访问形成死锁环；
+//   * 真空写墓碑不写 WAL、不 Sync：被回收的是已提交且不可再被快照读取的旧版本，
+//     崩溃后最多「复活」一个同样不可见的旧版本（end_csn 仍挡得住可见性），
+//     不会产生数据损坏（与语句级真空语义一致）；
+//   * 单次失败（IO/损坏）吞掉：后台线程不得因单次失败退出或 terminate。
+void Database::BackgroundVacuumLoop() {
+    while (true) {
+        std::unique_lock<std::mutex> lock(bg_vacuum_mutex_);
+        bg_vacuum_cv_.wait_for(lock, bg_vacuum_interval_,
+                               [this] { return bg_vacuum_stop_; });
+        if (bg_vacuum_stop_) break;
+        ++bg_vacuum_ticks_;
+        // 释放 bg_vacuum_mutex_ 后再真空，让 StopBackgroundVacuum 能在真空期间置位 stop。
+        lock.unlock();
+        try {
+            catalog_->VacuumAll(commit_tracker_->ActiveSnapshotList());
+        } catch (...) {
+            // 吸入异常：后台线程不得因单次失败退出或 terminate。
+        }
     }
 }
 

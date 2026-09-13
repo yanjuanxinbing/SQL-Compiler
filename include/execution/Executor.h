@@ -101,7 +101,10 @@ public:
     // READ COMMITTED 登记到本语句行读锁，语句末由外层 Execute() 释放；SERIALIZABLE 持有到提交。
     RowLockResult AcquireRowReadLock(const RID& rid);
     // 行级独占锁（写表逐行）：所有隔离级别在显式事务内都取，持有到提交（Commit/Rollback 释放）。
-    RowLockResult AcquireRowWriteLock(const RID& rid);
+    // table_res（表堆首页页号，非负）非空时参与「行级锁升级」：本事务在某表的行写锁数达到
+    // 阈值后自动尝试升级为表级 X 锁并释放行锁（多粒度锁语义，见 LockManager::TryEscalateTable）。
+    // 升级成功后，该表后续行访问直接放行（由表锁覆盖），锁条目数从 O(行) 收敛到 O(表)。
+    RowLockResult AcquireRowWriteLock(const RID& rid, int64_t table_res = -1);
     // SERIALIZABLE 谓词写前检查：以该表主键建键，若有其他活动事务的读谓词覆盖该
     // 键则阻塞（或 kDeadlock/kTimeout）。仅 SERIALIZABLE 显式事务启用，其余返回 kUnused。
     RowLockResult CheckSerializablePredicate(const std::string& table_name,

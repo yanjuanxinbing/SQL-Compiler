@@ -11,6 +11,12 @@ namespace sqlcompiler {
 namespace {
 // SERIALIZABLE 谓词写前检查的锁等待超时（毫秒）。
 constexpr int kPredicateWaitMs = 5000;
+
+// 行级锁升级（v3 自适应）：是否在某张表上尝试升级为表级 X 锁（多粒度锁，见
+// LockManager::TryEscalateTable）不再用固定阈值——小表批量写很快覆盖大半行、应提前
+// 升级收敛锁条目；大表过早升级会放大表级互斥、应延后。阈值由
+// LockManager::ComputeEscalationThreshold 依据「该表已登记行数」（规模近似）与
+// 「历史升级冲突采样」（kWouldBlock 次数）动态计算：小表提前、大表延后、冲突降阈。
 }  // namespace
 
 ExecutionContext::ExecutionContext(SystemCatalog* catalog,
@@ -85,14 +91,39 @@ ExecutionContext::RowLockResult ExecutionContext::AcquireRowReadLock(const RID& 
     return RowLockResult::kOk;
 }
 
-ExecutionContext::RowLockResult ExecutionContext::AcquireRowWriteLock(const RID& rid) {
+ExecutionContext::RowLockResult ExecutionContext::AcquireRowWriteLock(
+    const RID& rid, int64_t table_res) {
     Transaction* txn = txn_;
     if (txn == nullptr || !txn->IsActive() || txn_manager_ == nullptr) return RowLockResult::kUnused;
     LockManager* lm = txn_manager_->GetLockManager();
     if (lm == nullptr || !rid.IsValid()) return RowLockResult::kUnused;
-    LockResult r = lm->LockExclusive(txn->GetTxnId(), RowResourceId(rid.page_id, rid.slot_num), 0);
+    // 行级锁升级（v2）：本事务已对 table_res 升级为表级锁 → 该表行访问由表锁覆盖，
+    // 直接放行（无需逐行取锁）。语义与逐行持 X 锁一致（见 LockManager 多粒度冲突矩阵）。
+    if (table_res >= 0 && lm->IsTableEscalated(txn->GetTxnId(), table_res)) {
+        return RowLockResult::kOk;
+    }
+    const int64_t row_res = RowResourceId(rid.page_id, rid.slot_num);
+    LockResult r = lm->LockExclusive(txn->GetTxnId(), row_res, 0);
     if (r != LockResult::kGranted) {
         return (r == LockResult::kDeadlock) ? RowLockResult::kDeadlock : RowLockResult::kTimeout;
+    }
+    // 行级锁升级（v3 自适应）：登记行锁归属；行写锁数达到自适应阈值后尝试升级。
+    //   * 阈值 = LockManager::ComputeEscalationThreshold(表已登记行数, 升级冲突采样)：
+    //     小表（<256 行）提前升级、大表（>=4096 行）延后升级、升级曾失败（kWouldBlock）
+    //     则降阈更早再试——冲突一消解立即收敛。
+    //   * 升级成功（kGranted）→ 行锁已由表锁替换，后续行访问直接放行，锁条目数
+    //     从 O(行) 收敛到 O(表)（长事务批量写的锁表膨胀、UnlockAll/死锁检测开销下降）。
+    //   * 升级失败（kWouldBlock，他事务持冲突行/表锁）→ 回退为继续逐行持锁，
+    //     正确性不受影响（只是不享受收敛收益）。
+    if (table_res >= 0) {
+        lm->RegisterRowGroup(row_res, table_res);
+        const size_t thr = LockManager::ComputeEscalationThreshold(
+            lm->GetRegisteredRowCount(table_res), lm->GetTableConflictCount(table_res));
+        if (lm->CountRowLocks(txn->GetTxnId(), table_res) >= thr) {
+            LockResult er = lm->TryEscalateTable(txn->GetTxnId(), table_res,
+                                                 LockMode::kExclusive);
+            if (er == LockResult::kDeadlock) return RowLockResult::kDeadlock;
+        }
     }
     return RowLockResult::kOk;
 }

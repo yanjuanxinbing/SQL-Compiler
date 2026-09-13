@@ -42,6 +42,9 @@ void DeleteExecutor::Init() {
                 txn->GetIsolationLevel() == IsolationLevel::kSnapshot &&
                 tracker != nullptr) {
                 table_heap_->SetSnapshot(txn->GetSnapshotCsn(), tracker);
+            } else {
+                // 非快照/自动提交：复位共享堆上遗留的快照水位，避免陈旧读泄漏。
+                table_heap_->SetSnapshot(-1, nullptr);
             }
         }
         iterator_ = std::make_unique<TableHeap::Iterator>(table_heap_->Begin());
@@ -87,7 +90,9 @@ bool DeleteExecutor::Next(Tuple* tuple) {
                                   t.GetRid(), txn);
             }
             // T2 行级写锁：删该行前取 X 锁（持有到提交，Commit/Rollback 释放）。
-            auto rl = context_->AcquireRowWriteLock(t.GetRid());
+            // 传入表堆首页页号参与「行级锁升级」：大批量 DELETE 达阈值后行锁收敛为表级 X 锁。
+            auto rl = context_->AcquireRowWriteLock(t.GetRid(),
+                static_cast<int64_t>(table_heap_->GetFirstPageId()));
             if (rl == ExecutionContext::RowLockResult::kDeadlock ||
                 rl == ExecutionContext::RowLockResult::kTimeout) {
                 throw std::runtime_error(

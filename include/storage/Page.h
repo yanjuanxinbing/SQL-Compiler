@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <shared_mutex>
@@ -51,6 +52,13 @@ public:
     std::shared_mutex& GetLatch() { return latch_; }
     const std::shared_mutex& GetLatch() const { return latch_; }
 
+    // ---- Phase 4（创新特性 F）：页访问温度 ----
+    // 每次页被取用（GetPage 命中/装入、NewPage）累计一次访问计数，作为「温度」
+    // 近似（访问越频繁 = 越热）。温度感知刷盘据此把冷页优先写回、热页留在池内
+    // （NO-FORCE + WAL 保证：热脏页即便不落盘，崩溃后也能由 WAL redo 恢复）。
+    void RecordAccess() { ++access_count_; }
+    uint64_t GetAccessCount() const { return access_count_.load(); }
+
     // 重置页内容与元信息为初始状态，供缓冲池复用该帧时调用
     void ResetMemory();
 
@@ -64,6 +72,8 @@ private:
     uint64_t page_lsn_ = 0;
     // E4：页级读写锁。与 data_ 独立存在，不参与 ResetMemory（锁不随帧内容清零）。
     std::shared_mutex latch_;
+    // Phase 4：访问温度计数。原子：GetPage 可被多线程并发调用；ResetMemory 时清零。
+    std::atomic<uint64_t> access_count_{0};
 };
 
 }  // namespace sqlcompiler

@@ -1,9 +1,12 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "catalog/SystemCatalog.h"
@@ -28,8 +31,10 @@ class CommitTracker;
 class Database {
 public:
     // db_file: 数据文件路径（不存在则创建新库）；buffer_pool_size: 缓冲池可容纳的页数
+    // bg_flush_ms: 后台异步刷脏线程的唤醒间隔（毫秒，0 = 关闭，默认）。
+    // bg_vacuum_ms: MVCC 后台多版本真空线程的唤醒间隔（毫秒，0 = 关闭，默认）。
     explicit Database(const std::string& db_file, size_t buffer_pool_size = 64,
-                      int bg_flush_ms = 0);
+                      int bg_flush_ms = 0, int bg_vacuum_ms = 0);
     ~Database();
 
     // 执行一条SQL语句，内部完成 词法->语法->语义->计划->优化->执行 全流程，
@@ -71,13 +76,22 @@ public:
     // 满足指导书「页级读写、缓存命中统计、页替换日志输出」的要求。
     std::string GetStorageStats() const;
 
+    // ---- MVCC 低频后台真空线程（可观测性/控制）----
+    // 线程生命周期由构造参数 bg_vacuum_ms 驱动；以下访问器供诊断与测试使用。
+    bool IsBackgroundVacuumEnabled() const;
+    long GetBackgroundVacuumTicks() const;  // 被唤醒并执行真空的次数（可观测）
+
 private:
     std::unique_ptr<DiskManager> disk_manager_;
+    // Phase B：LogManager 必须声明在 BufferPoolManager 之前——成员逆序析构时
+    // BufferPoolManager 的析构仍会 FlushAllPages → FlushPageUnlocked 访问
+    // log_manager_->durable_lsn()/Flush()，若 LogManager 先被销毁则构成
+    // use-after-free（Phase 4 起 durable_lsn 持锁读取后必现崩溃）。
+    std::unique_ptr<LogManager> log_manager_;        // Phase B：WAL 写出器
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
     std::unique_ptr<SystemCatalog> catalog_;
     std::unique_ptr<ExecutionEngine> execution_engine_;
     std::unique_ptr<TransactionManager> txn_manager_;
-    std::unique_ptr<LogManager> log_manager_;        // Phase B：WAL 写出器
     std::unique_ptr<RecoveryManager> recovery_;      // Phase B：启动期 ARIES 恢复
     // T2：跨会话共享的事务级锁管理器（隔离级别 + 死锁回收）。
     std::unique_ptr<LockManager> lock_manager_;
@@ -97,6 +111,23 @@ private:
 
     // ---- Phase B：崩溃注入状态 ----
     std::atomic<int> crash_after_n_statements_{0};  // > 0 时每成功执行一条 N--
+
+    // ---- MVCC 低频后台真空线程 ----
+    // 与 E5 后台刷脏线程同一模式：仅当构造参数 bg_vacuum_ms > 0 时启动，默认关闭
+    // （行为与旧版完全一致）。线程每隔 interval 以「最老活动快照」为界对全部表做
+    // 一次惰性多版本真空（TableHeap::Vacuum），回收已提交且不再被任何活动快照
+    // 可见的旧版本槽位。生命周期：构造末尾启动，Shutdown 时先停再刷盘/同步。
+    void StartBackgroundVacuum(std::chrono::milliseconds interval);
+    void StopBackgroundVacuum();  // 幂等：未运行时 no-op
+    void BackgroundVacuumLoop();
+
+    std::thread bg_vacuum_thread_;          // 后台真空线程；未运行时为空
+    mutable std::mutex bg_vacuum_mutex_;    // 保护 bg_vacuum_running_ / stop_ / interval_
+    std::condition_variable bg_vacuum_cv_;
+    bool bg_vacuum_running_ = false;
+    bool bg_vacuum_stop_ = false;
+    std::chrono::milliseconds bg_vacuum_interval_{0};
+    std::atomic<long> bg_vacuum_ticks_{0};
 
     // 在 ExecuteSQL 内部、autocommit commit 之后调一次。若还有崩溃名额则扣减，
     // 归零后立即 _Exit(1)。

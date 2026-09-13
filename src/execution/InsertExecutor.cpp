@@ -215,8 +215,10 @@ bool InsertExecutor::InsertRow(const std::vector<Value>& row_values_in) {
             "INSERT failed (no space?)");
     }
     heap->SetActiveTransaction(nullptr);
-    // T2 行级写锁：新行取得 X 锁（持有到提交，Commit/Rollback 释放）。
-    auto rl = context_->AcquireRowWriteLock(rid);
+    // T2 行级写锁：新行取得 X 锁（持有到提交，Commit/Rollback 释放）。传入表堆首页
+    // 页号参与「行级锁升级」：大批量 INSERT 达阈值后行锁收敛为表级 X 锁。
+    auto rl = context_->AcquireRowWriteLock(rid,
+        static_cast<int64_t>(heap->GetFirstPageId()));
     if (rl == ExecutionContext::RowLockResult::kDeadlock ||
         rl == ExecutionContext::RowLockResult::kTimeout) {
         throw std::runtime_error(

@@ -1,5 +1,6 @@
 #include "catalog/SystemCatalog.h"
 
+#include "execution/ConstraintChecker.h"
 #include "lexer/Lexer.h"
 #include "parser/Parser.h"
 #include "txn/LogManager.h"
@@ -306,10 +307,45 @@ void SystemCatalog::SetActiveTransaction(Transaction* txn) {
 }
 
 // MVCC 快照隔离：对全部表的堆做惰性真空回收。
-void SystemCatalog::VacuumAll(int64_t oldest_active_csn) {
-    if (oldest_active_csn <= 0) return;
+// Phase 3（t4）：真空表堆的同时，对该表的所有索引执行索引墓碑回收——按低水位回表
+// 判定索引条目指向的版本是否对所有活动快照不可见（槽墓碑/越界、行已删除且失效
+// 水位越过边界，或头稳定可见但键已被改写），不可见则物理删除该条目，回收延迟删除/
+// 键改写遗留的陈旧索引空间。
+void SystemCatalog::VacuumAll(const std::vector<int64_t>& active_snapshots) {
+    if (active_snapshots.empty()) return;
+    const int64_t oldest = active_snapshots.front();
     for (auto& kv : table_heaps_) {
-        if (kv.second) kv.second->Vacuum(oldest_active_csn);
+        if (!kv.second) continue;
+        kv.second->Vacuum(oldest);
+        const TableInfo* table = symbol_table_.GetTable(kv.first);
+        if (table == nullptr) continue;  // __sys_tables__ 等系统堆无表定义、无索引
+        const auto& infos = GetIndexesForTable(kv.first);
+        if (infos.empty()) continue;
+        const std::vector<ValueType> col_types = BuildColumnTypes(*table);
+        for (const auto* info : infos) {
+            BPlusTree* tree = GetIndexTree(info->index_name);
+            if (tree == nullptr) continue;
+            // 索引列 -> 表列下标（key_col_indices 供 DecideIndexEntry 提取版本键）。
+            std::vector<int32_t> key_col_idx;
+            bool ok = true;
+            for (const auto& cn : info->key_columns) {
+                int32_t idx = -1;
+                for (size_t i = 0; i < table->columns.size(); ++i) {
+                    if (table->columns[i].name == cn) { idx = static_cast<int32_t>(i); break; }
+                }
+                if (idx < 0) { ok = false; break; }
+                key_col_idx.push_back(idx);
+            }
+            if (!ok) continue;
+            TableHeap* heap = kv.second.get();
+            tree->Vacuum(
+                [heap, &active_snapshots, key_col_idx, col_types](
+                    const RID& rid, const IndexKey& key) {
+                    return heap->DecideIndexEntry(rid, key, active_snapshots,
+                                                  key_col_idx, col_types) ==
+                           TableHeap::IndexVacuumDecision::kRemove;
+                });
+        }
     }
 }
 

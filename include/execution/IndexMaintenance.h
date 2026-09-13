@@ -36,15 +36,30 @@ void CheckUniqueIndexes(SystemCatalog* catalog, const TableInfo& table_info,
 
 // 把一行写入该表的全部索引。任一索引写入失败抛异常。
 // Phase A：txn 非空时把当前事务挂到每棵 B+Tree 上，让写路径抓 undo。
+// old_row 非空且该索引键未变时跳过插入（旧条目仍指向稳定 RID，直接复用，
+// 避免同 (key,rid) 重复条目）。
 void InsertIntoIndexes(SystemCatalog* catalog, const TableInfo& table_info,
                        const std::vector<Value>& row, const RID& rid,
-                       Transaction* txn = nullptr);
+                       Transaction* txn = nullptr,
+                       const std::vector<Value>* old_row = nullptr);
 
 // 从该表的全部索引中删除一行对应的索引项。
 // 索引项不存在不视为错误：删除路径要尽量幂等，否则一次失配会让后续 DELETE 全部
 // 报错，反而把可恢复的局面变成不可用。
+//
+// MVCC 二级索引精确可见性（t4）：new_row 非空且该索引键未变时跳过摘除；快照
+// 写者的逻辑删除/键改写对「非唯一二级索引」延迟摘除——旧条目保留，由快照读者
+// 回表 + 版本链（end_csn）与键重检精确过滤。唯一/主键索引始终急切维护（唯一性
+// 预检依赖条目存在性，延迟会引入重复键）。
 void DeleteFromIndexes(SystemCatalog* catalog, const TableInfo& table_info,
                        const std::vector<Value>& row, const RID& rid,
-                       Transaction* txn = nullptr);
+                       Transaction* txn = nullptr,
+                       const std::vector<Value>* new_row = nullptr);
+
+// 写堆失败后的索引恢复：把「确实被摘掉」的旧条目放回去。快照+非唯一索引的旧
+// 条目被 DeleteFromIndexes 保留，此处不重复放回（避免重复条目）。
+void RestoreDeletedIndexEntries(SystemCatalog* catalog, const TableInfo& table_info,
+                                const std::vector<Value>& row, const RID& rid,
+                                Transaction* txn);
 
 }  // namespace sqlcompiler

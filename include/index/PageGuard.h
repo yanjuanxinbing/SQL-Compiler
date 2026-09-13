@@ -46,6 +46,10 @@ public:
     // 提前归还（幂等）。析构时不会重复 Unpin。
     void Release();
 
+    // 仅 BPlusTree 分裂路径内部使用：取回已 pin 的帧，配合
+    // LatchedPageGuard::LatchPinned 在不经缓冲池的前提下给该帧加闩。
+    Page* GetPagePtr() const { return page_; }
+
 private:
     PageGuard(BufferPoolManager* bpm, Page* page, page_id_t page_id);
 
@@ -98,6 +102,19 @@ public:
         return LatchedPageGuard(bpm, p, pid);
     }
 
+    // 分裂路径专用：给「已 pin 住、尚未加闩」的帧直接加闩（不再经缓冲池，
+    // 从而可以同时持有父/子两把写闩而不违反「持页闩不得请求 BPM::latch_」的锁序）。
+    // 前置条件：page 当前已由调用方 pin（如持有对应 PageGuard），且调用方此刻
+    // 未持有任何其他页闩。本句柄析构只释放页锁、不 Unpin（pin 归属调用方）。
+    static LatchedPageGuard LatchPinned(Page* page, page_id_t page_id) {
+        if (page == nullptr) return LatchedPageGuard();
+        if constexpr (Exclusive)
+            page->WLatch();
+        else
+            page->RLatch();
+        return LatchedPageGuard(nullptr, page, page_id);
+    }
+
     ~LatchedPageGuard() { Release(); }
 
     LatchedPageGuard(LatchedPageGuard&& o) noexcept { *this = std::move(o); }
@@ -131,13 +148,17 @@ public:
     }
 
     // 提前归还：先释放页锁，再 Unpin（遵守锁序）。幂等。
+    // 注意：LatchPinned 构造的句柄 bpm_ == nullptr，只释放页锁、不 Unpin——
+    // 该帧的 pin 由调用方另行持有（PageGuard），其析构负责归还。
     void Release() {
-        if (page_ != nullptr && bpm_ != nullptr) {
+        if (page_ != nullptr) {
             if constexpr (Exclusive)
                 page_->WUnlatch();
             else
                 page_->RUnlatch();
-            bpm_->UnpinPage(page_id_, dirty_);
+            if (bpm_ != nullptr) {
+                bpm_->UnpinPage(page_id_, dirty_);
+            }
         }
         bpm_ = nullptr;
         page_ = nullptr;

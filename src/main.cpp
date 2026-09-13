@@ -221,9 +221,19 @@ int main(int argc, char** argv) {
         }
     }
 
+    // MVCC：允许通过环境变量 SQLCOMPILER_BG_VACUUM_MS 开启后台多版本真空线程
+    //（默认关闭，行为与旧版一致）。真空以「最老活动快照」为界回收旧版本槽位，
+    // 与语句级惰性真空互补，长事务持续更新场景下不再依赖语句计数触发。
+    int bg_vacuum_ms = 0;
+    if (const char* env = std::getenv("SQLCOMPILER_BG_VACUUM_MS")) {
+        bg_vacuum_ms = std::atoi(env);
+        if (bg_vacuum_ms < 0) bg_vacuum_ms = 0;
+    }
+
     sqlcompiler::Database* database = nullptr;
     try {
-        database = new sqlcompiler::Database(db_file, buffer_frames, bg_flush_ms);
+        database = new sqlcompiler::Database(db_file, buffer_frames, bg_flush_ms,
+                                             bg_vacuum_ms);
     } catch (const std::exception& e) {
         std::cerr << "Failed to open database '" << db_file << "': " << e.what()
                   << std::endl;
@@ -236,6 +246,16 @@ int main(int argc, char** argv) {
     std::string sql;
     std::cout << "sqlcompiler> " << std::flush;
     while (std::getline(std::cin, line)) {
+        // 去除行首 UTF-8 BOM（EF BB BF）：Windows 上 PowerShell/.NET 以管道向
+        // 子进程写入首批输入时会在最前面附加 BOM 前导，若不清除，首条语句会被
+        // 词法器判为非法字符。真实场景（如用户重定向 Notepad 保存的带 BOM 脚本）
+        // 同样受益。
+        if (line.size() >= 3 &&
+            static_cast<unsigned char>(line[0]) == 0xEF &&
+            static_cast<unsigned char>(line[1]) == 0xBB &&
+            static_cast<unsigned char>(line[2]) == 0xBF) {
+            line.erase(0, 3);
+        }
         sql += line;
         sql += "\n";
         if (!HasCompleteStatement(sql)) {

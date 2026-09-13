@@ -48,6 +48,9 @@ void UpdateExecutor::Init() {
                 tx->GetIsolationLevel() == IsolationLevel::kSnapshot &&
                 tracker != nullptr) {
                 table_heap_->SetSnapshot(tx->GetSnapshotCsn(), tracker);
+            } else {
+                // 非快照/自动提交：复位共享堆上遗留的快照水位，避免陈旧读泄漏。
+                table_heap_->SetSnapshot(-1, nullptr);
             }
         }
         iterator_ = std::make_unique<TableHeap::Iterator>(table_heap_->Begin());
@@ -121,12 +124,20 @@ bool UpdateExecutor::Next(Tuple* tuple) {
         }
         // 索引同步：先摘掉旧键，写堆成功后再挂上新键。
         // 顺序反过来（先插新键）会让唯一索引在「键未变」时自己撞自己。
+        // MVCC 二级索引精确可见性（t4）：键未变的更新跳过重建（旧条目仍指向
+        // 稳定 RID）；快照写者的键改写对非唯一二级索引延迟摘除旧条目，由回表
+        // 键重检精确过滤。
         const TableInfo* info = context_->GetCatalog()->GetTable(table_name_);
+        std::vector<Value> old_vals = cur.GetValues();
         if (info != nullptr) {
-            DeleteFromIndexes(context_->GetCatalog(), *info, cur.GetValues(), r, txn);
+            std::vector<Value> new_vals = new_t.GetValues();
+            DeleteFromIndexes(context_->GetCatalog(), *info, old_vals, r, txn,
+                              &new_vals);
         }
-        // T2 行级写锁：写该行前取 X 锁（持有到提交，Commit/Rollback 释放）。
-        auto rl = context_->AcquireRowWriteLock(r);
+        // T2 行级写锁：写该行前取 X 锁（持有到提交，Commit/Rollback 释放）。传入
+        // 表堆首页页号参与「行级锁升级」：大批量 UPDATE 达阈值后行锁收敛为表级 X 锁。
+        auto rl = context_->AcquireRowWriteLock(r,
+            static_cast<int64_t>(table_heap_->GetFirstPageId()));
         if (rl == ExecutionContext::RowLockResult::kDeadlock ||
             rl == ExecutionContext::RowLockResult::kTimeout) {
             throw std::runtime_error(
@@ -140,12 +151,16 @@ bool UpdateExecutor::Next(Tuple* tuple) {
         if (ok) {
             ++affected;
             if (info != nullptr) {
+                std::vector<Value> new_vals = new_t.GetValues();
                 InsertIntoIndexes(context_->GetCatalog(), *info,
-                                  new_t.GetValues(), r, txn);
+                                  new_vals, r, txn, &old_vals);
             }
         } else if (info != nullptr) {
-            // 写堆失败：把刚摘掉的旧键放回去，避免索引凭空少一条
-            InsertIntoIndexes(context_->GetCatalog(), *info, cur.GetValues(), r, txn);
+            // 写堆失败：把「确实被摘掉」的旧键放回去，避免索引凭空少一条。
+            // 快照+非唯一索引的旧条目在 DeleteFromIndexes 中已被保留，放回会
+            // 产生同 (key,rid) 重复条目，这里只恢复被急切摘除的条目。
+            RestoreDeletedIndexEntries(context_->GetCatalog(), *info,
+                                       old_vals, r, txn);
         }
     }
     // Phase A：语句结束前解除事务挂载，避免把快照读基记录泄漏到后续语句。

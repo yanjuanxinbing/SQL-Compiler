@@ -34,6 +34,10 @@ void SeqScanExecutor::Init() {
                 txn->GetIsolationLevel() == IsolationLevel::kSnapshot &&
                 tracker != nullptr) {
                 table_heap_->SetSnapshot(txn->GetSnapshotCsn(), tracker);
+            } else {
+                // 非快照/自动提交读：必须把共享堆上「上一语句遗留的快照水位」复位为
+                // 非快照模式，否则跨会话/跨语句会读到旧快照（陈旧读泄漏）。
+                table_heap_->SetSnapshot(-1, nullptr);
             }
         }
         iterator_ = std::make_unique<TableHeap::Iterator>(table_heap_->Begin());

@@ -30,6 +30,12 @@ struct BufferPoolStats {
     // 脏页写回次数：脏页内容被真正写回磁盘的次数（含淘汰换出、显式 Flush、
     // 全量刷脏、删除退页等路径）。供 \stats 输出「脏页写回 / IO 统计」。
     long writeback_count = 0;
+    // Phase 4（创新特性 F）：刷盘温度分布——温度感知刷盘下，写回的脏页按访问
+    // 温度分档：writeback_cold_count 记录「冷页（访问数 < 热阈值）写回」次数，
+    // writeback_hot_count 记录「热页写回」次数（温度感知下热页被延后，只有后续
+    // 显式刷/淘汰/关库才计一次）。关闭温度感知时全部记入 writeback_cold_count。
+    long writeback_cold_count = 0;
+    long writeback_hot_count = 0;
 
     double HitRate() const;
 };
@@ -96,6 +102,20 @@ public:
     size_t GetPoolSize() const { return pool_size_; }
     static size_t GetReplacementLogCapacity() { return kMaxReplacementLog; }
 
+    // ---- Phase 4（创新特性 F）：温度感知刷盘 ----
+    // 把 FlushAllDirtyPages 的「全量刷脏」升级为「冷热分级」：
+    //   * 温度 = 页帧自装载/复位以来的访问计数（GetPage 命中/装入、NewPage 各计一次）；
+    //   * 开启后每次全量刷脏只写回「冷脏页」（访问数 < 热阈值），热脏页延后留在池内
+    //     ——NO-FORCE + WAL 保证正确性（WAL-before-data：热脏页即便不落盘，崩溃后
+    //     由 redo 从日志恢复），换来提交路径 I/O 削减与热页保留命中率；
+    //   * 关闭（默认，SQLCOMPILER_TEMP_FLUSH 未设置）时行为与旧版逐页全量一致。
+    // 阈值与开关：
+    void SetTemperatureFlushEnabled(bool en) { temp_flush_enabled_ = en; }
+    bool IsTemperatureFlushEnabled() const { return temp_flush_enabled_; }
+    void SetHotAccessThreshold(uint64_t t) { hot_access_threshold_ = t; }
+    uint64_t GetHotAccessThreshold() const { return hot_access_threshold_; }
+    static constexpr uint64_t kDefaultHotAccessThreshold = 8;
+
     // ---- E6：缓冲池内存上限可配置与统计 ----
     // 缓冲池内存 ≈ 帧数 × 页大小（固定池，构造时一次性预分配 pages_ 帧数组）。
     // 这里把「内存上限」以字节为单位暴露，并给出当前实际占用，供 \stats / 外部
@@ -140,6 +160,8 @@ private:
     // 免锁内部实现：公共方法拿锁后委托给这些私有函数，避免非递归锁重入死锁。
     void FlushPageUnlocked(page_id_t page_id);   // FlushPage 的免锁主体
     void FlushAllDirtyUnlocked();               // FlushAllDirtyPages 的免锁主体
+    // Phase 4（F）：给一次写回记账（writeback_count + 冷/热分档）。前提：已持 latch_。
+    void RecordWritebackStat(const Page& page);
 
     size_t pool_size_;
     DiskManager* disk_manager_;
@@ -156,6 +178,10 @@ private:
 
     // Phase B：可空；非空时 FlushPage / FlushAllDirtyPages 走 LSN 检查。
     LogManager* log_manager_ = nullptr;
+
+    // Phase 4：温度感知刷盘开关与热阈值（由 latch_ 保护；默认关闭 = 旧行为）。
+    bool temp_flush_enabled_ = false;
+    uint64_t hot_access_threshold_ = kDefaultHotAccessThreshold;
 
     // ---- E5 后台刷脏线程状态 ----
     std::thread background_flusher_;     // 后台线程；未运行时为空

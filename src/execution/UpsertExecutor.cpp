@@ -266,7 +266,12 @@ void UpsertExecutor::UpdateConflictingRow(const std::vector<Value>& candidate_va
             (mgr != nullptr) ? mgr->GetCommitTracker() : nullptr;
         if (tracker != nullptr) {
             heap->SetSnapshot(txn->GetSnapshotCsn(), tracker);
+        } else {
+            heap->SetSnapshot(-1, nullptr);
         }
+    } else {
+        // 非快照/自动提交：复位共享堆上遗留的快照水位，避免陈旧读泄漏。
+        heap->SetSnapshot(-1, nullptr);
     }
 
     Tuple cur;
@@ -327,8 +332,15 @@ void UpsertExecutor::UpdateConflictingRow(const std::vector<Value>& candidate_va
     // 事务已提前挂到堆上（读行时已记录快照读基）。UpdateTuple 这里直接抓 undo。
     // T2 行级写锁：改写该行前取 X 锁（持有到提交，Commit/Rollback 释放），
     // 与 UpdateExecutor/DeleteExecutor 的写路径串行化，保证 FCW base 不被并发写绕开。
-    DeleteFromIndexes(context_->GetCatalog(), *info, cur.GetValues(), existing_rid, txn);
-    auto wl = context_->AcquireRowWriteLock(existing_rid);
+    // 传入表堆首页页号参与「行级锁升级」：大批量 UPSERT 达阈值后行锁收敛为表级 X 锁。
+    // MVCC 二级索引精确可见性（t4）：键未变时跳过重建；快照写者键改写对非唯一
+    // 二级索引延迟摘除旧条目（由回表键重检精确过滤）。
+    std::vector<Value> old_vals = cur.GetValues();
+    std::vector<Value> new_vals = new_t.GetValues();
+    DeleteFromIndexes(context_->GetCatalog(), *info, old_vals, existing_rid, txn,
+                      &new_vals);
+    auto wl = context_->AcquireRowWriteLock(existing_rid,
+        static_cast<int64_t>(heap->GetFirstPageId()));
     if (wl == ExecutionContext::RowLockResult::kDeadlock ||
         wl == ExecutionContext::RowLockResult::kTimeout) {
         heap->SetActiveTransaction(nullptr);
@@ -341,10 +353,12 @@ void UpsertExecutor::UpdateConflictingRow(const std::vector<Value>& candidate_va
     heap->SetActiveTransaction(nullptr);
     if (ok) {
         InsertIntoIndexes(context_->GetCatalog(), *info,
-                          new_t.GetValues(), existing_rid, txn);
+                          new_vals, existing_rid, txn, &old_vals);
     } else {
-        // 写堆失败：把刚摘掉的旧键放回去，避免索引凭空少一条
-        InsertIntoIndexes(context_->GetCatalog(), *info, cur.GetValues(), existing_rid, txn);
+        // 写堆失败：把「确实被摘掉」的旧键放回去，避免索引凭空少一条。
+        // 快照+非唯一索引的旧条目已被保留，放回会产生重复条目，只恢复急切摘除的。
+        RestoreDeletedIndexEntries(context_->GetCatalog(), *info,
+                                   old_vals, existing_rid, txn);
         heap->SetActiveTransaction(nullptr);
         throw CompilerException(ErrorStage::SEMANTIC,
             "ON DUPLICATE KEY UPDATE: heap write failed");

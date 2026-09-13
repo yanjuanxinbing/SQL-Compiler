@@ -54,6 +54,8 @@ void Page::ResetMemory() {
     // Phase B：新帧视为未参与 redo，page_lsn_ 必须归零，否则回收后的页面
     // 会被错误地认成「已经被某条 lsn 写过」。
     page_lsn_ = 0;
+    // Phase 4：访问温度清零——新帧重新积累温度。
+    access_count_ = 0;
 }
 
 }  // namespace sqlcompiler

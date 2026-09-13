@@ -77,8 +77,10 @@ public:
     TableHeap* GetTableHeap(const std::string& table_name);
 
     // MVCC 快照隔离：对全部表的堆做惰性真空回收（回收 begin_csn < 最老活动快照
-    // 的非 head 旧版本槽位）。以最老活动快照为界防误删仍可能被读取的版本。
-    void VacuumAll(int64_t oldest_active_csn);
+    // 的非 head 旧版本槽位），随后对该表全部二级索引做索引墓碑回收。以活动快照
+    // 列表为界防误删仍可能被读取的版本：堆真空用最老水位（= list.front()），索引
+    // 判定用完整升序列表（精确化判据 (ii) 需逐快照检查可见版本键）。
+    void VacuumAll(const std::vector<int64_t>& active_snapshots);
 
     // 提供内存态元数据视图，供语义分析/计划生成阶段复用（避免与编译器模块重复实现）
     SymbolTable& GetSymbolTable();

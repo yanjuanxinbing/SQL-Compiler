@@ -31,9 +31,24 @@ void IndexScanExecutor::Init() {
             txn->GetIsolationLevel() == IsolationLevel::kSnapshot &&
             mgr != nullptr && mgr->GetCommitTracker() != nullptr) {
             table_heap_->SetSnapshot(txn->GetSnapshotCsn(), mgr->GetCommitTracker());
+        } else {
+            // 非快照/自动提交读：复位共享堆上遗留的快照水位，避免陈旧读泄漏。
+            table_heap_->SetSnapshot(-1, nullptr);
         }
     }
     if (tree_ == nullptr) return;
+
+    // MVCC 精确可见性（t4）：解析被扫描索引的键列，供回表后做键重检（过滤
+    // 快照写者延迟保留的陈旧条目）。目录里找不到索引元数据时该过滤整体停用。
+    if (catalog != nullptr) {
+        for (const IndexInfo* idx : catalog->GetIndexesForTable(node_->table_name)) {
+            if (idx != nullptr && idx->index_name == node_->index_name) {
+                index_key_columns_ = idx->key_columns;
+                break;
+            }
+        }
+    }
+    seen_rids_.clear();
 
     if (node_->low_key.empty()) {
         cursor_ = tree_->Begin();
@@ -47,6 +62,21 @@ bool IndexScanExecutor::BeyondUpperBound(const IndexKey& key) const {
     const IndexKey high(node_->high_key);
     const int c = CompareKeyOnly(key, high);
     return node_->high_inclusive ? (c > 0) : (c >= 0);
+}
+
+// MVCC 精确可见性（t4）：键重检——回表得到的「本快照可见版本」必须真的落在
+// 扫描区间内。索引里延迟保留的陈旧条目（快照写者键改写/逻辑删除）指向的行，
+// 其可见版本键可能与条目键不同，据此过滤。
+bool IndexScanExecutor::InScanBounds(const IndexKey& key) const {
+    if (!node_->low_key.empty()) {
+        const int c = CompareKeyOnly(key, IndexKey(node_->low_key));
+        if (node_->low_inclusive ? (c < 0) : (c <= 0)) return false;
+    }
+    if (!node_->high_key.empty()) {
+        const int c = CompareKeyOnly(key, IndexKey(node_->high_key));
+        if (node_->high_inclusive ? (c > 0) : (c >= 0)) return false;
+    }
+    return true;
 }
 
 bool IndexScanExecutor::Next(Tuple* tuple) {
@@ -67,6 +97,25 @@ bool IndexScanExecutor::Next(Tuple* tuple) {
         // （删除路径会同步摘掉索引项），这里跳过而不是报错，避免一条陈旧索引项
         // 让整条查询失败。
         if (!table_heap_->GetTuple(rid, &t, column_types_)) continue;
+
+        // MVCC 精确可见性（t4）：按 RID 去重 + 可见版本键重检。快照写者的键改写/
+        // 逻辑删除在非唯一二级索引中延迟保留旧条目：同一稳定 RID 可能命中新旧多
+        // 条目（范围扫描会重复返回同一行），且旧条目的可见版本键与扫描区间不符。
+        if (!index_key_columns_.empty()) {
+            if (!seen_rids_.insert(rid).second) continue;  // 已返回过该逻辑行
+            IndexKey tuple_key;
+            bool key_ok = true;
+            for (const auto& col : index_key_columns_) {
+                auto it = column_index_map_.find(col);
+                if (it == column_index_map_.end() ||
+                    it->second >= t.ColumnCount()) {
+                    key_ok = false;
+                    break;
+                }
+                tuple_key.values.push_back(t.GetValue(it->second));
+            }
+            if (key_ok && !InScanBounds(tuple_key)) continue;
+        }
 
         if (node_->residual_predicate) {
             Value v = eval.Evaluate(node_->residual_predicate, t);

@@ -1,8 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
+#include "index/IndexKey.h"
 #include "storage/BufferPoolManager.h"
 #include "storage_engine/Tuple.h"
 
@@ -80,12 +83,50 @@ public:
     void SetSnapshot(int64_t csn, CommitTracker* tracker) {
         snapshot_csn_ = csn;
         commit_tracker_ = tracker;
+        // Phase 2：语句级内联真空预算重置（每个执行器语句经 SetSnapshot 进入）。
+        // 写路径（Update/Delete）随后每次写新版本时顺带回收本页已确认 < 低水位的
+        // 旧版本槽位，单语句至多回收 kInlineVacuumBudget 个，摊薄真空成本。
+        inline_vacuum_remaining_ = kInlineVacuumBudget;
     }
     int64_t GetSnapshotCsn() const { return snapshot_csn_; }
+
+    // Phase 3：版本索引缓存观测（命中/重建次数；测试与技术文档用）。
+    uint64_t GetVersionIndexHitCount() const { return version_index_hits_.load(); }
+    uint64_t GetVersionIndexBuildCount() const { return version_index_builds_.load(); }
+    // Phase 3（t3）：墓碑槽复用观测（InsertIntoPage/UpdateTuple 迁槽复用墓碑目录项
+    // 的次数；测试与技术文档用）。
+    uint64_t GetTombstoneReuseCount() const { return tombstone_reuse_count_.load(); }
 
     // 惰性真空回收：回收所有 begin_csn < oldest_active_csn 的「已被替代/删除」
     // 非 head 旧版本槽位（写墓碑）。以最老活动快照为界，避免误删仍可能被读取的版本。
     void Vacuum(int64_t oldest_active_csn);
+
+    // Phase 3（t4）索引真空的条目级判定结果。
+    enum class IndexVacuumDecision { kKeep, kRemove };
+
+    // Phase 3（t4）索引墓碑回收判定：索引项 (entry_key, rid) 是否可物理移除。
+    // 仅页读闩 + 槽头检查 + 版本键比较，不依赖本堆 SetSnapshot 状态（后台真空
+    // 不得扰动共享堆的会话快照）。kRemove 的两种情形均保证「所有活动快照都看不到
+    // 该条目指向的行版本」：
+    //   (i)  槽不可见：墓碑 / 越界 / 损坏，或 MVCC 头 end_xid!=0 && end_csn!=0 &&
+    //        end_csn <= active_snapshots.front()（与堆 Vacuum 同款判据，覆盖快照逻辑删除）；
+    //   (ii) 头稳定（end_xid==0）且已提交（begin_csn>0）、头键 != 条目键（旧键条目）：
+    //        - 头 begin_csn <= 最老活动快照 → 任何活动快照的可见版本都是该头，旧键
+    //          版本无人可见（覆盖「改写已对最老快照可见」的旧条目）；
+    //        - 头 begin_csn > 最老活动快照 → **精确化（Phase 3 收尾）**：不再保守
+    //          kKeep，而是沿版本链走到「最老快照的可见版本」，逐版本检查其可见区间
+    //          [v.begin_csn, succ.begin_csn) 是否含任一活动快照且该版本键 == 条目键；
+    //          有则 kKeep（仍有老快照需要该条目），无则 kRemove。
+    //    其余一律 kKeep（legacy 无头 / 未提交写者 / 头键==条目键的活跃条目 /
+    //    链损坏或超长：保守保留，最坏只是漏回收，不会误删仍可能被读到的条目）。
+    // active_snapshots：活动快照 CSN 升序列表（可含重复），由调用方从 CommitTracker
+    // 一次性拍取；空列表或最老水位 <= 0 时整体 kKeep（无快照可判定）。
+    // key_col_indices / column_types：版本反序列化后按索引列提取键与条目键比较。
+    IndexVacuumDecision DecideIndexEntry(
+        const RID& rid, const IndexKey& entry_key,
+        const std::vector<int64_t>& active_snapshots,
+        const std::vector<int32_t>& key_col_indices,
+        const std::vector<ValueType>& column_types) const;
 
     // 顺序扫描迭代器，供SeqScanExecutor使用
     class Iterator {
@@ -122,6 +163,66 @@ private:
     // 尝试在给定页内插入记录（写入槽位目录+记录内容），页空间不足返回false
     bool InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
                          const std::vector<ValueType>& column_types);
+
+    // Phase 2：内联轻量真空（O(1) 快照水位 + 无后台真空的写路径摊薄通道）。
+    // 写路径（Update/Delete）持页写锁时顺带回收本页「已确认 < 低水位」的旧版本
+    // 槽位（判据同 Vacuum：end_xid!=0 && end_csn!=0 && end_csn<=低水位），单语句
+    // 至多回收 kInlineVacuumBudget 个，把全表真空成本摊薄到日常写路径上；后台
+    // 真空保留为「低频兜底」。回收判据已证明与版本链遍历/FCW 检测安全共存。
+    // Phase 3（t3）增强：回收时做「链摘除」——把本页内引用被回收版本为 prev 的
+    // 后继版本，其 prev 改接到被回收版本自身的 prev（跳过回收版本），保证墓碑槽
+    // 不再被任何版本引用、可被 InsertIntoPage/UpdateTuple 安全复用。
+    static constexpr int kInlineVacuumBudget = 8;
+    // 在已持页写锁的页上回收旧版本槽位（page_id 供链摘除比对；
+    // budget 为本次最多回收数），返回实际回收数。
+    int InlineVacuumPage(page_id_t page_id, char* data, int32_t slot_count,
+                         int64_t low_water, int budget);
+    // 内联真空入口：取全局低水位并执行回收（无 tracker / 预算耗尽 / 无活动快照时
+    // no-op），并扣减语句级预算。
+    void RunInlineVacuum(page_id_t page_id, char* data, int32_t slot_count);
+    // 语句级内联真空剩余预算（由 SetSnapshot 重置）。
+    int32_t inline_vacuum_remaining_ = 0;
+
+    // ---- Phase 3：版本链 O(1) 查询（内存版本索引缓存）----
+    // 快照点查加速：缓存 rid → 按 begin_csn 升序的「稳定版本」数组。稳定 = 写者已
+    // 提交（begin_csn>0）且端已回填（end_xid==0 或 end_csn>0）。GetTuple 用二分
+    // 定位「最新 begin_csn<=S」的候选版本，端可见性 CSN 直判（免逐版本
+    // LookupCommitted 锁与跨页读取）。
+    // 自愈：head 槽头部作为缓存标记——任何写版本/删除/提交回填都改动 head 槽头，
+    // 标记不匹配即沿链重走重建；真空墓碑只落在「先被替代（写路径已触发重建）」的
+    // 版本上（head 被删时槽位本身变墓碑，GetTuple 在进入快照逻辑前即返回 false），
+    // 候选槽读校验再兜底一层。
+    struct VersionIndexEntry {
+        int64_t begin_xid = 0;              // 版本写者（供 RecordSnapshotRead 基）
+        int64_t begin_csn = 0;              // >0：写者已提交的 CSN
+        int64_t end_csn = 0;                // 0 = 当前仍可见；>0 = 失效水位
+        page_id_t page_id = INVALID_PAGE_ID;  // 版本所在页（可能跨页）
+        int32_t slot_num = -1;
+    };
+    struct VersionIndex {
+        std::vector<VersionIndexEntry> versions;  // 按 begin_csn 升序（旧→新）
+        // 构建时的 head 槽头部快照（命中校验用）。
+        int64_t head_begin_xid = 0;
+        int64_t head_begin_csn = 0;
+        int64_t head_end_xid = 0;
+        int64_t head_end_csn = 0;
+        int32_t head_prev_pid = INVALID_PAGE_ID;
+        int32_t head_prev_slot = -1;
+    };
+    // rid -> 版本索引（key = page_id<<32 | slot_num 的 64 位编码，免自定义 hash）。
+    // 独立于 write_mutex_：仅快照读线程触碰；命中/重建都是短临界区，且不在持该
+    // 锁期间取页锁（锁序：先取页读锁读 head/候选，再进缓存锁；反之不可）。
+    std::unordered_map<uint64_t, VersionIndex> version_index_;
+    mutable std::mutex version_index_mutex_;
+    // 观测：缓存命中/重建次数（测试与技术文档用；仅最佳努力计数）。
+    mutable std::atomic<uint64_t> version_index_hits_{0};
+    mutable std::atomic<uint64_t> version_index_builds_{0};
+    // Phase 3（t3）：墓碑槽复用计数（InsertIntoPage/UpdateTuple 复用墓碑目录项）。
+    mutable std::atomic<uint64_t> tombstone_reuse_count_{0};
+    // rid 的 64 位缓存键编码。
+    static uint64_t VersionIndexKey(const RID& r) {
+        return ((uint64_t)(uint32_t)r.page_id << 32) | (uint32_t)r.slot_num;
+    }
 
     // 定位current之后下一个存在有效（未删除）记录的RID，写入next，
     // 供Iterator::HasNext()/Next()使用；到达堆文件末尾返回false

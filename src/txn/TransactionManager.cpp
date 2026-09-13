@@ -122,14 +122,16 @@ void TransactionManager::Commit() {
         Rollback();
         return;
     }
-    // Phase B：写 COMMIT 记录 + Flush WAL + 落盘 dirty pages。
+    // Phase B：写 COMMIT 记录 + 组提交刷 WAL + 落盘 dirty pages。
+    // Phase 4：Flush() 改为 GroupCommit(commit_lsn)——并发提交共享一次 fsync，
+    // 批内跟随者只等待 durable 覆盖自己的 COMMIT LSN，吞吐随并发度提升。
     if (log_manager_ != nullptr) {
         LogRecord rec;
         rec.type_ = LogRecordType::COMMIT;
         rec.txn_id_ = txn->GetTxnId();
-        log_manager_->AppendRecord(std::move(rec));
+        const lsn_t commit_lsn = log_manager_->AppendRecord(std::move(rec));
         try {
-            log_manager_->Flush();
+            log_manager_->GroupCommit(commit_lsn);
         } catch (...) {
             // 测试场景里 WAL 不可写时吞掉，保持原有行为。
         }
@@ -220,9 +222,6 @@ void TransactionManager::Rollback() {
     // 立即 _Exit(1)，模拟崩溃在 rollback 中途发生。
     for (size_t i = total; i-- > 0; ) {
         const auto& rec = undo_log[i];
-        std::cerr << "[DBG-rb] txn=" << txn->GetTxnId()
-                  << " undo page=" << rec.page_id
-                  << " bi_size=" << rec.before_image.size() << std::endl;
         // 1) 把 page 恢复到 before-image。
         if (buffer_pool_manager_ != nullptr) {
             Page* page = buffer_pool_manager_->GetPage(rec.page_id);

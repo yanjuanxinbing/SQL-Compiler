@@ -68,6 +68,7 @@ Page* BufferPoolManager::GetPage(page_id_t page_id) {
         int frame_id = it->second;
         pages_[frame_id].IncPinCount();
         replacer_->Pin(frame_id);
+        pages_[frame_id].RecordAccess();  // Phase 4：命中即升温
         ++stats_.hit_count;
         return &pages_[frame_id];
     }
@@ -95,6 +96,7 @@ Page* BufferPoolManager::GetPage(page_id_t page_id) {
     // 重新加载磁盘页后该页的 page_lsn 不可知（磁盘格式不带 LSN），归零。
     // 后续 redo 会用「page.page_lsn < record.lsn」判定是否重放，安全。
     pages_[frame_id].SetPageLsn(0);
+    pages_[frame_id].RecordAccess();  // Phase 4：装入亦计一次访问（温度）
     page_table_[page_id] = frame_id;
     replacer_->Pin(frame_id);
     ++stats_.miss_count;
@@ -125,6 +127,7 @@ Page* BufferPoolManager::NewPage(page_id_t* page_id) {
     pages_[frame_id].SetDirty(false);
     // ResetMemory 已把 page_lsn_ 置 0；显式再次提醒意图。
     pages_[frame_id].SetPageLsn(0);
+    pages_[frame_id].RecordAccess();  // Phase 4：新页首次取用计一次访问（温度）
     page_table_[new_pid] = frame_id;
     replacer_->Pin(frame_id);
     if (page_id) *page_id = new_pid;
@@ -171,7 +174,7 @@ void BufferPoolManager::FlushPageUnlocked(page_id_t page_id) {
         }
     }
     // 统计脏页写回：仅当该页写回前确为脏页才累加。
-    if (pages_[frame_id].IsDirty()) ++stats_.writeback_count;
+    if (pages_[frame_id].IsDirty()) RecordWritebackStat(pages_[frame_id]);
     // E4：写盘前取该帧页级**读锁**，防止并发持写锁修改页数据的线程把正在落盘的内容
     // 改掉（写盘撕裂）。读锁允许多个写回线程共享并发，但会与独占写者互斥。
     std::shared_lock<std::shared_mutex> data_lock(pages_[frame_id].GetLatch());
@@ -207,12 +210,23 @@ void BufferPoolManager::FlushAllDirtyUnlocked() {
     }
     for (const auto& kv : page_table_) {
         int frame_id = kv.second;
-        if (!pages_[frame_id].IsDirty()) continue;
-        ++stats_.writeback_count;  // 全量刷脏：每个真脏页记一次写回
+        Page& page = pages_[frame_id];
+        if (!page.IsDirty()) continue;
+        // Phase 4（创新特性 F）：温度感知刷盘——冷热分级。
+        // 开启温度刷盘时，本次全量刷脏只写回「冷脏页」（访问数 < 热阈值）；
+        // 热脏页延后留在池内：NO-FORCE + WAL-before-data 保证其即便不落盘，
+        // 崩溃后也能由 WAL redo 恢复，换来的是提交路径 I/O 削减与热页命中率保留。
+        // 关闭时（默认）行为与旧版一致：全部写回，且全部记入冷档统计。
+        const bool hot = temp_flush_enabled_ &&
+                         page.GetAccessCount() >= hot_access_threshold_;
+        if (hot) {
+            continue;  // 热脏页本次不写回
+        }
+        RecordWritebackStat(page);  // 写回记账（cold 档）
         // E4：写盘加帧读锁防撕裂（见 FlushPageUnlocked 说明）。
-        std::shared_lock<std::shared_mutex> data_lock(pages_[frame_id].GetLatch());
-        disk_manager_->WritePage(kv.first, pages_[frame_id].GetData());
-        pages_[frame_id].SetDirty(false);
+        std::shared_lock<std::shared_mutex> data_lock(page.GetLatch());
+        disk_manager_->WritePage(kv.first, page.GetData());
+        page.SetDirty(false);
     }
 }
 
@@ -241,7 +255,7 @@ bool BufferPoolManager::DeletePage(page_id_t page_id) {
                 log_manager_->Flush();
             }
         }
-        ++stats_.writeback_count;  // 删除退页：脏页先写回再回收
+        RecordWritebackStat(pages_[frame_id]);  // 删除退页：脏页先写回再回收
         // E4：删除退页写回加帧读锁防撕裂（见 FlushPageUnlocked 说明）。
         std::shared_lock<std::shared_mutex> data_lock(pages_[frame_id].GetLatch());
         disk_manager_->WritePage(page_id, pages_[frame_id].GetData());
@@ -268,6 +282,21 @@ std::vector<std::pair<page_id_t, uint64_t>> BufferPoolManager::CollectDirtyPages
 BufferPoolStats BufferPoolManager::GetStats() const {
     std::lock_guard<std::mutex> lock(latch_);
     return stats_;  // 返回副本：调用方读的是快照，无需再持锁
+}
+
+// Phase 4（创新特性 F）：给一次写回记账——writeback_count 恒增，并按访问温度
+// 分档：开启温度刷盘且页访问数 >= 热阈值 → 热档（writeback_hot_count），否则
+// 冷档（writeback_cold_count）。关闭温度刷盘时全部归入冷档（与旧版计数一致）。
+// 调用前提：已持有 latch_（本方法只写 stats_ 且不碰其他共享状态）。
+void BufferPoolManager::RecordWritebackStat(const Page& page) {
+    ++stats_.writeback_count;
+    const bool hot = temp_flush_enabled_ &&
+                     page.GetAccessCount() >= hot_access_threshold_;
+    if (hot) {
+        ++stats_.writeback_hot_count;
+    } else {
+        ++stats_.writeback_cold_count;
+    }
 }
 
 std::vector<ReplacementLogEntry> BufferPoolManager::GetReplacementLog() const {
@@ -369,7 +398,7 @@ bool BufferPoolManager::FindFreeFrame(page_id_t loaded_page_id, int* frame_id) {
                     log_manager_->Flush();
                 }
             }
-            ++stats_.writeback_count;  // 淘汰换出脏页
+            RecordWritebackStat(pages_[victim]);  // 淘汰换出脏页
             // E4：淘汰换出写回加帧读锁防撕裂（见 FlushPageUnlocked 说明）。
             std::shared_lock<std::shared_mutex> data_lock(pages_[victim].GetLatch());
             disk_manager_->WritePage(evicted_pid, pages_[victim].GetData());
