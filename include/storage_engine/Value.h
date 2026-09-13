@@ -57,8 +57,18 @@ public:
     // 如"4字节长度前缀 + 内容"）。column_type 用于 NULL 值。
     size_t SerializedSize(ValueType column_type) const;
 
-    // 比较两个同类型Value的大小，返回负数/0/正数表示小于/等于/大于
+    // 比较两个Value的大小，返回负数/0/正数表示小于/等于/大于。
+    // 同类型直接比较；INT/FLOAT 之间按数值提升比较；VARCHAR ↔ INT/FLOAT
+    // 时尝试把 VARCHAR 解析为 double 再比较。当两侧类型无法相互转换
+    // （如 VARCHAR "IT" 与 INT 10）时，Compare 仍然返回一个非零值以避免
+    // 与「相等」语义混淆——但调用方应优先使用 CanCompare 检测「不可比」，
+    // 并按 SQL 三值逻辑把不可比的结果处理为 NULL（用于 WHERE/ON 谓词）。
     static int Compare(const Value& a, const Value& b);
+
+    // 是否可比较：当两侧类型一致、都为数值、或 VARCHAR 能解析为数值时返回 true。
+    // 用于比较谓词（=/<>/</<=/>/>=）在运行期拒绝跨类型不可比场景并退化为 NULL，
+    // 避免把 INNER JOIN ON 默默退化为 CROSS JOIN。
+    static bool CanCompare(const Value& a, const Value& b);
 
     std::string ToString() const;
 

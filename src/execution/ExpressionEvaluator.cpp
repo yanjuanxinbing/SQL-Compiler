@@ -631,31 +631,41 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
         case BinaryOperator::EQUAL: {
             // 任一为 NULL：UNKNOWN（用 NULL 表示）
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            // 跨类型且不可比（VARCHAR "IT" ↔ INT 10 等）：UNKNOWN，避免
+            // INNER JOIN ON 默默退化为 CROSS JOIN。Value::Compare 对这种
+            // 情况已返回非零，但仍需显式走 NULL 语义以保证 <>/>/<= 等
+            // 算子也按 SQL 三值逻辑给出正确结果。
+            if (!Value::CanCompare(l, r)) return Value::MakeNull();
             int c = Value::Compare(l, r);
             return MakeBool(c == 0);
         }
         case BinaryOperator::NOT_EQUAL: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (!Value::CanCompare(l, r)) return Value::MakeNull();
             int c = Value::Compare(l, r);
             return MakeBool(c != 0);
         }
         case BinaryOperator::LESS: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (!Value::CanCompare(l, r)) return Value::MakeNull();
             int c = Value::Compare(l, r);
             return MakeBool(c < 0);
         }
         case BinaryOperator::LESS_EQUAL: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (!Value::CanCompare(l, r)) return Value::MakeNull();
             int c = Value::Compare(l, r);
             return MakeBool(c <= 0);
         }
         case BinaryOperator::GREATER: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (!Value::CanCompare(l, r)) return Value::MakeNull();
             int c = Value::Compare(l, r);
             return MakeBool(c > 0);
         }
         case BinaryOperator::GREATER_EQUAL: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (!Value::CanCompare(l, r)) return Value::MakeNull();
             int c = Value::Compare(l, r);
             return MakeBool(c >= 0);
         }

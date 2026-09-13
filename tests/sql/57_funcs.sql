@@ -85,39 +85,17 @@ SELECT RANDOM();
 CREATE TABLE w (v INT, w_ INT);
 INSERT INTO w VALUES (1,10), (2,20), (3,30), (4,40), (5,50);
 
--- RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING
---   v=1: {1, 2} SUM = 30
---   v=2: {1, 2, 3} SUM = 60
---   v=3: {2, 3, 4} SUM = 90
---   v=4: {3, 4, 5} SUM = 120
---   v=5: {4, 5} SUM = 90
 SELECT v, SUM(w_) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM w ORDER BY v;
 
 -- ===========================================================
 -- 8) IGNORE NULLS —— 窗口函数跳过 NULL
 -- ===========================================================
--- 语义：FIRST_VALUE(x IGNORE NULLS) OVER (...) 在帧内从 frame_start
--- 顺序扫到 frame_end，找首个非 NULL 的 x 返回。默认 frame =
--- RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW，因此：
---   v=1: frame={1} w_=NULL → 无非 NULL → NULL
---   v=2: frame={1,2} → 首个非 NULL = 20
---   v=3: frame={1,2,3} → 首个非 NULL = 20
---   v=4: frame={1,2,3,4} → 首个非 NULL = 20
---   v=5: frame={1,2,3,4,5} → 首个非 NULL = 20
 CREATE TABLE n (v INT, w_ INT);
 INSERT INTO n VALUES (1, NULL), (2, 20), (3, NULL), (4, 40), (5, 50);
 SELECT v, FIRST_VALUE(w_ IGNORE NULLS) OVER (ORDER BY v) FROM n ORDER BY v;
 
--- 同样数据，把 frame 拉到整个分区（ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING），
--- 首个非 NULL 在整张表里都恒为 20：
 SELECT v, FIRST_VALUE(w_ IGNORE NULLS) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM n ORDER BY v;
 
--- LAG IGNORE NULLS：沿 LAG 方向跳过 NULL。
--- v=1: lag 1 → 无前驱 → NULL
--- v=2: lag 1 → v=1 w_=NULL → 跳过，无更多 → NULL
--- v=3: lag 1 → v=2 w_=20 → 20
--- v=4: lag 1 → v=3 w_=NULL → 跳过 → v=2 w_=20 → 20
--- v=5: lag 1 → v=4 w_=40 → 40
 SELECT v, LAG(w_ IGNORE NULLS) OVER (ORDER BY v) FROM n ORDER BY v;
 
 exit;

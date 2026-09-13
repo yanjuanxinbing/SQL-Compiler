@@ -291,6 +291,40 @@ PlanNodePtr Optimizer::PushDownFilterOverJoin(PlanNodePtr plan) {
         }
     }
 
+    // 外连接下的谓词下推约束（保证 LEFT/RIGHT/FULL OUTER 语义不被破坏）：
+    //   - LEFT JOIN: 右侧（nullable）的谓词不能下推，否则会让 LEFT JOIN
+    //     的 NULL-补行被过滤掉，破坏「保留左侧全部行」的语义。例如
+    //     `LEFT JOIN ... WHERE right.id IS NULL` 必须在外层 Filter 看到
+    //     补 NULL 之后的行才能筛出 unmatched 的左侧行；提前下推会让 Filter
+    //     只看到 right 表的原始行（都不为 NULL），于是把 LEFT JOIN 错误地
+    //     退化为 INNER JOIN 行为。
+    //   - RIGHT JOIN: 对称地，左侧（nullable）的谓词不能下推。
+    //   - FULL OUTER JOIN: 两侧都可能产生 NULL-补行，任意单侧谓词都不能
+    //     安全地下推。
+    // INNER / CROSS JOIN 没有 nullable 侧，单侧谓词全部可以下推（保持原
+    // 行为）。注意：「跨两侧」的合取项已经在上面的循环里全部归到 residual，
+    // 所以这里只需要把"只能单侧"的合取项按 join 类型回填。
+    switch (join->join_type) {
+        case JoinType::LEFT:
+            for (auto& c : right_pushable) residual.push_back(c);
+            right_pushable.clear();
+            break;
+        case JoinType::RIGHT:
+            for (auto& c : left_pushable) residual.push_back(c);
+            left_pushable.clear();
+            break;
+        case JoinType::FULL_OUTER:
+            for (auto& c : left_pushable) residual.push_back(c);
+            left_pushable.clear();
+            for (auto& c : right_pushable) residual.push_back(c);
+            right_pushable.clear();
+            break;
+        case JoinType::INNER:
+        case JoinType::CROSS:
+        default:
+            break;
+    }
+
     bool changed = false;
     if (!left_pushable.empty()) {
         auto new_left = std::make_shared<FilterNode>(MakeConjunction(left_pushable));
@@ -1366,6 +1400,13 @@ ExprPtr FoldExpr(const ExprPtr& e) {
         }
         case NodeType::LIKE_EXPR: {
             const auto* l = static_cast<const LikeExprNode*>(e.get());
+            // REGEXP / RLIKE / SIMILAR TO 使用 ERE/正则语义，需要 std::regex。
+            // 本文件没有等价实现，避免重复维护：直接交给运行期 EvaluateLike。
+            // 性能上仅失去"两边都是字面量"的常量折叠，量级影响极小。
+            if (l->kind != LikeExprNode::Kind::LIKE &&
+                l->kind != LikeExprNode::Kind::ILIKE) {
+                return e;
+            }
             auto op = FoldExpr(l->operand);
             auto pat = FoldExpr(l->pattern);
             if (op && pat && op->GetType() == NodeType::LITERAL_EXPR &&

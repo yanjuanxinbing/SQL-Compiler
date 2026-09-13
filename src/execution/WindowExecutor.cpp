@@ -355,8 +355,12 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
     size_t n = partition.ordered_indices.size();
     ExpressionEvaluator eval(column_index_map_, context_, nullptr);
 
-    // 计算 frame（仅聚合 OVER 需要）
-    bool needs_frame = IsAggregateFunc(name);
+    // 计算 frame。聚合 OVER、FIRST_VALUE / LAST_VALUE / NTH_VALUE 都依赖 frame 边界；
+    // 排名函数（ROW_NUMBER/RANK/DENSE_RANK/NTILE/PERCENT_RANK/CUME_DIST）与
+    // LAG/LEAD 不依赖 frame（LAG/LEAD 沿分区行序列直接偏移，与 frame 无关）。
+    bool needs_frame = IsAggregateFunc(name) ||
+                       name == "FIRST_VALUE" || name == "LAST_VALUE" ||
+                       name == "NTH_VALUE";
     size_t frame_start = 0, frame_end = n - 1;
     if (needs_frame) {
         ComputeFrame(spec, partition, pos, !spec.order_by.empty(),

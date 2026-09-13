@@ -294,6 +294,27 @@ size_t Value::SerializedSize(ValueType column_type) const {
     return 0;
 }
 
+namespace {
+
+// 跨类型 VARCHAR ↔ INT/FLOAT 时，把 VARCHAR 按十进制文本解析为 double。
+// 用于 DECIMAL/NUMERIC 等按文本持久化的数值列与数值字面量比较。
+// 失败时返回 false（空串 / 非数字字符 / 浮点溢出均视为不可解析）。
+bool ParseVarcharAsDouble(const Value& v, double* out) {
+    try {
+        size_t pos = 0;
+        std::string s = v.AsVarchar();
+        while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+        if (pos >= s.size()) return false;
+        double d = std::stod(s, &pos);
+        *out = d;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+}  // namespace
+
 int Value::Compare(const Value& a, const Value& b) {
     if (a.IsNull() || b.IsNull()) return 0;
     // 跨类型数值比较：把 INT 提升为 FLOAT
@@ -308,31 +329,24 @@ int Value::Compare(const Value& a, const Value& b) {
         }
         // 52_data_types: VARCHAR 与数值类型（INT/FLOAT）的跨类型比较。
         // DECIMAL 等按文本持久化的数值列与数值字面量比较时，尝试把 VARCHAR
-        // 解析为 double 再比较；解析失败（非数字字符串）则视为不相等。两次
-        // 跨类型方向都要处理，避免 DECIMAL 出现在比较两侧时的非对称。
-        auto parse_varchar_as_double = [](const Value& v, double* out) -> bool {
-            try {
-                size_t pos = 0;
-                std::string s = v.AsVarchar();
-                while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
-                if (pos >= s.size()) return false;
-                double d = std::stod(s, &pos);
-                *out = d;
-                return true;
-            } catch (...) {
-                return false;
-            }
-        };
+        // 解析为 double 再比较；解析失败（非数字字符串）则视为不相等（返回非零，
+        // 避免被误判为"相等"）。两次跨类型方向都要处理，避免 DECIMAL 出现在
+        // 比较两侧时的非对称。
         if (a.type_ == ValueType::VARCHAR && (b.type_ == ValueType::FLOAT || b.type_ == ValueType::INTEGER)) {
             double av = 0.0, bv = (b.type_ == ValueType::INTEGER) ? static_cast<double>(b.AsInt()) : b.AsFloat();
-            if (!parse_varchar_as_double(a, &av)) return 0;
+            if (!ParseVarcharAsDouble(a, &av)) {
+                // 不可解析：返回非零，使调用方识别为"不相等"。
+                return 1;
+            }
             if (av < bv) return -1;
             if (av > bv) return 1;
             return 0;
         }
         if (b.type_ == ValueType::VARCHAR && (a.type_ == ValueType::FLOAT || a.type_ == ValueType::INTEGER)) {
             double bv = 0.0, av = (a.type_ == ValueType::INTEGER) ? static_cast<double>(a.AsInt()) : a.AsFloat();
-            if (!parse_varchar_as_double(b, &bv)) return 0;
+            if (!ParseVarcharAsDouble(b, &bv)) {
+                return 1;
+            }
             if (av < bv) return -1;
             if (av > bv) return 1;
             return 0;
@@ -356,6 +370,29 @@ int Value::Compare(const Value& a, const Value& b) {
             return 0;
     }
     return 0;
+}
+
+bool Value::CanCompare(const Value& a, const Value& b) {
+    // NULL 参与比较（结果为 NULL），不算"不可比"。
+    if (a.IsNull() || b.IsNull()) return true;
+    // 同类型可直接比较。
+    if (a.type_ == b.type_) return true;
+    // 两端都为数值（INT / FLOAT）→ 数值提升可比。
+    auto is_numeric = [](ValueType t) {
+        return t == ValueType::INTEGER || t == ValueType::FLOAT;
+    };
+    if (is_numeric(a.type_) && is_numeric(b.type_)) return true;
+    // VARCHAR ↔ 数值：要求 VARCHAR 能解析为 double。
+    double tmp = 0.0;
+    if (a.type_ == ValueType::VARCHAR && is_numeric(b.type_)) {
+        return ParseVarcharAsDouble(a, &tmp);
+    }
+    if (b.type_ == ValueType::VARCHAR && is_numeric(a.type_)) {
+        return ParseVarcharAsDouble(b, &tmp);
+    }
+    // 其他跨类型组合（如 VARCHAR ↔ VARCHAR 已在同类型分支处理，
+    // NULL ↔ 任意已在 NULL 分支处理）一律视为不可比。
+    return false;
 }
 
 std::string Value::ToString() const {

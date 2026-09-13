@@ -26,6 +26,6 @@ CREATE TABLE dept(id INT, name VARCHAR);
 INSERT INTO dept VALUES (10, 'IT'), (20, 'HR');
 SELECT e.name AS emp, d.name AS department
 FROM emp e
-INNER JOIN dept d ON e.dept_id = d.id;
+INNER JOIN dept d ON e.dept = d.id;
 
 exit;

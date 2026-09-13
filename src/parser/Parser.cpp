@@ -150,6 +150,15 @@ StatementPtr Parser::ParseStatement() {
                         so->limit = std::atoi(second.lexeme.c_str());
                     } else {
                         so->limit = first_val;
+                        // 兼容 MySQL/PostgreSQL 风格：`LIMIT n OFFSET m`（见上方注释）。
+                        if (Check(TokenType::KEYWORD_OFFSET)) {
+                            Advance();
+                            Token off = Expect(TokenType::INTEGER_LITERAL,
+                                               "expected integer after OFFSET");
+                            so->limit_offset = std::atoi(off.lexeme.c_str());
+                            Match(TokenType::KEYWORD_ROW);
+                            Match(TokenType::KEYWORD_ROWS);
+                        }
                     }
                 }
             }
@@ -422,6 +431,19 @@ StatementPtr Parser::ParseSelectStatement(bool consume_trailers) {
                 stmt->limit = std::atoi(second.lexeme.c_str());
             } else {
                 stmt->limit = first_val;
+                // 兼容 MySQL/PostgreSQL 风格：`LIMIT n OFFSET m`。
+                // 在标准 OFFSET-FETCH 形式中 OFFSET 已经先行消费；此处
+                // 处理 LIMIT 出现在 OFFSET 之前的情形，否则 OFFSET
+                // 关键字会被残留给后续 token 引发静默错误。
+                if (Check(TokenType::KEYWORD_OFFSET)) {
+                    Advance();  // OFFSET
+                    Token off = Expect(TokenType::INTEGER_LITERAL,
+                                       "expected integer after OFFSET");
+                    stmt->limit_offset = std::atoi(off.lexeme.c_str());
+                    stmt->standard_offset = stmt->limit_offset;
+                    Match(TokenType::KEYWORD_ROW);
+                    Match(TokenType::KEYWORD_ROWS);  // ROW | ROWS 可选
+                }
             }
         }
         // 55_query: FETCH {FIRST|NEXT} n [ROW|ROWS] [ONLY|WITH TIES] —— SQL:2008 标准
@@ -514,6 +536,15 @@ StatementPtr Parser::ParseSelectStatementWithSetOps() {
                     so->limit = std::atoi(second.lexeme.c_str());
                 } else {
                     so->limit = first_val;
+                    // 兼容 MySQL/PostgreSQL 风格：`LIMIT n OFFSET m`（见上方注释）。
+                    if (Check(TokenType::KEYWORD_OFFSET)) {
+                        Advance();
+                        Token off = Expect(TokenType::INTEGER_LITERAL,
+                                           "expected integer after OFFSET");
+                        so->limit_offset = std::atoi(off.lexeme.c_str());
+                        Match(TokenType::KEYWORD_ROW);
+                        Match(TokenType::KEYWORD_ROWS);
+                    }
                 }
             }
             // 55_query: 在 set-op 链尾部接受 FETCH FIRST/NEXT n。
