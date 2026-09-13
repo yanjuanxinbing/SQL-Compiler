@@ -1969,6 +1969,22 @@ ExprPtr Parser::ParseComparisonExpr() {
     ExprPtr left = ParseAdditiveExpr();
     const Token& cur = CurrentToken();
 
+    // NOT BETWEEN x AND y —— 与 NOT IN 同形的特殊路径。
+    // 必须在 ParseNotExpr 的 NOT 包裹之前处理，否则会出现 `a NOT BETWEEN x AND y`
+    // 被错误解析为 `NOT(a)`：ParseNotExpr 看到 NOT 包裹整个 `a`，BETWEEN 子句被
+    // 静默丢弃；结果是 WHERE 永远为真。这是 BUG-2。
+    if (Check(TokenType::KEYWORD_NOT) && PeekToken(1).type == TokenType::KEYWORD_BETWEEN) {
+        Advance();  // consume NOT
+        Advance();  // consume BETWEEN
+        ExprPtr low = ParseAdditiveExpr();
+        Expect(TokenType::KEYWORD_AND, "expected AND after NOT BETWEEN");
+        ExprPtr high = ParseAdditiveExpr();
+        auto range = std::make_shared<FunctionCallExpr>("__BETWEEN_RANGE__",
+            std::vector<ExprPtr>{low, high});
+        auto between = std::make_shared<BinaryExpr>(BinaryOperator::BETWEEN, left, range);
+        return std::make_shared<UnaryExpr>(UnaryOperator::NOT, between);
+    }
+
     // NOT IN (SELECT ...) —— 形如 col NOT IN (SELECT ...)
     if (Check(TokenType::KEYWORD_NOT) && PeekToken(1).type == TokenType::KEYWORD_IN) {
         Advance(); // consume NOT

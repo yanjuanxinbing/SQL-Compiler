@@ -11,7 +11,6 @@ namespace sqlcompiler {
 
 namespace {
 
-const int32_t kNullMarker = -1;
 const int32_t kIntBytes = 4;
 const int32_t kFloatBytes = 8;
 
@@ -211,15 +210,28 @@ size_t Value::SerializeTo(char* buf, ValueType column_type) const {
             return static_cast<size_t>(kVarcharLenBytes + len);
         }
         case ValueType::NULL_TYPE: {
-            // Write a NULL marker whose width matches the column's declared
-            // type so subsequent columns are read at the correct offset.
-            WriteInt32(buf, kNullMarker);
-            if (column_type == ValueType::FLOAT) {
-                // Pad with 4 zero bytes so total width is kFloatBytes (8).
-                std::memset(buf + kIntBytes, 0, kIntBytes);
-                return static_cast<size_t>(kFloatBytes);
+            // BUG-5 (round 2): 不再用 in-band marker 表示 NULL。
+            // 旧实现写一个特殊 sentinel（如 -1 / INT_MIN）让 reader 检测，但
+            // sentinel 总会与某个合法 INT / FLOAT 值碰撞（最严重的就是 -1 与
+            // 自身冲突）。新做法：slot 写「默认值」（int=0 / float=0.0 / varchar 长度=0），
+            // NULL 信息由 Tuple 级别的 NULL bitmap 承载，reader 按位查 bitmap
+            // 强制把该列设为 NULL_TYPE。
+            //
+            // 这样 -2147483648 / -1 / 任何罕见 int / 任何 double 都能正常存储；
+            // 同时也彻底消除了 FLOAT slot「前 4 字节模式巧合等于 marker」的
+            // ~1/2^32 碰撞。
+            switch (column_type) {
+                case ValueType::INTEGER:
+                    WriteInt32(buf, 0);
+                    return kIntBytes;
+                case ValueType::FLOAT:
+                    WriteDouble(buf, 0.0);
+                    return static_cast<size_t>(kFloatBytes);
+                case ValueType::VARCHAR:
+                    WriteInt32(buf, 0);
+                    return kIntBytes;
             }
-            return kIntBytes;
+            return 0;
         }
     }
     return 0;
@@ -230,28 +242,14 @@ size_t Value::DeserializeFrom(const char* buf, ValueType type, Value* out) {
     out->type_ = type;
     switch (type) {
         case ValueType::INTEGER: {
-            int32_t v = ReadInt32(buf);
-            if (v == kNullMarker) {
-                // Magic marker: stored as -1 means NULL
-                out->type_ = ValueType::NULL_TYPE;
-                out->int_val_ = 0;
-            } else {
-                out->int_val_ = v;
-            }
+            // BUG-5 (round 2): 不再检测 in-band NULL marker。NULL 由 Tuple
+            // 级 bitmap 标识，Deserialize 只负责把字节读出来当作合法 INT 值。
+            out->int_val_ = ReadInt32(buf);
             out->float_val_ = 0.0;
             out->str_val_.clear();
             return kIntBytes;
         }
         case ValueType::FLOAT: {
-            // Detect NULL marker (-1) at the start of an 8-byte slot.
-            int32_t marker = ReadInt32(buf);
-            if (marker == kNullMarker) {
-                out->type_ = ValueType::NULL_TYPE;
-                out->int_val_ = 0;
-                out->float_val_ = 0.0;
-                out->str_val_.clear();
-                return static_cast<size_t>(kFloatBytes);
-            }
             out->float_val_ = ReadDouble(buf);
             out->int_val_ = 0;
             out->str_val_.clear();
@@ -259,13 +257,9 @@ size_t Value::DeserializeFrom(const char* buf, ValueType type, Value* out) {
         }
         case ValueType::VARCHAR: {
             int32_t len = ReadInt32(buf);
-            if (len < 0) {
-                out->type_ = ValueType::NULL_TYPE;
-                out->int_val_ = 0;
-                out->float_val_ = 0.0;
-                out->str_val_.clear();
-                return kIntBytes;
-            }
+            // 防御性：负长度（旧格式下是 NULL marker）。新格式下不会发生，
+            // 但读老 DB 时仍可能撞见；把负长度的内容当作 0 长度处理。
+            if (len < 0) len = 0;
             out->str_val_.assign(buf + kVarcharLenBytes, static_cast<size_t>(len));
             out->int_val_ = 0;
             out->float_val_ = 0.0;

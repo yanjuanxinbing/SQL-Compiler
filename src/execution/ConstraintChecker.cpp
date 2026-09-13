@@ -116,7 +116,10 @@ void ValidateRowConstraints(SystemCatalog* catalog, const TableInfo& table_info,
         std::string up;
         up.reserve(dt.size());
         for (char c : dt) up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-        return up == "VARCHAR" || up == "CHAR" || up == "STRING";
+        // BUG-3: TEXT(n) 与 VARCHAR(n)/CHAR(n) 同属「按字符计上限」的类型。
+        // 原实现只列举 VARCHAR/CHAR/STRING，导致 `CREATE TABLE t(s TEXT(5))`
+        // 后插入 6 字符串被静默接受。补充 TEXT。
+        return up == "VARCHAR" || up == "CHAR" || up == "STRING" || up == "TEXT";
     };
     for (size_t i = 0; i < cols.size(); ++i) {
         if (cols[i].char_length <= 0) continue;
@@ -250,9 +253,16 @@ void ValidateRowConstraints(SystemCatalog* catalog, const TableInfo& table_info,
     groups = std::move(unindexed_groups);
     // 52_data_types: 当表无主键（pk_groups_present=false）时跳过 PK 全表扫描，
     // 让后面的 UNIQUE 兜底段继续执行。
-    if (pk_groups_present && (groups.empty() || heap == nullptr)) return;
-
-    if (pk_groups_present) {
+    //
+    // 注意：原先这里写的是
+    //   if (pk_groups_present && (groups.empty() || heap == nullptr)) return;
+    // 这会把「PK 已经走完索引点查、unindexed_groups 因此为空」的情况一并截断
+    // 在函数末尾，导致后面的 UNIQUE 兜底扫描被静默跳过。这是 BUG-1：
+    //   CREATE TABLE t(id INT PRIMARY KEY, email TEXT UNIQUE)
+    //   INSERT 一行 email='a@x.com' 再插同样 email 时，UNIQUE 不报错。
+    // 改为「不 return，让 PK 全表扫描块自己根据 groups.empty() 决定是否
+    // 执行；UNIQUE 段无条件继续」。
+    if (pk_groups_present && !groups.empty() && heap != nullptr) {
     std::unordered_map<std::string, size_t> idx_map;
     for (size_t i = 0; i < cols.size(); ++i) idx_map[cols[i].name] = i;
 
@@ -306,7 +316,7 @@ void ValidateRowConstraints(SystemCatalog* catalog, const TableInfo& table_info,
             }
         }
     }
-    }  // 52_data_types: 关闭 pk_groups_present 块
+    }  // 52_data_types: 关闭 PK 全表扫描条件块
 
     // ---- 5) 52_data_types: UNIQUE 约束兜底扫描 ----
     //   列级 / 表级 UNIQUE(col1, col2, ...) 在执行路径上有两条：

@@ -300,6 +300,37 @@ bool SemanticAnalyzer::AnalyzeSelect(const SelectStatement& stmt) {
         if (!stmt.from_table_alias.empty()) {
             table_aliases.emplace_back(stmt.from_table_alias, stmt.from_table);
         }
+        // BUG-4: 当 FROM 引用了视图时，把视图 SELECT 的输出列（含 AS 别名）
+        // 注册为一张虚拟表放进 symbol_table_，让 ORDER BY / HAVING / WHERE
+        // 中的别名引用能通过列存在性校验。语义层先于 Planner 运行，
+        // 因此视图展开必须在语义层完成（与 LATERAL / VALUES 派生表同形）。
+        // Planner::TryExpandView 后续仍会把视图替换为 derived_table，
+        // 但那时 ORDER BY 早已过语义检查，所以这里必须做一遍。
+        if (from_is_view && catalog_ != nullptr) {
+            const SystemCatalog::ViewDefinition* v =
+                catalog_->LookupView(stmt.from_table);
+            if (v != nullptr && v->query != nullptr) {
+                TableInfo ti;
+                ti.table_name = stmt.from_table;
+                const auto& sl = v->query->select_list;
+                const auto& sa = v->query->select_aliases;
+                for (size_t i = 0; i < sl.size(); ++i) {
+                    ColumnInfo ci;
+                    if (i < sa.size() && !sa[i].empty()) {
+                        ci.name = sa[i];
+                    } else if (sl[i] &&
+                               sl[i]->GetType() == NodeType::COLUMN_REF_EXPR) {
+                        ci.name = std::static_pointer_cast<ColumnRefExpr>(sl[i])
+                                      ->column_name;
+                    } else {
+                        ci.name = "col" + std::to_string(i);
+                    }
+                    ci.data_type = "VARCHAR";
+                    ti.columns.push_back(std::move(ci));
+                }
+                symbol_table_.AddTable(ti);
+            }
+        }
     }
     for (auto& j : stmt.joins) {
         // 55_query: LATERAL 派生表 join —— 不在 catalog 中查表存在性；
