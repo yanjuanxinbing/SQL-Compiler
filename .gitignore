@@ -1,6 +1,8 @@
 /build
+/build_asan/
 /.vscode
 /tests/tmp
+/*.log
 # runtime artifacts
 sqlcompiler.db*
 *.bin.crc
