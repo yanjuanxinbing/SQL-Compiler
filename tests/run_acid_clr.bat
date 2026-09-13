@@ -10,7 +10,7 @@ setlocal enabledelayedexpansion
 
 set "SCRIPT_DIR=%~dp0"
 for %%D in ("%SCRIPT_DIR%..") do set "ROOT_DIR=%%~fD"
-set "BUILD_DIR=%ROOT_DIR%\build\Debug"
+set "BUILD_DIR=%ROOT_DIR%\build"
 set "WORK_DIR=%SCRIPT_DIR%tmp"
 set "EXEC=%BUILD_DIR%\sqlcompiler.exe"
 set "DB=%WORK_DIR%\50_undo_clr.db"
