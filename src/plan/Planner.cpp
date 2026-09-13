@@ -1634,7 +1634,17 @@ std::string InferExprTypeImpl(const Expr* raw,
             }
             if (IsAggregateFuncName(name)) {
                 if (name == "COUNT") return kInt;
-                // 其余聚合（SUM/AVG/MIN/MAX/STDDEV/VARIANCE/MEDIAN）取首个参数的类型：
+                // SUM/AVG 的运行时类型（EvalAggregateExpr）统一按 FLOAT 输出
+                // （sum_int + sum_float → MakeFloat），所以 schema 推断必须与运行时一致；
+                // 否则 catalog 中 backing table 声明为 INT，序列化时 Value 走 FLOAT
+                // 分支写 8 字节，反序列化按 INT 读 4 字节命中 NULL marker，数据丢失。
+                if (name == "SUM" || name == "AVG" ||
+                    name == "STDDEV" || name == "STDDEV_POP" || name == "STDDEV_SAMP" ||
+                    name == "VARIANCE" || name == "VAR_POP" || name == "VAR_SAMP" ||
+                    name == "MEDIAN") {
+                    return kFloat;
+                }
+                // 其余聚合（MIN/MAX）取首个参数的类型：
                 //   FLOAT 操作数 -> FLOAT；INT -> INT；STRING 视为 FLOAT 不合理，
                 //   退化到 VARCHAR。
                 if (f->arguments.empty()) return kInt;

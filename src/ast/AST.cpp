@@ -198,6 +198,12 @@ std::string SelectStatement::ToString() const {
     for (size_t i = 0; i < select_list.size(); ++i) {
         if (i > 0) oss << ", ";
         oss << (select_list[i] ? select_list[i]->ToString() : "?");
+        // 60_view_trigger: 必须把 select_aliases 也拼回去，否则 MV REFRESH 时
+        // Planner 把 query_text 重新 parse，得到的 AST 上 select_aliases 为空，
+        // InferSelectOutputSchema 退回 col0/col1 默认名，触发假的 schema drift。
+        if (i < select_aliases.size() && !select_aliases[i].empty()) {
+            oss << " AS " << select_aliases[i];
+        }
     }
     if (!from_table.empty()) {
         oss << " FROM " << from_table;

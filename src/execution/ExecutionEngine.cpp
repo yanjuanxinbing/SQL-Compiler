@@ -556,7 +556,26 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             // CTE hint: table_alias 以 "__cte__" 开头时优先路由到 CTE_BIND
             if (!n->table_alias.empty() && n->table_alias.rfind("__cte__", 0) == 0) {
                 std::string cte_name = n->table_alias.substr(7);
-                return wrap(std::make_unique<CteBindExecutor>(context, std::move(cte_name)));
+                // ---- 31_cte bug fix: 把下推谓词与 CTE 列名转发给 CteBindExecutor ----
+                // Optimizer::PushDownPredicates 可能把 `WHERE total >= 200` 这类
+                // 谓词下沉到 SeqScanNode.predicate 上（test 31_cte.sql 第 23–28 行）；
+                // 旧实现直接把 SeqScan 改写为 CteBindExecutor 而丢弃 predicate，
+                // 导致 CTE 上的外层 WHERE 被静默忽略。修复方式：以 CTE
+                // 物化时记录的 column_names 构造 column_index_map，连同 predicate
+                // 一起交给 CteBindExecutor 在 Next 中按行求值。
+                std::unordered_map<std::string, size_t> cte_cmap;
+                if (n->predicate && context->HasCte(cte_name)) {
+                    const auto* cols = context->GetCteColumns(cte_name);
+                    if (cols) {
+                        for (size_t i = 0; i < cols->size(); ++i) {
+                            const std::string& cn = (*cols)[i];
+                            cte_cmap[cn] = i;
+                            cte_cmap[cte_name + "." + cn] = i;
+                        }
+                    }
+                }
+                return wrap(std::make_unique<CteBindExecutor>(
+                    context, std::move(cte_name), n->predicate, std::move(cte_cmap)));
             }
             // 派生表占位（FROM (SELECT ...) AS alias）：table_name == alias 且
             // children[0] 挂有 Planner 递归生成的子计划。让真正的子计划替代占位 SeqScan。
@@ -570,7 +589,20 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             // CteDefineExecutor 注册），改走 CteBindExecutor。否则退回普通的
             // SeqScanExecutor，由 catalog 查找 table_heap。
             if (!n->table_name.empty() && context->HasCte(n->table_name)) {
-                return wrap(std::make_unique<CteBindExecutor>(context, n->table_name));
+                // ---- 31_cte bug fix: 与 __cte__ 分支一致，转发谓词 ----
+                std::unordered_map<std::string, size_t> cte_cmap;
+                if (n->predicate && context->HasCte(n->table_name)) {
+                    const auto* cols = context->GetCteColumns(n->table_name);
+                    if (cols) {
+                        for (size_t i = 0; i < cols->size(); ++i) {
+                            const std::string& cn = (*cols)[i];
+                            cte_cmap[cn] = i;
+                            cte_cmap[n->table_name + "." + cn] = i;
+                        }
+                    }
+                }
+                return wrap(std::make_unique<CteBindExecutor>(
+                    context, n->table_name, n->predicate, std::move(cte_cmap)));
             }
             return wrap(std::make_unique<SeqScanExecutor>(context, n->table_name,
                                                           n->table_alias, n->predicate));

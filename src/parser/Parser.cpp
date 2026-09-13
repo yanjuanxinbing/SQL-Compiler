@@ -3429,7 +3429,8 @@ StatementPtr Parser::ParseFunctionBodyStatement() {
     if (cur.type == TokenType::KEYWORD_DECLARE) {
         // 59_procs (Category 8): 先 peek 决定是 HANDLER / CURSOR / 普通变量。
         //   DECLARE [CONTINUE|EXIT|UNDO] HANDLER FOR ...
-        //   DECLARE name CURSOR FOR ...   ← 第二个 token 是 CURSOR（不是 name）
+        //   DECLARE name CURSOR FOR ...   ← MySQL/PostgreSQL 风格 (name 在前)
+        //   DECLARE CURSOR name FOR ...   ← 部分方言关键字先行风格
         //   DECLARE name TYPE [DEFAULT expr];
         if (PeekToken(1).type == TokenType::KEYWORD_HANDLER ||
             PeekToken(1).type == TokenType::KEYWORD_CONTINUE ||
@@ -3437,12 +3438,15 @@ StatementPtr Parser::ParseFunctionBodyStatement() {
             PeekToken(1).type == TokenType::KEYWORD_UNDO) {
             return ParseDeclareHandlerStatement();
         }
-        // CURSOR 形式需要先解析 name，再 peek-1 看 CURSOR 关键字。
-        // 这里为简化，要求用户写 `DECLARE CURSOR name FOR select` 形式
-        // （与 HANDLER 的关键字先行风格保持一致）；用户写 DECLARE name CURSOR
-        // 时本分支不识别，按普通变量继续解析，下方会抛"类型不支持"。
+        // 关键字先行：DECLARE CURSOR name FOR ...
         if (PeekToken(1).type == TokenType::KEYWORD_CURSOR) {
-            return ParseDeclareCursorStatement();
+            return ParseDeclareCursorStatement(/*cursor_keyword_first=*/true);
+        }
+        // name 在前：DECLARE name CURSOR FOR ... —— 看 peek(2) 是否是 CURSOR。
+        // 这两种形式都要接受（MySQL/PostgreSQL/标准 SQL 都用 name-first 形式）。
+        if (PeekToken(1).type == TokenType::IDENTIFIER &&
+            PeekToken(2).type == TokenType::KEYWORD_CURSOR) {
+            return ParseDeclareCursorStatement(/*cursor_keyword_first=*/false);
         }
         Advance();  // DECLARE
         Token vname = Expect(TokenType::IDENTIFIER, "expected variable name after DECLARE");
@@ -4237,11 +4241,21 @@ StatementPtr Parser::ParseDeclareHandlerStatement() {
     return stmt;
 }
 
-// DECLARE name CURSOR FOR <select>;
-StatementPtr Parser::ParseDeclareCursorStatement() {
+// DECLARE {CURSOR name | name CURSOR} FOR <select>;
+// 同时接受 MySQL/PostgreSQL/标准 SQL 风格（name 在前）
+// 与内部关键字先行风格（CURSOR 在前）。
+StatementPtr Parser::ParseDeclareCursorStatement(bool cursor_keyword_first) {
     Expect(TokenType::KEYWORD_DECLARE, "expected DECLARE");
-    Token name = Expect(TokenType::IDENTIFIER, "expected cursor name");
-    Expect(TokenType::KEYWORD_CURSOR, "expected CURSOR after cursor name");
+    std::string name;
+    if (cursor_keyword_first) {
+        Expect(TokenType::KEYWORD_CURSOR, "expected CURSOR after DECLARE");
+        Token id = Expect(TokenType::IDENTIFIER, "expected cursor name after CURSOR");
+        name = id.lexeme;
+    } else {
+        Token id = Expect(TokenType::IDENTIFIER, "expected cursor name");
+        Expect(TokenType::KEYWORD_CURSOR, "expected CURSOR after cursor name");
+        name = id.lexeme;
+    }
     Expect(TokenType::KEYWORD_FOR, "expected FOR after CURSOR");
     auto stmt_ptr = ParseSelectStatementWithSetOps();
     // V1 简化：cursor 仅接受单条 SELECT，不支持 UNION 等集合运算。
@@ -4251,7 +4265,7 @@ StatementPtr Parser::ParseDeclareCursorStatement() {
             "cursor query must be a plain SELECT (V1 limitation)");
     }
     Match(TokenType::SEMICOLON);
-    return std::make_shared<DeclareCursorStatement>(name.lexeme, sel);
+    return std::make_shared<DeclareCursorStatement>(name, sel);
 }
 
 StatementPtr Parser::ParseCursorOpenStatement() {

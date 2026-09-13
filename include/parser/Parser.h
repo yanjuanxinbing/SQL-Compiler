@@ -145,7 +145,7 @@ private:
     // 解析 DECLARE [type] HANDLER FOR cond stmt;
     StatementPtr ParseDeclareHandlerStatement();
     // 解析 DECLARE name CURSOR FOR select; / OPEN / FETCH / CLOSE
-    StatementPtr ParseDeclareCursorStatement();
+    StatementPtr ParseDeclareCursorStatement(bool cursor_keyword_first);
     StatementPtr ParseCursorOpenStatement();
     StatementPtr ParseCursorFetchStatement();
     StatementPtr ParseCursorCloseStatement();

@@ -52,7 +52,30 @@ void BulkInsertIntoTable(ExecutionContext* ctx,
         std::vector<Value> row;
         row.reserve(t.ColumnCount());
         for (size_t i = 0; i < t.ColumnCount(); ++i) {
-            row.push_back(t.GetValue(i));
+            Value v = t.GetValue(i);
+            // 60_view_trigger: 防御性 cast —— child tuple 的运行时类型必须与 backing
+            // table 的列类型一致，否则 Value::SerializeTo 走错分支（按运行时 type
+            // 写字节），反序列化按 column_type 读字节时命中 NULL marker，数值丢成 0。
+            // 这里按 col_types[i] 强制转换，保证序列化/反序列化路径字节宽度匹配。
+            if (i < col_types.size() && !v.IsNull()) {
+                ValueType want = col_types[i];
+                if (v.GetType() != want) {
+                    switch (want) {
+                        case ValueType::INTEGER:
+                            if (v.GetType() == ValueType::FLOAT) {
+                                v = Value::MakeInt(static_cast<int32_t>(v.AsFloat()));
+                            }
+                            break;
+                        case ValueType::FLOAT:
+                            if (v.GetType() == ValueType::INTEGER) {
+                                v = Value::MakeFloat(static_cast<double>(v.AsInt()));
+                            }
+                            break;
+                        default: break;
+                    }
+                }
+            }
+            row.push_back(std::move(v));
         }
         // 长度对齐
         if (row.size() < info->columns.size()) {

@@ -102,14 +102,18 @@ SELECT divide(10, 2);
 -- ============================================================
 -- Part E: DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
 -- ============================================================
+-- 注：SQL 标准 CONTINUE 语义 = handler 触发后继续执行下一条 statement，
+-- 因此若 SIGNAL 后面还有 `SET r = a / b`，handler 设的 r 会被下一行覆盖。
+-- 本测试把「除法赋值」放进 IF b != 0 里，让 handler 设的值能真正保留。
 CREATE FUNCTION safe_divide(a INT, b INT) RETURNS INT
 BEGIN
     DECLARE r INT DEFAULT 0;
     DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET r = -1;
     IF b = 0 THEN
         SIGNAL SQLSTATE '22012' SET MESSAGE_TEXT = 'div0';
+    ELSE
+        SET r = a / b;
     END IF;
-    SET r = a / b;
     RETURN r;
 END;
 
@@ -124,8 +128,9 @@ BEGIN
     DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET r = -1;
     IF b = 0 THEN
         SIGNAL SQLSTATE '22012' SET MESSAGE_TEXT = 'div0';
+    ELSE
+        SET r = a / b;
     END IF;
-    SET r = a / b;
     RETURN r;
 END;
 

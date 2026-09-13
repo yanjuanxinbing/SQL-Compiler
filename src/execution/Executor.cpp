@@ -13,18 +13,29 @@ SystemCatalog* ExecutionContext::GetCatalog() const {
     return catalog_;
 }
 
-void ExecutionContext::RegisterCte(const std::string& name, std::vector<Tuple> rows) {
-    cte_results_[name] = CteMaterialization{name, std::move(rows)};
+void ExecutionContext::RegisterCte(const std::string& name, std::vector<Tuple> rows,
+                                     std::vector<std::string> column_names) {
+    cte_results_[name] = CteMaterialization{name, std::move(rows), std::move(column_names)};
 }
 
 void ExecutionContext::AppendCteRows(const std::string& name,
                                      const std::vector<Tuple>& rows) {
     auto it = cte_results_.find(name);
     if (it == cte_results_.end()) {
-        cte_results_[name] = CteMaterialization{name, rows};
+        // 递归 CTE 在 MaterializePlan 之前应已 RegisterCte（带 column_names）；
+        // 此处仅作防御，column_names 留空。
+        cte_results_[name] = CteMaterialization{name, rows, {}};
     } else {
         it->second.rows.insert(it->second.rows.end(), rows.begin(), rows.end());
     }
+}
+
+const std::vector<std::string>* ExecutionContext::GetCteColumns(
+    const std::string& name) const {
+    auto it = cte_results_.find(name);
+    if (it == cte_results_.end()) return nullptr;
+    if (it->second.column_names.empty()) return nullptr;
+    return &it->second.column_names;
 }
 
 const std::vector<Tuple>* ExecutionContext::GetCteRows(const std::string& name) const {

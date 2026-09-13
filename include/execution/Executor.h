@@ -23,9 +23,18 @@ class StorageAccess;
 // 单条物化的 CTE：执行 CTE_DEFINE 节点时把 children[0] 的子计划跑完，
 // 把所有结果行收集在这里。后续同一次查询执行中任何 CteBindNode 都直接
 // 从这里读取，不必重新执行子计划。
+//
+// ---- 31_cte bug fix: column_names ----
+// column_names 是 CTE 物化时的输出列顺序（与 rows 各列一一对应）。
+// CteDefineExecutor 在 materialization 阶段从 cte_plan 的终止节点（Project /
+// Aggregate / Window / SetOp）提取；CteBindExecutor 在执行期用它构建
+// column_index_map，使下推到 SeqScanNode 的 WHERE / HAVING 谓词能正确解析
+// CTE 输出列上的 ColumnRefExpr（如 `WHERE total >= 200`）。该字段是
+//「可下推谓词 + CTE 引用」组合能正确求值的前提。
 struct CteMaterialization {
     std::string cte_name;
     std::vector<Tuple> rows;
+    std::vector<std::string> column_names;
 };
 
 // 执行上下文：贯穿整个查询执行过程，向各算子提供目录与存储访问入口
@@ -42,9 +51,15 @@ public:
 
     // CTE 注册表：CTE_DEFINE 节点负责写入，CteBind 节点负责读取。
     // 同一次 Execute 调用内对相同 cte_name 只允许写一次（递归 CTE 多次追加）。
-    void RegisterCte(const std::string& name, std::vector<Tuple> rows);
+    // column_names 是 CTE 物化时的输出列顺序（与 rows 各列一一对应）；CteDefineExecutor
+    // 必须从 cte_plan 的终止节点提取并随 rows 一起传入，让外层下推的谓词（如
+    // `WHERE total >= 200`）能正确解析 CTE 输出列。空 vector 表示没有可用列名
+    // （旧版兼容路径）。
+    void RegisterCte(const std::string& name, std::vector<Tuple> rows,
+                     std::vector<std::string> column_names = {});
     void AppendCteRows(const std::string& name, const std::vector<Tuple>& rows);
     const std::vector<Tuple>* GetCteRows(const std::string& name) const;
+    const std::vector<std::string>* GetCteColumns(const std::string& name) const;
     bool HasCte(const std::string& name) const;
     // 递归 CTE 的 CTE_BIND 在每次迭代时切换到「本轮新增的工作集」上。
     // 用 push/pop 把外层可见的旧结果保留下来，迭代结束后恢复。
