@@ -281,20 +281,31 @@ void LockManager::UnlockAll(int64_t txn_id) {
         }
     }
     // 撤销 txn 持有的 SERIALIZABLE 谓词锁，并唤醒在谓词上阻塞的写者。
-    // Phase 4：谓词按表存于 pred_tables_（源向量 + 惰性区间树），逐表剔除该事务。
+    // Phase 5：谓词按 (表, 列) 存于 pred_tables_（表级全表谓词 + 每列区间树），
+    // 逐表剔除该事务：先删表级全表哨兵，再逐列删区间、清空空列容器。
     for (auto it = pred_tables_.begin(); it != pred_tables_.end();) {
-        PredicateTable& t = it->second;
-        t.full_holders.erase(
-            std::remove(t.full_holders.begin(), t.full_holders.end(), txn_id),
-            t.full_holders.end());
-        t.intervals.erase(
-            std::remove_if(t.intervals.begin(), t.intervals.end(),
-                           [txn_id](const Interval& iv) { return iv.txn_id == txn_id; }),
-            t.intervals.end());
-        if (t.full_holders.empty() && t.intervals.empty()) {
+        PredicateTableGroup& g = it->second;
+        g.full_holders.erase(
+            std::remove(g.full_holders.begin(), g.full_holders.end(), txn_id),
+            g.full_holders.end());
+        for (auto cit = g.columns.begin(); cit != g.columns.end();) {
+            PredicateTable& t = cit->second;
+            t.intervals.erase(
+                std::remove_if(t.intervals.begin(), t.intervals.end(),
+                               [txn_id](const Interval& iv) {
+                                   return iv.txn_id == txn_id;
+                               }),
+                t.intervals.end());
+            if (t.intervals.empty()) {
+                cit = g.columns.erase(cit);
+            } else {
+                t.dirty = true;  // 源变了：下次查询惰性重建区间树
+                ++cit;
+            }
+        }
+        if (g.full_holders.empty() && g.columns.empty()) {
             it = pred_tables_.erase(it);
         } else {
-            t.dirty = true;  // 源变了：下次查询惰性重建区间树
             ++it;
         }
     }
@@ -334,14 +345,16 @@ size_t LockManager::CountPredicateLocks(int64_t txn_id, int64_t table_rid) const
     std::lock_guard<std::mutex> lk(mutex_);
     auto it = pred_tables_.find(table_rid);
     if (it == pred_tables_.end()) return 0;
-    const PredicateTable& t = it->second;
+    const PredicateTableGroup& g = it->second;
     size_t n = 0;
-    if (std::find(t.full_holders.begin(), t.full_holders.end(), txn_id) !=
-        t.full_holders.end()) {
-        ++n;  // 全表谓词哨兵计 1 条（与旧 pred_locks_ 语义一致）
+    if (std::find(g.full_holders.begin(), g.full_holders.end(), txn_id) !=
+        g.full_holders.end()) {
+        ++n;  // 表级全表谓词哨兵计 1 条（与旧 pred_locks_ 语义一致）
     }
-    for (const Interval& iv : t.intervals) {
-        if (iv.txn_id == txn_id) ++n;
+    for (const auto& kv : g.columns) {
+        for (const Interval& iv : kv.second.intervals) {
+            if (iv.txn_id == txn_id) ++n;
+        }
     }
     return n;
 }
@@ -350,7 +363,12 @@ size_t LockManager::CountTotalPredicates(int64_t table_rid) const {
     std::lock_guard<std::mutex> lk(mutex_);
     auto it = pred_tables_.find(table_rid);
     if (it == pred_tables_.end()) return 0;
-    return it->second.full_holders.size() + it->second.intervals.size();
+    const PredicateTableGroup& g = it->second;
+    size_t n = g.full_holders.size();
+    for (const auto& kv : g.columns) {
+        n += kv.second.intervals.size();
+    }
+    return n;
 }
 
 size_t LockManager::GetPredicateQueryComparisons() const {
@@ -472,61 +490,85 @@ LockResult LockManager::TryEscalateTable(int64_t txn_id, int64_t table_res,
     return LockResult::kGranted;
 }
 
+namespace {
+
+// 谓词区间端点比较辅助：lo/hi 的 values 为空表示开边界（lo 空 = -inf，hi 空 = +inf）。
+// a.lo <= b.hi（任一端开放即成立）。
+bool PredicateLoLeHi(const IndexKey& lo, const IndexKey& hi) {
+    return lo.values.empty() || hi.values.empty() || CompareKeyOnly(lo, hi) <= 0;
+}
+
+// 两个谓词区间重叠：a.lo <= b.hi && b.lo <= a.hi。
+// 只依赖 IndexKey 端点（PredicateLock 是 LockManager 私有嵌套类型，辅助函数
+// 不能引用它，避免类外访问控制错误）。
+bool PredicateIntervalsOverlap(const IndexKey& a_lo, const IndexKey& a_hi,
+                               const IndexKey& b_lo, const IndexKey& b_hi) {
+    return PredicateLoLeHi(a_lo, b_hi) && PredicateLoLeHi(b_lo, a_hi);
+}
+
+}  // namespace
+
 LockResult LockManager::AcquireReadPredicate(int64_t txn_id, int64_t table_rid,
-                                             bool is_full, const IndexKey& lo,
-                                             const IndexKey& hi) {
+                                             int32_t column, bool is_full,
+                                             const IndexKey& lo, const IndexKey& hi) {
     if (txn_id < 0) return LockResult::kDeadlock;
     std::lock_guard<std::mutex> lk(mutex_);
 
-    // Phase 4：谓词按 (表) 组织为 PredicateTable{full_holders + intervals}。
-    // 合并/继承规约逻辑与 v2 一致，仅存储容器从全局向量改为每表源向量。
-    PredicateTable& t = pred_tables_[table_rid];
+    // Phase 5：谓词按 (表, 列) 组织为 PredicateTableGroup{表级全表谓词 + 每列区间树}。
+    // 合并/继承规约逻辑与 v2 一致，仅存储容器泛化到「列」维度。
+    PredicateTableGroup& g = pred_tables_[table_rid];
 
-    // ---- 父子区间继承与合并（v2）----
-    // 收集本事务本表的既有谓词（先整体移除，规约后重插），做集合规约：
-    //   * 已持全表谓词 → 新谓词一律被父谓词覆盖，丢弃（子谓词继承父谓词的防幻读）。
-    //   * 新谓词为全表 → 删除全部区间谓词，仅保留全表谓词（父谓词统一覆盖）。
-    //   * 区间谓词 → 按 lo 排序后做区间合并（仅合并真重叠区间，覆盖能力不变），
-    //     被完整覆盖的子区间被丢弃；最终集合为「不重叠的最小区间覆盖」。
-    std::vector<PredicateLock> kept;   // 其他事务/其他表的谓词（原样保留）
-    std::vector<PredicateLock> group;  // 本事务本表既有区间谓词
+    // ---- 父子区间继承（表级全表谓词）----
+    // 已持表级全表谓词 → 任何子谓词（任意列任意区间）被父谓词覆盖，直接丢弃。
+    const bool has_full =
+        std::find(g.full_holders.begin(), g.full_holders.end(), txn_id) !=
+        g.full_holders.end();
+    if (has_full) {
+        return LockResult::kGranted;
+    }
+    if (is_full) {
+        // 新谓词为表级全表：删除本事务在全部列上的区间谓词，只保留全表哨兵。
+        // 其他事务的区间必须原样保留——全表谓词只覆盖本事务的读范围，无权撤销
+        // 他事务已注册的谓词（否则他事务的防幻读能力会凭空丢失）。
+        for (auto cit = g.columns.begin(); cit != g.columns.end();) {
+            PredicateTable& t = cit->second;
+            std::vector<Interval> kept;
+            for (const Interval& iv : t.intervals) {
+                if (iv.txn_id != txn_id) kept.push_back(iv);
+            }
+            if (kept.empty()) {
+                cit = g.columns.erase(cit);
+            } else {
+                t.intervals = std::move(kept);
+                t.dirty = true;
+                ++cit;
+            }
+        }
+        g.full_holders.push_back(txn_id);
+        return LockResult::kGranted;
+    }
+
+    // ---- 同列区间合并：本事务本列既有区间 + 新区间按 lo 升序，合并真重叠 ----
+    // 注意：合并输出必须用独立容器 merged —— kept 中还保留着其他事务的谓词，
+    // 直接复用 kept.back() 会让新区间与「最后一条被保留的谓词」误判重叠，
+    // 导致新区间被丢弃（如跨列/跨事务注册时覆盖能力丢失）。
+    PredicateTable& t = g.columns[column];
+    std::vector<PredicateLock> kept;   // 其他事务同列谓词（原样保留）
+    std::vector<PredicateLock> group;  // 本事务同列既有区间谓词
     for (const Interval& iv : t.intervals) {
-        PredicateLock p{iv.txn_id, table_rid, false, iv.lo, iv.hi};
+        PredicateLock p{iv.txn_id, table_rid, column, false, iv.lo, iv.hi};
         if (iv.txn_id == txn_id) {
             group.push_back(std::move(p));
         } else {
             kept.push_back(std::move(p));
         }
     }
-
-    const bool has_full =
-        std::find(t.full_holders.begin(), t.full_holders.end(), txn_id) !=
-        t.full_holders.end();
-    if (has_full) {
-        // 父谓词（全表）已覆盖任何子谓词：区间集合不变，直接返回。
-        return LockResult::kGranted;
-    }
-    if (is_full) {
-        // 新谓词为全表：删除本事务全部区间谓词（group），只保留全表哨兵。
-        // 其他事务的区间（kept）必须原样保留——全表谓词只覆盖本事务的读范围，
-        // 无权撤销他事务已注册的谓词（否则他事务的防幻读能力会凭空丢失）。
-        t.full_holders.push_back(txn_id);
-        t.intervals.clear();
-        for (const PredicateLock& o : kept) {
-            t.intervals.push_back(Interval{o.lo, o.hi, o.txn_id});
-        }
-        t.dirty = true;
-        return LockResult::kGranted;
-    }
-
-    // 区间合并：把既有区间 + 新区间按 lo 升序，合并真重叠的区间。
-    // 注意：合并输出必须用独立容器 merged —— kept 中还保留着其他事务/其他表的
-    // 谓词，直接复用 kept.back() 会让新区间与「最后一条被保留的谓词」误判重叠，
-    // 导致新区间被丢弃（如跨表注册时覆盖能力丢失）。
     std::vector<PredicateLock> intervals = std::move(group);
-    intervals.push_back(PredicateLock{txn_id, table_rid, false, lo, hi});
+    intervals.push_back(PredicateLock{txn_id, table_rid, column, false, lo, hi});
     std::sort(intervals.begin(), intervals.end(),
               [](const PredicateLock& a, const PredicateLock& b) {
+                  const bool ae = a.lo.values.empty(), be = b.lo.values.empty();
+                  if (ae != be) return ae;  // 开下界（-inf）排最前
                   return CompareKeyOnly(a.lo, b.lo) < 0;
               });
     std::vector<PredicateLock> merged;
@@ -537,11 +579,22 @@ LockResult LockManager::AcquireReadPredicate(int64_t txn_id, int64_t table_rid,
             continue;
         }
         PredicateLock& last = merged.back();
-        // 真重叠（last.lo <= cur.hi && cur.lo <= last.hi）→ 合并为并集。
-        if (CompareKeyOnly(last.lo, cur.hi) <= 0 &&
-            CompareKeyOnly(cur.lo, last.hi) <= 0) {
-            if (CompareKeyOnly(cur.lo, last.lo) < 0) last.lo = cur.lo;
-            if (CompareKeyOnly(cur.hi, last.hi) > 0) last.hi = cur.hi;
+        // 真重叠 → 合并为并集（并集的防幻读能力不小于原各区间）。
+        if (PredicateIntervalsOverlap(last.lo, last.hi, cur.lo, cur.hi)) {
+            if (last.lo.values.empty()) {
+                // 已是 -inf，无需更新
+            } else if (cur.lo.values.empty()) {
+                last.lo = cur.lo;  // cur 下界开放 → 并集下界为 -inf
+            } else if (CompareKeyOnly(cur.lo, last.lo) < 0) {
+                last.lo = cur.lo;
+            }
+            if (last.hi.values.empty()) {
+                // 已是 +inf，无需更新
+            } else if (cur.hi.values.empty()) {
+                last.hi = cur.hi;  // cur 上界开放 → 并集上界为 +inf
+            } else if (CompareKeyOnly(cur.hi, last.hi) > 0) {
+                last.hi = cur.hi;
+            }
         } else {
             merged.push_back(cur);
         }
@@ -557,8 +610,23 @@ LockResult LockManager::AcquireReadPredicate(int64_t txn_id, int64_t table_rid,
     return LockResult::kGranted;
 }
 
+void LockManager::GatherColumnConflicts(int64_t table_rid, int32_t column,
+                                        const IndexKey& key,
+                                        std::vector<int64_t>* out) {
+    auto tit = pred_tables_.find(table_rid);
+    if (tit == pred_tables_.end()) return;
+    PredicateTableGroup& g = tit->second;
+    for (int64_t f : g.full_holders) out->push_back(f);
+    auto cit = g.columns.find(column);
+    if (cit == g.columns.end()) return;
+    PredicateTable& t = cit->second;
+    if (t.dirty) PredicateTreeRebuild(t);
+    PredicateTreeQuery(t, key, out);
+}
+
 LockResult LockManager::CheckWritePredicate(int64_t txn_id, int64_t table_rid,
-                                            const IndexKey& key, int wait_ms) {
+                                            int32_t column, const IndexKey& key,
+                                            int wait_ms) {
     if (txn_id < 0) return LockResult::kDeadlock;
     std::unique_lock<std::mutex> lk(mutex_);
     const auto deadline =
@@ -569,23 +637,15 @@ LockResult LockManager::CheckWritePredicate(int64_t txn_id, int64_t table_rid,
 
     for (;;) {
         // 收集其他活动事务持有、且覆盖该键的谓词 → 冲突持有者集合（去重）。
-        // Phase 4：全表哨兵 O(#full) + 区间树 stabbing O(log P + K)；
+        // Phase 5：表级全表哨兵 O(#full) + 该列区间树 stabbing O(log P + K)；
         // 旧实现为对全部谓词线性 PredicateCovers → O(P)。
         std::vector<int64_t> conflicts;
-        auto tit = pred_tables_.find(table_rid);
-        if (tit != pred_tables_.end()) {
-            PredicateTable& t = tit->second;
-            if (t.dirty) PredicateTreeRebuild(t);
-            for (int64_t f : t.full_holders) {
-                if (f != txn_id) conflicts.push_back(f);
-            }
-            PredicateTreeQuery(t, key, &conflicts);
-            std::sort(conflicts.begin(), conflicts.end());
-            conflicts.erase(std::unique(conflicts.begin(), conflicts.end()),
-                            conflicts.end());
-            conflicts.erase(std::remove(conflicts.begin(), conflicts.end(), txn_id),
-                            conflicts.end());
-        }
+        GatherColumnConflicts(table_rid, column, key, &conflicts);
+        std::sort(conflicts.begin(), conflicts.end());
+        conflicts.erase(std::unique(conflicts.begin(), conflicts.end()),
+                        conflicts.end());
+        conflicts.erase(std::remove(conflicts.begin(), conflicts.end(), txn_id),
+                        conflicts.end());
         if (conflicts.empty()) return LockResult::kGranted;
 
         // 建立本事务指向各冲突谓词持有者的等待边。
@@ -606,6 +666,58 @@ LockResult LockManager::CheckWritePredicate(int64_t txn_id, int64_t table_rid,
     }
 }
 
+LockResult LockManager::CheckWritePredicateRow(int64_t txn_id, int64_t table_rid,
+                                               const std::vector<Value>& row,
+                                               int wait_ms) {
+    if (txn_id < 0) return LockResult::kDeadlock;
+    std::unique_lock<std::mutex> lk(mutex_);
+    const auto deadline =
+        (wait_ms > 0)
+            ? std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(wait_ms)
+            : std::chrono::steady_clock::time_point::max();
+
+    for (;;) {
+        // 整行写检查：表级全表谓词命中任意写；逐列对该列值做区间树 stabbing。
+        // 一次加锁内收集全部冲突持有者（不重复逐列取全局互斥）。
+        std::vector<int64_t> conflicts;
+        auto tit = pred_tables_.find(table_rid);
+        if (tit != pred_tables_.end()) {
+            PredicateTableGroup& g = tit->second;
+            for (int64_t f : g.full_holders) conflicts.push_back(f);
+            for (auto& kv : g.columns) {
+                const int32_t col = kv.first;
+                if (col < 0 || static_cast<size_t>(col) >= row.size()) continue;
+                const Value& v = row[static_cast<size_t>(col)];
+                if (v.IsNull()) continue;  // NULL 不进入索引值域，不可能命中区间
+                PredicateTable& t = kv.second;
+                if (t.dirty) PredicateTreeRebuild(t);
+                PredicateTreeQuery(t, IndexKey{std::vector<Value>{v}}, &conflicts);
+            }
+        }
+        std::sort(conflicts.begin(), conflicts.end());
+        conflicts.erase(std::unique(conflicts.begin(), conflicts.end()),
+                        conflicts.end());
+        conflicts.erase(std::remove(conflicts.begin(), conflicts.end(), txn_id),
+                        conflicts.end());
+        if (conflicts.empty()) return LockResult::kGranted;
+
+        // 建立本事务指向各冲突谓词持有者的等待边（与单列检查同一套死锁/超时逻辑）。
+        for (int64_t c : conflicts) waits_on_[txn_id].insert(c);
+        if (DeadlockCycle(txn_id)) {
+            UnlinkWaitEdges(txn_id);
+            return LockResult::kDeadlock;
+        }
+        if (wait_ms == 0) {
+            cv_.wait(lk);
+        } else if (cv_.wait_until(lk, deadline) == std::cv_status::timeout) {
+            UnlinkWaitEdges(txn_id);
+            return LockResult::kTimeout;
+        }
+        for (int64_t c : conflicts) waits_on_[txn_id].erase(c);
+    }
+}
+
 // ---- Phase 4：谓词锁居中区间树（惰性重建） ----
 
 // 重建 t 的区间树：intervals（源）→ lo_values（去重升序分裂点）+ nodes（区间树）。
@@ -614,6 +726,9 @@ LockResult LockManager::CheckWritePredicate(int64_t txn_id, int64_t table_rid,
 //   * hi < split 的区间递归到左子树；lo > split 的区间递归到右子树。
 // 每个区间恰好归属一个节点；stabbing 点查询沿分裂点二分下降，每层输出必然覆盖
 // 该键的区间前缀 → O(log P + K)。
+// Phase 5：lo/hi 的 values 为空表示开边界（lo 空 = -inf、hi 空 = +inf）：
+//   * 开下界不参与分裂点集合（-inf 无法做分裂点），开下界区间始终「跨过」任意分裂点；
+//   * 开上界区间恒满足 hi >= split（+inf 不小于任何分裂点）。
 void LockManager::PredicateTreeRebuild(PredicateTable& t) const {
     t.lo_values.clear();
     t.nodes.clear();
@@ -623,7 +738,10 @@ void LockManager::PredicateTreeRebuild(PredicateTable& t) const {
     }
     std::vector<IndexKey> los;
     los.reserve(t.intervals.size());
-    for (const Interval& iv : t.intervals) los.push_back(iv.lo);
+    for (const Interval& iv : t.intervals) {
+        if (iv.lo.values.empty()) continue;  // 开下界（-inf）不参与分裂点
+        los.push_back(iv.lo);
+    }
     std::sort(los.begin(), los.end(),
               [](const IndexKey& a, const IndexKey& b) {
                   return CompareKeyOnly(a, b) < 0;
@@ -634,6 +752,31 @@ void LockManager::PredicateTreeRebuild(PredicateTable& t) const {
                           }),
               los.end());
     t.lo_values = std::move(los);
+    if (t.lo_values.empty()) {
+        // 全部区间下界开放：无分裂点可用，退化单节点（split_idx = -1）。
+        // 查询只按 hi >= key 过滤（lo 开放恒满足）。
+        IntervalNode n;
+        for (const Interval& iv : t.intervals) {
+            n.by_lo_asc.emplace_back(iv.lo, iv.txn_id);
+            n.by_hi_desc.emplace_back(iv.hi, iv.txn_id);
+        }
+        std::sort(n.by_lo_asc.begin(), n.by_lo_asc.end(),
+                  [](const std::pair<IndexKey, int64_t>& a,
+                     const std::pair<IndexKey, int64_t>& b) {
+                      return CompareKeyOnly(a.first, b.first) < 0;
+                  });
+        std::sort(n.by_hi_desc.begin(), n.by_hi_desc.end(),
+                  [](const std::pair<IndexKey, int64_t>& a,
+                     const std::pair<IndexKey, int64_t>& b) {
+                      const bool ae = a.first.values.empty();
+                      const bool be = b.first.values.empty();
+                      if (ae != be) return ae;  // 开上界（+inf）在前
+                      return CompareKeyOnly(a.first, b.first) > 0;  // hi 降序
+                  });
+        t.nodes.push_back(std::move(n));
+        t.dirty = false;
+        return;
+    }
     PredicateTreeBuildRange(t, 0, t.lo_values.size(), t.intervals);
     t.dirty = false;
 }
@@ -655,26 +798,35 @@ int32_t LockManager::PredicateTreeBuildRange(PredicateTable& t, size_t lo_begin,
 
         std::vector<Interval> left_c, right_c;
         for (const Interval& iv : cands) {
-            const bool lo_le = CompareKeyOnly(iv.lo, split) <= 0;
-            const bool hi_ge = CompareKeyOnly(iv.hi, split) >= 0;
+            const bool lo_le =
+                iv.lo.values.empty() || CompareKeyOnly(iv.lo, split) <= 0;
+            const bool hi_ge =
+                iv.hi.values.empty() || CompareKeyOnly(iv.hi, split) >= 0;
             if (lo_le && hi_ge) {
                 // 跨过分裂点：存于本节点（lo <= split <= hi）。
                 n.by_lo_asc.emplace_back(iv.lo, iv.txn_id);
                 n.by_hi_desc.emplace_back(iv.hi, iv.txn_id);
-            } else if (CompareKeyOnly(iv.hi, split) < 0) {
-                left_c.push_back(iv);   // 完全在分裂点左侧
+            } else if (!iv.hi.values.empty() &&
+                       CompareKeyOnly(iv.hi, split) < 0) {
+                left_c.push_back(iv);   // 完全在分裂点左侧（hi 非空才可能）
             } else {
-                right_c.push_back(iv);  // 完全在分裂点右侧
+                right_c.push_back(iv);  // 完全在分裂点右侧（lo > split）
             }
         }
         std::sort(n.by_lo_asc.begin(), n.by_lo_asc.end(),
                   [](const std::pair<IndexKey, int64_t>& a,
                      const std::pair<IndexKey, int64_t>& b) {
+                      const bool ae = a.first.values.empty();
+                      const bool be = b.first.values.empty();
+                      if (ae != be) return ae;  // 开下界（-inf）在前
                       return CompareKeyOnly(a.first, b.first) < 0;
                   });
         std::sort(n.by_hi_desc.begin(), n.by_hi_desc.end(),
                   [](const std::pair<IndexKey, int64_t>& a,
                      const std::pair<IndexKey, int64_t>& b) {
+                      const bool ae = a.first.values.empty();
+                      const bool be = b.first.values.empty();
+                      if (ae != be) return ae;  // 开上界（+inf）在前
                       return CompareKeyOnly(a.first, b.first) > 0;  // hi 降序
                   });
         const int32_t split_pos = n.split_idx;  // 捕获：递归后 n 可能悬垂，不得再读
@@ -698,19 +850,30 @@ void LockManager::PredicateTreeQuery(const PredicateTable& t, const IndexKey& ke
     int32_t idx = 0;  // 根
     while (idx >= 0) {
         const IntervalNode& n = t.nodes[static_cast<size_t>(idx)];
+        if (n.split_idx < 0) {
+            // 退化单节点：全区间下界开放（-inf），只需 hi >= key。
+            for (const auto& pr : n.by_hi_desc) {
+                if (pr.first.values.empty() || CompareKeyOnly(pr.first, key) >= 0)
+                    out->push_back(pr.second);
+                else break;
+            }
+            return;
+        }
         const IndexKey& split = t.lo_values[static_cast<size_t>(n.split_idx)];
         const int c = CompareKeyOnly(key, split);
         if (c < 0) {
             // key < split：本节点区间都有 hi >= split > key，只需 lo <= key。
             for (const auto& pr : n.by_lo_asc) {
-                if (CompareKeyOnly(pr.first, key) <= 0) out->push_back(pr.second);
+                if (pr.first.values.empty() || CompareKeyOnly(pr.first, key) <= 0)
+                    out->push_back(pr.second);
                 else break;
             }
             idx = n.left;
         } else if (c > 0) {
             // key > split：本节点区间都有 lo <= split < key，只需 hi >= key。
             for (const auto& pr : n.by_hi_desc) {
-                if (CompareKeyOnly(pr.first, key) >= 0) out->push_back(pr.second);
+                if (pr.first.values.empty() || CompareKeyOnly(pr.first, key) >= 0)
+                    out->push_back(pr.second);
                 else break;
             }
             idx = n.right;

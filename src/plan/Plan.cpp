@@ -120,7 +120,30 @@ std::string NodeBodyToString(const PlanNode& node, int depth) {
         }
         case PlanNodeType::INDEX_SCAN: {
             auto& n = static_cast<const IndexScanNode&>(node);
-            oss << "IndexScan(" << n.table_name << " using " << n.index_name << ")";
+            oss << "IndexScan(" << n.table_name << " using " << n.index_name;
+            // Phase 5：打印区间边界（含复合索引多列前缀），供 EXPLAIN / 收敛验证。
+            const auto print_key = [&](const std::vector<Value>& key) {
+                for (size_t i = 0; i < key.size(); ++i) {
+                    if (i) oss << ",";
+                    oss << key[i].ToString();
+                }
+            };
+            if (!n.low_key.empty() || !n.high_key.empty()) {
+                oss << " [";
+                if (!n.low_key.empty()) {
+                    oss << "low=";
+                    print_key(n.low_key);
+                    if (!n.low_inclusive) oss << " excl";
+                }
+                if (!n.high_key.empty()) {
+                    if (!n.low_key.empty()) oss << " ";
+                    oss << "high=";
+                    print_key(n.high_key);
+                    if (!n.high_inclusive) oss << " excl";
+                }
+                oss << "]";
+            }
+            oss << ")";
             break;
         }
         case PlanNodeType::TRUNCATE_TABLE: {

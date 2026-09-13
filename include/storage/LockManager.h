@@ -78,23 +78,37 @@ public:
     void UnlockAll(int64_t txn_id);
 
     // ---- SERIALIZABLE 谓词锁（防幻读）----
-    // 谓词作用在主键键空间，隶属某张表（table_rid = 表堆首页页号）。
+    // Phase 5（周期 1）：谓词从「主键键空间」泛化为「(表, 列, 区间)」——
+    // column 为表模式中的列下标（0 基），谓词独立注册/冲突于各自列的值域；
+    // 另保留「表级全表谓词」（is_full=true）供无界扫描（SEQ_SCAN / 无界 INDEX_SCAN）
+    // 使用：覆盖整表任意写入，父谓词统一覆盖任何子谓词。
+    //
+    // 区间端点以 IndexKey 表示单列值；lo/hi 为空（values 为空）表示开边界
+    // （lo 空 = -inf，hi 空 = +inf），支持单侧开放范围（如 col > 5）。
+    //
     // AcquireReadPredicate：SERIALIZABLE 范围/全扫描在读前注册谓词；多个读谓词
     //   共享共存，持有到提交（UnlockAll 一并释放）。不在此处判冲突。
-    //   【区间继承与合并（v2）】同事务同表上注册的谓词做集合规约：
-    //     * 父谓词继承：已持全表谓词（is_full）或某区间完整覆盖新区间时，
-    //       新区间被父谓词覆盖，直接丢弃（子谓词继承父谓词的防幻读能力）。
-    //     * 区间合并：新区间与已有区间重叠时，合并为二者的并集（一个更宽的
+    //   【区间继承与合并（v2）】同事务同表同列上注册的谓词做集合规约：
+    //     * 父谓词继承：已持表级全表谓词（is_full）时，任何子谓词被父谓词覆盖，
+    //       直接丢弃（子谓词继承父谓词的防幻读能力）。
+    //     * 区间合并：同列新区间与已有区间重叠时，合并为二者的并集（一个更宽的
     //       区间），覆盖能力是原有并集的上近似（更保守，不破坏防幻读正确性），
     //       同时把谓词条目数从 N 收敛到不重叠的最小区间数。
-    //     * 全表化收敛：新谓词为 is_full 时，删除本事务本表全部区间谓词，
-    //       只保留全表谓词（父谓词统一覆盖）。
+    //     * 全表化收敛：新谓词为 is_full 时，删除本事务本表全部列区间谓词，
+    //       只保留表级全表谓词（父谓词统一覆盖）。
     //   收益：长事务多次范围扫描不再线性累积谓词条目（内存），CheckWritePredicate
     //   的冲突扫描量随之下降（延迟）。
-    LockResult AcquireReadPredicate(int64_t txn_id, int64_t table_rid,
+    LockResult AcquireReadPredicate(int64_t txn_id, int64_t table_rid, int32_t column,
                                     bool is_full, const IndexKey& lo, const IndexKey& hi);
-    LockResult CheckWritePredicate(int64_t txn_id, int64_t table_rid,
+    // 单列写前检查：key 为 row[column] 的单值键。命中其他活动事务注册的该列
+    // 谓词（或表级全表谓词）则阻塞（或 kDeadlock/kTimeout）。
+    LockResult CheckWritePredicate(int64_t txn_id, int64_t table_rid, int32_t column,
                                    const IndexKey& key, int wait_ms = 0);
+    // 整行写前检查：row 中每个非空列逐一做单列检查（表级全表谓词同样命中）。
+    // 一次加锁内收集全部冲突持有者，避免逐列多次取全局互斥。供写算子
+    // （INSERT/UPDATE/DELETE/UPSERT）按「受影响行」做防幻读检查。
+    LockResult CheckWritePredicateRow(int64_t txn_id, int64_t table_rid,
+                                      const std::vector<Value>& row, int wait_ms = 0);
 
     // 断言查询：事务 txn_id 当前是否持有 res_id 上的锁（不区分模式）。
     bool IsLockHeld(int64_t txn_id, int64_t res_id) const;
@@ -197,48 +211,54 @@ private:
     // （TryEscalateTable 因他人持冲突行/表锁返回 kWouldBlock 的次数）。
     std::unordered_map<int64_t, size_t> table_escalation_conflicts_;
 
-    // SERIALIZABLE 谓词锁：某事务在某表主键键空间上的一条（可能全表）读谓词，
-    // 持有到提交。is_full=false 时区间为 [lo, hi]（含端点）。
+    // SERIALIZABLE 谓词锁：某事务在某表某列值域上的一条（可能全表）读谓词，
+    // 持有到提交。is_full=false 时区间为 [lo, hi]（含端点；lo/hi 为空 = 开边界）。
     // 本结构仅供 AcquireReadPredicate 的「父子区间继承与合并」规约逻辑使用；
-    // 实际存储按 (表, 区间) 组织为 Phase 4 的居中区间树（见 pred_tables_）。
+    // 实际存储按 (表, 列) 组织为 Phase 4 的居中区间树（见 pred_tables_）。
     struct PredicateLock {
         int64_t txn_id;
         int64_t table_rid;
+        int32_t column;      // 谓词所属列（表模式下标）；is_full 时忽略
         bool is_full;
-        IndexKey lo;
-        IndexKey hi;
+        IndexKey lo;         // 空 = -inf（开）
+        IndexKey hi;         // 空 = +inf（开）
     };
 
     // ---- Phase 4（创新特性 E）：谓词锁区间树 ----
     // 旧实现把所有谓词线性存于 pred_locks_ 向量，CheckWritePredicate 逐条
     // PredicateCovers 扫描 → O(P)。改为按表组织「居中区间树」（centered
     // interval tree，教科书 CLRS 区间树形态）：
-    //   * 每张表一棵树；节点分裂点取 lo 值集合的中位数；
+    //   * 每张表每列一棵树；节点分裂点取 lo 值集合的中位数；
     //   * 跨过分裂点的区间存于节点本身（by_lo_asc / by_hi_desc 双有序表），
     //     完全在左/右的区间递归到左右子树；
     //   * 点查询 stabbing query 沿分裂点二分下降，每层只输出必然覆盖该键的
-    //     区间前缀 → O(log P + K)（K 为命中区间数），全表谓词作哨兵单独存放；
+    //     区间前缀 → O(log P + K)（K 为命中区间数），表级全表谓词作哨兵单独存放；
     //   * 谓词注册/注销频率低（每语句级），采用「源向量 + 脏标记 + 惰性重建」
     //     （rebuild O(P log P) 摊薄在热路径之外）。
+    //   * Phase 5：区间端点 lo/hi 为空值（values 为空）表示开边界（lo 空 = -inf、
+    //     hi 空 = +inf），由比较函数统一处理，支持单侧开放范围谓词。
     struct Interval {
-        IndexKey lo;      // 含端点
-        IndexKey hi;
+        IndexKey lo;      // 含端点；空 = -inf
+        IndexKey hi;      // 含端点；空 = +inf
         int64_t txn_id;
     };
     struct IntervalNode {
-        int32_t split_idx = -1;   // lo_values 中分裂点的下标
-        std::vector<std::pair<IndexKey, int64_t>> by_lo_asc;   // (lo, txn) 升序
-        std::vector<std::pair<IndexKey, int64_t>> by_hi_desc;  // (hi, txn) 降序
+        int32_t split_idx = -1;   // lo_values 中分裂点的下标；-1 = 退化单节点（全 lo 开放）
+        std::vector<std::pair<IndexKey, int64_t>> by_lo_asc;   // (lo, txn) 升序（空 lo = -inf 在前）
+        std::vector<std::pair<IndexKey, int64_t>> by_hi_desc;  // (hi, txn) 降序（空 hi = +inf 在前）
         int32_t left = -1, right = -1;   // 子树节点下标（nodes 向量）
     };
-    struct PredicateTable {
-        std::vector<int64_t> full_holders;   // 全表谓词哨兵持有者（is_full）
+    struct PredicateTable {   // 单列的区间树源
         std::vector<Interval> intervals;      // 源：合并后的区间条目（source of truth）
-        std::vector<IndexKey> lo_values;      // 去重升序的 lo 集合（分裂点序列）
+        std::vector<IndexKey> lo_values;      // 去重升序的 lo 集合（分裂点序列，不含空 lo）
         std::vector<IntervalNode> nodes;      // 惰性重建的区间树（后序遍历下标）
         bool dirty = true;
     };
-    std::unordered_map<int64_t, PredicateTable> pred_tables_;  // table_rid -> 树
+    struct PredicateTableGroup {   // 每张表的谓词集合
+        std::vector<int64_t> full_holders;   // 表级全表谓词哨兵持有者（is_full，覆盖整表）
+        std::unordered_map<int32_t, PredicateTable> columns;  // 列下标 -> 该列区间树
+    };
+    std::unordered_map<int64_t, PredicateTableGroup> pred_tables_;  // table_rid -> 谓词集合
     mutable size_t predicate_query_comparisons_ = 0;  // 累计键比较次数（观测用）
 
     // 惰性重建 t 的区间树（intervals → lo_values + nodes）。
@@ -250,6 +270,9 @@ private:
     // 由调用方过滤）。空树时 no-op。
     void PredicateTreeQuery(const PredicateTable& t, const IndexKey& key,
                             std::vector<int64_t>* out) const;
+    // 收集 table_rid 上命中 key 的冲突持有者（表级全表谓词 + column 列区间树）。
+    void GatherColumnConflicts(int64_t table_rid, int32_t column, const IndexKey& key,
+                               std::vector<int64_t>* out);
 };
 
 }  // namespace sqlcompiler

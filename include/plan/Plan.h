@@ -113,6 +113,13 @@ public:
     std::vector<Value> high_key;     // 空表示 +inf
     bool low_inclusive = true;
     bool high_inclusive = true;
+    // Phase 5（周期 1）：复合索引多列前缀区间。low_key/high_key 可能只覆盖索引键
+    // 的「前 low_bound_cols / high_bound_cols 列」（前缀），其后列不参与边界比较。
+    // 例：索引 (a, b)，谓词 a=5 AND b BETWEEN 1 AND 10 →
+    //   low_key=(5,1), low_bound_cols=2；high_key=(5), high_bound_cols=1。
+    // 0 = 未显式设置：执行器按 low_key/high_key 全长处理（单列索引旧行为）。
+    size_t low_bound_cols = 0;
+    size_t high_bound_cols = 0;
 
     // 无法用索引消解的剩余谓词，回表拿到 Tuple 后再判一次。
     // 为空表示索引区间已经精确等价于原谓词。

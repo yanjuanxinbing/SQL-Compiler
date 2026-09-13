@@ -29,11 +29,14 @@
 #include "execution/UpsertExecutor.h"
 #include "execution/WindowExecutor.h"
 #include "catalog/IndexInfo.h"
+#include "catalog/SystemCatalog.h"
 #include "plan/Plan.h"
 #include "storage/LockManager.h"
 #include "txn/Transaction.h"
 #include "txn/TransactionManager.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include <utility>
 
@@ -153,56 +156,324 @@ std::vector<std::pair<std::string, std::string>> CollectScanTableNames(
     return names;
 }
 
-// SERIALIZABLE 读谓词信息：某真实表及其主键读谓词（is_full 表示全表覆盖，
-// 否则为有界区间 [lo, hi]）。用于在读前注册谓词锁以闭合幻读窗口。
+// SERIALIZABLE 读谓词信息：某真实表上的列谓词。
+//   column >= 0 → 该列（表模式下标）上的闭区间 [lo, hi]（lo/hi 为空 = 开边界，
+//     -inf/+inf），谓词持有到提交；
+//   column < 0 && is_full → 表级全表谓词（覆盖整表任意写入）。
+// Phase 5（周期 1）：谓词从「主键区间」泛化为「(表, 列, 区间)」——非主键列、
+// 二级索引列与 Filter 谓词中的任意等值/范围列都可注册；写侧
+// CheckWritePredicateRow 按受影响行逐列匹配冲突。
 struct ScanPredicateInfo {
     std::string table;
-    bool is_full = true;
+    int32_t column = -1;
+    bool is_full = false;
     IndexKey lo;
     IndexKey hi;
 };
 
-// 遍历计划收集被扫描的真实表，按扫描形态确定谓词：
-//   SEQ_SCAN 或无界 INDEX_SCAN → 全表（is_full=true）；任何一处全表覆盖即视为全表。
-//   仅当该表全部扫描均为有界 INDEX_SCAN（low_key/high_key 均非空）才用区间。
-static std::vector<ScanPredicateInfo> CollectScanPredicates(const PlanNodePtr& node) {
-    std::unordered_map<std::string, int> seen;  // table -> 1=range, 2=full
-    std::unordered_map<std::string, IndexKey> lo_map, hi_map;
+// 拆合取谓词为 AND 连接子句（与优化器同一套拆分逻辑）。
+void SplitConjuncts(const ExprPtr& expr, std::vector<ExprPtr>* out) {
+    if (!expr) return;
+    if (expr->GetType() == NodeType::BINARY_EXPR) {
+        const auto* bin = static_cast<const BinaryExpr*>(expr.get());
+        if (bin->op == BinaryOperator::AND) {
+            SplitConjuncts(bin->left, out);
+            SplitConjuncts(bin->right, out);
+            return;
+        }
+    }
+    out->push_back(expr);
+}
+
+struct ColCompare {
+    std::string column;
+    BinaryOperator op;
+    ExprPtr literal;
+};
+
+BinaryOperator FlipOp(BinaryOperator op) {
+    switch (op) {
+        case BinaryOperator::LESS: return BinaryOperator::GREATER;
+        case BinaryOperator::LESS_EQUAL: return BinaryOperator::GREATER_EQUAL;
+        case BinaryOperator::GREATER: return BinaryOperator::LESS;
+        case BinaryOperator::GREATER_EQUAL: return BinaryOperator::LESS_EQUAL;
+        default: return op;
+    }
+}
+
+bool IsLiteral(const ExprPtr& e) {
+    return e && e->GetType() == NodeType::LITERAL_EXPR;
+}
+
+// 匹配 <列> <比较> <字面量>（支持字面量在左；限定到扫描表/别名的列才接受）。
+bool MatchColumnCompare(const ExprPtr& expr, const std::string& table,
+                        const std::string& alias, ColCompare* out) {
+    if (!expr || expr->GetType() != NodeType::BINARY_EXPR) return false;
+    const auto* bin = static_cast<const BinaryExpr*>(expr.get());
+    switch (bin->op) {
+        case BinaryOperator::EQUAL:
+        case BinaryOperator::LESS:
+        case BinaryOperator::LESS_EQUAL:
+        case BinaryOperator::GREATER:
+        case BinaryOperator::GREATER_EQUAL:
+            break;
+        default:
+            return false;
+    }
+    auto column_of = [&](const ExprPtr& e, std::string* name) {
+        if (!e || e->GetType() != NodeType::COLUMN_REF_EXPR) return false;
+        const auto* col = static_cast<const ColumnRefExpr*>(e.get());
+        if (!col->table_name.empty() && col->table_name != table &&
+            col->table_name != alias) {
+            return false;
+        }
+        *name = col->column_name;
+        return true;
+    };
+    std::string name;
+    if (column_of(bin->left, &name) && IsLiteral(bin->right)) {
+        out->column = name;
+        out->op = bin->op;
+        out->literal = bin->right;
+        return true;
+    }
+    if (column_of(bin->right, &name) && IsLiteral(bin->left)) {
+        out->column = name;
+        out->op = FlipOp(bin->op);
+        out->literal = bin->left;
+        return true;
+    }
+    return false;
+}
+
+// 字面量转 Value，按目标列类型归一化（与优化器一致：类型必须与列声明一致，
+// 否则 Value::Compare 的结果没有意义）。
+bool LiteralToValue(const ExprPtr& e, ValueType target, Value* out) {
+    if (!IsLiteral(e) || out == nullptr) return false;
+    const auto* lit = static_cast<const LiteralExpr*>(e.get());
+    switch (lit->literal_type) {
+        case LiteralType::INTEGER:
+            if (target == ValueType::INTEGER) {
+                *out = Value::MakeInt(static_cast<int32_t>(std::atoi(lit->value.c_str())));
+                return true;
+            }
+            if (target == ValueType::FLOAT) {
+                *out = Value::MakeFloat(std::atof(lit->value.c_str()));
+                return true;
+            }
+            return false;
+        case LiteralType::FLOAT:
+            if (target != ValueType::FLOAT) return false;
+            *out = Value::MakeFloat(std::atof(lit->value.c_str()));
+            return true;
+        case LiteralType::STRING:
+            if (target != ValueType::VARCHAR) return false;
+            *out = Value::MakeVarchar(lit->value);
+            return true;
+        default:
+            return false;
+    }
+}
+
+// 单列约束：等值/范围收紧（与优化器同规则：等值最紧；同向范围取更紧）。
+struct ColConstraint {
+    bool has_eq = false;
+    Value eq;
+    bool has_lo = false;
+    Value lo;
+    bool has_hi = false;
+    Value hi;
+};
+
+void ApplyCompare(ColConstraint& c, BinaryOperator op, const Value& v) {
+    const auto tighten_lo = [&]() {
+        if (!c.has_lo || Value::Compare(v, c.lo) > 0) {
+            c.lo = v;
+            c.has_lo = true;
+        }
+    };
+    const auto tighten_hi = [&]() {
+        if (!c.has_hi || Value::Compare(v, c.hi) < 0) {
+            c.hi = v;
+            c.has_hi = true;
+        }
+    };
+    switch (op) {
+        case BinaryOperator::EQUAL:
+            c.has_eq = true;
+            c.eq = v;
+            c.has_lo = c.has_hi = false;  // 等值替代任何范围
+            break;
+        case BinaryOperator::GREATER:
+        case BinaryOperator::GREATER_EQUAL:
+            if (!c.has_eq) tighten_lo();
+            break;
+        case BinaryOperator::LESS:
+        case BinaryOperator::LESS_EQUAL:
+            if (!c.has_eq) tighten_hi();
+            break;
+        default:
+            break;
+    }
+}
+
+// 把谓词表达式中的列比较提取为按列约束 → 列谓词（跳过无法解析/非本表列）。
+void AddPredicateColumns(SystemCatalog* catalog, const std::string& table,
+                         const std::string& alias, const ExprPtr& predicate,
+                         std::vector<ScanPredicateInfo>* out) {
+    if (catalog == nullptr || !predicate || out == nullptr) return;
+    const TableInfo* info = catalog->GetTable(table);
+    if (info == nullptr) return;
+    std::vector<ExprPtr> conjuncts;
+    SplitConjuncts(predicate, &conjuncts);
+    std::vector<ColConstraint> cons(info->columns.size());
+    for (const auto& c : conjuncts) {
+        ColCompare cc;
+        if (!MatchColumnCompare(c, table, alias, &cc)) continue;
+        size_t idx = info->columns.size();
+        for (size_t i = 0; i < info->columns.size(); ++i) {
+            if (info->columns[i].name == cc.column) { idx = i; break; }
+        }
+        if (idx == info->columns.size()) continue;  // 非本表列（JOIN 对端/外层引用）
+        // 列类型由表定义投影（ColumnInfo 只持 data_type 字符串，运行时类型用
+        // BuildIndexKeyTypes 推导，避免重复的类型名 → ValueType 映射）。
+        std::vector<ValueType> t2;
+        if (!BuildIndexKeyTypes(*info, std::vector<std::string>{cc.column}, &t2) ||
+            t2.size() != 1) {
+            continue;
+        }
+        Value v;
+        if (!LiteralToValue(cc.literal, t2[0], &v)) continue;
+        ApplyCompare(cons[idx], cc.op, v);
+    }
+    for (size_t i = 0; i < cons.size(); ++i) {
+        const ColConstraint& c = cons[i];
+        ScanPredicateInfo p;
+        p.table = table;
+        p.column = static_cast<int32_t>(i);
+        if (c.has_eq) {
+            p.lo = IndexKey(std::vector<Value>{c.eq});
+            p.hi = IndexKey(std::vector<Value>{c.eq});
+        } else {
+            if (c.has_lo) p.lo = IndexKey(std::vector<Value>{c.lo});
+            if (c.has_hi) p.hi = IndexKey(std::vector<Value>{c.hi});
+        }
+        if (p.lo.values.empty() && p.hi.values.empty()) continue;
+        out->push_back(std::move(p));
+    }
+}
+
+// 把索引扫描边界（low_key/high_key + 前缀列数）转换为覆盖列的列谓词：
+//   共同前缀中值相等的列 → 点谓词 [v, v]；首个范围列 → 区间 [lo, hi]
+//   （某侧缺失即开放）。索引键列必须解析到表列下标（索引可能建在非前导列上）。
+void AddIndexBoundPredicates(SystemCatalog* catalog,
+                             const std::shared_ptr<IndexScanNode>& s,
+                             std::vector<ScanPredicateInfo>* out) {
+    if (catalog == nullptr || out == nullptr) return;
+    const size_t low_cols = s->low_bound_cols, high_cols = s->high_bound_cols;
+    if (low_cols == 0 && high_cols == 0) return;
+    const IndexInfo* info = catalog->GetIndex(s->index_name);
+    if (info == nullptr) return;
+    // 索引键列位置 j -> 表列下标（索引键顺序 ≠ 表列顺序）。
+    auto col_of = [&](size_t j) -> int32_t {
+        if (info->key_columns.size() <= j) return -1;
+        const TableInfo* tinfo = catalog->GetTable(s->table_name);
+        if (tinfo == nullptr) return -1;
+        for (size_t i = 0; i < tinfo->columns.size(); ++i) {
+            if (tinfo->columns[i].name == info->key_columns[j]) {
+                return static_cast<int32_t>(i);
+            }
+        }
+        return -1;
+    };
+    // 共同前缀中值相等的列 → 点谓词。
+    const size_t common = std::min(low_cols, high_cols);
+    size_t eq_cols = 0;
+    for (size_t j = 0; j < common; ++j) {
+        if (Value::Compare(s->low_key[j], s->high_key[j]) != 0) break;
+        ++eq_cols;
+    }
+    for (size_t j = 0; j < eq_cols; ++j) {
+        const int32_t cidx = col_of(j);
+        if (cidx < 0) continue;
+        ScanPredicateInfo p;
+        p.table = s->table_name;
+        p.column = cidx;
+        p.lo = IndexKey(std::vector<Value>{s->low_key[j]});
+        p.hi = p.lo;
+        out->push_back(std::move(p));
+    }
+    // 首个范围列（某侧仍覆盖到该列时）。
+    const size_t range_col = eq_cols;
+    if (range_col >= low_cols && range_col >= high_cols) return;
+    const int32_t cidx = col_of(range_col);
+    if (cidx < 0) return;
+    ScanPredicateInfo p;
+    p.table = s->table_name;
+    p.column = cidx;
+    if (range_col < low_cols) p.lo = IndexKey(std::vector<Value>{s->low_key[range_col]});
+    if (range_col < high_cols) p.hi = IndexKey(std::vector<Value>{s->high_key[range_col]});
+    out->push_back(std::move(p));
+}
+
+bool HasPredicateFor(const std::vector<ScanPredicateInfo>& out, const std::string& t) {
+    for (const auto& p : out) {
+        if (p.table == t) return true;
+    }
+    return false;
+}
+
+// 遍历计划收集被扫描真实表的读谓词（SERIALIZABLE 闭合幻读窗口）：
+//   * INDEX_SCAN：索引边界覆盖列 → 点/区间谓词；residual_predicate 中的列比较
+//     另行提取；两者都提取不到 → 全表谓词。
+//   * Filter 直接覆盖 SeqScan：提取 Filter 谓词中的列比较；提取不到 → 全表谓词。
+//   * 其余扫描形态（纯 SEQ_SCAN / JOIN 下的扫描 / 派生表）：全表谓词。
+// 同一表任一扫描为全表 → 整体升级为全表谓词（注册时的全表化收敛会清理同事务的
+// 列级谓词）。
+static std::vector<ScanPredicateInfo> CollectScanPredicates(SystemCatalog* catalog,
+                                                            const PlanNodePtr& node) {
+    std::vector<ScanPredicateInfo> out;
+    std::unordered_set<std::string> full;  // 需全表覆盖的表
     std::function<void(const PlanNodePtr&)> walk = [&](const PlanNodePtr& n) {
         if (!n) return;
-        if (n->GetType() == PlanNodeType::SEQ_SCAN) {
-            auto s = std::static_pointer_cast<SeqScanNode>(n);
-            if (!s->table_name.empty()) seen[s->table_name] = 2;
-        } else if (n->GetType() == PlanNodeType::INDEX_SCAN) {
+        if (n->GetType() == PlanNodeType::INDEX_SCAN) {
             auto s = std::static_pointer_cast<IndexScanNode>(n);
-            if (!s->table_name.empty()) {
-                const bool bounded = !s->low_key.empty() && !s->high_key.empty();
-                auto it = seen.find(s->table_name);
-                if (it == seen.end()) {
-                    if (bounded) {
-                        seen.emplace(s->table_name, 1);
-                        lo_map[s->table_name] = IndexKey(s->low_key);
-                        hi_map[s->table_name] = IndexKey(s->high_key);
-                    } else {
-                        seen.emplace(s->table_name, 2);
-                    }
-                } else if (it->second == 1 && !bounded) {
-                    it->second = 2;
+            if (!s->table_name.empty() && full.count(s->table_name) == 0) {
+                AddIndexBoundPredicates(catalog, s, &out);
+                if (s->residual_predicate) {
+                    AddPredicateColumns(catalog, s->table_name, s->table_alias,
+                                        s->residual_predicate, &out);
+                }
+                if (!HasPredicateFor(out, s->table_name)) {
+                    full.insert(s->table_name);
                 }
             }
+        } else if (n->GetType() == PlanNodeType::FILTER &&
+                   n->children.size() == 1 &&
+                   n->children[0]->GetType() == PlanNodeType::SEQ_SCAN) {
+            auto s = std::static_pointer_cast<SeqScanNode>(n->children[0]);
+            auto f = std::static_pointer_cast<FilterNode>(n);
+            if (!s->table_name.empty() && full.count(s->table_name) == 0) {
+                AddPredicateColumns(catalog, s->table_name, s->table_alias,
+                                    f->predicate, &out);
+                if (!HasPredicateFor(out, s->table_name)) {
+                    full.insert(s->table_name);
+                }
+            }
+            // 派生表（table_name == alias 且 children 非空）的内层子计划仍需下探。
+            for (auto& cc : n->children[0]->children) walk(cc);
+            return;
+        } else if (n->GetType() == PlanNodeType::SEQ_SCAN) {
+            auto s = std::static_pointer_cast<SeqScanNode>(n);
+            if (!s->table_name.empty()) full.insert(s->table_name);
         }
         for (auto& c : n->children) walk(c);
     };
     walk(node);
-    std::vector<ScanPredicateInfo> out;
-    for (auto& kv : seen) {
+    for (const std::string& t : full) {
         ScanPredicateInfo info;
-        info.table = kv.first;
-        info.is_full = (kv.second == 2);
-        if (!info.is_full) {
-            info.lo = lo_map[kv.first];
-            info.hi = hi_map[kv.first];
-        }
+        info.table = t;
+        info.is_full = true;
         out.push_back(std::move(info));
     }
     return out;
@@ -493,14 +764,16 @@ ExecutionResult ExecutionEngine::ExecuteSubplan(const PlanNodePtr& plan,
         }
     }
 
-    // SERIALIZABLE：在读前为被扫描的真实表注册主键读谓词，闭合幻读窗口
-    //（其他事务向该范围插入/删除命中键时会与我们冲突）。读谓词持有到提交，
-    // 由 Commit/Rollback 的 UnlockAll 一并释放。
+    // SERIALIZABLE：在读前为被扫描的真实表注册列读谓词，闭合幻读窗口
+    //（其他事务向该范围插入/删除命中键时会与我们冲突）。Phase 5：谓词按
+    // (表, 列, 区间) 注册——任意列（含二级索引列）的等值/范围谓词都参与写前冲突
+    // 判定。读谓词持有到提交，由 Commit/Rollback 的 UnlockAll 一并释放。
     if (lock_enabled && iso == IsolationLevel::kSerializable) {
-        for (const auto& p : CollectScanPredicates(plan)) {
+        for (const auto& p : CollectScanPredicates(ctx->GetCatalog(), plan)) {
             int64_t r = TableResourceId(ctx->GetCatalog(), p.table);
             if (r < 0) continue;  // 派生表/CTE 别名，非真实表
-            lm->AcquireReadPredicate(txn->GetTxnId(), r, p.is_full, p.lo, p.hi);
+            lm->AcquireReadPredicate(txn->GetTxnId(), r, p.column, p.is_full,
+                                     p.lo, p.hi);
         }
     }
 

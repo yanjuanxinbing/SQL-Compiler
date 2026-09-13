@@ -1795,42 +1795,42 @@ static void TestPredicateLockMerge() {
     const IndexKey k35{std::vector<Value>{Value::MakeInt(35)}};
 
     // (1) 重叠区间合并：[10,20] ∪ [15,25] → [10,25]，条目数收敛到 1。
-    CHECK(lm.AcquireReadPredicate(1, tab, false, k10, k20) == LockResult::kGranted);
+    CHECK(lm.AcquireReadPredicate(1, tab, 0, false, k10, k20) == LockResult::kGranted);
     CHECK(lm.CountPredicateLocks(1, tab) == 1);
-    CHECK(lm.AcquireReadPredicate(1, tab, false, k15, k25) == LockResult::kGranted);
+    CHECK(lm.AcquireReadPredicate(1, tab, 0, false, k15, k25) == LockResult::kGranted);
     CHECK(lm.CountPredicateLocks(1, tab) == 1);
 
     // (2) 不相交区间保留：[10,25] ∪ [30,40] → 2 条（不可合并）。
-    CHECK(lm.AcquireReadPredicate(1, tab, false, k30, k40) == LockResult::kGranted);
+    CHECK(lm.AcquireReadPredicate(1, tab, 0, false, k30, k40) == LockResult::kGranted);
     CHECK(lm.CountPredicateLocks(1, tab) == 2);
 
     // (3) 桥接合并：[10,25] ∪ [30,40] ∪ [22,28] → [10,25] 拓宽为 [10,28]，
     //     与 [30,40] 仍不相交 → 保持 2 条（不产生伪合并）。
-    CHECK(lm.AcquireReadPredicate(1, tab, false, k22, k28) == LockResult::kGranted);
+    CHECK(lm.AcquireReadPredicate(1, tab, 0, false, k22, k28) == LockResult::kGranted);
     CHECK(lm.CountPredicateLocks(1, tab) == 2);
 
     // (4) 不同事务各自独立：txn2 的区间不并入 txn1。
-    CHECK(lm.AcquireReadPredicate(2, tab, false, k10, k20) == LockResult::kGranted);
+    CHECK(lm.AcquireReadPredicate(2, tab, 0, false, k10, k20) == LockResult::kGranted);
     CHECK(lm.CountPredicateLocks(1, tab) == 2);
     CHECK(lm.CountPredicateLocks(2, tab) == 1);
 
     // (5) 全表谓词收敛：txn1 注册 is_full 后，其全部区间谓词被父谓词统一覆盖删除。
-    CHECK(lm.AcquireReadPredicate(1, tab, true, k10, k20) == LockResult::kGranted);
+    CHECK(lm.AcquireReadPredicate(1, tab, 0, true, k10, k20) == LockResult::kGranted);
     CHECK(lm.CountPredicateLocks(1, tab) == 1);
 
     // (6) 父谓词继承：已持全表谓词后，新区间谓词一律被丢弃（条目数不变）。
-    CHECK(lm.AcquireReadPredicate(1, tab, false, k30, k40) == LockResult::kGranted);
+    CHECK(lm.AcquireReadPredicate(1, tab, 0, false, k30, k40) == LockResult::kGranted);
     CHECK(lm.CountPredicateLocks(1, tab) == 1);
 
     // (7) 合并后覆盖能力不变：txn2 的 [10,20] 挡住 txn3 对 15 的写；
     //     txn1 的全表谓词挡住 txn3 对 35 的写（原 [30,40] 之外的键也被覆盖）。
-    CHECK(lm.CheckWritePredicate(3, tab, k15, 100) == LockResult::kTimeout);
-    CHECK(lm.CheckWritePredicate(3, tab, k35, 100) == LockResult::kTimeout);
+    CHECK(lm.CheckWritePredicate(3, tab, 0, k15, 100) == LockResult::kTimeout);
+    CHECK(lm.CheckWritePredicate(3, tab, 0, k35, 100) == LockResult::kTimeout);
     lm.UnlockAll(3);
 
     // (8) 不同表互不影响：txn1 在表 9 上独立计数。
     const int64_t tab2 = 9;
-    CHECK(lm.AcquireReadPredicate(1, tab2, false, k10, k20) == LockResult::kGranted);
+    CHECK(lm.AcquireReadPredicate(1, tab2, 0, false, k10, k20) == LockResult::kGranted);
     CHECK(lm.CountPredicateLocks(1, tab) == 1);
     CHECK(lm.CountPredicateLocks(1, tab2) == 1);
 }
@@ -2127,6 +2127,147 @@ static void TestSerializablePredicatePhantom() {
     RemoveFile(path + ".fpl");
 }
 
+// ---- Phase 5（周期 1）：谓词锁扩展至任意列 + 复合索引区间推导 ----
+
+// 非主键列范围幻读复现：A 走二级索引按非主键列 g 范围扫描（g >= 50）注册列 g 的
+// 读谓词；B 向该范围插入新行（g=60）。主键 100 不在任何主键谓词约束内——旧实现
+// （写前仅检查主键）会放行，A 重扫出现幻读；新实现按 (表, 列, 区间) 判定，
+// g=60 命中列 g 谓词 → 挡住 B（幻读窗口闭合）。反向：B 插入 g=10（不命中列谓词）
+// 不被挡（并发性保持）。
+static void TestSerializablePredicateNonPkPhantom() {
+    const std::string path = "storage_ut_phantom_nonpk.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto sA = db.CreateSession();
+        auto sB = db.CreateSession();
+        auto* mgA = sA->GetTransactionManager();
+        CHECK(mgA != nullptr);
+        mgA->SetIsolationLevel(IsolationLevel::kSerializable);
+
+        CHECK(db.ExecuteSQL("CREATE TABLE np(id INT PRIMARY KEY, g INT)", sA.get()).success);
+        CHECK(db.ExecuteSQL("CREATE INDEX idx_np_g ON np(g)", sA.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO np VALUES (1,10),(2,20),(3,30)", sA.get()).success);
+
+        // A：按非主键列 g 范围扫描（命中二级索引 idx_np_g）→ 注册列 g 谓词 [50, +inf)。
+        CHECK(db.ExecuteSQL("BEGIN", sA.get()).success);
+        auto sr = db.ExecuteSQL("SELECT id FROM np WHERE g >= 50", sA.get());
+        CHECK(sr.success);
+
+        // B 插入 g=60（主键 100 不受任何主键谓词约束）：非主键列谓词命中 → 必须被挡。
+        std::atomic<int> b_done{0};
+        ExecutionResult rb;
+        std::thread bw([&] {
+            rb = db.ExecuteSQL("BEGIN", sB.get());
+            if (!rb.success) { b_done = 1; return; }
+            auto r = db.ExecuteSQL("INSERT INTO np VALUES (100, 60)", sB.get());
+            rb = r;
+            if (r.success) db.ExecuteSQL("COMMIT", sB.get());
+            b_done = 1;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        CHECK(!b_done.load());   // 非主键列谓词命中 → B 被挡（幻读窗口闭合）
+        CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
+        bw.join();
+        CHECK(b_done.load());
+        CHECK(rb.success);
+
+        // 并发性保持：B 插入 g=10（不在 A 的列 g 谓词 [50,+inf) 内）不被挡。
+        std::atomic<int> b2_done{0};
+        ExecutionResult rb2;
+        std::thread bw2([&] {
+            rb2 = db.ExecuteSQL("BEGIN", sB.get());
+            if (!rb2.success) { b2_done = 1; return; }
+            auto r = db.ExecuteSQL("INSERT INTO np VALUES (200, 10)", sB.get());
+            rb2 = r;
+            if (r.success) db.ExecuteSQL("COMMIT", sB.get());
+            b2_done = 1;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        CHECK(b2_done.load());   // 不命中列谓词 → 无需等 A（与幻读窗口正交）
+        bw2.join();
+        CHECK(rb2.success);
+
+        CHECK(db.ExecuteSQL("SELECT COUNT(*) FROM np", sA.get()).success);
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// 复合索引多列前缀区间收敛：谓词 a=1 AND b>5 在复合主键 (a,b) 索引上应推导出
+// low=[1,5]（2 列前缀）与 high=[1]（1 列前缀）；a=1 AND b=2 收窄为两列点谓词
+// low=high=[1,2]；a>5 仅首列范围（low=[5]，无上界）。用 EXPLAIN 计划文本断言
+// 区间端点收敛，并验证收敛后的扫描不丢行。
+static void TestCompositeIndexRangeConvergence() {
+    const std::string path = "storage_ut_composite.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto s = db.CreateSession();
+        CHECK(db.ExecuteSQL(
+                  "CREATE TABLE ci(a INT, b INT, c INT, PRIMARY KEY(a, b))",
+                  s.get()).success);
+        CHECK(db.ExecuteSQL(
+                  "INSERT INTO ci VALUES (1,1,1),(1,2,2),(1,6,3),(2,1,4)",
+                  s.get()).success);
+
+        // (1) a=1 AND b>5：low 收敛到 2 列前缀 [1,5]，high 收敛到 1 列前缀 [1]。
+        auto r1 = db.ExecuteSQL("EXPLAIN SELECT * FROM ci WHERE a = 1 AND b > 5",
+                                s.get());
+        CHECK(r1.success);
+        CHECK(r1.rows.size() == 1);
+        const std::string p1 = r1.rows[0].GetValue(0).ToString();
+        CHECK(p1.find("IndexScan") != std::string::npos);
+        CHECK(p1.find("low=1,5") != std::string::npos);
+        CHECK(p1.find("high=1") != std::string::npos);
+
+        // (2) a=1 AND b=2：两列等值 → low=high=[1,2]（前缀全收窄为点）。
+        auto r2 = db.ExecuteSQL("EXPLAIN SELECT * FROM ci WHERE a = 1 AND b = 2",
+                                s.get());
+        CHECK(r2.success);
+        CHECK(r2.rows.size() == 1);
+        const std::string p2 = r2.rows[0].GetValue(0).ToString();
+        CHECK(p2.find("IndexScan") != std::string::npos);
+        CHECK(p2.find("low=1,2") != std::string::npos);
+        CHECK(p2.find("high=1,2") != std::string::npos);
+
+        // (3) a>5：仅首列范围 → low=[5]（1 列），无上界。
+        auto r3 = db.ExecuteSQL("EXPLAIN SELECT * FROM ci WHERE a > 5", s.get());
+        CHECK(r3.success);
+        CHECK(r3.rows.size() == 1);
+        const std::string p3 = r3.rows[0].GetValue(0).ToString();
+        CHECK(p3.find("IndexScan") != std::string::npos);
+        CHECK(p3.find("low=5") != std::string::npos);
+        CHECK(p3.find("high=") == std::string::npos);
+
+        // (4) 正确性：前缀区间收敛后的范围扫描不丢行、不超界。
+        auto chk = db.ExecuteSQL("SELECT c FROM ci WHERE a = 1 AND b > 5 ORDER BY c",
+                                 s.get());
+        CHECK(chk.success);
+        CHECK(chk.rows.size() == 1);
+        CHECK(chk.rows[0].GetValue(0).ToString() == "3");
+
+        // (5) 正确性：两列点查返回精确行。
+        auto chk2 = db.ExecuteSQL("SELECT c FROM ci WHERE a = 1 AND b = 2", s.get());
+        CHECK(chk2.success);
+        CHECK(chk2.rows.size() == 1);
+        CHECK(chk2.rows[0].GetValue(0).ToString() == "2");
+
+        // (6) 正确性：首列范围扫描返回全部命中行。
+        auto chk3 = db.ExecuteSQL("SELECT COUNT(*) FROM ci WHERE a > 0", s.get());
+        CHECK(chk3.success);
+        CHECK(chk3.rows.size() == 1);
+        CHECK(chk3.rows[0].GetValue(0).ToString() == "4");
+
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
 // ---- Phase 4（创新特性 E）：谓词锁区间树 ----
 // 1) 正确性：万级区间 + 全表哨兵下，覆盖/未覆盖键的写检查结果正确；
 // 2) 复杂度：未覆盖键的 stabbing 查询比较次数 << P（O(log P) 而非线性 O(P)）；
@@ -2138,7 +2279,7 @@ static void TestPredicateIntervalTree() {
     for (int i = 0; i < kIntervals; ++i) {
         IndexKey lo{std::vector<Value>{Value::MakeInt(i * 1000)}};
         IndexKey hi{std::vector<Value>{Value::MakeInt(i * 1000 + 500)}};
-        CHECK(lm.AcquireReadPredicate(i + 1, tab, false, lo, hi) ==
+        CHECK(lm.AcquireReadPredicate(i + 1, tab, 0, false, lo, hi) ==
               LockResult::kGranted);
     }
     CHECK(lm.CountTotalPredicates(tab) == static_cast<size_t>(kIntervals));
@@ -2149,24 +2290,24 @@ static void TestPredicateIntervalTree() {
     // (1) 覆盖键 → 阻塞（kTimeout）；未覆盖键 → 通过（kGranted）。
     IndexKey hit{std::vector<Value>{Value::MakeInt(12345)}};  // 在 [12000,12500]
     IndexKey miss{std::vector<Value>{Value::MakeInt(600)}};   // 在 [500,1000] 之间
-    CHECK(lm.CheckWritePredicate(probe, tab, hit, 1) == LockResult::kTimeout);
-    CHECK(lm.CheckWritePredicate(probe, tab, miss, 1) == LockResult::kGranted);
+    CHECK(lm.CheckWritePredicate(probe, tab, 0, hit, 1) == LockResult::kTimeout);
+    CHECK(lm.CheckWritePredicate(probe, tab, 0, miss, 1) == LockResult::kGranted);
 
     // (2) O(log P)：未覆盖键的比较次数远小于 1 万（线性扫描需 ~1 万次判定）。
     lm.ResetPredicateQueryComparisons();
-    CHECK(lm.CheckWritePredicate(probe, tab, miss, 1) == LockResult::kGranted);
+    CHECK(lm.CheckWritePredicate(probe, tab, 0, miss, 1) == LockResult::kGranted);
     const size_t comps = lm.GetPredicateQueryComparisons();
     CHECK(comps > 0);
     CHECK(comps < 100);  // log2(1e4) ≈ 14 层，上限给足余量
 
     // (3) 全表哨兵挡住任意键；且他事务的区间谓词不被误删（is_full 只收敛自己）。
-    CHECK(lm.AcquireReadPredicate(other, tab, true, IndexKey{}, IndexKey{}) ==
+    CHECK(lm.AcquireReadPredicate(other, tab, 0, true, IndexKey{}, IndexKey{}) ==
           LockResult::kGranted);
-    CHECK(lm.CheckWritePredicate(probe, tab, miss, 1) == LockResult::kTimeout);
+    CHECK(lm.CheckWritePredicate(probe, tab, 0, miss, 1) == LockResult::kTimeout);
     lm.UnlockAll(other);  // 移除全表哨兵
     // 他事务 txn 1 的 [0,500] 应仍在：键 10 仍被挡住。
     IndexKey hit_low{std::vector<Value>{Value::MakeInt(10)}};
-    CHECK(lm.CheckWritePredicate(probe, tab, hit_low, 1) == LockResult::kTimeout);
+    CHECK(lm.CheckWritePredicate(probe, tab, 0, hit_low, 1) == LockResult::kTimeout);
 }
 
 // ---- Phase 4（创新特性 F）：WAL 组提交（领导者-跟随者）----
@@ -3734,6 +3875,8 @@ int main() {
     TestBPlusTreeConcurrency();
     TestOptimisticSplitConcurrency();
     TestSerializablePredicatePhantom();
+    TestSerializablePredicateNonPkPhantom();
+    TestCompositeIndexRangeConvergence();
     TestPredicateIntervalTree();
     TestGroupCommit();
     TestTemperatureAwareFlush();

@@ -135,22 +135,13 @@ ExecutionContext::RowLockResult ExecutionContext::CheckSerializablePredicate(
     if (txn->GetIsolationLevel() != IsolationLevel::kSerializable) return RowLockResult::kUnused;
     LockManager* lm = txn_manager_->GetLockManager();
     if (lm == nullptr || catalog_ == nullptr) return RowLockResult::kUnused;
-    const TableInfo* info = catalog_->GetTable(table_name);
     TableHeap* heap = catalog_->GetTableHeap(table_name);
-    if (info == nullptr || heap == nullptr) return RowLockResult::kUnused;
-    // 主键键：所有标记为 PRIMARY KEY 的列按列序取值。谓词作用在主键键空间。
-    std::vector<Value> key_vals;
-    key_vals.reserve(info->columns.size());
-    for (size_t i = 0; i < info->columns.size() && i < row.size(); ++i) {
-        if (info->columns[i].is_primary_key) {
-            if (row[i].IsNull()) return RowLockResult::kUnused;
-            key_vals.push_back(row[i]);
-        }
-    }
-    if (key_vals.empty()) return RowLockResult::kUnused;  // 无主键：谓词边界未定义
+    if (heap == nullptr) return RowLockResult::kUnused;
+    // Phase 5：写前检查泛化为「按受影响行」——表级全表谓词命中任意写；逐列检查
+    // 本行各列值是否命中该列注册的读谓词（含任意非主键列）。row 与表模式按列序
+    // 对齐；内部一次加锁收集全部冲突持有者。
     const int64_t table_rid = static_cast<int64_t>(heap->GetFirstPageId());
-    IndexKey key(std::move(key_vals));
-    LockResult r = lm->CheckWritePredicate(txn->GetTxnId(), table_rid, key, kPredicateWaitMs);
+    LockResult r = lm->CheckWritePredicateRow(txn->GetTxnId(), table_rid, row, kPredicateWaitMs);
     if (r != LockResult::kGranted) {
         return (r == LockResult::kDeadlock) ? RowLockResult::kDeadlock : RowLockResult::kTimeout;
     }

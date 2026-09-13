@@ -5,9 +5,28 @@
 #include "txn/Transaction.h"
 #include "txn/TransactionManager.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace sqlcompiler {
+
+namespace {
+
+// 前缀比较：仅比较 key 的前 prefix_cols 列与 bound（bound 恰好含 prefix_cols 个值）。
+// 前缀完全相等即视为相等（忽略 key 的剩余列）——复合索引上界按最左前缀收窄，
+// 剩余列在字典序下没有独立边界；否则返回首个不同列的符号。
+// 单列索引 / 旧计划未标注前缀列数（bound_cols==0）时，调用方传入 bound 的全列数，
+// 退化为完整键比较（与原 CompareKeyOnly 行为一致）。
+int CompareKeyPrefix(const IndexKey& key, size_t prefix_cols, const IndexKey& bound) {
+    const size_t n = std::min({prefix_cols, key.values.size(), bound.values.size()});
+    for (size_t i = 0; i < n; ++i) {
+        int c = Value::Compare(key.values[i], bound.values[i]);
+        if (c != 0) return c;
+    }
+    return 0;
+}
+
+}  // namespace
 
 IndexScanExecutor::IndexScanExecutor(
     ExecutionContext* context, std::shared_ptr<IndexScanNode> node,
@@ -60,7 +79,10 @@ void IndexScanExecutor::Init() {
 bool IndexScanExecutor::BeyondUpperBound(const IndexKey& key) const {
     if (node_->high_key.empty()) return false;
     const IndexKey high(node_->high_key);
-    const int c = CompareKeyOnly(key, high);
+    // 复合索引：只比较上界覆盖的前缀列；未标注（bound_cols==0）按完整键比较。
+    const size_t cols = node_->high_bound_cols > 0 ? node_->high_bound_cols
+                                                   : high.values.size();
+    const int c = CompareKeyPrefix(key, cols, high);
     return node_->high_inclusive ? (c > 0) : (c >= 0);
 }
 
@@ -69,11 +91,17 @@ bool IndexScanExecutor::BeyondUpperBound(const IndexKey& key) const {
 // 其可见版本键可能与条目键不同，据此过滤。
 bool IndexScanExecutor::InScanBounds(const IndexKey& key) const {
     if (!node_->low_key.empty()) {
-        const int c = CompareKeyOnly(key, IndexKey(node_->low_key));
+        const IndexKey low(node_->low_key);
+        const size_t lcols = node_->low_bound_cols > 0 ? node_->low_bound_cols
+                                                       : low.values.size();
+        const int c = CompareKeyPrefix(key, lcols, low);
         if (node_->low_inclusive ? (c < 0) : (c <= 0)) return false;
     }
     if (!node_->high_key.empty()) {
-        const int c = CompareKeyOnly(key, IndexKey(node_->high_key));
+        const IndexKey high(node_->high_key);
+        const size_t hcols = node_->high_bound_cols > 0 ? node_->high_bound_cols
+                                                        : high.values.size();
+        const int c = CompareKeyPrefix(key, hcols, high);
         if (node_->high_inclusive ? (c > 0) : (c >= 0)) return false;
     }
     return true;
@@ -86,9 +114,13 @@ bool IndexScanExecutor::Next(Tuple* tuple) {
     IndexKey key;
     RID rid;
     while (cursor_->Next(&key, &rid)) {
-        // 下界是开区间时，LowerBound 会把等于下界的项也带出来，这里跳过
+        // 下界是开区间时，LowerBound 会把等于下界的项也带出来，这里跳过。
+        // 复合索引前缀下界：前缀相等即视为等于下界（key 的剩余列无独立边界）。
         if (!node_->low_key.empty() && !node_->low_inclusive) {
-            if (CompareKeyOnly(key, IndexKey(node_->low_key)) == 0) continue;
+            const IndexKey low(node_->low_key);
+            const size_t lcols = node_->low_bound_cols > 0 ? node_->low_bound_cols
+                                                           : low.values.size();
+            if (CompareKeyPrefix(key, lcols, low) == 0) continue;
         }
         if (BeyondUpperBound(key)) return false;
 
