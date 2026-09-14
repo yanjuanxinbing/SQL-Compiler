@@ -1,0 +1,31 @@
+-- 49_acid_recovery.sql
+-- Phase B：WAL + 重做 + 崩溃恢复的占位说明文件。
+--
+-- 本测试**不**通过 run_all_tests.bat 直接驱动。它需要「打开同一个 db 文件两
+-- 次」的语义：第一次创建 schema/写入基线数据 → 中途 \crash → 第二次打开时
+-- 验证未提交事务被回滚、已提交事务保留。
+--
+-- 执行方式：运行 tests/run_acid_recovery.bat。该脚本会：
+--   1) 删除旧的 49_acid_recovery.db 与 .wal；
+--   2) 用 build/Debug/sqlcompiler.exe 跑 phase1 (CREATE + INSERT + BEGIN +
+--      UPDATE + \crash)，期望非零退出码；
+--   3) 用同一个 .db 跑 phase2 (SELECT + UPDATE + BEGIN + UPDATE + ROLLBACK +
+--      SELECT)；
+--   4) 校验：
+--        - phase1 exit != 0（崩溃注入生效）
+--        - phase2 exit == 0（重启后能正常执行）
+--        - phase2 SELECT 输出包含 "1 | 100"（phase1 未提交的 UPDATE 被回滚）
+--        - phase2 SELECT 输出包含 "2 | 60"（phase2 自身的 UPDATE 持久化）
+--
+-- 预期输出保存在 tests/tmp/49_acid_recovery.out，便于回归对比。
+--
+-- Phase B 语义：
+--   * BEGIN / UPDATE 都会写 WAL；COMMIT/ROLLBACK 末尾追加 BEGIN/COMMIT/ABORT
+--     记录并 fdatasync。
+--   * 重启后 RecoveryManager 跑 analysis -> redo -> undo（ARIES 3-phase）。
+--   * 物理 page-image redo：LSN 检查保证幂等（page.page_lsn < record.lsn 时
+--     才覆盖）。
+--
+-- 本文件留空以避免被 run_all_tests.bat 当作可执行测试（其会期望 "exit=0"）。
+-- 真正的测试由 run_acid_recovery.bat 驱动。
+exit;

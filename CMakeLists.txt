@@ -17,7 +17,7 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 
 # 收集所有源文件
 file(GLOB_RECURSE SQLCOMPILER_LIB_SOURCES
-    # ---- 编译器模块（词法/语法/语义/计划/优化/代码生成） ----
+    # ---- 编译器模块（词法/语法/语义/计划/优化） ----
     ${CMAKE_SOURCE_DIR}/src/common/*.cpp
     ${CMAKE_SOURCE_DIR}/src/lexer/*.cpp
     ${CMAKE_SOURCE_DIR}/src/ast/*.cpp
@@ -25,13 +25,15 @@ file(GLOB_RECURSE SQLCOMPILER_LIB_SOURCES
     ${CMAKE_SOURCE_DIR}/src/semantic/*.cpp
     ${CMAKE_SOURCE_DIR}/src/plan/*.cpp
     ${CMAKE_SOURCE_DIR}/src/optimizer/*.cpp
-    ${CMAKE_SOURCE_DIR}/src/codegen/*.cpp
 
     # ---- 存储子系统（页式存储 + 缓存管理） ----
     ${CMAKE_SOURCE_DIR}/src/storage/*.cpp
 
     # ---- 存储引擎（记录/元组 <-> 页的映射） ----
     ${CMAKE_SOURCE_DIR}/src/storage_engine/*.cpp
+
+    # ---- 索引（B+Tree） ----
+    ${CMAKE_SOURCE_DIR}/src/index/*.cpp
 
     # ---- 系统目录（元数据持久化） ----
     ${CMAKE_SOURCE_DIR}/src/catalog/*.cpp
@@ -41,6 +43,9 @@ file(GLOB_RECURSE SQLCOMPILER_LIB_SOURCES
 
     # ---- 数据库总入口（门面类） ----
     ${CMAKE_SOURCE_DIR}/src/db/*.cpp
+
+    # ---- 事务子系统（Phase A：内存 undo log；Phase B：WAL + 恢复） ----
+    ${CMAKE_SOURCE_DIR}/src/txn/*.cpp
 )
 
 # 编译为静态库，方便主程序与未来的测试共同链接

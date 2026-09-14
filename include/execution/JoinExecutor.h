@@ -11,7 +11,7 @@
 
 namespace sqlcompiler {
 
-// 连接算子（嵌套循环实现）：对左右两个子算子做 INNER/LEFT/RIGHT JOIN，
+// 连接算子（嵌套循环实现）：对左右两个子算子做 INNER/LEFT/RIGHT/FULL OUTER/CROSS JOIN，
 // 按 on 条件过滤。对应逻辑计划中的 JoinNode。
 // 注：输出 Tuple 是左右元组的拼接（先左后右），列下标为左表列数 + 右表列下标。
 class JoinExecutor : public Executor {
@@ -34,12 +34,14 @@ private:
     std::vector<Tuple> left_buffer_;
     std::vector<Tuple> right_buffer_;
 
-    // RIGHT JOIN: pre-collect matched flags for right tuples
+    // RIGHT JOIN / FULL OUTER JOIN: pre-collect matched flags for right tuples
     std::vector<bool> right_matched_;
+    // FULL OUTER JOIN: pre-collect matched flags for left tuples
+    std::vector<bool> left_matched_;
 
     size_t li_;
     size_t ri_;
-    bool cur_left_pushed_;  // LEFT JOIN: whether current left tuple has been emitted
+    bool cur_left_pushed_;  // LEFT JOIN / FULL OUTER: whether current left tuple has been emitted
 };
 
 }  // namespace sqlcompiler

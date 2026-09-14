@@ -11,7 +11,10 @@ enum class ErrorStage {
     SYNTAX,        // 语法分析阶段
     SEMANTIC,      // 语义分析阶段
     OPTIMIZATION,  // 优化阶段
-    CODEGEN        // 代码/计划生成阶段
+    CODEGEN,       // 代码/计划生成阶段
+    RUNTIME        // 执行期错误（如 REGEXP 模式非法）；FormatError 对其
+                   // 不输出 "[Runtime]" 前缀，以便直接呈现业务文案
+                   // （如 "Error: invalid regex pattern: ..."）。
 };
 
 // 将阶段枚举转换为可读字符串

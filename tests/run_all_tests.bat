@@ -89,6 +89,93 @@ for %%f in ("%SQL_DIR%\*.sql") do (
     )
 )
 
+REM ---- Phase B: WAL + crash recovery smoke test (needs 2 phases) ----
+REM Driven by run_acid_recovery.bat: phase1 triggers \crash, phase2 verifies
+REM BEGIN state rolled back, COMMIT persisted. Exit 0 = pass.
+echo.
+echo [ RUN  ] acid_recovery (run_acid_recovery.bat)
+call "%SCRIPT_DIR%run_acid_recovery.bat" > nul 2>&1
+set "ACID_EXITCODE=!errorlevel!"
+if !ACID_EXITCODE! neq 0 goto :acid_recovery_fail
+set /a PASSED = PASSED + 1
+echo  [ OK ]
+goto :acid_recovery_done
+:acid_recovery_fail
+echo  [FAIL] (acid_recovery exit=!ACID_EXITCODE!)
+set /a FAILED = FAILED + 1
+set "FAILED_TESTS=!FAILED_TESTS! 49_acid_recovery!"
+:acid_recovery_done
+
+REM ---- Phase C: CLR chain + mid-rollback crash recovery smoke test ----
+REM Driven by run_acid_clr.bat: phase1 triggers \crash_after_undo_steps,
+REM phase2 verifies redo+undo chain completes remaining undos after crash.
+echo.
+echo [ RUN  ] acid_clr (run_acid_clr.bat)
+call "%SCRIPT_DIR%run_acid_clr.bat" > nul 2>&1
+set "ACID_CLR_EXITCODE=!errorlevel!"
+if !ACID_CLR_EXITCODE! neq 0 goto :acid_clr_fail
+set /a PASSED = PASSED + 1
+echo  [ OK ]
+goto :acid_clr_done
+:acid_clr_fail
+echo  [FAIL] (acid_clr exit=!ACID_CLR_EXITCODE!)
+set /a FAILED = FAILED + 1
+set "FAILED_TESTS=!FAILED_TESTS! 50_undo_clr!"
+:acid_clr_done
+
+REM ---- Phase D: Trigger persistence smoke test (60_view_trigger) ----
+REM Driven by run_trigger_persistence.bat: phase1 creates a trigger and exits;
+REM phase2 reopens the same DB and drops the trigger (success proves persistence).
+echo.
+echo [ RUN  ] trigger_persist (run_trigger_persistence.bat)
+call "%SCRIPT_DIR%run_trigger_persistence.bat" > nul 2>&1
+set "TRIG_PERSIST_EXITCODE=!errorlevel!"
+if !TRIG_PERSIST_EXITCODE! neq 0 goto :trigger_persist_fail
+set /a PASSED = PASSED + 1
+echo  [ OK ]
+goto :trigger_persist_done
+:trigger_persist_fail
+echo [FAIL] (trigger_persist exit=!TRIG_PERSIST_EXITCODE!)
+set /a FAILED = FAILED + 1
+set "FAILED_TESTS=!FAILED_TESTS! 60_trigger_persist!"
+:trigger_persist_done
+
+REM ---- Phase E: Debug meta-command smoke test (62_debug_meta) ----
+REM Driven by run_debug_meta.bat: feeds a SELECT into the REPL then verifies
+REM the \.tokens / \.ast / \.plan outputs through findstr matches.
+echo.
+echo [ RUN  ] debug_meta (run_debug_meta.bat)
+call "%SCRIPT_DIR%run_debug_meta.bat" > nul 2>&1
+set "DEBUG_META_EXITCODE=!errorlevel!"
+if !DEBUG_META_EXITCODE! neq 0 goto :debug_meta_fail
+set /a PASSED = PASSED + 1
+echo  [ OK ]
+goto :debug_meta_done
+:debug_meta_fail
+echo [FAIL] (debug_meta exit=!DEBUG_META_EXITCODE!)
+set /a FAILED = FAILED + 1
+set "FAILED_TESTS=!FAILED_TESTS! 62_debug_meta!"
+:debug_meta_done
+
+REM ---- Phase F: TokenTypeToString completeness smoke test (80_tokens_complete) ----
+REM 80_tokens_complete feeds a SELECT ... ORDER BY gpa DESC into the REPL, then
+REM runs \.tokens and verifies that the printed tokens include [KEYWORD_DESC]
+REM and do NOT contain any [UNKNOWN] entry. Catches the TokenTypeToString
+REM fallback-to-UNKNOWN bug that hid DESC (and 130+ other keywords).
+echo.
+echo [ RUN  ] tokens_complete (run_tokens_complete.bat)
+call "%SCRIPT_DIR%run_tokens_complete.bat" > nul 2>&1
+set "TOKENS_COMPLETE_EXITCODE=!errorlevel!"
+if !TOKENS_COMPLETE_EXITCODE! neq 0 goto :tokens_complete_fail
+set /a PASSED = PASSED + 1
+echo  [ OK ]
+goto :tokens_complete_done
+:tokens_complete_fail
+echo [FAIL] (tokens_complete exit=!TOKENS_COMPLETE_EXITCODE!)
+set /a FAILED = FAILED + 1
+set "FAILED_TESTS=!FAILED_TESTS! 80_tokens_complete!"
+:tokens_complete_done
+
 echo.
 echo ==========================================
 echo   Summary:  !PASSED! passed,  !FAILED! failed

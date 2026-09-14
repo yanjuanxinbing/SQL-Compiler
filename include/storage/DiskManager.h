@@ -25,8 +25,15 @@ public:
     // 从磁盘文件中读取page_id对应的页内容到data（大小需为PAGE_SIZE）
     void ReadPage(page_id_t page_id, char* data);
 
-    // 将data（大小为PAGE_SIZE）写入磁盘文件中page_id对应的位置
-    void WritePage(page_id_t page_id, const char* data);
+    // 将data（大小为PAGE_SIZE）写入磁盘文件中page_id对应的位置。
+    // force=true 时调用 OS fsync 把数据落到磁盘；默认 false（依赖 Shutdown
+    // 或显式 Sync 兜底），用于 Phase B 的 COMMIT 路径确保 dirty page 落盘。
+    void WritePage(page_id_t page_id, const char* data, bool force = false);
+
+    // 强制把数据文件刷新到磁盘（fdatasync / FlushFileBuffers）。Phase B 的
+    // COMMIT 路径在 LogManager::Flush 之后调用本接口，保证 redo 数据先于
+    // WAL 的 CHECKPOINT 可见。
+    void Sync();
 
     // 当前已分配（含已回收）的页数，即下一个全新page_id
     int GetNumPages() const;

@@ -1,0 +1,34 @@
+-- 50_undo_clr.sql
+-- Phase C：CLR 链 + 中途崩溃恢复的占位说明文件。
+--
+-- 本测试**不**通过 run_all_tests.bat 直接驱动。它需要「打开同一个 db 文件两
+-- 次」的语义：第一次创建 schema/写入基线数据 → BEGIN → 多次 INSERT → ROLLBACK
+-- 时通过 \\crash_after_undo_steps 注入崩溃，模拟撤销中途 _Exit(1) → 第二次
+-- 打开时由 RecoveryManager 走 redo+undo 链完成剩余撤销。
+--
+-- 执行方式：运行 tests/run_acid_clr.bat。该脚本会：
+--   1) 删除旧的 50_undo_clr.db 与 .wal；
+--   2) 用 build/Debug/sqlcompiler.exe 跑 phase1（CREATE + 3 baseline INSERT
+--      + BEGIN + 3 INSERT + ROLLBACK + \\crash_after_undo_steps 1），期望
+--      非零退出码；
+--   3) 用同一个 .db 跑 phase2（SELECT）期望输出 (0 rows)；
+--   4) 校验：
+--        - phase1 exit != 0（crash 注入生效）
+--        - phase2 exit == 0（重启后能正常执行）
+--        - phase2 SELECT 输出包含 "(0 rows)"（三条 INSERT 全部回滚干净）
+--
+-- 预期输出保存在 tests/tmp/50_undo_clr.out，便于回归对比。
+--
+-- Phase C 语义：
+--   * ROLLBACK 时每撤销一条原始 UPDATE 立刻写一条 CLR（Compensation Log
+--     Record），CLR 的 undo_next_lsn 指向 undo 链上下一个待撤销 LSN；每条
+--     CLR 后 Flush WAL。
+--   * RecoveryManager::UndoPass 沿 prev_lsn 链反向走：遇到 CLR 跳到
+--     clr.undo_next_lsn_（跳过已撤销工作），遇到 UPDATE 应用 before-image
+--     并再写一条 CLR。
+--   * 崩溃在撤销 N 步后发生时，重启从已写入的 CLR 处继续撤销剩余步骤，
+--     最终事务被标记 ABORT + page 状态正确。
+--
+-- 本文件留空以避免被 run_all_tests.bat 当作可执行测试（其会期望 "exit=0"）。
+-- 真正的测试由 run_acid_clr.bat 驱动。
+exit;
