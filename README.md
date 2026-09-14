@@ -1,14 +1,13 @@
 # SQL-Compiler / 简化数据库系统
 
-一个使用 C++17 实现的简化数据库系统框架，覆盖：
+一个使用 C++17 完整实现的简化数据库系统，覆盖 **SQL 编译器 → 执行引擎 → 存储引擎 → 页式存储 → 事务/恢复/并发控制** 全链路，并以「操作系统页面管理」为主线实践了分页、缓存与置换、锁与死锁、读者-写者、内存回收、崩溃恢复、I/O 调度等操作系统核心概念。
 
-1. **SQL 编译器**：词法分析 → 语法分析 → 语义分析 → 执行计划生成 → 优化 → 代码生成
-2. **页式存储系统**：固定大小页的分配/回收、磁盘读写、LRU/FIFO 缓存管理
-3. **数据库系统**：执行引擎（火山模型算子）、存储引擎（记录↔页映射）、系统目录持久化
+- 语言/构建：C++17 · CMake · MinGW GCC（`D:/mingw64/bin/g++.exe`）
+- 验收基线：存储单元测试 **58953 checks / 0 fails**；SQL 全量回归 **55 passed / 0 failed**（含两套崩溃注入）；`-Wall -Wextra` **零告警**
 
-当前仓库只包含**框架代码**（头文件声明 + 空函数体骨架），所有函数逻辑均标记 `TODO`，需要自行实现。全部文件已通过 g++ 编译与链接验证（空实现可通过编译，但运行不产生正确结果）。
+---
 
-## 整体架构
+## 1. 整体架构
 
 ```
                      SQL文本
@@ -21,211 +20,132 @@
                         │ 逻辑执行计划 PlanNodePtr
    ┌────────────────────▼────────────────────┐
    │           执行引擎 ExecutionEngine        │
-   │  将Plan树转换为算子树(Executor)并驱动运行  │
-   │  CreateTable / Insert / SeqScan /        │
-   │  Filter / Project / Delete / Update      │
+   │  SeqScan/IndexScan/Filter/Project/Join/  │
+   │  Sort/Aggregate/Insert/Update/Delete/... │
    └───────┬───────────────────────┬─────────┘
            │                       │
    ┌───────▼────────┐     ┌────────▼─────────┐
-   │  SystemCatalog  │     │    TableHeap      │
-   │ （元数据，本身   │     │ （记录↔页映射，    │
-   │  也是一张持久化   │     │  存储引擎核心）    │
-   │  的特殊表）      │     └────────┬─────────┘
-   └───────┬────────┘              │
+   │  SystemCatalog  │     │    TableHeap      │  MVCC 版本链 + O(1) 版本索引缓存
+   │ （元数据持久化） │     │  BPlusTree 二级索引 │  乐观页级并发（乐观重启 + 快慢写路径）
+   └───────┬────────┘     └────────┬─────────┘
+           │          事务子系统（横切）         │
+           │  LogManager(WAL+组提交) · LockManager(S/X+谓词锁+分片) │
+           │  TransactionManager · CommitTracker(快照低水位 O(1)) │
            └───────────┬───────────┘
                         │ get_page / write_page
              ┌──────────▼──────────┐
-             │  BufferPoolManager   │  ← LRU/FIFO替换策略、命中率统计、替换日志
-             │     （缓存管理）      │
+             │  BufferPoolManager   │  LRU/FIFO/CLOCK/LRU-K 可插拔替换、
+             │     （缓存管理）      │  温度感知刷脏、后台刷脏、命中构成统计
              └──────────┬──────────┘
-                        │
              ┌──────────▼──────────┐
-             │     DiskManager      │  ← 页的分配/回收、磁盘文件读写
-             │    （页式存储系统）    │
+             │     DiskManager      │  块设备抽象（File/Memory/Sparse/Network）、
+             │    （页式存储系统）    │  .fpl 空闲页位图、.crc 页校验、64 位定位
              └──────────┬──────────┘
                         │
-                     数据文件(.db)
+                     数据文件(.db) + .wal + .fpl + .crc
 ```
 
-`Database`（`db/Database.h`）是整个系统的门面类，对外提供 `ExecuteSQL(sql)` 一个接口，内部串联上图所有模块。
+`Database`（`db/Database.h`）是整个系统的门面类，对外提供 `ExecuteSQL(sql)` 接口与交互式 CLI。
 
-## 目录结构
+## 2. 核心能力
+
+### 2.1 编译器链路
+词法 → 语法 → 语义 → 逻辑计划 → 优化（谓词下推 / 索引访问路径 / 复合索引前缀区间推导）→ 代码生成，支持 SELECT（含 JOIN/GROUP BY/ORDER BY/LIMIT/窗口函数/子查询）、INSERT/UPSERT、UPDATE、DELETE、DDL、视图/触发器/函数、事务语句、EXPLAIN / SHOW。
+
+### 2.2 页式存储（对应「操作系统页面管理」）
+- 固定 4KB 页、唯一页号、页分配/释放/读写、空闲页位图跨重启持久化（`.fpl`，向后兼容）
+- 页 CRC 损坏检测（`.crc`）、64 位文件定位（>2GB 文件）、Windows `_commit` / POSIX `fsync` 真持久
+- **可交换块设备**：`FileBlockDevice`（默认）、`MemoryBlockDevice`、`SparseFileBlockDevice`、`LoopbackNetworkBlockDevice`、`FaultInjectingBlockDevice`（测试）——注入即换介质，业务零改动
+
+### 2.3 缓存管理与置换
+- LRU / FIFO / CLOCK / LRU-K（K=1 退化为 LRU），`Replacer` 策略模式可插拔
+- 温度感知刷脏（`SQLCOMPILER_TEMP_FLUSH`）+ 自适应温度阈值（`SQLCOMPILER_HOT_RATIO_PERCENT`）
+- 内存上限可配（`SQLCOMPILER_BUFFER_MEMORY`）、后台刷脏（`SQLCOMPILER_BG_FLUSH_MS`）
+- 可观测：命中构成（cold/warm/hot）、脏页年龄分布、后台刷脏直方图、IO 队列（`\stats`）
+
+### 2.4 事务、锁与隔离级别
+- WAL-before-data + 组提交（时间窗 `SQLCOMPILER_GROUPCOMMIT_WINDOW_MS`）+ ARIES redo/undo + CLR 链崩溃恢复
+- 锁管理器：行/表多粒度 S/X 锁、谓词锁（`(表, 列, 区间)` 居中区间树）、等待图 DFS 死锁检测、等待超时、自适应锁升级、按表/命名空间**分片锁**（16 shard）
+- 隔离级别：READ UNCOMMITTED / READ COMMITTED / SERIALIZABLE / SNAPSHOT（MVCC）
+- MVCC：48B 版本头版本链、快照低水位 O(1) 查询、FCW 防丢失更新、内联 + 后台真空、二级索引精确可见性、索引墓碑回收
+
+### 2.5 B+Tree 索引并发
+- 页级读写闩 + 乐观重启：读路径无锁等待（版本校验失败整体重启），写路径快/慢分档 + 预分裂
+- 实测吞吐：4 线程 **1.93×** / 8 线程 **2.71×** / 16 线程 **3.18×**（vs 树级锁基线）
+
+### 2.6 诊断
+- `\stats`：存储统计（命中率、替换、写回、IO、WAL fsync、温度分档、脏页年龄、刷脏直方图）
+- `\analyze`：页映射快照（pid → 帧号/脏/访问计数）、底层介质名、CRC 校验失败累计计数
+- `\crash` / `\crash_after_undo_steps N`：崩溃注入，用于崩溃恢复验证
+
+## 3. 构建与测试
+
+```powershell
+# 构建（Debug）
+cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_CXX_COMPILER=D:/mingw64/bin/g++.exe
+cmake --build build -- -j8
+
+# 存储单元测试（58953 checks / 0 fails）
+.\build\storage_ut.exe
+
+# 全量 SQL 回归 + 崩溃注入（55 passed / 0 failed）
+powershell -ExecutionPolicy Bypass -File tests\run_sql_regression.ps1
+
+# 告警审计（-Wall -Wextra 零告警）
+cmake -S . -B build_audit -G "MinGW Makefiles" -DCMAKE_CXX_COMPILER=D:/mingw64/bin/g++.exe -DCMAKE_CXX_FLAGS="-Wall -Wextra"
+cmake --build build_audit -- -j8
+```
+
+**一键复现**：`tests\run_repro_all.ps1`（构建 → storage_ut → SQL 回归 → 参数扫描，证据包输出到 `docs\test_evidence\`）。
+
+## 4. 使用方式
+
+```powershell
+.\build\sqlcompiler.exe mydb.db
+```
+
+交互式 CLI 输入 SQL（以 `;` 结尾），也支持 `\stats;`、`\analyze;`、`\crash;` 等调试指令；多语句脚本可通过 stdin 重定向或 `tests\run_sql_regression.ps1` 驱动。
+
+### 环境变量（均为可选项，默认行为保守）
+
+| 变量 | 作用 |
+|---|---|
+| `SQLCOMPILER_BUFFER_MEMORY` | 缓冲池内存上限（字节），默认 64 帧（256 KB） |
+| `SQLCOMPILER_BG_FLUSH_MS` | 后台刷脏间隔（ms），默认 0 = 关闭 |
+| `SQLCOMPILER_BG_VACUUM_MS` | 后台真空间隔（ms），默认 0 = 关闭 |
+| `SQLCOMPILER_GROUPCOMMIT_WINDOW_MS` | 组提交时间窗（ms），默认 0 = 纯跟随者聚合 |
+| `SQLCOMPILER_TEMP_FLUSH` | 设置即开启温度感知刷盘 + 自适应阈值 |
+| `SQLCOMPILER_HOT_RATIO_PERCENT` | 目标热页占比（1..99），覆盖默认 20% |
+
+## 5. 目录结构
 
 ```
 SQL-Compiler/
 ├── CMakeLists.txt
-├── include/
-│   ├── common/Error.h              # 统一异常类型 CompilerException
-│   │
-│   │   ── 编译器模块 ──
-│   ├── lexer/{Token,Lexer}.h       # 词法分析：Token流（种别码+词素+行列号）
-│   ├── ast/AST.h                   # AST：语句节点 + 表达式节点
-│   ├── parser/Parser.h             # 递归下降语法分析器
-│   ├── semantic/{SymbolTable,SemanticAnalyzer}.h  # 表/列元数据 + 语义检查
-│   ├── plan/{Plan,Planner}.h       # 逻辑执行计划节点 + AST→Plan转换
-│   ├── optimizer/Optimizer.h       # 谓词下推/列裁剪/常量折叠
-│   ├── codegen/CodeGenerator.h     # Plan→指令序列
-│   │
-│   │   ── 存储子系统（对应"操作系统知识的实践"）──
-│   ├── storage/Page.h              # 固定大小(4KB)物理页
-│   ├── storage/DiskManager.h       # 页级磁盘读写、页分配/回收
-│   ├── storage/Replacer.h          # 替换策略抽象接口
-│   ├── storage/LRUReplacer.h       # LRU替换策略
-│   ├── storage/FIFOReplacer.h      # FIFO替换策略
-│   ├── storage/BufferPoolManager.h # 缓冲池：get_page/flush_page + 命中统计+替换日志
-│   │
-│   │   ── 数据库系统：存储引擎 ──
-│   ├── storage_engine/Value.h      # 运行时值类型（INT/FLOAT/VARCHAR/NULL）
-│   ├── storage_engine/Tuple.h      # 元组（行）与RID（记录标识符）
-│   ├── storage_engine/TableHeap.h  # 表↔页集合映射，槽位式记录存取，SeqScan迭代器
-│   │
-│   │   ── 数据库系统：系统目录 ──
-│   ├── catalog/SystemCatalog.h     # 元数据管理，自身作为特殊表持久化
-│   │
-│   │   ── 数据库系统：执行引擎 ──
-│   ├── execution/Executor.h            # 算子基类（火山模型）+ ExecutionContext
-│   ├── execution/ExpressionEvaluator.h # 在Tuple上对AST表达式求值
-│   ├── execution/SeqScanExecutor.h     # 顺序扫描
-│   ├── execution/FilterExecutor.h      # 条件过滤
-│   ├── execution/ProjectExecutor.h     # 投影
-│   ├── execution/CreateTableExecutor.h # 建表
-│   ├── execution/DropTableExecutor.h   # 删表
-│   ├── execution/InsertExecutor.h      # 插入
-│   ├── execution/DeleteExecutor.h      # 删除
-│   ├── execution/UpdateExecutor.h      # 更新（可选扩展语法）
-│   ├── execution/ExecutionEngine.h     # Plan树 → Executor树，驱动执行
-│   │
-│   └── db/Database.h               # 门面类：ExecuteSQL(sql) 一站式入口
-│
-└── src/                             # 与include一一对应的实现文件（骨架，全部为TODO）
-    └── main.cpp                     # CLI入口
+├── include/  src/            # 与 include 一一对应的实现
+│   ├── common/ lexer/ ast/ parser/ semantic/ plan/ optimizer/ codegen/   # 编译器链路
+│   ├── storage/              # 页式存储：Page/DiskManager/BlockDevice/BufferPoolManager/Replacer 族/PageAllocator/LockManager/OsModuleOptimizations
+│   ├── storage_engine/       # Value/Tuple/TableHeap（MVCC 版本链 + 版本索引缓存）
+│   ├── index/                # BPlusTree 乐观页级并发 + Cursor + Vacuum
+│   ├── catalog/              # SystemCatalog 元数据持久化 + 真空调度
+│   ├── execution/            # 火山模型算子 + ExpressionEvaluator + ExecutionEngine
+│   ├── txn/                  # LogManager/RecoveryManager/TransactionManager/CommitTracker
+│   └── db/                   # Database 门面类
+├── tests/
+│   ├── sql/                  # 53 条 SQL 回归脚本（含崩溃注入）
+│   ├── storage/storage_ut.cpp# 存储子系统单元测试（58953 checks）
+│   ├── run_sql_regression.ps1 / run_repro_all.ps1 / run_param_sweep.ps1
+└── docs/                     # 开发计划、设计文档、验收报告、test_evidence/ 测试证据
 ```
 
-## 模块职责一览
+## 6. 验收与证据
 
-| 层 | 模块 | 职责 |
-| --- | --- | --- |
-| 编译器 | `lexer` | SQL源码 → Token流，识别关键字/标识符/常量/运算符/分隔符，非法字符报错(类型+位置) |
-| 编译器 | `ast` / `parser` | Token流 → AST，支持 SELECT/INSERT/UPDATE/DELETE/CREATE TABLE/DROP TABLE，语法错误报错(位置+期望符号) |
-| 编译器 | `semantic` | 表/列存在性检查、类型一致性检查、INSERT列数/列序检查，维护Catalog |
-| 编译器 | `plan` / `optimizer` / `codegen` | AST → 逻辑执行计划(SeqScan/Filter/Project等算子) → 优化 → 指令序列 |
-| 存储 | `storage` | 页的分配/释放/读写（DiskManager），LRU/FIFO缓存（BufferPoolManager），命中统计与替换日志 |
-| 数据库 | `storage_engine` | Row(Tuple)与Page的映射关系，记录的序列化，表数据在磁盘上的物理组织（TableHeap） |
-| 数据库 | `catalog` | 维护表名/列名/列类型等元数据，元数据本身作为一张特殊表持久化存储 |
-| 数据库 | `execution` | 解析并执行逻辑计划，实现 CreateTable/Insert/SeqScan/Filter/Project/Delete/Update 等算子 |
-| 数据库 | `db` | 门面类，对外提供CLI/API：输入SQL文本，返回Token流/AST/语义结果/执行计划/查询结果或错误信息 |
+| 项目 | 结果 |
+|---|---|
+| 存储单元测试 | **58953 checks / 0 fails**（`docs/test_evidence/storage_ut_run.log`） |
+| SQL 回归 | **55 passed / 0 failed**（53 条脚本 + 崩溃注入；`docs/test_evidence/sql_regression_run.log`） |
+| 崩溃恢复 | 49_acid_recovery / 50_undo_clr 两阶段跨重启验证通过 |
+| 告警审计 | `-Wall -Wextra` 零告警（`docs/test_evidence/audit_build.log`） |
+| 性能基准 | B+Tree 并发写 3.18×（16 线程）、组提交 fsync 9.8× 削减、快照低水位读取约 465×、分片锁异表 5.8× 吞吐 |
 
-## 数据流转细节
-
-**写路径（如 INSERT）**：
-`SQL文本 → Lexer → Parser(AST) → SemanticAnalyzer(校验) → Planner(InsertNode)
-→ InsertExecutor对VALUES求值为Tuple → TableHeap::InsertTuple()
-→ BufferPoolManager::GetPage()/NewPage()（缓存未命中则触发替换）
-→ DiskManager::WritePage()落盘`
-
-**读路径（如 SELECT ... WHERE）**：
-`SQL文本 → ... → Planner生成 Project(Filter(SeqScan)) 计划树
-→ ExecutionEngine::BuildExecutor()构造对应的算子树
-→ SeqScanExecutor通过TableHeap::Iterator逐条读取Tuple（背后是GetPage/ReadPage）
-→ FilterExecutor用ExpressionEvaluator对WHERE表达式求值，筛选记录
-→ ProjectExecutor按SELECT列表计算输出列
-→ ExecutionEngine收集所有输出Tuple，包装为ExecutionResult返回`
-
-## 已支持 / 可扩展的SQL语法
-
-**核心语法（AST已建模，需自行实现解析与执行）**：
-- `SELECT [DISTINCT] col1, col2, ... FROM table [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT n]`
-- `INSERT INTO table [(col1, col2, ...)] VALUES (...), (...), ...`
-- `UPDATE table SET col1 = expr1, ... [WHERE ...]`
-- `DELETE FROM table [WHERE ...]`
-- `CREATE TABLE table (col1 TYPE [PRIMARY KEY] [NOT NULL], ...)`
-- `DROP TABLE table`
-
-**可选扩展（题目中的"可选扩展"部分，已预留相应结构）**：
-- `UPDATE`：`UpdateStatement` / `UpdateNode` / `UpdateExecutor` 均已建模
-- `JOIN` / `ORDER BY` / `GROUP BY`：`JoinClause` / `OrderByItem` / `AggregateNode` 已在AST与Plan中建模，但对应的 `JoinExecutor` / `SortExecutor` / `AggregateExecutor` 尚未创建，需要时可参照现有Executor风格自行添加
-- 查询优化（谓词下推等）：`Optimizer::PushDownPredicates()` 已留出接口
-
-## B+Tree 索引
-
-索引是真正的磁盘结构：节点即 4KB 页面，走 `BufferPoolManager`，根页 id 持久化在
-系统目录里，重启后直接可用，无需重建。
-
-**语法**
-
-```sql
-CREATE [UNIQUE] INDEX <name> ON <table>(col1, col2, ...);
-DROP INDEX [IF EXISTS] <name>;
-```
-
-`CREATE TABLE` 时会为每个 `PRIMARY KEY` 组自动建立一棵唯一索引（命名为
-`__pk_<表名>_<组号>`），主键唯一性校验因此是 O(log N) 的索引点查而非全表扫描。
-该索引不允许被 `DROP INDEX` 删除——它是主键约束的实现载体。
-
-**查询优化**：`WHERE` 中形如 `col = c` / `col > c` / `col BETWEEN a AND b` 的谓词，
-若 `col` 上有索引，优化器会把 `Filter -> SeqScan` 改写成 `IndexScan`；无法用索引
-消解的合取项作为残余谓词在回表后再判一次。改写策略刻意保守，任何不确定的形态
-都保持原计划——访问路径改写出错的症状是「查询静默少返回几行」，比崩溃难查得多。
-
-**设计要点**
-
-- 键为 `std::vector<Value>`，复合键按字典序比较，复用 `Value::Compare`。
-- 叶子内按 `(key, rid)` 严格全序。内部节点的分隔键也携带 RID，否则非唯一索引里
-  同一个键跨页时，下降无法判断该走左页还是右页。
-- 插入采用**下降途中预分裂**：进入节点前先保证它装得下，叶子插入永不失败，
-  没有级联分裂，也不需要在页头维护父指针。
-- 根页 id 恒定不变：根分裂时把根内容搬到新页、原根页改写成内部节点，
-  免去「根分裂后回写目录元数据」这条易漏的一致性路径。
-- 页内修改一律「物化 → 修改 → 整页重写」，插入/分裂/删除共用同一套读写函数。
-- 所有页面访问经 `PageGuard`（RAII），禁止裸 `GetPage`/`UnpinPage` 配对。
-
-**已知限制**
-
-- 删除只打墓碑，不做节点合并与再平衡，大量删除后会留下半空节点。
-- 索引键不允许 `NULL`；变长列必须声明有界长度（`VARCHAR(n)`，n ≤ 512）才能建索引。
-- 访问路径改写只用单列索引的最左列，且不处理 `JOIN` 下的扫描。
-- 无 WAL：崩溃一致性依赖「每条语句成功后全量刷盘」，这不是原子的。
-
-## 测试用例建议（对应题目要求）
-
-```sql
-CREATE TABLE student(id INT, name VARCHAR, age INT);
-INSERT INTO student(id,name,age) VALUES (1,'Alice',20);
-SELECT id,name FROM student WHERE age > 18;
-DELETE FROM student WHERE id = 1;
-```
-
-**错误测试**：缺分号、列名拼写错误、类型不匹配、值个数不一致、未闭合字符串等，
-应分别在 Parser（语法错误）与 SemanticAnalyzer（语义错误）阶段被捕获并给出 `位置+原因`。
-
-## 构建方式
-
-```bash
-mkdir build && cd build
-cmake ..
-cmake --build .
-./sqlcompiler [数据文件路径，默认 sqlcompiler.db]
-```
-
-> 当前所有函数体均为空/占位实现（标记 `TODO`），可以编译通过（已用 g++ 验证全部33个源文件
-> 编译、链接、运行均无错误），但运行时不会产生正确结果，需要逐个模块补充实现。
-
-## 建议的实现顺序
-
-1. **词法/语法**：`lexer/Token.cpp` → `lexer/Lexer.cpp` → `ast/AST.cpp`（补ToString便于调试）→ `parser/Parser.cpp`
-2. **页式存储**（可独立于编译器先行开发、单独测试）：
-   `storage/Page.cpp` → `storage/DiskManager.cpp` → `storage/LRUReplacer.cpp`/`FIFOReplacer.cpp` → `storage/BufferPoolManager.cpp`
-3. **存储引擎**：`storage_engine/Value.cpp` → `storage_engine/Tuple.cpp` → `storage_engine/TableHeap.cpp`（依赖BufferPoolManager）
-4. **系统目录**：`semantic/SymbolTable.cpp` → `catalog/SystemCatalog.cpp`（依赖TableHeap，实现元数据的持久化与加载）
-5. **语义分析 / 计划生成**：`semantic/SemanticAnalyzer.cpp` → `plan/Plan.cpp` → `plan/Planner.cpp`
-6. **执行引擎**：`execution/Executor.cpp` → `execution/ExpressionEvaluator.cpp` → 各 `*Executor.cpp`
-   （建议顺序：SeqScan → CreateTable → Insert → Filter → Project → Delete → Update）→ `execution/ExecutionEngine.cpp`
-7. **优化器（可选，最后做）**：`optimizer/Optimizer.cpp`
-8. **代码生成（可选，若只需要执行结果可跳过；若要求输出独立的指令序列则实现）**：`codegen/CodeGenerator.cpp`
-9. **总入口**：`db/Database.cpp` → `main.cpp`，实现CLI，串联全部流程并支持多语句脚本、结果打印
-
-## 关于"执行计划输出格式"
-
-题目要求执行计划可输出为树形结构/JSON/S表达式。当前 `PlanNode::ToString()` 与 `Instruction::ToString()`
-均预留了文本化接口；若需要JSON格式，可在 `PlanNode` 基础上另行实现一个 `ToJson()` 方法，
-或在 `CodeGenerator` 中新增一种"序列化为JSON"的输出模式，不影响现有算子结构。
+完整文档见 `docs/`（开发计划 `Storage_Dev_Plan.md`、设计文档 `upload_os_module/04_模块设计文档.md`、需求比对与后续计划 `upload_os_module/06_需求比对与后续计划.md`）。

@@ -89,7 +89,7 @@ ColumnInfo MakeColumnInfo(const ColumnDefinition& cd) {
 //   VARCHAR -> INT/FLOAT  解析失败报错。
 //   VARCHAR shrink  截断到 char_length；超长报错。
 Value CastValue(const Value& v, const std::string& dst_type,
-                int32_t dst_char_length, ValueType src_type) {
+                int32_t dst_char_length, ValueType /*src_type*/) {
     std::string dt = NormalizeType(dst_type);
     if (v.IsNull()) return v;  // NULL 不做转换。
 

@@ -52,6 +52,10 @@ file(GLOB_RECURSE SQLCOMPILER_LIB_SOURCES
 # 编译为静态库，方便主程序与未来的测试共同链接
 add_library(sqlcompiler_lib STATIC ${SQLCOMPILER_LIB_SOURCES})
 target_include_directories(sqlcompiler_lib PUBLIC ${CMAKE_SOURCE_DIR}/include)
+if(WIN32)
+    # 回环网络块设备（LoopbackNetworkBlockDevice）依赖 Winsock
+    target_link_libraries(sqlcompiler_lib PUBLIC ws2_32)
+endif()
 
 # 主程序可执行文件
 add_executable(sqlcompiler ${CMAKE_SOURCE_DIR}/src/main.cpp)

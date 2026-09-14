@@ -90,8 +90,14 @@ public:
     // 执行算子（SeqScan/IndexScan）在逐行取得 S 锁时若处于 READ COMMITTED 则登记；
     // SERIALIZABLE 的行读锁持有到提交（由 Commit/Rollback 的 UnlockAll 释放），
     // 无需登记。外层 Execute() 在语句结束/异常路径上据此统一回收。
-    void RecordRowReadLock(int64_t rid) { statement_row_read_locks_.push_back(rid); }
-    const std::vector<int64_t>& GetRowReadLocks() const { return statement_row_read_locks_; }
+    // table_res 为行锁所属表资源 id（表堆首页页号，非负）：语句末释放行读锁时
+    // 需要与获取时一致的表提示来路由分片（见 LockManager::Unlock 的 table_hint）。
+    void RecordRowReadLock(int64_t rid, int64_t table_res = -1) {
+        statement_row_read_locks_.emplace_back(rid, table_res);
+    }
+    const std::vector<std::pair<int64_t, int64_t>>& GetRowReadLocks() const {
+        return statement_row_read_locks_;
+    }
     void ClearRowReadLocks() { statement_row_read_locks_.clear(); }
 
     // T2 行级锁获取结果：kOk=已取得；kUnused=未启用（自动提交/无锁管理器/无效RID）；
@@ -99,7 +105,9 @@ public:
     enum class RowLockResult { kOk, kUnused, kDeadlock, kTimeout };
     // 行级共享锁（读表逐行）：仅在显式事务+注入 LockManager 且非 READ UNCOMMITTED 时取；
     // READ COMMITTED 登记到本语句行读锁，语句末由外层 Execute() 释放；SERIALIZABLE 持有到提交。
-    RowLockResult AcquireRowReadLock(const RID& rid);
+    // table_res（表堆首页页号，非负）作为 LockManager 的表提示：行读锁与表锁同分片，
+    // 语句末释放时按同一提示路由（缺省 -1 时按已登记归属/资源自身哈希路由）。
+    RowLockResult AcquireRowReadLock(const RID& rid, int64_t table_res = -1);
     // 行级独占锁（写表逐行）：所有隔离级别在显式事务内都取，持有到提交（Commit/Rollback 释放）。
     // table_res（表堆首页页号，非负）非空时参与「行级锁升级」：本事务在某表的行写锁数达到
     // 阈值后自动尝试升级为表级 X 锁并释放行锁（多粒度锁语义，见 LockManager::TryEscalateTable）。
@@ -127,7 +135,8 @@ private:
     // Phase A：所属事务管理器（由 ExecutionEngine 在构造 ctx 时注入）。
     TransactionManager* txn_manager_ = nullptr;
     // T2：当前语句已取得、需按 READ COMMITTED 语句末释放的行读锁。
-    std::vector<int64_t> statement_row_read_locks_;
+    // 元素为 (行锁资源 id, 所属表资源 id)：释放时按表提示路由分片。
+    std::vector<std::pair<int64_t, int64_t>> statement_row_read_locks_;
 };
 
 // 执行算子基类，采用火山模型（Volcano / Iterator Model）：

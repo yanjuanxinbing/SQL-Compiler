@@ -315,8 +315,29 @@ bool TableHeap::InsertTuple(const Tuple& tuple, RID* rid,
         if (prev.Valid()) {
             int32_t next_pid, slot_count, free_off;
             ReadPageHeader(prev.Data(), next_pid, slot_count, free_off);
+            // Phase B：页链链接（prev.next_pid = new_pid）必须写 WAL。
+            // page_lsn 是纯内存字段、不跨重启持久化，恢复时 redo 会把页重放
+            // 成 WAL 中最后一条 UPDATE 的 after 状态；链接修改若无 WAL 记录，
+            // 多页表跨重启后页链会断在未链接处（重放覆盖掉链接），只读到第一页。
+            std::vector<char> before_image;
+            if (log_manager_ != nullptr) {
+                before_image.assign(prev.Data(), prev.Data() + PAGE_SIZE);
+            }
             WritePageHeader(prev.Data(), new_pid, slot_count, free_off);
             prev.MarkDirty();
+            if (log_manager_ != nullptr) {
+                LogRecord rec;
+                rec.type_ = LogRecordType::UPDATE;
+                rec.txn_id_ = (active_txn_ != nullptr) ? active_txn_->GetTxnId() : 0;
+                rec.page_id_ = prev_pid;
+                rec.before_image_ = std::move(before_image);
+                rec.after_image_.assign(prev.Data(), prev.Data() + PAGE_SIZE);
+                lsn_t lsn = log_manager_->AppendRecord(std::move(rec));
+                prev.SetPageLsn(lsn);
+                if (active_txn_ != nullptr && active_txn_->IsActive()) {
+                    active_txn_->SetLastUndoLSN(lsn);
+                }
+            }
         }
     } else {
         first_page_id_ = new_pid;
@@ -437,7 +458,7 @@ bool TableHeap::GetTuple(const RID& rid, Tuple* tuple,
                 if (ok && !IsTombstone(cl) && ReadMvccHeader(cd + co, &ch) &&
                     ch.begin_xid == cand.begin_xid && ch.begin_csn == cand.begin_csn &&
                     ch.end_csn == cand.end_csn &&
-                    co + static_cast<int32_t>(sizeof(MvccRecordHeader)) <= PAGE_SIZE) {
+                    static_cast<size_t>(co) + sizeof(MvccRecordHeader) <= PAGE_SIZE) {
                     // 命中：反序列化候选版本内容（跳过 48 字节头），并登记快照读基。
                     ++version_index_hits_;
                     if (tuple) {

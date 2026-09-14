@@ -1,0 +1,27 @@
+﻿storage_ut.exe : [mvcc] snapshot write conflict for txn 9; aborting by first-committer-wins
+At C:\Users\Lenovo\Desktop\SQL-Compiler\tests\run_repro_all.ps1:45 char:1
++ & (Join-Path $build "storage_ut.exe") 2>&1 | Out-File (Join-Path $evi ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([mvcc] snapshot...-committer-wins:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[mvcc] snapshot write conflict for txn 4; aborting by first-committer-wins
+[mvcc] snapshot write conflict for txn 4; aborting by first-committer-wins
+[low-water] 10k active snapshots, 10k reads: 129 us, recompute_count=0 (O(1) read cache)
+[low-water] legacy O(N) scan x10000: 68445 us (对照：N=10k 时旧实现每次调用都扫全表)
+[Phase3-G6] shard-lock throughput: same-table=329218 ops/s, diff-table=2133333 ops/s (6.5x faster)
+[dbg] Q1 rows=10000 reads=169 | Q2 rows=1000 reads=19 | Q3 rows=499 reads=11
+[Phase4] group-commit: 128 commits, concurrent fsyncs=12, serial fsyncs=128 (10.7x fewer)
+[Phase4] group-commit window: 64 commits, no-window fsyncs=24, window fsyncs=4 (6.0x fewer)
+
+======== Storage UT ========
+checks: 58953   fails: 0
+RESULT: PASS
+==== OS 模块性能对比基准（优化前 vs 优化后）====
+[Stage1] CRC 吞吐   : 优化(286.9 MB/s)  vs  基线(289.4 MB/s)
+        一致性      : PASS   (收益=消除惰性建表竞态/编译期表中初始化)
+[Stage2] LRU 吞吐    : 优化(2.3 M ops/s)  vs  基线(2.3 M ops/s)  加速 0.98x
+        状态一致    : PASS
+[Stage3] 分配遍历    : 优化(64.0 次访问/次分配)  vs  基线(128.0 次)
+        减少        : 50.0%
+==== 基准结束 ====

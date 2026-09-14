@@ -67,7 +67,8 @@ void ReleaseRowReadLocks(ExecutionContext* ctx) {
         ctx->ClearRowReadLocks();
         return;
     }
-    for (int64_t r : ctx->GetRowReadLocks()) lm->Unlock(txn->GetTxnId(), r);
+    // 释放时按登记的表提示路由分片（与获取时一致，G6 分片锁）。
+    for (const auto& [r, th] : ctx->GetRowReadLocks()) lm->Unlock(txn->GetTxnId(), r, th);
     ctx->ClearRowReadLocks();
 }
 
@@ -476,15 +477,6 @@ static std::vector<ScanPredicateInfo> CollectScanPredicates(SystemCatalog* catal
         info.is_full = true;
         out.push_back(std::move(info));
     }
-    return out;
-}
-
-// 将 vector<string> 形式 (仅有表名) 适配到新签名；用作纯单表路径的兼容入口。
-static std::vector<std::pair<std::string, std::string>> ToPairs(
-    const std::vector<std::string>& names) {
-    std::vector<std::pair<std::string, std::string>> out;
-    out.reserve(names.size());
-    for (const auto& n : names) out.emplace_back(n, std::string{});
     return out;
 }
 

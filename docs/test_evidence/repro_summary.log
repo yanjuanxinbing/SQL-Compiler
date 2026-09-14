@@ -1,0 +1,26 @@
+==== Phase 5 周期4 一键复现证据包 ====
+time: 2026-09-14 15:30:36
+
+---- [1/4] build ----
+build: OK
+
+---- [2/4] storage_ut ----
+storage_ut: PASS (58953 checks / 0 fails)
+
+---- [3/4] sql regression (incl. crash injection) ----
+sql regression: PASS (55 passed / 0 failed)
+
+---- [4/4] param sweep ----
+param sweep: PASS (log: param_sweep.log)
+
+---- [5/5] charts & console capture ----
+charts: PASS (5 PNGs)
+
+==== Summary ====
+storage_ut   : PASS (58953 checks)
+sql regression: PASS (55/55)
+param sweep  : PASS
+charts/shot  : PASS (5 PNGs)
+overall      : ALL GREEN
+evidence: build.log / storage_ut.log / sql_regression_run.log / param_sweep.log / 5x PNG / repro_summary.log
+==== End ====

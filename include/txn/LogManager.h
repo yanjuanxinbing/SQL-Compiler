@@ -73,6 +73,14 @@ public:
     // 领导者 SyncOs 失败时抛出（跟随者会看到 durable 未推进并自行领跑重试）。
     lsn_t GroupCommit(lsn_t target);
 
+    // Phase 5（周期 2）：组提交时间窗聚合。ms > 0 时，领导者成为后先在窗口内
+    // 等待更多提交到达（到达者成为跟随者），窗口结束再统一快照并一次 SyncOs，
+    // 覆盖窗口内全部提交——高频小事务场景 fsync 次数在「纯跟随者聚合」基础上
+    // 进一步下降。默认 0（关闭，保持领导者-跟随者被动聚合）。
+    // 启动时由环境变量 SQLCOMPILER_GROUPCOMMIT_WINDOW_MS（毫秒）配置；UT/基准
+    // 可直设。
+    void SetGroupCommitWindowMs(long ms);
+
     // 当前「已被持久化」的最大 LSN（Phase 4 起持锁读取，与 GroupCommit 并发安全）。
     lsn_t durable_lsn() const;
 
@@ -95,6 +103,7 @@ private:
     std::condition_variable gc_cv_;  // 组提交跟随者等待 durable 推进
     bool gc_leader_ = false;         // 是否有线程正在执行 SyncOs（领导者）
     std::atomic<size_t> sync_count_{0};  // 累计 SyncOs 次数（观测，原子：领导者在解锁后同步）
+    long group_commit_window_ms_ = 0;    // 周期 2：组提交时间窗（毫秒；0 = 关闭）
     lsn_t next_lsn_ = 1;       // 下一个待分配的 LSN
     lsn_t durable_lsn_ = 0;     // 已持久化的最大 LSN
     // 每个事务最近一次 AppendRecord 的 LSN；AppendRecord 时用此值填 prev_lsn_。

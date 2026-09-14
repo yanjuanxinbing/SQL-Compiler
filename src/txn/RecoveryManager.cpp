@@ -80,8 +80,15 @@ void RecoveryManager::AnalysisPass(const std::vector<LogRecord>& records) {
                 if (dirty_page_table_.find(rec.page_id_) == dirty_page_table_.end()) {
                     dirty_page_table_[rec.page_id_] = rec.lsn_;
                 }
-                // 更新事务最近 LSN。
-                txn_table_[rec.txn_id_] = rec.lsn_;
+                // txn_id == 0 表示系统/无事务写入（不是可撤销的事务）。这类记录
+                // 不能进活动事务表：其 prev_lsn 链天然断（AppendRecord 对 txn 0
+                // 不串链），undo pass 若把「最后一条 txn-0 记录」当活动事务撤销，
+                // 会造成只撤一条、其余同批记录幸存的部分回滚——正是索引元数据
+                // 跨重启丢失的根因放大路径。
+                if (rec.txn_id_ != 0) {
+                    // 更新事务最近 LSN。
+                    txn_table_[rec.txn_id_] = rec.lsn_;
+                }
                 break;
             case LogRecordType::CHECKPOINT:
                 // V1 简化：CHECKPOINT 不带额外表项，跳过。

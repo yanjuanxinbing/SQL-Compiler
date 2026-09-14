@@ -36,6 +36,12 @@ struct BufferPoolStats {
     // 显式刷/淘汰/关库才计一次）。关闭温度感知时全部记入 writeback_cold_count。
     long writeback_cold_count = 0;
     long writeback_hot_count = 0;
+    // T4 可观测性：命中构成——缓冲池命中按「命中页的访问温度」分桶计数：
+    //   hot = 访问数 >= 热阈值；warm = 访问数 >= 温阈值（= 热阈值/2，至少 1）；
+    //   cold = 其余。用于 \stats 展示「替换策略命中构成」（替换目标 = 冷页优先）。
+    long hit_cold_count = 0;
+    long hit_warm_count = 0;
+    long hit_hot_count = 0;
 
     double HitRate() const;
 };
@@ -45,6 +51,14 @@ struct ReplacementLogEntry {
     page_id_t evicted_page_id;  // 被淘汰的页（INVALID_PAGE_ID表示淘汰的是空槽位）
     page_id_t loaded_page_id;   // 本次换入的页
     bool evicted_was_dirty;     // 被淘汰的页在换出前是否为脏页
+};
+
+// T4 诊断（\analyze）：缓冲池页映射快照条目——逻辑页在池中的帧号、脏标志与访问温度。
+struct PageMapEntry {
+    page_id_t page_id;
+    int frame_id;
+    bool dirty;
+    uint64_t access_count;
 };
 
 // 缓冲池管理器：在内存中缓存固定数量的页，减少磁盘IO次数
@@ -76,7 +90,8 @@ public:
     // 将缓冲池中所有脏页写回磁盘（不写干净页）。
     // Phase B：COMMIT 时调用此方法把脏页快速落盘，路径上自动尊重 WAL 规则。
     // 配合 DiskManager::Sync() 实现 COMMIT 语义。
-    void FlushAllDirtyPages();
+    // 返回本次实际写回页数（T4：供后台刷脏直方图记账）。
+    int FlushAllDirtyPages();
 
     // 将缓冲池中所有页写回磁盘（包括干净页）。Phase A 测试依赖此方法做
     // 测试收尾清理；保留接口。
@@ -112,9 +127,36 @@ public:
     // 阈值与开关：
     void SetTemperatureFlushEnabled(bool en) { temp_flush_enabled_ = en; }
     bool IsTemperatureFlushEnabled() const { return temp_flush_enabled_; }
-    void SetHotAccessThreshold(uint64_t t) { hot_access_threshold_ = t; }
+    // 手动指定固定热阈值；调用后关闭自适应（手动优先级最高）。
+    void SetHotAccessThreshold(uint64_t t) {
+        hot_access_threshold_ = t;
+        adaptive_threshold_enabled_ = false;
+    }
     uint64_t GetHotAccessThreshold() const { return hot_access_threshold_; }
     static constexpr uint64_t kDefaultHotAccessThreshold = 8;
+
+    // ---- Phase 5（G5）：温度阈值自适应 ----
+    // 把静态热阈值升级为「按访问分布动态估计 + LRU-K 频率信号联动」：
+    //   * 动态估计：每次全量刷脏前，以当前脏页访问计数分布（直方图）估计热阈值，
+    //     目标是「约 hot_ratio_percent% 的高频脏页判定为热」（P 分位估计），冷页
+    //     写回、热页留池，热页占比随工作集温度自动收敛；
+    //   * 平坦分布保护：脏页访问计数几乎一致（同温）时阈值上推至全体判冷，避免
+    //     「全部判定为热 → 整次刷盘空转、脏页长期滞留」；
+    //   * LRU-K 联动：替换策略为 LRU-K 时阈值至少取 K——访问 < K 的页是 LRU-K
+    //     语义下的「非相关」一次性引用，恒按冷页写回，热页判定与淘汰策略对齐；
+    //   * 显式 SetHotAccessThreshold 手动设值会关闭自适应（手动优先级最高）。
+    void SetAdaptiveThresholdEnabled(bool en) { adaptive_threshold_enabled_ = en; }
+    bool IsAdaptiveThresholdEnabled() const { return adaptive_threshold_enabled_; }
+    // 目标热页占比（百分比，1..99，默认 20）。自适应估计用该占比从访问分布
+    // 高频端向下取分位作为热阈值。
+    void SetHotRatioPercent(uint64_t pct) {
+        hot_ratio_percent_ = (pct >= 1 && pct <= 99) ? pct : hot_ratio_percent_;
+    }
+    uint64_t GetHotRatioPercent() const { return hot_ratio_percent_; }
+    // 最近一次动态估计出的热阈值（观测，供 \stats / 单测验证）。
+    uint64_t GetLastEstimatedThreshold() const { return last_estimated_threshold_; }
+    // 最近一次参与估计的脏页数（观测）。
+    size_t GetLastDirtySampled() const { return last_dirty_sampled_; }
 
     // ---- E6：缓冲池内存上限可配置与统计 ----
     // 缓冲池内存 ≈ 帧数 × 页大小（固定池，构造时一次性预分配 pages_ 帧数组）。
@@ -148,6 +190,25 @@ public:
     long GetBackgroundFlushTicks() const;    // 累计被唤醒并尝试刷脏的次数
     std::chrono::milliseconds GetBackgroundFlushInterval() const;
 
+    // ---- T4：可观测性 ----
+    // 温阈值（命中构成分档与热阈值一起使用）：热阈值/2（至少 1）。由 latch_ 保护。
+    uint64_t GetWarmAccessThreshold() const;
+    // 脏页年龄分布（5 桶，单位 = 池操作序号 op_tick）：
+    //   [0] 刚变脏；[1,4) [4,10) [10,30) [30,∞)。只统计当前仍脏的帧。
+    std::vector<long> GetDirtyAgeDistribution() const;
+    // 当前待刷脏帧数（脏页数）——「IO 队列」观测的一部分（同步模型下排队 = 脏帧）。
+    size_t GetDirtyFrameCount() const;
+    // 后台刷脏直方图（6 桶，每次后台刷脏实际写回页数 n）：
+    //   [0] [1] [2,4) [4,8) [8,16) [16,∞)。
+    std::vector<long> GetBackgroundFlushHistogram() const;
+    // 诊断（\analyze）：页在缓冲池中的帧号；-1 = 不在池。
+    int GetFrameOfPage(page_id_t page_id) const;
+    // 诊断（\analyze）：页当前是否脏（仅对在池中的页有效；不在池返回 false）。
+    bool IsPageDirtyInPool(page_id_t page_id) const;
+    // 诊断（\analyze）：缓冲池页映射快照（page_id → 帧号/脏/访问温度），
+    // 按 page_id 升序。持 latch_ 返回副本，供 \analyze 打印页映射。
+    std::vector<PageMapEntry> GetPageMapSnapshot() const;
+
 private:
     void BackgroundFlushLoop();
     // 全局锁：串行化所有对 frames / page_table_ / free_list_ 等共享状态的访问。
@@ -159,9 +220,17 @@ private:
 
     // 免锁内部实现：公共方法拿锁后委托给这些私有函数，避免非递归锁重入死锁。
     void FlushPageUnlocked(page_id_t page_id);   // FlushPage 的免锁主体
-    void FlushAllDirtyUnlocked();               // FlushAllDirtyPages 的免锁主体
+    int FlushAllDirtyUnlocked();                 // FlushAllDirtyPages 的免锁主体（返回写回页数）
+    // Phase 5（G5）：按当前脏页访问计数分布动态估计热阈值并写入
+    // hot_access_threshold_（观测：last_estimated_threshold_ / last_dirty_sampled_）。
+    // 前提：已持 latch_；仅当温度刷盘 + 自适应均开启时由 FlushAllDirtyUnlocked 调用。
+    void EstimateAdaptiveThreshold();
     // Phase 4（F）：给一次写回记账（writeback_count + 冷/热分档）。前提：已持 latch_。
     void RecordWritebackStat(const Page& page);
+    // T4：给一次命中按温度分档记账（hit_cold/warm/hot_count）。前提：已持 latch_。
+    void RecordHitTemperatureStat(const Page& page);
+    // T4：给一次后台刷脏写回页数记账（bg_flush_hist_ 直方图）。前提：已持 latch_。
+    void RecordBackgroundFlushStat(int written);
 
     size_t pool_size_;
     DiskManager* disk_manager_;
@@ -176,12 +245,29 @@ private:
     static constexpr size_t kMaxReplacementLog = 1024;
     std::vector<ReplacementLogEntry> replacement_log_;
 
+    // ---- T4 可观测性状态（由 latch_ 保护）----
+    // 池操作序号：每个公共变更方法（GetPage/NewPage/UnpinPage/Flush*/DeletePage/
+    // CollectDirtyPages）递增一次。用作「脏页年龄」的逻辑时钟（变脏后经历的操作数）。
+    int64_t op_tick_ = 0;
+    // 后台刷脏直方图：每次后台刷脏实际写回页数的分布（6 桶，见
+    // GetBackgroundFlushHistogram 注释）。仅后台线程记账。
+    std::vector<long> bg_flush_hist_;
+
     // Phase B：可空；非空时 FlushPage / FlushAllDirtyPages 走 LSN 检查。
     LogManager* log_manager_ = nullptr;
 
     // Phase 4：温度感知刷盘开关与热阈值（由 latch_ 保护；默认关闭 = 旧行为）。
     bool temp_flush_enabled_ = false;
     uint64_t hot_access_threshold_ = kDefaultHotAccessThreshold;
+
+    // ---- Phase 5（G5）：温度阈值自适应状态（由 latch_ 保护）----
+    bool adaptive_threshold_enabled_ = false;   // 自适应估计开关（默认关 = 静态阈值）
+    uint64_t hot_ratio_percent_ = 20;           // 目标热页占比（%，1..99）
+    uint64_t last_estimated_threshold_ = 0;     // 最近一次动态估计的热阈值（观测）
+    size_t last_dirty_sampled_ = 0;             // 最近一次参与估计的脏页数（观测）
+    // 替换策略与 LRU-K 的 K（LRU-K 联动用；构造时固化，仅观测读取）。
+    ReplacementPolicy policy_ = ReplacementPolicy::LRU;
+    size_t lru_k_ = 0;
 
     // ---- E5 后台刷脏线程状态 ----
     std::thread background_flusher_;     // 后台线程；未运行时为空

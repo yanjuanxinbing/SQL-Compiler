@@ -59,6 +59,15 @@ public:
     void RecordAccess() { ++access_count_; }
     uint64_t GetAccessCount() const { return access_count_.load(); }
 
+    // ---- T4 可观测性：脏页年龄 ----
+    // 记录「变脏时刻」的池操作序号（由 BufferPoolManager 的 op_tick_ 提供）；
+    // 仅当页从干净变脏时更新一次（幂等）。写回（SetDirty(false)）不清零——年龄
+    // 分布只统计「当前仍脏」的帧，读取方需先判 IsDirty()。ResetMemory 时清零。
+    // 注：绕过 BPM 直接 SetDirty(true) 的路径（恢复/undo 等）不更新本字段，年龄
+    // 会被计为「很久以前」，仅影响观测分桶、不影响正确性。
+    void MarkDirtyFromClean(int64_t op_tick);
+    int64_t GetDirtySinceTick() const { return dirty_since_tick_; }
+
     // 重置页内容与元信息为初始状态，供缓冲池复用该帧时调用
     void ResetMemory();
 
@@ -74,6 +83,8 @@ private:
     std::shared_mutex latch_;
     // Phase 4：访问温度计数。原子：GetPage 可被多线程并发调用；ResetMemory 时清零。
     std::atomic<uint64_t> access_count_{0};
+    // T4：脏页年龄基准（变脏时刻的池操作序号；仅在 IsDirty()==true 时有效）。
+    int64_t dirty_since_tick_ = 0;
 };
 
 }  // namespace sqlcompiler

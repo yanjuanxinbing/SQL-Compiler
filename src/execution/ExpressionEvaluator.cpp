@@ -200,19 +200,6 @@ int32_t ValueToIntTruncate(const Value& v) {
     return 0;
 }
 
-double ValueToFloat(const Value& v) {
-    if (v.GetType() == ValueType::FLOAT) return v.AsFloat();
-    if (v.GetType() == ValueType::INTEGER) return static_cast<double>(v.AsInt());
-    if (v.GetType() == ValueType::VARCHAR) {
-        try {
-            return std::stod(v.AsVarchar());
-        } catch (...) {
-            return 0.0;
-        }
-    }
-    return 0.0;
-}
-
 std::string TrimWhitespace(const std::string& s) {
     size_t b = 0, e = s.size();
     while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
@@ -241,13 +228,11 @@ bool ParseDateString(const std::string& s, int* year, int* month, int* day) {
         if (!any) return 0;
         return static_cast<int>(acc * sign);
     };
-    auto expect = [&](size_t& pos, char ch) -> bool {
-        if (pos < s.size() && s[pos] == ch) { ++pos; return true; }
-        return false;
-    };
     size_t pos = 0;
     int y = read_int(pos);
-    if (pos >= s.size() || !std::isdigit(static_cast<unsigned char>(s[pos - 1 >= 0 ? s.size() - 1 : 0]))) {
+    // 原写法 `pos - 1 >= 0 ? s.size() - 1 : 0` 中 pos 为无符号、恒真，
+    // 语义等价于检查字符串末字符；此处化简并消除 -Wtype-limits。
+    if (pos >= s.size() || !std::isdigit(static_cast<unsigned char>(s[s.size() - 1]))) {
         // first read_int failed
         return false;
     }
@@ -1210,7 +1195,7 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
 // 43_upsert: VALUES(col) —— 通过 ExecutionContext 上的 upsert_values_bind 取值。
 // 不在 upsert 上下文时返回 NULL（语义层应保证 VALUES(col) 不出现在其它语境）。
 Value ExpressionEvaluator::EvaluateUpsertValuesRef(const UpsertValuesRefExpr& expr,
-                                                   const Tuple& tuple) const {
+                                                   const Tuple& /*tuple*/) const {
     if (!ctx_) return Value::MakeNull();
     const auto* bind = ctx_->GetUpsertValuesBind();
     if (!bind) return Value::MakeNull();

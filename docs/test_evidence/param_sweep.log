@@ -1,0 +1,24 @@
+==== Phase 5 周期4 参数扫描实验 ====
+time: 2026-09-14 15:32:19
+workload: c:\Users\Lenovo\Desktop\SQL-Compiler\tests\tmp_sweep2\workload.sql
+
+case,exit,elapsed_ms,hit_pct,disk_writes,wal_fsyncs,writeback_cold,writeback_hot,bg_ticks,memory,frames
+baseline-default,0,2713,99.99%,12345,219,346,0,0,262144 B / 262144 B  (64/64 frames),64
+buf-64KB,0,2478,99.05%,5022,857,2078,0,0,65536 B / 65536 B  (16/16 frames),16
+buf-1MB,0,2684,99.99%,13833,219,346,0,0,294912 B / 1048576 B  (72/256 frames),256
+buf-4MB,0,2701,99.99%,13833,219,346,0,0,294912 B / 4194304 B  (72/1024 frames),1024
+temp-flush-on,0,2726,99.99%,12345,219,14,332,0,262144 B / 262144 B  (64/64 frames),64
+temp-flush-on-ratio-40,0,2707,99.99%,12345,219,14,332,0,262144 B / 262144 B  (64/64 frames),64
+bg-flush-10ms,0,2649,99.99%,13042,331,865,0,293,262144 B / 262144 B  (64/64 frames),64
+groupcommit-2ms,0,3476,99.99%,12345,219,346,0,0,262144 B / 262144 B  (64/64 frames),64
+bg-vacuum-5ms,0,2634,99.99%,12345,219,346,0,0,262144 B / 262144 B  (64/64 frames),64
+all-opt,0,3521,99.99%,14473,323,768,50,355,294912 B / 1048576 B  (72/256 frames),256
+
+==== 推荐配置（观测结论，供交付说明） ====
+  SQLCOMPILER_BUFFER_MEMORY=1048576   (1MB / 256 帧：64 帧已覆盖本数据集；1MB 为更大工作集留余量)
+  SQLCOMPILER_TEMP_FLUSH=1            (温度感知刷盘：写回分流 cold/hot，热页留池延后写回)
+  SQLCOMPILER_HOT_RATIO_PERCENT=20    (自适应目标热页占比，默认即可)
+  SQLCOMPILER_BG_FLUSH_MS=10          (后台异步刷脏，把写回摊到后台线程；短负载总 I/O 略增)
+  SQLCOMPILER_GROUPCOMMIT_WINDOW_MS=2 (仅多会话高频提交开启；单会话串行提交会徒增窗口等待)
+  SQLCOMPILER_BG_VACUUM_MS=5          (后台 MVCC 真空，长事务场景建议开启)
+==== End ====

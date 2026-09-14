@@ -68,7 +68,8 @@ void ExecutionContext::PopCteOverride(const std::string& name) {
     it->second.pop_back();
 }
 
-ExecutionContext::RowLockResult ExecutionContext::AcquireRowReadLock(const RID& rid) {
+ExecutionContext::RowLockResult ExecutionContext::AcquireRowReadLock(
+    const RID& rid, int64_t table_res) {
     Transaction* txn = txn_;
     if (txn == nullptr || !txn->IsActive() || txn_manager_ == nullptr) return RowLockResult::kUnused;
     LockManager* lm = txn_manager_->GetLockManager();
@@ -80,13 +81,14 @@ ExecutionContext::RowLockResult ExecutionContext::AcquireRowReadLock(const RID& 
         return RowLockResult::kUnused;
     }
     const int64_t res = RowResourceId(rid.page_id, rid.slot_num);
-    LockResult r = lm->LockShared(txn->GetTxnId(), res, 0);
+    // table_res 作为表提示传入：行读锁与所属表锁路由到同一分片（G6 分片锁）。
+    LockResult r = lm->LockShared(txn->GetTxnId(), res, 0, table_res);
     if (r != LockResult::kGranted) {
         return (r == LockResult::kDeadlock) ? RowLockResult::kDeadlock : RowLockResult::kTimeout;
     }
     // READ COMMITTED：本语句登记的读锁在语句末释放；SERIALIZABLE 持有到提交（不登记）。
     if (txn->GetIsolationLevel() == IsolationLevel::kReadCommitted) {
-        RecordRowReadLock(res);
+        RecordRowReadLock(res, table_res);
     }
     return RowLockResult::kOk;
 }
@@ -103,7 +105,8 @@ ExecutionContext::RowLockResult ExecutionContext::AcquireRowWriteLock(
         return RowLockResult::kOk;
     }
     const int64_t row_res = RowResourceId(rid.page_id, rid.slot_num);
-    LockResult r = lm->LockExclusive(txn->GetTxnId(), row_res, 0);
+    // table_res 作为表提示传入：行写锁与所属表锁路由到同一分片（G6 分片锁）。
+    LockResult r = lm->LockExclusive(txn->GetTxnId(), row_res, 0, table_res);
     if (r != LockResult::kGranted) {
         return (r == LockResult::kDeadlock) ? RowLockResult::kDeadlock : RowLockResult::kTimeout;
     }

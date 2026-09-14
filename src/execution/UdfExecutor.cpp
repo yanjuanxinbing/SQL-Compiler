@@ -7,32 +7,6 @@ namespace sqlcompiler {
 
 namespace {
 
-// 把表达式的值强制转换为声明的列类型，避免 INT/FLOAT 混淆。
-// 本实现只覆盖 INT / FLOAT / VARCHAR 三种与 DECLARE 兼容的类型；其它
-// 类型原样返回。
-Value CoerceToType(const Value& v, const std::string& data_type) {
-    std::string up;
-    up.reserve(data_type.size());
-    for (char c : data_type) up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-    if (v.IsNull()) return v;
-    if (up == "INT" || up == "INTEGER") {
-        if (v.GetType() == ValueType::INTEGER) return v;
-        if (v.GetType() == ValueType::FLOAT) return Value::MakeInt(static_cast<int32_t>(v.AsFloat()));
-        if (v.GetType() == ValueType::VARCHAR) {
-            try { return Value::MakeInt(static_cast<int32_t>(std::stoi(v.AsVarchar()))); }
-            catch (...) { return Value::MakeInt(0); }
-        }
-    } else if (up == "FLOAT" || up == "DOUBLE") {
-        if (v.GetType() == ValueType::FLOAT) return v;
-        if (v.GetType() == ValueType::INTEGER) return Value::MakeFloat(static_cast<double>(v.AsInt()));
-        if (v.GetType() == ValueType::VARCHAR) {
-            try { return Value::MakeFloat(std::stod(v.AsVarchar())); }
-            catch (...) { return Value::MakeFloat(0.0); }
-        }
-    }
-    return v;
-}
-
 // 解释表达式的真值。SQL 三值逻辑：仅当 IsTrue（非 NULL 且为 truthy）时返回 true；
 // NULL 与 false / 0 都视为 false。
 bool IsTruthyValue(const Value& v) {

@@ -53,6 +53,7 @@ void CodeGenerator::GenerateNode(const PlanNodePtr& node, std::vector<Instructio
         case PlanNodeType::DELETE:       GenerateDelete(node, out); break;
         case PlanNodeType::CREATE_TABLE: GenerateCreateTable(node, out); break;
         case PlanNodeType::DROP_TABLE:   GenerateDropTable(node, out); break;
+        default:                         break;
     }
 }
 
@@ -81,6 +82,7 @@ void CodeGenerator::GenerateJoin(const PlanNodePtr& node, std::vector<Instructio
         case JoinType::INNER: jt = "INNER"; break;
         case JoinType::LEFT:  jt = "LEFT";  break;
         case JoinType::RIGHT: jt = "RIGHT"; break;
+        default:              break;
     }
     out.push_back({"JOIN", {jt, n->condition ? n->condition->ToString() : "?"}});
 }

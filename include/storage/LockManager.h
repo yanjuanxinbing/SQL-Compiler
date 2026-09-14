@@ -19,10 +19,19 @@
 //   * 本 LockManager 提供「事务长」的逻辑锁（S/X 兼容矩阵 + 等待图死锁回收），
 //     粒度独立于页，供显式事务在 DML 算子边界声明访问集合并持有到 End。
 //
-// 线程安全：单实例内部一把 mutex_ 保护锁表、等待图与条件变量；锁授予对并发调用
-// 线程安全。
+// 线程安全：锁表与谓词表按「所属表/命名空间」分片（kLockShardCount 个分片，每分片
+// 独立互斥 + 条件变量），行锁与其所属表锁路由到同一分片，多粒度层级冲突检查恒在
+// 单分片内完成；跨分片的等待图与归属登记由全局 meta_mutex_ 保护。锁序约定：
+//   分片互斥（多个时按下标升序）-> meta_mutex_，恒不允许反向。
+// 分片路由（见 ShardOf）：表资源（res >= 0）按自身哈希；行资源（res < 0）按
+//   table_hint（生产路径恒传）→ 已登记归属（RegisterRowGroup）→ 资源自身哈希。
+//   注意：行锁与其所属表锁必须落在同一分片——取行锁时传入 table_hint（或先
+//   RegisterRowGroup 再取锁）。若先按自身哈希取锁、之后才登记归属，则该行锁与
+//   表锁异片，层级冲突检查与行级锁升级将看不到对方。
 // =============================================================================
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <chrono>
 #include <condition_variable>
@@ -62,17 +71,24 @@ public:
 
     // 共享锁：当前无 X 持有者即可叠加授予。阻塞：等待毫秒数由 wait_ms 决定
     // （0 = 无限）。调用方需是 txn_id 对应事务。
-    LockResult LockShared(int64_t txn_id, int64_t res_id, int wait_ms = 0);
+    // table_hint：行锁（res_id < 0）所属表资源 id（表堆首页页号，非负）。生产路径
+    // （ExecutionContext 行读/写锁）一律传入；用于把行锁与其表锁路由到同一分片。
+    // 未传入时按已登记归属（RegisterRowGroup）路由，仍无归属则按资源自身哈希路由
+    //（兼容裸 LockManager 用法与既有测试）。
+    LockResult LockShared(int64_t txn_id, int64_t res_id, int wait_ms = 0,
+                          int64_t table_hint = -1);
 
     // 独占锁：当前无 任何 持有者（S 或 X）才可授予。
-    LockResult LockExclusive(int64_t txn_id, int64_t res_id, int wait_ms = 0);
+    LockResult LockExclusive(int64_t txn_id, int64_t res_id, int wait_ms = 0,
+                             int64_t table_hint = -1);
 
     // 非阻塞尝试版：冲突立即返回 kWouldBlock。用于单线程断言冲突/死锁场景。
-    LockResult TryLockShared(int64_t txn_id, int64_t res_id);
-    LockResult TryLockExclusive(int64_t txn_id, int64_t res_id);
+    LockResult TryLockShared(int64_t txn_id, int64_t res_id, int64_t table_hint = -1);
+    LockResult TryLockExclusive(int64_t txn_id, int64_t res_id, int64_t table_hint = -1);
 
     // 释放某个事务在指定资源上的锁，并把自己持有的等待图边清除；可唤醒等待者。
-    void Unlock(int64_t txn_id, int64_t res_id);
+    // table_hint 语义同上：与获取时的路由保持一致（行读锁的语句级释放必须传入）。
+    void Unlock(int64_t txn_id, int64_t res_id, int64_t table_hint = -1);
 
     // 释放某个事务的全部锁（Commit / Rollback 时调用）。
     void UnlockAll(int64_t txn_id);
@@ -153,6 +169,15 @@ public:
     size_t GetPredicateQueryComparisons() const;
     void ResetPredicateQueryComparisons();
 
+    // ---- 周期 2（G3）观测：增量更新 vs 整树重建 ----
+    // 累计整树重建次数（重建 = O(P log P) 全量）。增量注册路径下应远小于注册次数，
+    // 用于验证「大量区间注册不再触发整树重建」。
+    size_t GetPredicateRebuildCount() const;
+    // 累计增量插入的二分步数（每次 O(log P)），验证插入开销与区间总数解耦。
+    size_t GetPredicateInsertSteps() const;
+    // 同时清零重建次数与插入步数（供基准对照）。
+    void ResetPredicateInsertCounters();
+
     // ---- 自适应锁升级阈值（v3）----
     // 固定阈值（128 行）对所有表一刀切并不合适：小表（几十行）批量写时行锁条目数
     // 已占表的大半，应提前升级收敛；大表（上万行）128 行远未覆盖足够比例，过早升级
@@ -177,53 +202,6 @@ private:
         std::vector<std::pair<int64_t, LockMode>> waiters;
     };
 
-    LockResult Acquire(int64_t txn_id, int64_t res_id, LockMode mode,
-                       int wait_ms, bool block_try);
-    // 不持锁的前置判定：当前持有者中是否存在与 mode 冲突的事务（排除 txn_id 自身）。
-    bool Conflicts(const LockState& st, int64_t txn_id, LockMode mode) const;
-    bool ModeCompatible(LockMode a, LockMode b) const;
-    // 多粒度层级冲突：行锁（res<0）检查其所属表的表级锁持有者；表锁（res>=0）
-    // 检查本表下所有行锁的持有者。无登记归属的行锁/未知表不参与层级冲突。
-    bool HierarchyConflicts(int64_t txn_id, int64_t res_id, LockMode mode) const;
-    // 把 txn 加入对 res 持有者集合中「冲突」事务的等待图边（含层级冲突的边）。
-    void LinkWaitEdges(int64_t txn_id, int64_t res_id, LockMode mode);
-    void UnlinkWaitEdges(int64_t txn_id);
-    // 从 txn 出发，沿 waits_on_ 做 DFS；若能回到 txn 则说明形成死锁环。
-    bool DeadlockCycle(int64_t txn_id) const;
-    bool Dfs(int64_t cur, const int64_t start, std::unordered_set<int64_t>& onpath,
-             std::unordered_set<int64_t>& visited) const;
-
-    mutable std::mutex mutex_;
-    std::condition_variable cv_;
-    std::unordered_map<int64_t, LockState> locks_;          // res_id -> LockState
-    std::unordered_map<int64_t, std::unordered_set<int64_t>> waits_on_;  // 等待图
-
-    // ---- 行级锁升级的层次映射 ----
-    // row_group_：行锁 res（<0）→ 所属表资源 id（非负）。由 ExecutionContext 在
-    // 行锁授予后登记；无登记的行锁不参与层级冲突（兼容裸 LockManager 用法）。
-    std::unordered_map<int64_t, int64_t> row_group_;
-    // table_rows_：表资源 id（非负）→ 该表下已登记的行锁集合（反查索引，供表级
-    // 锁请求时检查本表所有行锁持有者）。
-    std::unordered_map<int64_t, std::unordered_set<int64_t>> table_rows_;
-    // escalated_tables_：txn_id → 已升级为表级锁的表集合（升级成功标记）。
-    std::unordered_map<int64_t, std::unordered_set<int64_t>> escalated_tables_;
-    // table_escalation_conflicts_：表资源 id → 该表累计的升级冲突次数
-    // （TryEscalateTable 因他人持冲突行/表锁返回 kWouldBlock 的次数）。
-    std::unordered_map<int64_t, size_t> table_escalation_conflicts_;
-
-    // SERIALIZABLE 谓词锁：某事务在某表某列值域上的一条（可能全表）读谓词，
-    // 持有到提交。is_full=false 时区间为 [lo, hi]（含端点；lo/hi 为空 = 开边界）。
-    // 本结构仅供 AcquireReadPredicate 的「父子区间继承与合并」规约逻辑使用；
-    // 实际存储按 (表, 列) 组织为 Phase 4 的居中区间树（见 pred_tables_）。
-    struct PredicateLock {
-        int64_t txn_id;
-        int64_t table_rid;
-        int32_t column;      // 谓词所属列（表模式下标）；is_full 时忽略
-        bool is_full;
-        IndexKey lo;         // 空 = -inf（开）
-        IndexKey hi;         // 空 = +inf（开）
-    };
-
     // ---- Phase 4（创新特性 E）：谓词锁区间树 ----
     // 旧实现把所有谓词线性存于 pred_locks_ 向量，CheckWritePredicate 逐条
     // PredicateCovers 扫描 → O(P)。改为按表组织「居中区间树」（centered
@@ -243,23 +221,105 @@ private:
         int64_t txn_id;
     };
     struct IntervalNode {
-        int32_t split_idx = -1;   // lo_values 中分裂点的下标；-1 = 退化单节点（全 lo 开放）
+        int32_t split_idx = -1;   // lo_values 中分裂点的下标；-1 = 退化节点（无分裂点）
         std::vector<std::pair<IndexKey, int64_t>> by_lo_asc;   // (lo, txn) 升序（空 lo = -inf 在前）
         std::vector<std::pair<IndexKey, int64_t>> by_hi_desc;  // (hi, txn) 降序（空 hi = +inf 在前）
         int32_t left = -1, right = -1;   // 子树节点下标（nodes 向量）
+        // 周期 2：退化节点（split_idx = -1）的完整区间集。只有「无法归属任何分裂点」
+        // 的区间进入（如 lo 落在分裂点间隙、开下界区间 hi 小于某范围最左分裂点），
+        // 查询时线性双端过滤 lo <= key <= hi。普通节点不填充。
+        std::vector<Interval> fallback;
     };
     struct PredicateTable {   // 单列的区间树源
         std::vector<Interval> intervals;      // 源：合并后的区间条目（source of truth）
         std::vector<IndexKey> lo_values;      // 去重升序的 lo 集合（分裂点序列，不含空 lo）
-        std::vector<IntervalNode> nodes;      // 惰性重建的区间树（后序遍历下标）
-        bool dirty = true;
+        std::vector<IntervalNode> nodes;      // 增量维护的区间树（后序遍历下标）
+        bool dirty = true;                    // true = 树与 intervals 不同步，下次查询需重建
+        size_t pending_inserts_ = 0;          // 周期 2：自上次构建以来累计的增量插入条数
+                                              // （退化控制：超过阈值后置 dirty 延迟重建）
     };
     struct PredicateTableGroup {   // 每张表的谓词集合
         std::vector<int64_t> full_holders;   // 表级全表谓词哨兵持有者（is_full，覆盖整表）
         std::unordered_map<int32_t, PredicateTable> columns;  // 列下标 -> 该列区间树
     };
-    std::unordered_map<int64_t, PredicateTableGroup> pred_tables_;  // table_rid -> 谓词集合
-    mutable size_t predicate_query_comparisons_ = 0;  // 累计键比较次数（观测用）
+
+    // ---- Phase 5（周期 3，G6）：按表/命名空间分片锁 ----
+    // 每分片一把互斥 + 条件变量 + 锁表 + 谓词表。行锁与其所属表锁路由到同一分片
+    // （表分片），多粒度层级冲突、锁升级、行锁计数均在单分片内完成，不跨分片加锁。
+    struct LockShard {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::unordered_map<int64_t, LockState> locks;  // res_id -> LockState
+        std::unordered_map<int64_t, PredicateTableGroup> pred_tables;  // table_rid -> 谓词
+    };
+    // 分片数（2 的幂，异表并发下分片间无互斥，热点路径细粒度化）。
+    static constexpr size_t kLockShardCount = 16;
+    static constexpr size_t kLockShardMask = kLockShardCount - 1;
+    mutable std::array<LockShard, kLockShardCount> shards_;
+
+    // 跨分片元数据（meta_mutex_ 保护）：等待图 + 行锁归属登记 + 升级状态。
+    mutable std::mutex meta_mutex_;
+    std::unordered_map<int64_t, std::unordered_set<int64_t>> waits_on_;  // 等待图
+    // ---- 行级锁升级的层次映射 ----
+    // row_group_：行锁 res（<0）→ 所属表资源 id（非负）。由 ExecutionContext 在
+    // 行锁授予后登记；无登记的行锁不参与层级冲突（兼容裸 LockManager 用法）。
+    // 同时作为未传 table_hint 的行锁的路由依据。
+    std::unordered_map<int64_t, int64_t> row_group_;
+    // table_rows_：表资源 id（非负）→ 该表下已登记的行锁集合（反查索引，供表级
+    // 锁请求时检查本表所有行锁持有者）。
+    std::unordered_map<int64_t, std::unordered_set<int64_t>> table_rows_;
+    // escalated_tables_：txn_id → 已升级为表级锁的表集合（升级成功标记）。
+    std::unordered_map<int64_t, std::unordered_set<int64_t>> escalated_tables_;
+    // table_escalation_conflicts_：表资源 id → 该表累计的升级冲突次数
+    // （TryEscalateTable 因他人持冲突行/表锁返回 kWouldBlock 的次数）。
+    std::unordered_map<int64_t, size_t> table_escalation_conflicts_;
+
+    // 观测计数器（原子：分片内更新、无锁读取，跨分片共享）。
+    mutable std::atomic<size_t> predicate_query_comparisons_{0};  // 累计键比较次数（观测用）
+    mutable std::atomic<size_t> predicate_rebuild_count_{0};      // 周期 2：累计整树重建次数
+    mutable std::atomic<size_t> predicate_insert_steps_{0};       // 周期 2：增量插入累计二分步数
+
+    LockResult Acquire(int64_t txn_id, int64_t res_id, LockMode mode,
+                       int wait_ms, bool block_try, int64_t table_hint = -1);
+    // 不持锁的前置判定：当前持有者中是否存在与 mode 冲突的事务（排除 txn_id 自身）。
+    bool Conflicts(const LockState& st, int64_t txn_id, LockMode mode) const;
+    bool ModeCompatible(LockMode a, LockMode b) const;
+    // 多粒度层级冲突：行锁（res<0）检查其所属表的表级锁持有者；表锁（res>=0）
+    // 检查本表下所有行锁的持有者。无登记归属的行锁/未知表不参与层级冲突。
+    // 前置：已持有 shard 分片的互斥；res 的相关资源与该分片同片（见 ShardOf 路由）。
+    // table_hint：行锁的所属表（生产路径恒传）。>=0 时直接以它作为所属表，免读
+    // meta_mutex_（行锁热路径免全局锁）；<0 时回退到 row_group_ 登记查表（meta）。
+    bool HierarchyConflicts(size_t shard, int64_t txn_id, int64_t res_id,
+                            LockMode mode, int64_t table_hint = -1) const;
+    // 把 txn 加入对 res 持有者集合中「冲突」事务的等待图边（含层级冲突的边）。
+    // 前置：已持有 shard 分片互斥；内部按锁序（分片 -> meta_mutex_）访问元数据。
+    void LinkWaitEdges(size_t shard, int64_t txn_id, int64_t res_id, LockMode mode);
+    void UnlinkWaitEdges(int64_t txn_id);
+    // 从 txn 出发，沿 waits_on_ 做 DFS；若能回到 txn 则说明形成死锁环。
+    // 前置：可持有分片互斥，内部取 meta_mutex_（分片 -> meta，见锁序约定）。
+    bool DeadlockCycle(int64_t txn_id) const;
+    bool Dfs(int64_t cur, const int64_t start, std::unordered_set<int64_t>& onpath,
+             std::unordered_set<int64_t>& visited) const;
+
+    // ---- 分片路由 ----
+    // 表资源（res >= 0）按自身哈希取分片；行资源（res < 0）优先按表提示 table_hint
+    // 路由（生产路径恒有），其次按已登记归属表（row_group_，读 meta_mutex_，取完即放，
+    // 不在持 meta 期间取分片锁），最后按资源自身哈希。返回 [0, kLockShardCount)。
+    size_t TableShard(int64_t table_res) const;
+    size_t ShardOf(int64_t res_id, int64_t table_hint) const;
+
+    // SERIALIZABLE 谓词锁：某事务在某表某列值域上的一条（可能全表）读谓词，
+    // 持有到提交。is_full=false 时区间为 [lo, hi]（含端点；lo/hi 为空 = 开边界）。
+    // 本结构仅供 AcquireReadPredicate 的「父子区间继承与合并」规约逻辑使用；
+    // 实际存储按 (表, 列) 组织为 Phase 4 的居中区间树（见分片内 pred_tables）。
+    struct PredicateLock {
+        int64_t txn_id;
+        int64_t table_rid;
+        int32_t column;      // 谓词所属列（表模式下标）；is_full 时忽略
+        bool is_full;
+        IndexKey lo;         // 空 = -inf（开）
+        IndexKey hi;         // 空 = +inf（开）
+    };
 
     // 惰性重建 t 的区间树（intervals → lo_values + nodes）。
     void PredicateTreeRebuild(PredicateTable& t) const;
@@ -271,8 +331,28 @@ private:
     void PredicateTreeQuery(const PredicateTable& t, const IndexKey& key,
                             std::vector<int64_t>* out) const;
     // 收集 table_rid 上命中 key 的冲突持有者（表级全表谓词 + column 列区间树）。
-    void GatherColumnConflicts(int64_t table_rid, int32_t column, const IndexKey& key,
-                               std::vector<int64_t>* out);
+    // 前置：已持有 table_rid 所在分片（shard）的互斥。
+    void GatherColumnConflicts(size_t shard, int64_t table_rid, int32_t column,
+                               const IndexKey& key, std::vector<int64_t>* out);
+
+    // ---- 周期 2（G3）：谓词区间树增量更新 ----
+    // 旧实现每次注册/注销后置 dirty，下次查询整树重建（O(P log P)，P = 区间数）。
+    // 改为增量同步：树形与分裂点保持静态，只对「新增/消失」的区间做二分定位的
+    // 节点增删（O(D log P)，D = 变更条数）：
+    //   * PredicateTreeInsert：按与构建相同的归属规则二分下降，跨过分裂点的区间
+    //     插进节点有序表（二分定位）；落到空子树则建退化叶子（split_idx=-1）兜底；
+    //   * PredicateTreeRemove：同规则下降，从节点有序表精确剔除 (lo,hi,txn)；
+    //   * 退化控制：累计增量插入超过阈值（64 且过半）→ 置 dirty 延迟整树重建，
+    //     避免长期增量导致树形失衡（重建频率摊薄为 O(1) 每比例）。
+    // PredicateTreeSync 把树从旧集合同步到新集合（先删消失的，再插新增的）；
+    // 树未构建或同步中途失败时置 dirty 兜底。
+    void PredicateTreeSync(PredicateTable& t,
+                           const std::vector<Interval>& old_set,
+                           const std::vector<Interval>& new_set) const;
+    // 增量插入一条区间到已构建的树；返回本次二分层数（观测 O(log P)）。
+    size_t PredicateTreeInsert(PredicateTable& t, const Interval& iv) const;
+    // 增量删除一条区间（(lo,hi,txn) 精确匹配）；找不到返回 false。
+    bool PredicateTreeRemove(PredicateTable& t, const Interval& iv) const;
 };
 
 }  // namespace sqlcompiler

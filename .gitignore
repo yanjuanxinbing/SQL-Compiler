@@ -1,7 +1,9 @@
 /build
 /build_asan/
+/build_audit/
 /.vscode
 /tests/tmp
+/tests/tmp_sweep*
 /*.log
 # runtime artifacts
 sqlcompiler.db*

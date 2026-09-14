@@ -70,6 +70,8 @@ Value EvaluateDefaultLiteral(const ExprPtr& default_expr,
         case LiteralType::BOOLEAN:
             return Value::MakeInt(
                 (lit->value != "0" && lit->value != "false" && lit->value != "FALSE") ? 1 : 0);
+        default:
+            return Value::MakeNull();
     }
     return Value::MakeNull();
 }

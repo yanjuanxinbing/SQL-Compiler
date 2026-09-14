@@ -8,19 +8,6 @@ namespace sqlcompiler {
 
 namespace {
 
-const char* LiteralTypeToString(LiteralType t) {
-    switch (t) {
-        case LiteralType::INTEGER:    return "INT";
-        case LiteralType::FLOAT:      return "FLOAT";
-        case LiteralType::STRING:     return "STRING";
-        case LiteralType::NULL_VALUE: return "NULL";
-        case LiteralType::BOOLEAN:    return "BOOL";
-        case LiteralType::DATE:       return "DATE";
-        case LiteralType::TIMESTAMP:  return "TIMESTAMP";
-    }
-    return "?";
-}
-
 const char* BinaryOpToString(BinaryOperator op) {
     switch (op) {
         case BinaryOperator::ADD:            return "+";
@@ -43,14 +30,6 @@ const char* BinaryOpToString(BinaryOperator op) {
         case BinaryOperator::IS_NOT_NULL:    return "IS NOT NULL";
         case BinaryOperator::INTERVAL_ADD:   return "+";
         case BinaryOperator::INTERVAL_SUB:   return "-";
-    }
-    return "?";
-}
-
-const char* UnaryOpToString(UnaryOperator op) {
-    switch (op) {
-        case UnaryOperator::NOT:    return "NOT";
-        case UnaryOperator::NEGATE: return "-";
     }
     return "?";
 }

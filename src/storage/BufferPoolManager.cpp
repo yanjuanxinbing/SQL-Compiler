@@ -6,6 +6,7 @@
 #include "storage/LRUKReplacer.h"
 #include "txn/LogManager.h"
 
+#include <algorithm>
 #include <cstring>
 #include <shared_mutex>
 
@@ -32,7 +33,9 @@ double BufferPoolStats::HitRate() const {
 
 BufferPoolManager::BufferPoolManager(size_t pool_size, DiskManager* disk_manager,
                                       ReplacementPolicy policy, size_t lru_k)
-    : pool_size_(pool_size), disk_manager_(disk_manager), pages_(pool_size) {
+    : pool_size_(pool_size), disk_manager_(disk_manager), pages_(pool_size),
+      policy_(policy),
+      lru_k_((policy == ReplacementPolicy::LRUK) ? lru_k : 0) {
     if (policy == ReplacementPolicy::LRU) {
         replacer_ = std::make_unique<LRUReplacer>(pool_size);
     } else if (policy == ReplacementPolicy::LRUK) {
@@ -62,6 +65,7 @@ BufferPoolManager::~BufferPoolManager() {
 
 Page* BufferPoolManager::GetPage(page_id_t page_id) {
     std::lock_guard<std::mutex> lock(latch_);
+    ++op_tick_;  // T4：池操作逻辑时钟（脏页年龄基准）
     if (page_id < 0) return nullptr;
     auto it = page_table_.find(page_id);
     if (it != page_table_.end()) {
@@ -70,6 +74,7 @@ Page* BufferPoolManager::GetPage(page_id_t page_id) {
         replacer_->Pin(frame_id);
         pages_[frame_id].RecordAccess();  // Phase 4：命中即升温
         ++stats_.hit_count;
+        RecordHitTemperatureStat(pages_[frame_id]);  // T4：命中构成按温度分桶
         return &pages_[frame_id];
     }
     int frame_id = -1;
@@ -105,6 +110,7 @@ Page* BufferPoolManager::GetPage(page_id_t page_id) {
 
 Page* BufferPoolManager::NewPage(page_id_t* page_id) {
     std::lock_guard<std::mutex> lock(latch_);
+    ++op_tick_;  // T4：池操作逻辑时钟（脏页年龄基准）
     // 先分配页号再找帧，确保 FindFreeFrame 记录的替换日志的 loaded 字段为真实新页号。
     page_id_t new_pid = disk_manager_->AllocatePage();
     int frame_id = -1;
@@ -137,11 +143,13 @@ Page* BufferPoolManager::NewPage(page_id_t* page_id) {
 
 bool BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) {
     std::lock_guard<std::mutex> lock(latch_);
+    ++op_tick_;  // T4：池操作逻辑时钟（脏页年龄基准）
     auto it = page_table_.find(page_id);
     if (it == page_table_.end()) return false;
     int frame_id = it->second;
     if (is_dirty) {
-        pages_[frame_id].SetDirty(true);
+        // T4：脏页年龄——从干净变脏时记录变脏时刻（幂等；重复标脏不覆盖）。
+        pages_[frame_id].MarkDirtyFromClean(op_tick_);
     }
     pages_[frame_id].DecPinCount();
     if (pages_[frame_id].GetPinCount() == 0) {
@@ -152,6 +160,7 @@ bool BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) {
 
 bool BufferPoolManager::FlushPage(page_id_t page_id) {
     std::lock_guard<std::mutex> lock(latch_);
+    ++op_tick_;  // T4：池操作逻辑时钟（脏页年龄基准）
     FlushPageUnlocked(page_id);
     return true;
 }
@@ -182,13 +191,14 @@ void BufferPoolManager::FlushPageUnlocked(page_id_t page_id) {
     pages_[frame_id].SetDirty(false);
 }
 
-void BufferPoolManager::FlushAllDirtyPages() {
+int BufferPoolManager::FlushAllDirtyPages() {
     std::lock_guard<std::mutex> lock(latch_);
-    FlushAllDirtyUnlocked();
+    ++op_tick_;  // T4：池操作逻辑时钟（脏页年龄基准）
+    return FlushAllDirtyUnlocked();
 }
 
-// FlushAllDirtyPages 的免锁主体。
-void BufferPoolManager::FlushAllDirtyUnlocked() {
+// FlushAllDirtyPages 的免锁主体。返回本次实际写回页数（T4：后台刷脏直方图记账）。
+int BufferPoolManager::FlushAllDirtyUnlocked() {
     // Phase B：组提交优化。原先逐脏页调 FlushPage 会对每个 page_lsn > durable 的
     // 页各触发一次日志 Flush；这里改为一次性把日志刷到所有脏页中最大的 page_lsn，
     // 只需一遍 LogManager::Flush。数据页仍逐页写回，但 WAL-before-data 保证不变。
@@ -208,6 +218,12 @@ void BufferPoolManager::FlushAllDirtyUnlocked() {
             log_manager_->Flush();
         }
     }
+    // Phase 5（G5）：温度阈值自适应——刷盘前按当前脏页访问分布动态估计热阈值，
+    // 本轮刷盘与统计分档统一使用新阈值（冷页写回、热页留池）。
+    if (temp_flush_enabled_ && adaptive_threshold_enabled_) {
+        EstimateAdaptiveThreshold();
+    }
+    int written = 0;
     for (const auto& kv : page_table_) {
         int frame_id = kv.second;
         Page& page = pages_[frame_id];
@@ -227,11 +243,14 @@ void BufferPoolManager::FlushAllDirtyUnlocked() {
         std::shared_lock<std::shared_mutex> data_lock(page.GetLatch());
         disk_manager_->WritePage(kv.first, page.GetData());
         page.SetDirty(false);
+        ++written;
     }
+    return written;
 }
 
 void BufferPoolManager::FlushAllPages() {
     std::lock_guard<std::mutex> lock(latch_);
+    ++op_tick_;  // T4：池操作逻辑时钟（脏页年龄基准）
     for (const auto& kv : page_table_) {
         FlushPageUnlocked(kv.first);
     }
@@ -239,6 +258,7 @@ void BufferPoolManager::FlushAllPages() {
 
 bool BufferPoolManager::DeletePage(page_id_t page_id) {
     std::lock_guard<std::mutex> lock(latch_);
+    ++op_tick_;  // T4：池操作逻辑时钟（脏页年龄基准）
     auto it = page_table_.find(page_id);
     if (it == page_table_.end()) {
         disk_manager_->DeallocatePage(page_id);
@@ -269,6 +289,7 @@ bool BufferPoolManager::DeletePage(page_id_t page_id) {
 
 std::vector<std::pair<page_id_t, uint64_t>> BufferPoolManager::CollectDirtyPages() {
     std::lock_guard<std::mutex> lock(latch_);
+    ++op_tick_;  // T4：池操作逻辑时钟（脏页年龄基准）
     std::vector<std::pair<page_id_t, uint64_t>> out;
     for (const auto& kv : page_table_) {
         int frame_id = kv.second;
@@ -297,6 +318,168 @@ void BufferPoolManager::RecordWritebackStat(const Page& page) {
     } else {
         ++stats_.writeback_cold_count;
     }
+}
+
+// T4：命中构成按温度分档记账。分档（与 GetWarmAccessThreshold 一致）：
+//   hot = 访问数 >= 热阈值；warm = 访问数 >= 温阈值；cold = 其余。
+// 调用前提：已持有 latch_（只写 stats_）。
+void BufferPoolManager::RecordHitTemperatureStat(const Page& page) {
+    const uint64_t c = page.GetAccessCount();
+    if (c >= hot_access_threshold_) {
+        ++stats_.hit_hot_count;
+    } else if (c >= GetWarmAccessThreshold()) {
+        ++stats_.hit_warm_count;
+    } else {
+        ++stats_.hit_cold_count;
+    }
+}
+
+// T4：给一次后台刷脏写回页数记账。调用前提：已持有 latch_。
+void BufferPoolManager::RecordBackgroundFlushStat(int written) {
+    if (bg_flush_hist_.size() < 6) bg_flush_hist_.assign(6, 0);
+    size_t idx;
+    if (written < 1) {
+        idx = 0;
+    } else if (written < 2) {
+        idx = 1;
+    } else if (written < 4) {
+        idx = 2;
+    } else if (written < 8) {
+        idx = 3;
+    } else if (written < 16) {
+        idx = 4;
+    } else {
+        idx = 5;
+    }
+    ++bg_flush_hist_[idx];
+}
+
+// ---- T4 可观测性实现 ----
+
+uint64_t BufferPoolManager::GetWarmAccessThreshold() const {
+    std::lock_guard<std::mutex> lock(latch_);
+    uint64_t t = hot_access_threshold_ / 2;
+    return t == 0 ? 1 : t;
+}
+
+std::vector<long> BufferPoolManager::GetDirtyAgeDistribution() const {
+    std::lock_guard<std::mutex> lock(latch_);
+    std::vector<long> out(5, 0);
+    for (const auto& kv : page_table_) {
+        const Page& page = pages_[kv.second];
+        if (!page.IsDirty()) continue;
+        const int64_t age = op_tick_ - page.GetDirtySinceTick();
+        if (age < 1) {
+            ++out[0];
+        } else if (age < 4) {
+            ++out[1];
+        } else if (age < 10) {
+            ++out[2];
+        } else if (age < 30) {
+            ++out[3];
+        } else {
+            ++out[4];
+        }
+    }
+    return out;
+}
+
+size_t BufferPoolManager::GetDirtyFrameCount() const {
+    std::lock_guard<std::mutex> lock(latch_);
+    size_t n = 0;
+    for (const auto& kv : page_table_) {
+        if (pages_[kv.second].IsDirty()) ++n;
+    }
+    return n;
+}
+
+std::vector<long> BufferPoolManager::GetBackgroundFlushHistogram() const {
+    std::lock_guard<std::mutex> lock(latch_);
+    std::vector<long> out = bg_flush_hist_;  // 返回副本；未记账时为空
+    if (out.size() < 6) out.resize(6, 0);    // 固定 6 桶，防 \stats 越界
+    return out;
+}
+
+int BufferPoolManager::GetFrameOfPage(page_id_t page_id) const {
+    std::lock_guard<std::mutex> lock(latch_);
+    auto it = page_table_.find(page_id);
+    return it == page_table_.end() ? -1 : it->second;
+}
+
+bool BufferPoolManager::IsPageDirtyInPool(page_id_t page_id) const {
+    std::lock_guard<std::mutex> lock(latch_);
+    auto it = page_table_.find(page_id);
+    return it != page_table_.end() && pages_[it->second].IsDirty();
+}
+
+// T4 诊断（\analyze）：缓冲池页映射快照，按 page_id 升序返回副本。
+std::vector<PageMapEntry> BufferPoolManager::GetPageMapSnapshot() const {
+    std::lock_guard<std::mutex> lock(latch_);
+    std::vector<PageMapEntry> out;
+    out.reserve(page_table_.size());
+    for (const auto& kv : page_table_) {
+        const Page& page = pages_[kv.second];
+        out.push_back(PageMapEntry{kv.first, kv.second, page.IsDirty(),
+                                   page.GetAccessCount()});
+    }
+    std::sort(out.begin(), out.end(),
+              [](const PageMapEntry& a, const PageMapEntry& b) {
+                  return a.page_id < b.page_id;
+              });
+    return out;
+}
+
+// Phase 5（G5）：温度阈值自适应——按当前脏页访问计数分布动态估计热阈值。
+// 调用前提：已持有 latch_（本方法只读 pages_/page_table_ 并写阈值相关成员）。
+// 语义：
+//   * 样本 = 当前全部脏页的访问计数（升序排序）；
+//   * P 分位估计：目标热页数 goal = round(hot_ratio_percent_% × n)（至少 1），
+//     阈值取「高频端第 goal 个」访问数；若边界同温层把实际热页数放大到超过
+//     cap = max(goal, n - goal)，则抬升阈值让整层判冷，避免低频大量同温页
+//     全部判热（热页占比偏置、收敛失效）；
+//   * 平坦分布保护：脏页访问计数几乎一致（极差 < 2，整数计数下的「同温」）时
+//     阈值上推至全体判冷，防止「全部判定为热 → 整次刷盘空转、脏页长期滞留」；
+//   * LRU-K 联动：替换策略为 LRU-K 时阈值至少取 K——访问 < K 的页是 LRU-K
+//     语义下的「非相关」一次性引用，恒按冷页写回，热页判定与淘汰策略对齐。
+// 结果写入 hot_access_threshold_，并同步到观测成员 last_estimated_threshold_ /
+// last_dirty_sampled_。
+void BufferPoolManager::EstimateAdaptiveThreshold() {
+    std::vector<uint64_t> counts;
+    counts.reserve(page_table_.size());
+    for (const auto& kv : page_table_) {
+        Page& page = pages_[kv.second];
+        if (page.IsDirty()) counts.push_back(page.GetAccessCount());
+    }
+    last_dirty_sampled_ = counts.size();
+    if (counts.empty()) return;  // 无脏页样本：保持当前阈值不动
+
+    std::sort(counts.begin(), counts.end());
+    const uint64_t lo = counts.front();
+    const uint64_t hi = counts.back();
+    uint64_t t;
+    if (hi - lo < 2) {
+        // 平坦分布（同温）：全体判冷。
+        t = hi + 1;
+    } else {
+        const size_t n = counts.size();
+        const size_t goal = std::max<size_t>(1, (n * hot_ratio_percent_ + 50) / 100);
+        const size_t idx = (goal < n) ? (n - goal) : 0;  // 高频端第 goal 个
+        t = counts[idx];
+        // 边界并列放大保护：同温层把热页数推到 cap 之上时抬升阈值，整层判冷。
+        const size_t hot_cnt =
+            n - static_cast<size_t>(std::lower_bound(counts.begin(), counts.end(), t) -
+                                    counts.begin());
+        const size_t cap = std::max(goal, n - goal);
+        if (hot_cnt > cap) {
+            auto ub = std::upper_bound(counts.begin(), counts.end(), t);
+            t = (ub == counts.end()) ? (hi + 1) : *ub;
+        }
+    }
+    // LRU-K 联动：热页判定与淘汰策略对齐（访问 < K 恒按冷页写回）。
+    if (policy_ == ReplacementPolicy::LRUK) t = std::max(t, lru_k_);
+
+    hot_access_threshold_ = t;
+    last_estimated_threshold_ = t;
 }
 
 std::vector<ReplacementLogEntry> BufferPoolManager::GetReplacementLog() const {
@@ -354,7 +537,11 @@ void BufferPoolManager::BackgroundFlushLoop() {
         // 释放 bg_mutex_ 后再刷，让 StopBackgroundFlush 能在刷盘期间置位 stop。
         lock.unlock();
         try {
-            FlushAllDirtyPages();
+            const int written = FlushAllDirtyPages();
+            // T4：后台刷脏直方图记账（写回页数分桶）。FlushAllDirtyPages 内部自锁，
+            // 此处单独取 latch_ 记账，避免统计与刷盘操作共用一次临界区；仅影响观测。
+            std::lock_guard<std::mutex> stat_lock(latch_);
+            RecordBackgroundFlushStat(written);
         } catch (...) {
             // 吸入磁盘错误，后台线程不得因单次失败而退出或 terminate。
         }

@@ -516,6 +516,17 @@ bool BPlusTree::InsertSlowPath(const IndexKey& key, const RID& rid,
 
         // ---- 2) 下降，遇到装不下的孩子就地分裂 ----
         page_id_t pid = root_page_id_;
+        // 慢路径「父闩 → 子闩」切换间的并发防护（两层，缺一不可）：
+        //   a) 父节点回读复核：下降决策基于父节点旧状态（写闩下 ChooseChild）。
+        //      释放父写闩后，父节点可能被并发分裂，分隔键更新后键的归属叶子右移。
+        //      若只靠子页版本复核，当子页恰在窗口期被分裂、读到的已是「分裂后的
+        //      左半页」版本时无法察觉——键被插进错误的叶子，破坏「分隔键 ↔ 叶子
+        //      内容」一致性（键落错叶子、导航找不到）。因此读子页后要回读父节点
+        //      版本，变化即整体重启下降。
+        //   b) 子页版本复核：取到子写闩后核对读闩时记录的版本，覆盖「父回读之后
+        //      到子加闩之前」子页再被分裂的窗口。
+        uint32_t expected_child_ver = 0;
+        bool have_child_ver = false;
         int guard_steps = 0;
         while (true) {
             // 每层最多重试一次（分裂后重选孩子），步数上限兜底防御损坏页导致的死循环
@@ -523,6 +534,10 @@ bool BPlusTree::InsertSlowPath(const IndexKey& key, const RID& rid,
 
             PageWriteGuard node = PageWriteGuard::Fetch(bpm_, pid);
             if (!node.Valid()) return false;
+            if (have_child_ver && ReadVersion(node.Data()) != expected_child_ver) {
+                node.Release();  // 子页在下降窗口期被并发改写 → 整体重启
+                break;
+            }
             char* d = node.Data();
             if (GetPageType(d) == PageType::kLeaf) {
                 // ---- 3) 叶子插入。由预分裂不变式保证一定装得下 ----
@@ -541,14 +556,26 @@ bool BPlusTree::InsertSlowPath(const IndexKey& key, const RID& rid,
             std::vector<InternalEntry> entries;
             if (!ReadInternalEntries(d, key_schema_, &entries)) return false;
             const page_id_t child_pid = ChooseChild(d, entries, key, rid);
+            const uint32_t parent_ver = ReadVersion(d);  // 记录父版本，供回读复核
+            const page_id_t parent_pid = pid;
             node.Release();  // 释放父闩后才能取子页（持页闩期间禁止请求 BPM）
             if (child_pid < 0) return false;
 
             bool overflow;
+            uint32_t child_ver = 0;
             {
                 PageReadGuard child = PageReadGuard::Fetch(bpm_, child_pid);
                 if (!child.Valid()) return false;
                 overflow = MayOverflow(child.Data(), reserve);
+                child_ver = ReadVersion(child.Data());
+            }
+
+            // 父节点回读复核（见上 a）：下降窗口期内父分隔键若被并发分裂更新，
+            // child_pid 可能已不再是 key 的归属叶子 → 整体重启下降。
+            {
+                PageReadGuard parent_check = PageReadGuard::Fetch(bpm_, parent_pid);
+                if (!parent_check.Valid()) return false;
+                if (ReadVersion(parent_check.Data()) != parent_ver) break;
             }
 
             if (overflow) {
@@ -558,6 +585,8 @@ bool BPlusTree::InsertSlowPath(const IndexKey& key, const RID& rid,
                 continue;                   // 分裂成功 → 重选孩子
             }
             pid = child_pid;
+            expected_child_ver = child_ver;  // 下一轮取子写闩后复核
+            have_child_ver = true;
         }
     }
     // 极端重启风暴（不应发生）：放弃本次插入，与旧实现的步数兜底语义一致。

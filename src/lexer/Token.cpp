@@ -103,8 +103,8 @@ std::string TokenTypeToString(TokenType type) {
         case TokenType::DOT:               return "DOT";
         case TokenType::END_OF_FILE:       return "END_OF_FILE";
         case TokenType::UNKNOWN:           return "UNKNOWN";
+        default:                           return "UNKNOWN";
     }
-    return "UNKNOWN";
 }
 
 Token::Token() : type(TokenType::UNKNOWN), lexeme(""), line(0), column(0) {

@@ -40,6 +40,8 @@ bool ContainsAggregateExpr(const ExprPtr& e) {
             }
             return false;
         }
+        default:
+            return false;
     }
     return false;
 }
@@ -126,6 +128,8 @@ ExprPtr RewriteAggregateRefs(const ExprPtr& expr,
             }
             return expr;
         }
+        default:
+            return expr;
     }
     return expr;
 }

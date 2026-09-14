@@ -185,6 +185,12 @@ private:
     LogManager* log_manager_ = nullptr;  // Phase B：可选 WAL 写出器
     SymbolTable symbol_table_;  // 内存态元数据缓存
 
+    // 当前挂到 catalog 写路径上的事务。SetActiveTransaction 记录一份，供
+    // 惰性创建的 __sys_indexes__ 堆 / 索引树在创建后立刻继承——否则这些后建
+    // 实例在 WAL 记录里 txn_id=0，恢复期 undo pass 会把它当活动事务撤销，
+    // 跨重启后索引元数据被抹掉（只有 page 3 记录被撤、page 0 幸存，链不完整）。
+    Transaction* active_txn_ = nullptr;
+
     page_id_t sys_tables_first_page_id_;  // 系统目录自身存储表的首页
     // 索引目录堆的首页。旧版本数据库没有这张堆，此时为 INVALID_PAGE_ID，
     // 首次 CREATE INDEX 时惰性创建——这样旧库文件仍能正常打开。

@@ -76,6 +76,18 @@ public:
     // 满足指导书「页级读写、缓存命中统计、页替换日志输出」的要求。
     std::string GetStorageStats() const;
 
+    // ---- T4 诊断：\analyze 命令 ----
+    // 生成页映射 / 介质 / CRC 校验的诊断信息字符串（由 \analyze 命令触发）：
+    //   * 页映射：缓冲池中每个逻辑页 → 帧号、是否脏、访问温度；
+    //   * 介质：当前块设备名（memory / sparse / 网络回环 / 文件）；
+    //   * CRC 累计校验失败计数与磁盘 IO 计数（介质损坏观测）。
+    std::string GetStorageAnalysis() const;
+
+    // 诊断：磁盘物理读/写页累计计数（转发 DiskManager）。供量化测试（如
+    // 复合索引多列前缀收敛带来的扫描页数下降）与 \stats 扩展使用；只读无副作用。
+    long long GetDiskIOReadCount() const;
+    long long GetDiskIOWriteCount() const;
+
     // ---- MVCC 低频后台真空线程（可观测性/控制）----
     // 线程生命周期由构造参数 bg_vacuum_ms 驱动；以下访问器供诊断与测试使用。
     bool IsBackgroundVacuumEnabled() const;

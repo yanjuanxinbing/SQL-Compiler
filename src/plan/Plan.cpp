@@ -11,8 +11,8 @@ const char* JoinTypeName(JoinType t) {
         case JoinType::INNER: return "INNER";
         case JoinType::LEFT:  return "LEFT";
         case JoinType::RIGHT: return "RIGHT";
+        default: return "?";
     }
-    return "?";
 }
 
 std::string Indent(int depth) {
@@ -173,6 +173,8 @@ std::string NodeBodyToString(const PlanNode& node, int depth) {
             oss << ")";
             break;
         }
+        default:
+            break;
     }
     oss << "\n";
     for (auto& child : node.children) {

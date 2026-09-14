@@ -153,7 +153,6 @@ int32_t PkI32(const char* b, int32_t o) {
 // 构造 occupied 个交替的空闲块（块头 8B + 固定载荷 stride）。
 void BuildFragmentedLayout(char* buffer, int32_t payload_bytes, int heads) {
     constexpr int32_t kHdr = 12;   // 区域头到 free_head 的偏移
-    constexpr int32_t kBlockHdr = 8;
     const int32_t step = (payload_bytes / heads) & ~7;  // 对齐到 8
     int32_t prev = 0;
     for (int i = 0; i < heads; ++i) {

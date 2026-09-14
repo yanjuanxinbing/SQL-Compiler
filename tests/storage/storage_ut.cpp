@@ -139,7 +139,7 @@ static void TestDiskManager() {
         // 未分配页读取应全零（不越界崩溃）
         char z[PAGE_SIZE];
         dm.ReadPage(999, z);
-        for (int i = 0; i < PAGE_SIZE; ++i) CHECK(z[i] == 0);
+        for (size_t i = 0; i < PAGE_SIZE; ++i) CHECK(z[i] == 0);
 
         // GetNumPages 反映已分配的页数
         CHECK(dm.GetNumPages() >= 1);
@@ -1613,7 +1613,8 @@ static void TestRowLockEscalation() {
     const int64_t first_row = RowResourceId(1, 0);
     for (int i = 0; i < kRows; ++i) {
         int64_t r = RowResourceId(1, i);
-        CHECK(lm.LockExclusive(1, r, 0) == LockResult::kGranted);
+        // table_hint=tab：行锁与其所属表锁同分片（G6 分片锁路由不变量）。
+        CHECK(lm.LockExclusive(1, r, 0, tab) == LockResult::kGranted);
         lm.RegisterRowGroup(r, tab);
     }
     CHECK(lm.CountRowLocks(1, tab) == static_cast<size_t>(kRows));
@@ -1637,9 +1638,9 @@ static void TestRowLockEscalation() {
     const int64_t tab2 = 2000;
     const int64_t r1 = RowResourceId(2, 0);
     const int64_t r2 = RowResourceId(2, 1);
-    CHECK(lm.LockShared(3, r1, 0) == LockResult::kGranted);
+    CHECK(lm.LockShared(3, r1, 0, tab2) == LockResult::kGranted);
     lm.RegisterRowGroup(r1, tab2);
-    CHECK(lm.LockExclusive(4, r2, 0) == LockResult::kGranted);
+    CHECK(lm.LockExclusive(4, r2, 0, tab2) == LockResult::kGranted);
     lm.RegisterRowGroup(r2, tab2);
     CHECK(lm.TryEscalateTable(4, tab2, LockMode::kExclusive) == LockResult::kWouldBlock);
     CHECK(lm.IsLockHeld(4, r2));   // 升级失败 → txn4 保留逐行锁，正确性不受影响
@@ -1651,7 +1652,7 @@ static void TestRowLockEscalation() {
     // (4) 表级 S 锁：与行 S 兼容、与行 X 冲突（多粒度冲突矩阵的另一半）。
     const int64_t tab3 = 3000;
     const int64_t s1 = RowResourceId(3, 0);
-    CHECK(lm.LockShared(5, s1, 0) == LockResult::kGranted);
+    CHECK(lm.LockShared(5, s1, 0, tab3) == LockResult::kGranted);
     lm.RegisterRowGroup(s1, tab3);
     CHECK(lm.TryEscalateTable(5, tab3, LockMode::kShared) == LockResult::kGranted);
     CHECK(lm.IsTableEscalated(5, tab3));
@@ -1695,7 +1696,8 @@ static void TestAdaptiveLockEscalation() {
     int escalated_at = -1;
     for (int i = 0; i < kSmall && escalated_at < 0; ++i) {
         int64_t r = RowResourceId(1, i);
-        CHECK(lm.LockExclusive(21, r, 0) == LockResult::kGranted);
+        // table_hint=small_tab：行锁与其所属表锁同分片（G6 分片锁路由不变量）。
+        CHECK(lm.LockExclusive(21, r, 0, small_tab) == LockResult::kGranted);
         lm.RegisterRowGroup(r, small_tab);  // 已登记行 → 幂等，registered 保持 64
         const size_t thr = LockManager::ComputeEscalationThreshold(
             lm.GetRegisteredRowCount(small_tab), lm.GetTableConflictCount(small_tab));
@@ -1718,7 +1720,7 @@ static void TestAdaptiveLockEscalation() {
     int big_escalated = -1;
     for (int i = 0; i < 256; ++i) {
         int64_t r = RowResourceId(2, 10000 + i);
-        CHECK(lm.LockExclusive(22, r, 0) == LockResult::kGranted);
+        CHECK(lm.LockExclusive(22, r, 0, big_tab) == LockResult::kGranted);
         lm.RegisterRowGroup(r, big_tab);
         if (big_escalated < 0) {
             const size_t thr = LockManager::ComputeEscalationThreshold(
@@ -1743,13 +1745,13 @@ static void TestAdaptiveLockEscalation() {
     for (int i = 0; i < 64; ++i) lm.RegisterRowGroup(RowResourceId(3, i), hot_tab);
     for (int i = 0; i < 10; ++i) {
         int64_t r = RowResourceId(3, i);
-        CHECK(lm.LockExclusive(23, r, 0) == LockResult::kGranted);
+        CHECK(lm.LockExclusive(23, r, 0, hot_tab) == LockResult::kGranted);
         lm.RegisterRowGroup(r, hot_tab);
     }
     int hot_escalated = -1;
     for (int i = 10; i < 42; ++i) {
         int64_t r = RowResourceId(3, i);
-        CHECK(lm.LockExclusive(24, r, 0) == LockResult::kGranted);
+        CHECK(lm.LockExclusive(24, r, 0, hot_tab) == LockResult::kGranted);
         lm.RegisterRowGroup(r, hot_tab);
         const size_t thr = LockManager::ComputeEscalationThreshold(
             lm.GetRegisteredRowCount(hot_tab), lm.GetTableConflictCount(hot_tab));
@@ -1768,7 +1770,7 @@ static void TestAdaptiveLockEscalation() {
     lm.UnlockAll(23);  // txn23 提交/回滚释放行锁
     // txn24 再写 1 行后立即重试升级 → 冲突消解，成功。
     int64_t rnext = RowResourceId(3, 42);
-    CHECK(lm.LockExclusive(24, rnext, 0) == LockResult::kGranted);
+    CHECK(lm.LockExclusive(24, rnext, 0, hot_tab) == LockResult::kGranted);
     lm.RegisterRowGroup(rnext, hot_tab);
     CHECK(lm.TryEscalateTable(24, hot_tab, LockMode::kExclusive) == LockResult::kGranted);
     CHECK(lm.IsTableEscalated(24, hot_tab));
@@ -2268,6 +2270,102 @@ static void TestCompositeIndexRangeConvergence() {
     RemoveFile(path + ".fpl");
 }
 
+// 复合索引多列前缀收敛的扫描页数量化（G2 验收闭环：「页数下降可量化」）。
+// 同一份 10k 行数据（a∈[0,9] × b∈[0,999]，复合主键 (a,b)）上：
+//   - Q1  `a >= 0`            → 单列下界，扫全表索引（10k 行）
+//   - Q2  `a = 5`             → 单列点区间，扫 a=5 子树（1000 行）
+//   - Q3  `a = 5 AND b > 500` → 2 列前缀下界 [5,500]（开区间），扫 500 行
+// 每次测量前 Shutdown + 重建实例（空缓冲池冷启动），以磁盘物理读页数差值量化
+// 扫描页数：多列前缀把 a=5 子树的扫描范围再收窄一半 → 读页数下降；全表 vs 子树
+// 差一个数量级。结构证据（EXPLAIN 端点）与页数证据同源互证。
+static void TestCompositeIndexPageConvergence() {
+    const std::string path = "storage_ut_pageconv.bin";
+
+    // 建库 + 插入 10k 行 → Shutdown（落盘）→ 重开（冷缓存）→ 执行查询，
+    // 输出 (行数, 该查询引起的磁盘物理读页数)。
+    auto RunQuery = [&](const std::string& sql, size_t* rows, long long* reads) {
+        for (const std::string& suffix : {std::string(""), std::string(".wal"),
+                                          std::string(".crc"), std::string(".fpl")}) {
+            RemoveFile(path + suffix);
+        }
+        {
+            Database db(path, 64);
+            auto s = db.CreateSession();
+            CHECK(db.ExecuteSQL(
+                "CREATE TABLE pc(a INT, b INT, c INT, PRIMARY KEY(a, b))",
+                s.get()).success);
+            CHECK(db.ExecuteSQL("BEGIN", s.get()).success);
+            for (int a = 0; a < 10; ++a) {
+                std::string ins = "INSERT INTO pc VALUES ";
+                for (int b = 0; b < 1000; ++b) {
+                    if (b) ins += ",";
+                    ins += "(" + std::to_string(a) + "," + std::to_string(b) +
+                           "," + std::to_string(a * 1000 + b) + ")";
+                }
+                CHECK(db.ExecuteSQL(ins, s.get()).success);
+            }
+            CHECK(db.ExecuteSQL("COMMIT", s.get()).success);
+            db.Shutdown();
+        }
+        {
+            Database db(path, 64);
+            auto s = db.CreateSession();
+            const long long before = db.GetDiskIOReadCount();
+            auto r = db.ExecuteSQL(sql, s.get());
+            const long long after = db.GetDiskIOReadCount();
+            CHECK(r.success);
+            if (rows) *rows = r.rows.size();
+            if (reads) *reads = after - before;
+            db.Shutdown();
+        }
+    };
+
+    size_t r1 = 0, r2 = 0, r3 = 0;
+    long long rd1 = 0, rd2 = 0, rd3 = 0;
+    RunQuery("SELECT c FROM pc WHERE a >= 0", &r1, &rd1);
+    RunQuery("SELECT c FROM pc WHERE a = 5", &r2, &rd2);
+    RunQuery("SELECT c FROM pc WHERE a = 5 AND b > 500", &r3, &rd3);
+    std::printf("[dbg] Q1 rows=%zu reads=%lld | Q2 rows=%zu reads=%lld | Q3 rows=%zu reads=%lld\n",
+                r1, rd1, r2, rd2, r3, rd3);
+
+    // (1) 正确性：三个查询命中行数符合预期（10k / 1000 / 499）。
+    CHECK(r1 == 10000);
+    CHECK(r2 == 1000);
+    CHECK(r3 == 499);
+
+    // (2) 结构证据：a=5 AND b>500 在 EXPLAIN 中收敛为 2 列下界 [5,500]
+    // （b 侧为开区间，打印带 excl 标记）与 1 列上界 [5]。
+    {
+        Database db(path, 64);
+        auto s = db.CreateSession();
+        auto rx = db.ExecuteSQL(
+            "EXPLAIN SELECT c FROM pc WHERE a = 5 AND b > 500", s.get());
+        CHECK(rx.success);
+        CHECK(rx.rows.size() == 1);
+        const std::string px = rx.rows[0].GetValue(0).ToString();
+        CHECK(px.find("low=5,500") != std::string::npos);
+        CHECK(px.find("excl") != std::string::npos);  // b>500 → 开区间下界
+        CHECK(px.find("high=5") != std::string::npos);
+        db.Shutdown();
+    }
+
+    // (3) 页数量化：冷缓存下物理读页数 = 扫描实际访问页数。
+    // 多列前缀收窄带来的下降是「读页单调严格递减」：全表 10k 行 > a=5 子树
+    // 1000 行 > a=5 AND b>500 的 500 行。不要求严格 2 倍——b>500 覆盖子树约
+    // 一半叶子页，但两查询共享相同的根→叶下降页数，固定下降成本使
+    // (L/2 + d) × 2 < L + d 在 d>0 时恒不成立，因此用单调 + 数量级断言。
+    CHECK(rd3 > 0);                        // 窄扫描确已发生物理读
+    CHECK(rd3 < rd2);                      // 多列前缀：a=5 子树 1000→500 行，读页严格下降
+    CHECK(rd2 < rd1);                      // 单列点区间 < 全表扫描
+    CHECK(rd3 * 5 < rd1);                  // 窄扫描读页远小于全表（数量级，防抖动）
+    CHECK(rd2 * 2 < rd1);                  // a=5 子树（1000 行）不足全表（10k 行）一半读页
+
+    for (const std::string& suffix : {std::string(""), std::string(".wal"),
+                                      std::string(".crc"), std::string(".fpl")}) {
+        RemoveFile(path + suffix);
+    }
+}
+
 // ---- Phase 4（创新特性 E）：谓词锁区间树 ----
 // 1) 正确性：万级区间 + 全表哨兵下，覆盖/未覆盖键的写检查结果正确；
 // 2) 复杂度：未覆盖键的 stabbing 查询比较次数 << P（O(log P) 而非线性 O(P)）；
@@ -2379,6 +2477,166 @@ static void TestGroupCommit() {
     RemoveFile(path);
 }
 
+// ---- 周期 2（G3）：谓词区间树增量更新 ----
+// 1) 正确性：增量插入/删除后，命中/未命中的键检查结果与整树重建一致；
+// 2) 开销：大量单条注册（单语句多条谓词）不再触发整树重建（rebuild 次数
+//    保持 0），增量插入二分步数有 O(log P) 上界；
+// 3) 退化兜底：lo 落在分裂点间隙 / 开下界区间（旧实现静默丢弃）也能命中。
+static void TestPredicateIncrementalInsert() {
+    LockManager lm;
+    const int64_t tab = 88;
+    const int32_t col = 0;
+    const auto I = [](int64_t v) {
+        return IndexKey{std::vector<Value>{Value::MakeInt(static_cast<int32_t>(v))}};
+    };
+
+    // (0) 种子：注册 50 条区间并触发一次查询，让树惰性构建（整树重建 1 次）。
+    for (int64_t t = 1; t <= 50; ++t) {
+        CHECK(lm.AcquireReadPredicate(t, tab, col, false, I(t * 100),
+                                      I(t * 100 + 50)) == LockResult::kGranted);
+    }
+    {
+        IndexKey miss = I(0);
+        CHECK(lm.CheckWritePredicate(999, tab, col, miss, 1) == LockResult::kGranted);
+    }
+    CHECK(lm.GetPredicateRebuildCount() >= 1);  // 惰性构建发生
+    lm.ResetPredicateInsertCounters();
+
+    // (1) 增量插入：再注册 200 条新区间（不同事务），全部走增量路径不重建。
+    // 区间 lo 取 5500+j*20（大于旧分裂点最大值 5000）——旧实现每次注册都会
+    // 整树重建的典型场景；增量路径下仅新建退化叶子并二分定位，不触发重建。
+    for (int64_t t = 1000; t < 1200; ++t) {
+        const int64_t lo = 5500 + (t - 1000) * 20;
+        CHECK(lm.AcquireReadPredicate(t, tab, col, false, I(lo),
+                                      I(lo + 10)) == LockResult::kGranted);
+    }
+    CHECK(lm.GetPredicateRebuildCount() == 0);  // 增量注册不触发整树重建
+
+    // (2) 增量查询正确性：区间内键阻塞、区间外键放行。
+    {
+        IndexKey hit = I(5505);   // [5500,5510]（txn 1000）
+        CHECK(lm.CheckWritePredicate(999, tab, col, hit, 1) == LockResult::kTimeout);
+        IndexKey miss = I(5515);  // 两条区间之间的间隙
+        CHECK(lm.CheckWritePredicate(999, tab, col, miss, 1) == LockResult::kGranted);
+    }
+
+    // (3) 退化兜底：旧实现会静默丢弃的区间在增量路径下仍被精确命中。
+    //     txn 2000：[-inf, 12]（开下界，hi 小于最左分裂点 100）
+    CHECK(lm.AcquireReadPredicate(2000, tab, col, false, IndexKey{},
+                                  I(12)) == LockResult::kGranted);
+    {
+        IndexKey hit = I(7);
+        CHECK(lm.CheckWritePredicate(999, tab, col, hit, 1) == LockResult::kTimeout);
+        IndexKey miss = I(13);
+        CHECK(lm.CheckWritePredicate(999, tab, col, miss, 1) == LockResult::kGranted);
+    }
+    //     txn 2001：[300000, 300050]（lo 远大于现有全部区间，增量插入落空子树）
+    CHECK(lm.AcquireReadPredicate(2001, tab, col, false, I(300000),
+                                  I(300050)) == LockResult::kGranted);
+    {
+        IndexKey hit = I(300020);
+        CHECK(lm.CheckWritePredicate(999, tab, col, hit, 1) == LockResult::kTimeout);
+        IndexKey miss = I(300060);
+        CHECK(lm.CheckWritePredicate(999, tab, col, miss, 1) == LockResult::kGranted);
+    }
+
+    // (4) 增量删除（UnlockAll）：该事务区间消失后键放行，他事务区间不受影响。
+    lm.UnlockAll(1000);  // 删除 [5500,5510]
+    {
+        IndexKey freed = I(5505);
+        CHECK(lm.CheckWritePredicate(999, tab, col, freed, 1) == LockResult::kGranted);
+        IndexKey other = I(5525);  // txn 1001 的 [5520,5530] 仍在
+        CHECK(lm.CheckWritePredicate(999, tab, col, other, 1) == LockResult::kTimeout);
+    }
+    // 删除后继续增量插入仍正确：txn 2002 复用刚释放的键区间。
+    CHECK(lm.AcquireReadPredicate(2002, tab, col, false, I(5500),
+                                  I(5510)) == LockResult::kGranted);
+    {
+        IndexKey hit = I(5505);
+        CHECK(lm.CheckWritePredicate(999, tab, col, hit, 1) == LockResult::kTimeout);
+    }
+    CHECK(lm.GetPredicateRebuildCount() == 0);  // 删除与复用同样不重建
+
+    // (5) 开销上界：增量插入累计二分步数 ≈ 注册数 × O(log P)。
+    const size_t steps = lm.GetPredicateInsertSteps();
+    CHECK(steps > 0);
+    CHECK(steps < 250 * 20);  // 每条 < 20 次分裂点比较（log2(300)≈9，余量给足）
+}
+
+// ---- 周期 2（G4）：组提交时间窗聚合 ----
+// 并发高频小事务提交（到达分散）：纯跟随者聚合（窗口=0）时每次 SyncOs 只覆盖
+// 当前到达的一批；开启时间窗后，领导者等待窗口把慢速到达的提交也并入本批 →
+// fsync 次数进一步下降。断言：每个提交返回时 durable 覆盖其 target（正确性）；
+// 窗口 fsync < 无窗口 fsync（收益）；两者都远小于提交数。
+static void TestGroupCommitTimeWindow() {
+    const std::string path = "storage_ut_groupcommit_window.wal";
+    RemoveFile(path);
+    const int kThreads = 16;
+    const int kPerThread = 4;
+    const int kCommits = kThreads * kPerThread;
+
+    struct Res {
+        lsn_t target;
+        lsn_t durable;
+    };
+    const auto run_commits = [&](LogManager& lm, int64_t id_base,
+                                 std::vector<std::vector<Res>>* results) {
+        results->assign(static_cast<size_t>(kThreads), {});
+        std::vector<std::thread> ws;
+        for (int t = 0; t < kThreads; ++t) {
+            ws.emplace_back([&, t] {
+                // 分散到达：模拟高频小事务的随机到达时刻（0~14ms）。
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(static_cast<long>((t % 8) * 2)));
+                auto& rs = (*results)[static_cast<size_t>(t)];
+                for (int i = 0; i < kPerThread; ++i) {
+                    LogRecord rec;
+                    rec.type_ = LogRecordType::COMMIT;
+                    rec.txn_id_ = id_base + t * kPerThread + i;
+                    const lsn_t target = lm.AppendRecord(std::move(rec));
+                    const lsn_t d = lm.GroupCommit(target);
+                    rs.push_back(Res{target, d});
+                }
+            });
+        }
+        for (auto& w : ws) w.join();
+    };
+
+    {
+        // 对照：无窗口（纯跟随者聚合）。
+        LogManager lm_no(path);
+        std::vector<std::vector<Res>> res_no;
+        run_commits(lm_no, 1, &res_no);
+        const size_t syncs_no_window = lm_no.GetSyncCount();
+        CHECK(syncs_no_window >= 1);
+        CHECK(syncs_no_window < static_cast<size_t>(kCommits));
+        for (const auto& rs : res_no) {
+            for (const Res& r : rs) CHECK(r.durable >= r.target);
+        }
+
+        // 时间窗：40ms 窗口聚合慢速到达的提交。
+        LogManager lm(path);
+        lm.SetGroupCommitWindowMs(40);
+        std::vector<std::vector<Res>> res_win;
+        run_commits(lm, 100000, &res_win);
+        const size_t syncs_window = lm.GetSyncCount();
+        CHECK(syncs_window >= 1);
+        CHECK(syncs_window < static_cast<size_t>(kCommits));
+        for (const auto& rs : res_win) {
+            for (const Res& r : rs) CHECK(r.durable >= r.target);
+        }
+
+        // 收益：时间窗 fsync 数少于纯跟随者聚合（到达分散时窗口聚合更充分）。
+        CHECK(syncs_window < syncs_no_window);
+        std::printf("[Phase4] group-commit window: %d commits, no-window fsyncs=%zu, "
+                    "window fsyncs=%zu (%.1fx fewer)\n",
+                    kCommits, syncs_no_window, syncs_window,
+                    static_cast<double>(syncs_no_window) /
+                        static_cast<double>(syncs_window));
+    }
+    RemoveFile(path);
+}
+
 // ---- Phase 4（创新特性 F）：温度感知刷盘 ----
 // 1) 开启后：全量刷脏只写回冷页（访问数 < 热阈值），热脏页留池（WAL 兜底）；
 // 2) 统计分档：writeback_cold_count / writeback_hot_count 正确；
@@ -2451,6 +2709,123 @@ static void TestTemperatureAwareFlush() {
         CHECK(st.writeback_cold_count == 4);  // 关闭时全部归入冷档
         CHECK(st.writeback_hot_count == 0);
     }
+    RemoveFile(path); RemoveFile(path + ".crc");
+}
+
+// ---- Phase 5（G5）：温度阈值自适应 ----
+// 1) P 分位估计：脏页访问计数 1..12 均匀分布，pct=25 → 阈值=10，
+//    高频端 3 页（10,11,12）判热留池，其余 9 页判冷写回；
+// 2) 平坦分布保护：访问计数几乎一致（同温）→ 阈值上推全体判冷、全部写回；
+// 3) LRU-K 联动：LRUK(K=8) 下阈值至少取 K，访问 < K 的页恒按冷页写回；
+// 4) 手动 SetHotAccessThreshold 关闭自适应（手动优先级最高）。
+static void TestAdaptiveTemperatureThreshold() {
+    const std::string path = "storage_ut_adapttemp.bin";
+    RemoveFile(path); RemoveFile(path + ".crc");
+
+    // 1) P 分位估计（LRU，无 LRU-K 干扰）。
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm);
+        bpm.SetTemperatureFlushEnabled(true);
+        bpm.SetAdaptiveThresholdEnabled(true);
+        bpm.SetHotRatioPercent(25);
+        // 12 个脏页，访问计数 1..12 互不相同（无并列）。
+        std::vector<page_id_t> pids;
+        for (int c = 1; c <= 12; ++c) {
+            page_id_t pid = INVALID_PAGE_ID;
+            Page* p = bpm.NewPage(&pid);
+            CHECK(p != nullptr);
+            for (int i = 1; i < c; ++i) p->RecordAccess();  // 总访问数 = c
+            bpm.UnpinPage(pid, true);
+            pids.push_back(pid);
+        }
+        bpm.FlushAllDirtyPages();
+        CHECK(bpm.GetLastEstimatedThreshold() == 10);  // 高频端 25%（3 页）→ 阈值 10
+        CHECK(bpm.GetLastDirtySampled() == 12);
+        for (int c = 1; c <= 9; ++c) {  // 冷页 1..9 已写回清脏
+            Page* p = bpm.GetPage(pids[c - 1]);
+            CHECK(!p->IsDirty());
+            bpm.UnpinPage(pids[c - 1], false);
+        }
+        for (int c = 10; c <= 12; ++c) {  // 热页 10..12 留池仍脏
+            Page* p = bpm.GetPage(pids[c - 1]);
+            CHECK(p->IsDirty());
+            bpm.UnpinPage(pids[c - 1], false);
+        }
+        BufferPoolStats st = bpm.GetStats();
+        CHECK(st.writeback_cold_count == 9);
+        CHECK(st.writeback_hot_count == 0);
+    }
+
+    // 2) 平坦分布保护：同温 → 全体判冷、全部写回。
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm);
+        bpm.SetTemperatureFlushEnabled(true);
+        bpm.SetAdaptiveThresholdEnabled(true);
+        for (int i = 0; i < 6; ++i) {
+            page_id_t pid = INVALID_PAGE_ID;
+            Page* p = bpm.NewPage(&pid);
+            CHECK(p != nullptr);
+            for (int j = 0; j < 5; ++j) p->RecordAccess();  // 全部访问 6 次（同温）
+            bpm.UnpinPage(pid, true);
+        }
+        bpm.FlushAllDirtyPages();
+        CHECK(bpm.GetLastEstimatedThreshold() == 7);  // hi=6 + 1 → 全体判冷
+        BufferPoolStats st = bpm.GetStats();
+        CHECK(st.writeback_cold_count == 6);  // 全部写回、全记冷档
+        CHECK(st.writeback_hot_count == 0);
+    }
+
+    // 3) LRU-K 联动：阈值至少取 K，访问 < K 恒判冷。
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm, ReplacementPolicy::LRUK, 8);
+        bpm.SetTemperatureFlushEnabled(true);
+        bpm.SetAdaptiveThresholdEnabled(true);
+        bpm.SetHotRatioPercent(20);
+        // 3 个脏页，访问 5,6,7（均 < K=8）；非平坦（极差 2）。
+        std::vector<int> accs = {5, 6, 7};
+        for (int c : accs) {
+            page_id_t pid = INVALID_PAGE_ID;
+            Page* p = bpm.NewPage(&pid);
+            CHECK(p != nullptr);
+            for (int i = 1; i < c; ++i) p->RecordAccess();
+            bpm.UnpinPage(pid, true);
+        }
+        bpm.FlushAllDirtyPages();
+        // 分位估计得 7，LRU-K 联动抬到 8 → 3 页全部判冷写回。
+        CHECK(bpm.GetLastEstimatedThreshold() == 8);
+        BufferPoolStats st = bpm.GetStats();
+        CHECK(st.writeback_cold_count == 3);
+        CHECK(st.writeback_hot_count == 0);
+    }
+
+    // 4) 手动阈值优先级最高：设值即关闭自适应。
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm);
+        bpm.SetTemperatureFlushEnabled(true);
+        bpm.SetAdaptiveThresholdEnabled(true);
+        bpm.SetHotAccessThreshold(4);  // 手动设值 → 自适应关闭
+        CHECK(!bpm.IsAdaptiveThresholdEnabled());
+        // 造 2 冷（访问 1）+ 1 热（访问 5 >= 4）：按固定阈值 4 分级。
+        page_id_t cold1 = INVALID_PAGE_ID, cold2 = INVALID_PAGE_ID, hot = INVALID_PAGE_ID;
+        Page* p = bpm.NewPage(&cold1);
+        CHECK(p != nullptr); bpm.UnpinPage(cold1, true);
+        p = bpm.NewPage(&cold2);
+        CHECK(p != nullptr); bpm.UnpinPage(cold2, true);
+        p = bpm.NewPage(&hot);
+        CHECK(p != nullptr);
+        for (int i = 0; i < 5; ++i) p->RecordAccess();
+        bpm.UnpinPage(hot, true);
+        bpm.FlushAllDirtyPages();
+        CHECK(bpm.GetHotAccessThreshold() == 4);
+        BufferPoolStats st = bpm.GetStats();
+        CHECK(st.writeback_cold_count == 2);
+        CHECK(st.writeback_hot_count == 0);
+    }
+
     RemoveFile(path); RemoveFile(path + ".crc");
 }
 
@@ -3828,6 +4203,343 @@ static void TestSnapshotIndexScan() {
     RemoveFile(path + ".fpl");
 }
 
+// 周期 3（G6）压力测试：同表 vs 异表 DML 锁吞吐对比。
+// 多线程并发执行「行 X 锁 + 释放」（模拟逐行 DML 写路径）：
+//   * 同表：全部线程访问同一张表的行 → 所有行锁路由到同一分片（单分片互斥热点，
+//     线程串行化，吞吐受单把互斥限制）；
+//   * 异表：每线程独立一张表 → 行锁散布到不同分片（分片间无互斥，并行）。
+// 各线程访问各自行集（无锁冲突），隔离出「分片互斥竞争」这一变量本身对吞吐的影响。
+// 输出各自吞吐（ops/s）与加速比；断言异表吞吐严格高于同表（分片化收益的实测证据）。
+static void TestLockManagerShardThroughput() {
+    const int kThreads = 16;
+    const int kRowsPerThread = 64;
+    const int kOpsPerThread = 20000;
+    LockManager lm;
+    // 每线程一张表（同表场景共用表 0；表 id 随机落片，异表场景期望散布到 ~10+ 分片）。
+    std::vector<int64_t> tables(kThreads);
+    for (int i = 0; i < kThreads; ++i) tables[i] = 100000 + i;
+    // 登记行锁归属（每行 → 所属表），模拟真实表堆已登记的行集合。
+    for (int t = 0; t < kThreads; ++t) {
+        for (int r = 0; r < kRowsPerThread; ++r) {
+            lm.RegisterRowGroup(RowResourceId(t + 1, r), tables[t]);
+        }
+    }
+
+    auto run_phase = [&](bool same_table) -> double {
+        std::vector<std::thread> threads;
+        std::atomic<bool> go{false};
+        for (int ti = 0; ti < kThreads; ++ti) {
+            threads.emplace_back([&, ti]() {
+                const int64_t table = same_table ? tables[0] : tables[ti];
+                const int64_t txn = ti + 1000;
+                while (!go.load(std::memory_order_acquire)) {}
+                for (int i = 0; i < kOpsPerThread; ++i) {
+                    const int64_t row = RowResourceId(ti + 1, i % kRowsPerThread);
+                    if (lm.LockExclusive(txn, row, 0, table) == LockResult::kGranted) {
+                        lm.Unlock(txn, row, table);
+                    }
+                }
+            });
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        go.store(true, std::memory_order_release);
+        for (auto& th : threads) th.join();
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        const double total_ops = static_cast<double>(kThreads) * kOpsPerThread;
+        return total_ops * 1000.0 / static_cast<double>(ms > 0 ? ms : 1);  // ops/s
+    };
+
+    const double same = run_phase(true);   // 同表：单分片
+    const double diff = run_phase(false);  // 异表：多分片
+    std::printf("[Phase3-G6] shard-lock throughput: same-table=%.0f ops/s, "
+                "diff-table=%.0f ops/s (%.1fx faster)\n",
+                same, diff, diff / same);
+    CHECK(diff > same);  // 分片化收益：异表吞吐严格高于同表（单分片串行化）
+}
+
+// ---------------------------------------------------------------------------
+// T4a. 介质扩展：Memory / SparseFile / LoopbackNetwork 三种可交换块设备
+// ---------------------------------------------------------------------------
+static void TestT4BlockDevices() {
+    // (a) 内存块设备：读写往返、EnsureCapacity 扩容、未写区为 0、越界读不足
+    {
+        MemoryBlockDevice dev;
+        CHECK(dev.IsReady());
+        CHECK(dev.Name() == "memory");
+        CHECK(dev.Size() == 0);
+        char w[64];
+        std::memset(w, 0x5A, sizeof(w));
+        CHECK(dev.Write(100, w, sizeof(w)) == sizeof(w));
+        CHECK(dev.Size() >= 164);
+        char r[64];
+        std::memset(r, 0, sizeof(r));
+        CHECK(dev.Read(100, r, sizeof(r)) == sizeof(r));
+        CHECK(std::memcmp(w, r, sizeof(w)) == 0);
+        char hole[32];
+        std::memset(hole, 0xFF, sizeof(hole));
+        CHECK(dev.Read(0, hole, sizeof(hole)) == sizeof(hole));  // 未写区恒为 0
+        bool all_zero = true;
+        for (char c : hole) if (c != 0) { all_zero = false; break; }
+        CHECK(all_zero);
+        CHECK(dev.Read(100000, r, sizeof(r)) == 0);  // 越介质末尾：返回不足
+    }
+    // (b) 稀疏文件块设备：洞读 0、逻辑 vs 物理占用、区间合并、Sync 落盘
+    {
+        const std::string path = "storage_ut_sparse.bin";
+        RemoveFile(path);
+        {
+            SparseFileBlockDevice dev(path);
+            CHECK(dev.IsReady());
+            CHECK(dev.Size() == 0);
+            char w[4096];
+            std::memset(w, 0x11, sizeof(w));
+            // 写越 EOF 成洞：逻辑大小增长，物理只为已写区记账
+            CHECK(dev.Write(0, w, sizeof(w)) == sizeof(w));
+            CHECK(dev.Write(8192, w, sizeof(w)) == sizeof(w));
+            CHECK(dev.Size() == 8192 + 4096);
+            CHECK(dev.AllocatedBytes() == 8192);  // 两个 4K 区，中间 4K 是洞
+            CHECK(dev.AllocatedRegionCount() == 2);
+            // 洞区读回 0
+            char r[4096];
+            std::memset(r, 0xFF, sizeof(r));
+            CHECK(dev.Read(4096, r, sizeof(r)) == sizeof(r));
+            bool hole_zero = true;
+            for (char c : r) if (c != 0) { hole_zero = false; break; }
+            CHECK(hole_zero);
+            // 已写区往返一致
+            std::memset(r, 0, sizeof(r));
+            CHECK(dev.Read(0, r, sizeof(r)) == sizeof(r));
+            CHECK(std::memcmp(w, r, sizeof(w)) == 0);
+            // 补写洞区：三个区间 [0,4K)+[4K,8K)+[8K,12K) 合并为 [0,12K) 一个区间
+            CHECK(dev.Write(4096, w, sizeof(w)) == sizeof(w));
+            CHECK(dev.AllocatedBytes() == 12288);
+            CHECK(dev.AllocatedRegionCount() == 1);
+            dev.Sync();  // 落盘不抛
+        }
+        RemoveFile(path);
+    }
+    // (c) 回环网络块设备：TCP 读写往返 + 请求计数 + Size/EnsureCapacity 透传
+    {
+        LoopbackNetworkBlockDevice dev;
+        CHECK(dev.IsReady());
+        CHECK(dev.GetPort() > 0);
+        char w[256];
+        std::memset(w, 0x3C, sizeof(w));
+        CHECK(dev.Write(0, w, sizeof(w)) == sizeof(w));
+        CHECK(dev.Size() == 256);
+        char r[256];
+        std::memset(r, 0, sizeof(r));
+        CHECK(dev.Read(0, r, sizeof(r)) == sizeof(r));
+        CHECK(std::memcmp(w, r, sizeof(w)) == 0);
+        CHECK(dev.GetWriteRequests() >= 1);
+        CHECK(dev.GetReadRequests() >= 1);
+        dev.EnsureCapacity(1024);
+        CHECK(dev.Size() == 1024);
+    }
+    // (d) DiskManager 注入内存块设备：零业务改动换介质，写读往返 + 介质名
+    {
+        const std::string path = "storage_ut_memdev.bin";
+        RemoveFile(path);
+        RemoveFile(path + ".crc");
+        RemoveFile(path + ".fpl");
+        {
+            DiskManager dm(path, std::make_unique<MemoryBlockDevice>());
+            CHECK(dm.GetDeviceName() == "memory");
+            page_id_t p0 = 0;
+            char buf[PAGE_SIZE];
+            std::memset(buf, 0x77, PAGE_SIZE);
+            dm.WritePage(p0, buf, true);
+            char rbuf[PAGE_SIZE];
+            dm.ReadPage(p0, rbuf);
+            CHECK(std::memcmp(buf, rbuf, PAGE_SIZE) == 0);
+        }
+        RemoveFile(path);
+        RemoveFile(path + ".crc");
+        RemoveFile(path + ".fpl");
+    }
+    // (e) DiskManager 注入稀疏文件块设备：稀疏建库读写
+    {
+        const std::string path = "storage_ut_sparse_db.bin";
+        RemoveFile(path);
+        RemoveFile(path + ".crc");
+        RemoveFile(path + ".fpl");
+        {
+            DiskManager dm(path, std::make_unique<SparseFileBlockDevice>(path));
+            CHECK(dm.GetDeviceName().find("sparse") != std::string::npos);
+            page_id_t p0 = 0;
+            char buf[PAGE_SIZE];
+            std::memset(buf, 0x21, PAGE_SIZE);
+            dm.WritePage(p0, buf, true);
+            char rbuf[PAGE_SIZE];
+            dm.ReadPage(p0, rbuf);
+            CHECK(std::memcmp(buf, rbuf, PAGE_SIZE) == 0);
+        }
+        RemoveFile(path);
+        RemoveFile(path + ".crc");
+        RemoveFile(path + ".fpl");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T4b. 可观测性：命中构成 / 脏页年龄 / 后台刷脏直方图 / 页映射 / IO 队列
+// ---------------------------------------------------------------------------
+static void TestT4Observability() {
+    const std::string path = "storage_ut_t4_obs.bin";
+    RemoveFile(path);
+    RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(16, &dm);
+        bpm.SetHotAccessThreshold(4);  // 固定阈值：>=4 热，>=2 温，<2 冷
+
+        // (a) 命中构成分档：随访问升温，warm → hot 递进（NewPage 已计 1 次访问，
+        //     故首次命中 access=2 即 >= 温阈值 2 → warm 档）
+        page_id_t p0 = -1;
+        CHECK(bpm.NewPage(&p0) != nullptr);
+        bpm.UnpinPage(p0, false);
+        const long cold0 = bpm.GetStats().hit_cold_count;
+        CHECK(bpm.GetPage(p0) != nullptr);  // access=2 → warm 命中
+        bpm.UnpinPage(p0, false);
+        const auto st1 = bpm.GetStats();
+        CHECK(st1.hit_warm_count >= 1);
+        CHECK(st1.hit_cold_count == cold0);  // 命中页已达温档，不再进 cold
+        for (int k = 0; k < 4; ++k) {  // access 推进到 6，跨越 hot 档
+            CHECK(bpm.GetPage(p0) != nullptr);
+            bpm.UnpinPage(p0, false);
+        }
+        CHECK(bpm.GetStats().hit_hot_count >= 1);  // 高温命中进 hot 档
+        const long hit_total = bpm.GetStats().hit_cold_count +
+                               bpm.GetStats().hit_warm_count +
+                               bpm.GetStats().hit_hot_count;
+        CHECK(hit_total == 5);  // 5 次命中全部按温度分档记账
+        CHECK(bpm.GetWarmAccessThreshold() == 2);
+
+        // (b) 脏页年龄分布：刚变脏入 [0,1) 桶；池操作推进后年龄桶外移
+        Page* g = bpm.GetPage(p0);
+        CHECK(g != nullptr);
+        std::memset(g->GetData(), 0xAB, PAGE_SIZE);
+        bpm.UnpinPage(p0, true);
+        const auto age0 = bpm.GetDirtyAgeDistribution();
+        CHECK(age0.size() == 5);
+        CHECK(bpm.GetDirtyFrameCount() >= 1);  // IO 队列观测：脏帧 ≥1
+        CHECK(age0[0] >= 1);                   // 刚变脏 → [0,1) 桶
+        page_id_t p1 = -1;
+        CHECK(bpm.NewPage(&p1) != nullptr);
+        bpm.UnpinPage(p1, false);
+        CHECK(bpm.GetPage(p0) != nullptr);
+        bpm.UnpinPage(p0, false);
+        const auto age1 = bpm.GetDirtyAgeDistribution();
+        const long total_dirty = age1[0] + age1[1] + age1[2] + age1[3] + age1[4];
+        CHECK(total_dirty >= 1);  // 脏页仍未写回
+
+        // (c) 页映射快照 / GetFrameOfPage / IsPageDirtyInPool
+        const auto& snap = bpm.GetPageMapSnapshot();
+        CHECK(!snap.empty());
+        int found_p0 = -1;
+        for (const auto& e : snap) {
+            if (e.page_id == p0) {
+                found_p0 = e.frame_id;
+                CHECK(e.dirty);  // p0 仍脏
+                CHECK(e.access_count >= 1);
+            }
+        }
+        CHECK(found_p0 >= 0);
+        CHECK(bpm.GetFrameOfPage(p0) == found_p0);
+        CHECK(bpm.IsPageDirtyInPool(p0));
+        CHECK(bpm.GetFrameOfPage(9999) == -1);  // 不在池
+        CHECK(!bpm.IsPageDirtyInPool(9999));
+
+        // (d) 后台刷脏直方图：启动后台线程等待至少一次刷脏记账，之后脏帧清空
+        bpm.StartBackgroundFlush(std::chrono::milliseconds(20));
+        const long long deadline_ms = 2000;
+        long long waited = 0;
+        while (bpm.GetStats().writeback_count == 0 && waited < deadline_ms) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            waited += 10;
+        }
+        bpm.StopBackgroundFlush();
+        const auto hist = bpm.GetBackgroundFlushHistogram();
+        CHECK(hist.size() == 6);
+        long hist_total = 0;
+        for (long v : hist) hist_total += v;
+        CHECK(hist_total >= 1);  // 至少记账一次后台刷脏
+        CHECK(!bpm.IsPageDirtyInPool(p0));  // 后台已把 p0 写回
+    }
+    RemoveFile(path);
+    RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// ---------------------------------------------------------------------------
+// T4c. 诊断：CRC 校验累计计数 + \analyze / \stats 扩展输出
+// ---------------------------------------------------------------------------
+static void TestT4Diagnostics() {
+    // (a) CRC 校验失败累计计数：坏块注入 → 读回 mismatch → 计数 +1 并上抛
+    const std::string path = "storage_ut_t4_diag.bin";
+    RemoveFile(path);
+    RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        auto device = std::make_unique<FaultInjectingBlockDevice>(
+            std::make_unique<FileBlockDevice>(path));
+        FaultInjectingBlockDevice* faulty = device.get();
+        DiskManager dm(path, std::move(device));
+        CHECK(dm.GetCrcErrorCount() == 0);
+        page_id_t p0 = 0;
+        char buf[PAGE_SIZE];
+        std::memset(buf, 0x33, PAGE_SIZE);
+        dm.WritePage(p0, buf, true);
+        char rbuf[PAGE_SIZE];
+        dm.ReadPage(p0, rbuf);
+        CHECK(std::memcmp(buf, rbuf, PAGE_SIZE) == 0);
+        CHECK(dm.GetCrcErrorCount() == 0);  // 正常路径无累计
+        // 注入坏块：写入成功但数据被 0xFF 覆写 → CRC mismatch → 计数 +1 并上抛
+        faulty->CorruptWritesForRange(8, 16);
+        dm.WritePage(p0, buf, true);
+        bool threw = false;
+        try {
+            dm.ReadPage(p0, rbuf);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        CHECK(threw);
+        CHECK(dm.GetCrcErrorCount() == 1);
+    }
+    RemoveFile(path);
+    RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    // (b) \analyze / \stats：T4 新指标出现在输出中；\analyze 命令可执行
+    {
+        const std::string db = "storage_ut_t4_db.bin";
+        RemoveFile(db); RemoveFile(db + ".wal");
+        RemoveFile(db + ".crc"); RemoveFile(db + ".fpl");
+        {
+            Database dbc(db, 64);
+            auto r = dbc.ExecuteSQL("create table t (a int, b int)");
+            CHECK(r.success);
+            r = dbc.ExecuteSQL("insert into t values (1, 2), (3, 4), (5, 6)");
+            CHECK(r.success);
+            const std::string stats = dbc.GetStorageStats();
+            CHECK(stats.find("hit composition") != std::string::npos);
+            CHECK(stats.find("dirty age dist") != std::string::npos);
+            CHECK(stats.find("bg flush histogram") != std::string::npos);
+            CHECK(stats.find("io queue") != std::string::npos);
+            const std::string an = dbc.GetStorageAnalysis();
+            CHECK(an.find("device") != std::string::npos);
+            CHECK(an.find("crc errors") != std::string::npos);
+            CHECK(an.find("page map") != std::string::npos);
+            r = dbc.ExecuteSQL("\\analyze");  // 命令路径本身可执行
+            CHECK(r.success);
+            CHECK(r.message.find("page map") != std::string::npos);
+        }
+        RemoveFile(db); RemoveFile(db + ".wal");
+        RemoveFile(db + ".crc"); RemoveFile(db + ".fpl");
+    }
+}
+
 int main() {
     TestDiskManager();
     TestFreePagePersistence();
@@ -3870,6 +4582,7 @@ int main() {
     TestRowLockTier();
     TestRowLockEscalation();
     TestAdaptiveLockEscalation();
+    TestLockManagerShardThroughput();
     TestPredicateLockMerge();
     TestRowLevelConcurrency();
     TestBPlusTreeConcurrency();
@@ -3877,9 +4590,16 @@ int main() {
     TestSerializablePredicatePhantom();
     TestSerializablePredicateNonPkPhantom();
     TestCompositeIndexRangeConvergence();
+    TestCompositeIndexPageConvergence();
     TestPredicateIntervalTree();
     TestGroupCommit();
+    TestPredicateIncrementalInsert();
+    TestGroupCommitTimeWindow();
     TestTemperatureAwareFlush();
+    TestAdaptiveTemperatureThreshold();
+    TestT4BlockDevices();
+    TestT4Observability();
+    TestT4Diagnostics();
 
     std::printf("\n======== Storage UT ========\n");
     std::printf("checks: %d   fails: %d\n", g_checks, g_fails);

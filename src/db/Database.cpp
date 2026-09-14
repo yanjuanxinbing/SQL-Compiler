@@ -110,6 +110,23 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size,
     buffer_pool_manager_ = std::make_unique<BufferPoolManager>(
         buffer_pool_size, disk_manager_.get());
 
+    // Phase 5（G5）：温度感知刷盘 + 自适应阈值的环境变量开关（仅调优，不改语义）。
+    //   * SQLCOMPILER_TEMP_FLUSH 设置即开启温度感知刷盘（默认关闭，行为与旧版逐页
+    //     全量一致）：全量刷脏只写回冷脏页，热脏页延后留池（NO-FORCE + WAL 保证
+    //     正确性）。开启时默认启用自适应阈值（hot_ratio_percent_=20%，P 分位动态估计）。
+    //   * SQLCOMPILER_HOT_RATIO_PERCENT（1..99）覆盖目标热页占比；须与
+    //     SQLCOMPILER_TEMP_FLUSH 配合（仅设占比不开启刷盘时自适应不生效）。
+    if (std::getenv("SQLCOMPILER_TEMP_FLUSH") != nullptr) {
+        buffer_pool_manager_->SetTemperatureFlushEnabled(true);
+        buffer_pool_manager_->SetAdaptiveThresholdEnabled(true);
+    }
+    if (const char* env = std::getenv("SQLCOMPILER_HOT_RATIO_PERCENT")) {
+        const int pct = std::atoi(env);
+        if (pct >= 1 && pct <= 99) {
+            buffer_pool_manager_->SetHotRatioPercent(static_cast<uint64_t>(pct));
+        }
+    }
+
     // Phase B：先打开 WAL 文件，然后跑恢复（ARIES 3-phase），再决定是 Bootstrap
     // 还是 LoadFromDisk。注意：LogManager 必须在 catalog LoadFromDisk 之前完成，
     // 因为 redo 期间可能需要 catalog 的元数据来解析目录页。
@@ -235,7 +252,8 @@ std::shared_ptr<Session> Database::CreateSession() {
 ExecutionResult Database::ExecuteSQLImpl(const std::string& sql,
                                          TransactionManager* txn_mgr) {
     // \stats —— 输出存储子系统诊断信息（缓冲池/页分配/替换日志）。
-    // 需在通用 \crash 处理之前识别。
+    // \analyze —— T4 诊断：输出页映射/介质/CRC 校验信息。
+    // 均需在通用 \crash 处理之前识别。
     if (IsCrashDebugCommand(sql)) {
         size_t i = 0;
         while (i < sql.size() && (sql[i] == ' ' || sql[i] == '\t')) ++i;
@@ -248,6 +266,18 @@ ExecutionResult Database::ExecuteSQLImpl(const std::string& sql,
                 ExecutionResult ok;
                 ok.success = true;
                 ok.message = GetStorageStats();
+                return ok;
+            }
+        }
+        if (sql.compare(i, 8, "\\analyze") == 0) {
+            bool is_analyze = (i + 8 >= sql.size()) ||
+                              (sql[i + 8] == ' ' || sql[i + 8] == '\t' ||
+                               sql[i + 8] == ';' || sql[i + 8] == '\r' ||
+                               sql[i + 8] == '\n');
+            if (is_analyze) {
+                ExecutionResult ok;
+                ok.success = true;
+                ok.message = GetStorageAnalysis();
                 return ok;
             }
         }
@@ -517,6 +547,14 @@ void Database::BackgroundVacuumLoop() {
     }
 }
 
+long long Database::GetDiskIOReadCount() const {
+    return disk_manager_ != nullptr ? disk_manager_->GetIOReadCount() : 0;
+}
+
+long long Database::GetDiskIOWriteCount() const {
+    return disk_manager_ != nullptr ? disk_manager_->GetIOWriteCount() : 0;
+}
+
 std::string Database::GetStorageStats() const {
     std::ostringstream oss;
     oss << "--- storage stats ---\n";
@@ -541,7 +579,21 @@ std::string Database::GetStorageStats() const {
         << buffer_pool_manager_->GetPoolSize() << " frames)\n";
     oss << "hits / misses / repl : " << hits << " / " << misses
         << " / " << repl << "\n";
-    oss << "dirty writebacks     : " << st.writeback_count << "\n";
+    oss << "dirty writebacks     : " << st.writeback_count
+        << "  (cold=" << st.writeback_cold_count
+        << ", hot=" << st.writeback_hot_count << ")\n";
+    oss << "temp flush           : "
+        << (buffer_pool_manager_->IsTemperatureFlushEnabled() ? "on" : "off")
+        << ", threshold=" << buffer_pool_manager_->GetHotAccessThreshold()
+        << (buffer_pool_manager_->IsAdaptiveThresholdEnabled()
+                ? " (adaptive, ratio=" +
+                      std::to_string(buffer_pool_manager_->GetHotRatioPercent()) +
+                      "%, last_est=" +
+                      std::to_string(buffer_pool_manager_->GetLastEstimatedThreshold()) +
+                      ", sampled=" +
+                      std::to_string(buffer_pool_manager_->GetLastDirtySampled()) + ")"
+                : "")
+        << "\n";
     oss << "hit ratio            : " << std::fixed << std::setprecision(2)
         << hit_ratio << "%\n";
     oss << "disk pages / free    : "
@@ -550,6 +602,9 @@ std::string Database::GetStorageStats() const {
     oss << "disk reads / writes  : "
         << disk_manager_->GetIOReadCount() << " / "
         << disk_manager_->GetIOWriteCount() << "\n";
+    oss << "wal fsyncs           : "
+        << (log_manager_ != nullptr ? log_manager_->GetSyncCount() : 0)
+        << "\n";
     oss << "background flush     : "
         << (buffer_pool_manager_->IsBackgroundFlushEnabled()
                 ? "every " +
@@ -559,6 +614,29 @@ std::string Database::GetStorageStats() const {
                       std::to_string(buffer_pool_manager_->GetBackgroundFlushTicks())
                 : "disabled")
         << "\n";
+    // ---- T4 可观测性：命中构成 / 脏页年龄 / 后台刷脏直方图 / IO 队列 ----
+    const long th = static_cast<long>(buffer_pool_manager_->GetHotAccessThreshold());
+    const long tw = static_cast<long>(buffer_pool_manager_->GetWarmAccessThreshold());
+    const long hit_total = st.hit_cold_count + st.hit_warm_count + st.hit_hot_count;
+    const long hc = (hit_total > 0) ? (100 * st.hit_cold_count) / hit_total : 0;
+    const long hw = (hit_total > 0) ? (100 * st.hit_warm_count) / hit_total : 0;
+    const long hh = (hit_total > 0) ? (100 * st.hit_hot_count) / hit_total : 0;
+    oss << "hit composition      : cold=" << st.hit_cold_count << " (" << hc
+        << "%) warm=" << st.hit_warm_count << " (" << hw
+        << "%) hot=" << st.hit_hot_count << " (" << hh
+        << "%)  [tiers: hot>=" << th << ", warm>=" << tw << "]\n";
+    const std::vector<long> age = buffer_pool_manager_->GetDirtyAgeDistribution();
+    oss << "dirty age dist       : [0,1)=" << age[0] << " [1,4)=" << age[1]
+        << " [4,10)=" << age[2] << " [10,30)=" << age[3]
+        << " [30,inf)=" << age[4] << "  (tick units)\n";
+    const std::vector<long> hist = buffer_pool_manager_->GetBackgroundFlushHistogram();
+    oss << "bg flush histogram   : [0]=" << hist[0] << " [1]=" << hist[1]
+        << " [2,4)=" << hist[2] << " [4,8)=" << hist[3]
+        << " [8,16)=" << hist[4] << " [16,inf)=" << hist[5] << "\n";
+    oss << "io queue             : dirty frames="
+        << buffer_pool_manager_->GetDirtyFrameCount()
+        << ", disk reads=" << disk_manager_->GetIOReadCount()
+        << ", disk writes=" << disk_manager_->GetIOWriteCount() << "\n";
     const size_t cap = BufferPoolManager::GetReplacementLogCapacity();
     const size_t shown = std::min<size_t>(log.size(), 20);
     oss << "replacement log (" << log.size() << " recent, cap " << cap
@@ -568,6 +646,37 @@ std::string Database::GetStorageStats() const {
         oss << "    evict=pid " << e.evicted_page_id
             << "   loaded=pid " << e.loaded_page_id
             << (e.evicted_was_dirty ? "   [dirty]" : "") << "\n";
+    }
+    return oss.str();
+}
+
+// T4 诊断（\analyze）：页映射 / 介质 / CRC 校验信息。
+std::string Database::GetStorageAnalysis() const {
+    std::ostringstream oss;
+    oss << "--- storage analysis ---\n";
+    if (buffer_pool_manager_ == nullptr || disk_manager_ == nullptr) {
+        oss << "(not initialized)\n";
+        return oss.str();
+    }
+    oss << "device               : " << disk_manager_->GetDeviceName() << "\n";
+    oss << "disk pages / free    : "
+        << disk_manager_->GetNumPages() << " / "
+        << disk_manager_->GetNumFreePages() << "\n";
+    oss << "disk reads / writes  : "
+        << disk_manager_->GetIOReadCount() << " / "
+        << disk_manager_->GetIOWriteCount() << "\n";
+    oss << "crc errors           : " << disk_manager_->GetCrcErrorCount() << "\n";
+    const auto& snapshot = buffer_pool_manager_->GetPageMapSnapshot();
+    oss << "page map (" << snapshot.size() << " frames in pool):\n";
+    const size_t shown = std::min<size_t>(snapshot.size(), 64);
+    for (size_t k = 0; k < shown; ++k) {
+        const PageMapEntry& e = snapshot[k];
+        oss << "    pid " << e.page_id << " -> frame " << e.frame_id
+            << (e.dirty ? " [dirty]" : "")
+            << "  access=" << e.access_count << "\n";
+    }
+    if (snapshot.size() > shown) {
+        oss << "    ... (" << (snapshot.size() - shown) << " more)\n";
     }
     return oss.str();
 }

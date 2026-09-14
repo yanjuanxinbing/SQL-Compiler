@@ -22,10 +22,11 @@
 
 #include "txn/LogManager.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
-#if defined(_WIN32)
+#if defined(_MSC_VER)
 // _open / _read / _write are flagged C4996 by MSVC; we deliberately use the
 // low-level POSIX-style API to talk to FlushFileBuffers directly. Silence the
 // "use _sopen_s" hint that doesn't apply here.
@@ -61,6 +62,11 @@ inline uint32_t ReadU32(const char* src) {
 }  // namespace
 
 LogManager::LogManager(const std::string& wal_file) : wal_file_(wal_file) {
+    // 周期 2：组提交时间窗默认关闭（0 = 纯跟随者聚合）；由环境变量配置毫秒数。
+    if (const char* w = std::getenv("SQLCOMPILER_GROUPCOMMIT_WINDOW_MS")) {
+        const long ms = std::atol(w);
+        if (ms > 0) group_commit_window_ms_ = ms;
+    }
     if (!OpenForAppend()) {
         throw std::runtime_error("LogManager: cannot open WAL file: " + wal_file_);
     }
@@ -285,6 +291,14 @@ lsn_t LogManager::GroupCommit(lsn_t target) {
         }
         // 成为领导者。
         gc_leader_ = true;
+        // 周期 2：时间窗聚合——领导者先等待窗口结束，让窗口内到达的提交成为
+        // 跟随者并入本批；wait_for 释放锁，跟随者因此能进来登记并等待。
+        if (group_commit_window_ms_ > 0) {
+            gc_cv_.wait_for(lock,
+                            std::chrono::milliseconds(group_commit_window_ms_));
+        }
+        // 窗口结束重新快照 flush_to：窗口内新追加的记录（含跟随者提交）一并覆盖，
+        // 一次 SyncOs 持久化整批。随后 durable 只升不降。
         const lsn_t flush_to = next_lsn_ > 0 ? next_lsn_ - 1 : 0;
         lock.unlock();
         const bool ok = SyncOs();
@@ -306,6 +320,12 @@ lsn_t LogManager::GroupCommit(lsn_t target) {
 lsn_t LogManager::durable_lsn() const {
     std::lock_guard<std::mutex> lk(mutex_);
     return durable_lsn_;
+}
+
+void LogManager::SetGroupCommitWindowMs(long ms) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    group_commit_window_ms_ = ms > 0 ? ms : 0;
+    if (ms > 0) gc_cv_.notify_all();  // 若已有领导者等待，提前结束窗口按新值重走
 }
 
 size_t LogManager::GetSyncCount() const {
@@ -358,7 +378,7 @@ std::vector<LogRecord> LogManager::ReadAll() {
     return records;
 }
 
-#if defined(_WIN32)
+#if defined(_MSC_VER)
 #pragma warning(pop)
 #endif
 

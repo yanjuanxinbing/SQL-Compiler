@@ -5,9 +5,10 @@
 #include <stdexcept>
 
 #ifdef _WIN32
-#include <io.h>  // _fileno, _commit
+#include <io.h>       // _fileno, _commit, _get_osfhandle
+#include <windows.h>  // FSCTL_SET_SPARSE / SetEndOfFile（稀疏文件）
 #else
-#include <unistd.h>  // fileno, fsync
+#include <unistd.h>  // fileno, fsync, ftruncate
 #endif
 
 namespace sqlcompiler {
@@ -163,6 +164,139 @@ void FaultInjectingBlockDevice::CorruptWritesForRange(long long from, long long 
     }
     corrupt_from_ = from;
     corrupt_len_ = len;
+}
+
+// ---- T4：内存块设备 ----
+
+size_t MemoryBlockDevice::Read(long long offset, char* buf, size_t len) {
+    if (offset < 0 || buf == nullptr || len == 0) return 0;
+    const long long avail = Size() - offset;
+    if (avail <= 0) return 0;  // 介质末尾：返回不足（上层补零）
+    const size_t n = std::min<size_t>(len, static_cast<size_t>(avail));
+    std::memcpy(buf, data_.data() + static_cast<size_t>(offset), n);
+    return n;
+}
+
+size_t MemoryBlockDevice::Write(long long offset, const char* buf, size_t len) {
+    if (offset < 0 || buf == nullptr || len == 0) return 0;
+    EnsureCapacity(offset + static_cast<long long>(len));
+    std::memcpy(data_.data() + static_cast<size_t>(offset), buf, len);
+    return len;
+}
+
+void MemoryBlockDevice::EnsureCapacity(long long byte_count) {
+    if (byte_count <= 0) return;
+    if (static_cast<long long>(data_.size()) >= byte_count) return;
+    data_.resize(static_cast<size_t>(byte_count), 0);  // 新增区恒为 0
+}
+
+// ---- T4：稀疏文件块设备 ----
+
+SparseFileBlockDevice::SparseFileBlockDevice(const std::string& path) : path_(path) {
+    f_ = std::fopen(path_.c_str(), "r+b");
+    if (f_ == nullptr) {
+        f_ = std::fopen(path_.c_str(), "w+b");
+    }
+    if (f_ == nullptr) return;
+#ifdef _WIN32
+    // 显式标记为稀疏文件（FSCTL_SET_SPARSE）：之后写越 EOF / 跳过区域会自动成洞，
+    // 物理上只为已写数据分配簇。标记失败不影响正确性（退化为普通文件，洞读 0 仍
+    // 由上层 memset 兜底），只是稀疏节省量可能受限。
+    const HANDLE h = reinterpret_cast<HANDLE>(::_get_osfhandle(::_fileno(f_)));
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD dummy = 0;
+        if (::DeviceIoControl(h, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0,
+                              &dummy, nullptr)) {
+            sparse_ok_ = true;
+        }
+    }
+#endif
+    logical_size_ = TellFileSize(f_);
+}
+
+SparseFileBlockDevice::~SparseFileBlockDevice() {
+    if (f_ != nullptr) {
+        std::fflush(f_);
+        std::fclose(f_);
+        f_ = nullptr;
+    }
+}
+
+size_t SparseFileBlockDevice::Read(long long offset, char* buf, size_t len) {
+    if (f_ == nullptr || offset < 0 || buf == nullptr || len == 0) return 0;
+    const long long avail = logical_size_ - offset;
+    if (avail <= 0) return 0;  // 逻辑末尾：返回不足
+    const size_t n = std::min<size_t>(len, static_cast<size_t>(avail));
+    // 洞区域（未分配区）先清零：稀疏文件读洞本身返回 0，此处显式 memset 双保险。
+    std::memset(buf, 0, n);
+    FSeek64(f_, offset, SEEK_SET);
+    size_t got = std::fread(buf, 1, n, f_);
+    if (got < n && std::ferror(f_)) {
+        std::clearerr(f_);
+        throw std::runtime_error("SparseFileBlockDevice::Read failed: " + path_);
+    }
+    return n;
+}
+
+size_t SparseFileBlockDevice::Write(long long offset, const char* buf, size_t len) {
+    if (f_ == nullptr || offset < 0 || buf == nullptr || len == 0) return 0;
+    const long long end = offset + static_cast<long long>(len);
+    if (end > logical_size_) {
+        logical_size_ = end;  // 写越 EOF：产生洞（不物理分配中间区域）
+    }
+    FSeek64(f_, offset, SEEK_SET);
+    size_t written = std::fwrite(buf, 1, len, f_);
+    std::fflush(f_);
+    if (written != len || std::ferror(f_)) {
+        std::clearerr(f_);
+        throw std::runtime_error("SparseFileBlockDevice::Write failed: " + path_);
+    }
+    MergeRegion(offset, end);  // 跟踪已分配区间（仅观测，不影响正确性）
+    return written;
+}
+
+void SparseFileBlockDevice::EnsureCapacity(long long byte_count) {
+    if (f_ == nullptr || byte_count <= 0) return;
+    if (logical_size_ >= byte_count) return;
+#ifdef _WIN32
+    // 用 SetEndOfFile 扩展逻辑大小：不写任何字节 → 扩展区保持稀疏（不分配簇）。
+    const HANDLE h = reinterpret_cast<HANDLE>(::_get_osfhandle(::_fileno(f_)));
+    LARGE_INTEGER off;
+    off.QuadPart = byte_count;
+    if (h != INVALID_HANDLE_VALUE && ::SetFilePointerEx(h, off, nullptr, FILE_BEGIN) &&
+        ::SetEndOfFile(h)) {
+        logical_size_ = byte_count;
+    }
+#else
+    if (::ftruncate(::fileno(f_), static_cast<off_t>(byte_count)) == 0) {
+        logical_size_ = byte_count;
+    }
+#endif
+}
+
+void SparseFileBlockDevice::Sync() {
+    DurableSync(f_);
+}
+
+// 把 [lo, hi) 合并进已分配区间集合（保持有序、不重叠；相邻连续写合并为同一区间），
+// 并同步更新 allocated_bytes_（物理占用近似）。
+void SparseFileBlockDevice::MergeRegion(long long lo, long long hi) {
+    if (hi <= lo) return;
+    size_t i = 0;
+    while (i < regions_.size() && regions_[i].second < lo) ++i;  // 第一个可能重叠/相邻的区间
+    long long nlo = lo, nhi = hi;
+    size_t j = i;
+    while (j < regions_.size() && regions_[j].first <= nhi) {
+        nlo = std::min(nlo, regions_[j].first);
+        nhi = std::max(nhi, regions_[j].second);
+        ++j;
+    }
+    for (size_t k = i; k < j; ++k) {
+        allocated_bytes_ -= (regions_[k].second - regions_[k].first);
+    }
+    regions_.erase(regions_.begin() + i, regions_.begin() + j);
+    regions_.insert(regions_.begin() + i, std::make_pair(nlo, nhi));
+    allocated_bytes_ += (nhi - nlo);
 }
 
 }  // namespace sqlcompiler

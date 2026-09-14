@@ -84,11 +84,11 @@ DiskManager::DiskManager(const std::string& db_file)
 DiskManager::DiskManager(const std::string& db_file,
                          std::unique_ptr<BlockDevice> device)
     : db_file_name_(db_file),
-      next_page_id_(0),
-      file_size_(0),
       // E7：默认用文件设备打开数据文件；测试可注入自定义设备（如坏块注入器）。
       device_(device ? std::move(device)
-                     : std::make_unique<FileBlockDevice>(db_file)) {
+                     : std::make_unique<FileBlockDevice>(db_file)),
+      next_page_id_(0),
+      file_size_(0) {
     device_ready_ = device_ && device_->IsReady();
     file_size_ = device_ready_ ? device_->Size() : 0;
     next_page_id_ = static_cast<page_id_t>(file_size_ / PAGE_SIZE);
@@ -148,8 +148,8 @@ void DiskManager::ReadPage(page_id_t page_id, char* data) {
     ++io_read_count_;  // 真正触达磁盘的读页
     // 读取本页可用的字节数，不足 PAGE_SIZE 的部分已由 memset 补零。
     long long avail = file_size_ - offset;
-    size_t to_read = (avail >= PAGE_SIZE) ? PAGE_SIZE
-                                          : static_cast<size_t>(avail);
+    size_t to_read = (avail >= static_cast<long long>(PAGE_SIZE)) ? PAGE_SIZE
+                                                                  : static_cast<size_t>(avail);
     size_t got = device_->Read(offset, data, to_read);
     if (got < to_read) {
         // 读到不足（非错误状态，如介质末尾）时保持补零结果，容错处理。
@@ -159,6 +159,7 @@ void DiskManager::ReadPage(page_id_t page_id, char* data) {
     uint32_t stored = 0;
     if (GetPageCrc(page_id, &stored)) {
         if (osopt::Crc32(data, PAGE_SIZE) != stored) {
+            ++crc_error_count_;  // T4 诊断：累计一次校验失败（介质损坏观测）
             throw std::runtime_error("page CRC mismatch: page " +
                                      std::to_string(page_id));
         }
@@ -226,6 +227,16 @@ long long DiskManager::GetIOReadCount() const {
 long long DiskManager::GetIOWriteCount() const {
     std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(db_io_latch_));
     return io_write_count_;
+}
+
+long long DiskManager::GetCrcErrorCount() const {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(db_io_latch_));
+    return crc_error_count_;
+}
+
+std::string DiskManager::GetDeviceName() const {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(db_io_latch_));
+    return device_ != nullptr ? device_->Name() : db_file_name_;
 }
 
 void DiskManager::EnsureFileCapacity(page_id_t page_id) {

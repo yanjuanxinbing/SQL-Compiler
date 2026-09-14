@@ -66,6 +66,8 @@ Value EvaluateDefaultLiteral(const ExprPtr& default_expr,
             // boolean 字面量不直接对应本实现的 ValueType，归一化为 INTEGER
             return Value::MakeInt(
                 (lit->value != "0" && lit->value != "false" && lit->value != "FALSE") ? 1 : 0);
+        default:
+            return Value::MakeNull();
     }
     return Value::MakeNull();
 }

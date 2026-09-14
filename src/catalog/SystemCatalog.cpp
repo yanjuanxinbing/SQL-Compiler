@@ -288,13 +288,9 @@ void SystemCatalog::SetLogManager(LogManager* lm) {
     if (index_heap_) index_heap_->SetLogManager(lm);
 }
 
-// ---- Phase B helper：把 catalog 持有的所有 heap/tree 在创建/打开之后立即
-// 绑定 log_manager（针对 Bootstrap / LoadFromDisk 之后又新建 heap 的场景）。
-// 直接调用 SetLogManager(lm) 即可（它已经会遍历全部已存在的成员）。
-// 该函数是 SetLogManager 的同义别名，让调用点的语义更明确。
-namespace { void BindWalToAllCatalogMembers(SystemCatalog*, LogManager*) {} }
-
 void SystemCatalog::SetActiveTransaction(Transaction* txn) {
+    // 记录一份，供惰性创建的成员（__sys_indexes__ 堆、索引树）在创建后继承。
+    active_txn_ = txn;
     // 推到所有 catalog 自有的 TableHeap 与 BPlusTree，让 sys_tables 与
     // sys_indexes 的写路径正确记录 WAL。
     for (auto& kv : table_heaps_) {
@@ -418,7 +414,6 @@ bool SystemCatalog::CreateTable(const TableInfo& table_info) {
     TableHeap* heap = TableHeap::Create(buffer_pool_manager_);
     if (!heap) return false;
     if (log_manager_ != nullptr) heap->SetLogManager(log_manager_);
-    page_id_t user_pid = heap->GetFirstPageId();
     table_heaps_[table_info.table_name].reset(heap);
     return PersistTableMetadata(table_info);
 }
@@ -661,6 +656,9 @@ bool SystemCatalog::EnsureSysIndexesHeap() {
         if (index_heap_ != nullptr && log_manager_ != nullptr) {
             index_heap_->SetLogManager(log_manager_);
         }
+        if (index_heap_ != nullptr && active_txn_ != nullptr) {
+            index_heap_->SetActiveTransaction(active_txn_);
+        }
         return index_heap_ != nullptr;
     }
     // 惰性创建：旧版本数据库里没有索引目录堆，首次用到时才建，
@@ -668,6 +666,9 @@ bool SystemCatalog::EnsureSysIndexesHeap() {
     TableHeap* heap = TableHeap::Create(buffer_pool_manager_);
     if (heap == nullptr) return false;
     if (log_manager_ != nullptr) heap->SetLogManager(log_manager_);
+    // 继承当前事务：堆在 SetActiveTransaction 之后才创建，不补挂会把
+    // 后续写入的 WAL 记录打成 txn_id=0，恢复期被误当活动事务撤销。
+    if (active_txn_ != nullptr) heap->SetActiveTransaction(active_txn_);
     index_heap_.reset(heap);
     sys_indexes_first_page_id_ = heap->GetFirstPageId();
 
@@ -724,7 +725,9 @@ void SystemCatalog::LoadIndexesFromDisk() {
         if (!BuildIndexKeyTypes(*table, info.key_columns, &info.key_types)) {
             continue;  // 列已不存在：索引失效，当作没有这个索引
         }
-        if (!OpenIndexTree(info)) continue;
+        if (!OpenIndexTree(info)) {
+            continue;
+        }
         indexes_[info.index_name] = std::move(info);
     }
 }
@@ -734,6 +737,7 @@ bool SystemCatalog::OpenIndexTree(const IndexInfo& index_info) {
                                 index_info.is_unique, index_info.root_page_id);
     if (tree == nullptr) return false;
     if (log_manager_ != nullptr) tree->SetLogManager(log_manager_);
+    if (active_txn_ != nullptr) tree->SetActiveTransaction(active_txn_);
     index_trees_[index_info.index_name] = std::move(tree);
     return true;
 }
@@ -763,6 +767,7 @@ bool SystemCatalog::CreateIndex(const IndexInfo& index_info, std::string* error)
                                   info.is_unique);
     if (tree == nullptr) return fail("failed to allocate index root page");
     if (log_manager_ != nullptr) tree->SetLogManager(log_manager_);
+    if (active_txn_ != nullptr) tree->SetActiveTransaction(active_txn_);
     info.root_page_id = tree->GetRootPageId();
 
     if (!PersistIndexMetadata(info)) {
@@ -797,6 +802,7 @@ void SystemCatalog::ResetIndexesOfTable(const std::string& table_name) {
                                       info.is_unique);
         if (tree == nullptr) continue;
         if (log_manager_ != nullptr) tree->SetLogManager(log_manager_);
+        if (active_txn_ != nullptr) tree->SetActiveTransaction(active_txn_);
         info.root_page_id = tree->GetRootPageId();
         index_trees_[info.index_name] = std::move(tree);
         // 根页变了，元数据要跟着落盘

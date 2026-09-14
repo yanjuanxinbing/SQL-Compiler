@@ -112,19 +112,29 @@
 
 ---
 
-## T4 — 介质与可观测性
+## T4 — 介质与可观测性 ✅ 已完成（2026-09-14）
 
 | 目标 | 关键任务 | 验收标准 |
 |---|---|---|
-| 更多块设备 | 实现内存/稀疏文件/网络块设备（复用 `BlockDevice` 抽象） | 交换 `FileBlockDevice` 零业务改动 |
-| 可观测 | `\stats` 补：替换策略命中构成、脏页年龄分布、后台刷脏直方图、IO 队列 | 指标与 `1-系统调用` 自洽 |
-| 诊断 | 崩溃转储、页 CRC 误报率统计、`\analyze` 页映射可打印 | 诊断命令可作为事故复盘依据 |
+| 更多块设备 ✅ | 实现内存/稀疏文件/网络块设备（复用 `BlockDevice` 抽象） | 交换 `FileBlockDevice` 零业务改动 |
+| 可观测 ✅ | `\stats` 补：替换策略命中构成、脏页年龄分布、后台刷脏直方图、IO 队列 | 指标与 `1-系统调用` 自洽 |
+| 诊断 ✅ | 崩溃转储、页 CRC 误报率统计、`\analyze` 页映射可打印 | 诊断命令可作为事故复盘依据 |
 
 **资源**：1 名（介质+可观测，约 60%）。
 
+### T4 完成进度（2026-09-14）
+
+- ✅ **三种可交换块设备**：`MemoryBlockDevice`（`std::vector<char>` 内存介质，Sync 空操作）、`SparseFileBlockDevice`（Windows `FSCTL_SET_SPARSE` / POSIX 洞语义，逻辑大小 vs 物理占用分开记账，`AllocatedBytes()`/`AllocatedRegionCount()` 观测）、`LoopbackNetworkBlockDevice`（进程内 TCP 回环服务端 + 长度前缀协议，PIMPL 隐藏 Winsock；`GetReadRequests`/`GetWriteRequests` 计数）。三者平级复用 `BlockDevice` 抽象，`DiskManager` 注入即换介质，零业务改动。
+- ✅ **可观测性（`\stats` 扩展）**：命中构成按访问温度分档（`hit_cold/warm/hot_count`，温阈值 = 热阈值/2）；脏页年龄分布 5 桶（池操作逻辑时钟 `op_tick_` + `Page::MarkDirtyFromClean` 记录变脏时刻）；后台刷脏直方图 6 桶（`RecordBackgroundFlushStat` 按每次写回页数记账）；IO 队列 = 脏帧数 + 磁盘读/写计数。
+- ✅ **诊断（`\analyze`）**：`Database::GetStorageAnalysis` 输出底层介质名、磁盘页/空闲、IO 计数、CRC 校验失败累计计数、缓冲池页映射快照（`GetPageMapSnapshot`：pid → 帧号/脏标志/访问温度，按 pid 升序）；命令处理并入 `\stats` 分支（同样需 `;` 结尾）。
+- ✅ **CRC 累计计数**：`DiskManager` 新增 `crc_error_count_`/`GetCrcErrorCount()`，读页 CRC mismatch 上抛前累计，供介质损坏率观测。
+- ✅ **测试**：新增 `TestT4BlockDevices`（内存/稀疏/网络设备直接读写 + DiskManager 注入往返）、`TestT4Observability`（命中构成分档递进、脏页年龄分布、后台刷脏直方图记账、页映射/帧号/脏标志查询）、`TestT4Diagnostics`（坏块注入 → CRC 计数 +1、`\stats`/`\analyze` 输出含 T4 指标）。
+- ✅ **回归**：存储 UT **58953 checks / 0 fails**（较 58871 净增 82）；SQL 全量回归 **55 passed / 0 failed**；CMake 增补 `ws2_32` 链接（MinGW 下 `#pragma comment` 不生效）。
+- ✅ **实测证据**：`docs/test_evidence/storage_ut_run.log`、`t4_obs_diag_console.log`（`\stats`+`\analyze` 全指标输出）、`t4_bg_flush_console.log`（后台刷脏 20ms 间隔，ticks 26→52、hist `[0]` 桶 26→52）。
+
 ---
 
-## T5 — 收口与发布
+## T5 — 收口与发布 ✅ 已完成（2026-09-14）
 
 | 目标 | 关键任务 | 验收标准 |
 |---|---|---|
@@ -133,6 +143,14 @@
 | 评审 | 对照「进程调度/内存/置换」映射，文档补上并发模型章节 | 评审通过 |
 
 **资源**：1 名（30%）集中收口。
+
+### T5 完成进度（2026-09-14）
+
+- ✅ **告警审计**：`-Wall -Wextra` 全量编译 **0 warning / 0 error**。清理 234 条告警：8 处 switch 补 `default`（消 208 条 `-Wswitch`）、删除 5 个未用匿名函数 / 2 个未用变量 / 2 个未用参数、修 3 处 `-Wsign-compare`、1 处 `-Wtype-limits`、DiskManager 构造初始化序 `-Wreorder`、MSVC `#pragma` 加 `_MSC_VER` 防护。
+- ✅ **全量验证**：storage_ut **58953 checks / 0 fails**（与清理前一致，行为零变化）；SQL 回归 **55 passed / 0 failed**（含 49_acid_recovery / 50_undo_clr 崩溃注入两阶段）。
+- ✅ **验收文档**：README 重写为最终交付版（架构/能力/构建测试/CLI/环境变量/验收证据）；`03_测试执行记录.md` 更新为 T5 基线并补审计记录。
+- ✅ **评审**：`04_模块设计文档.md` 新增 §7 并发模型章节（锁层次与锁序、分片锁、乐观并发、后台线程调度、与 OS 课程映射）。
+- ✅ **证据**：`docs/test_evidence/audit_build.log`（零告警编译日志）、`storage_ut_run.log`、`sql_regression_run.log`。
 
 ---
 

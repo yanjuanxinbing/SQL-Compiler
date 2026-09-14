@@ -59,6 +59,15 @@ public:
     long long GetIOReadCount() const;
     long long GetIOWriteCount() const;
 
+    // ---- T4 诊断：CRC 校验累计计数 ----
+    // 每次读页时若该页存在持久化 CRC 记录且核对失败（磁盘损坏/位翻转/部分写），
+    // 在抛出 I/O 错误前累计一次。供 \analyze / 故障诊断观察「介质损坏率」。
+    long long GetCrcErrorCount() const;
+
+    // ---- T4 诊断：底层介质名 ----
+    // 透传当前块设备名称（如 "memory" / "<path>(sparse)"），供 \analyze 输出。
+    std::string GetDeviceName() const;
+
 private:
     std::string db_file_name_;
     // 数据文件的页块设备（默认为 FileBlockDevice；测试可注入故障设备）。
@@ -76,6 +85,9 @@ private:
     // 物理磁盘 I/O 计数：仅在真正触达磁盘的读/写处累加。
     long long io_read_count_ = 0;   // 物理读页次数（页面从磁盘加载）
     long long io_write_count_ = 0;  // 物理写页次数（页面写回磁盘）
+
+    // T4 诊断：CRC 校验失败累计次数（见 GetCrcErrorCount）。
+    long long crc_error_count_ = 0;
 
     // ---- 空闲页持久化（<db>.fpl 位图，见 LoadFreePageBitmap 注释）----
     // <db>.fpl 布局：24 字节头部 + 页位图；位 i = 1 表示 page i 空闲可复用。

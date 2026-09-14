@@ -155,7 +155,9 @@ bool IndexScanExecutor::Next(Tuple* tuple) {
         }
         if (tuple != nullptr) *tuple = std::move(t);
         // T2 行级读锁：显式事务内逐行取 S 锁（READ COMMITTED 登记、语句末释放）。
-        auto rl = context_->AcquireRowReadLock(t.GetRid());
+        // 传入表堆首页页号作表提示：行读锁与所属表锁同分片（G6 分片锁）。
+        auto rl = context_->AcquireRowReadLock(t.GetRid(),
+            static_cast<int64_t>(table_heap_->GetFirstPageId()));
         if (rl == ExecutionContext::RowLockResult::kDeadlock ||
             rl == ExecutionContext::RowLockResult::kTimeout) {
             throw std::runtime_error(
