@@ -2105,7 +2105,12 @@ ExprPtr Parser::ParseComparisonExpr() {
         !Check(TokenType::OP_GREATER) && !Check(TokenType::OP_GREATER_EQUAL) &&
         !(Check(TokenType::KEYWORD_NOT) &&
           (PeekToken(1).type == TokenType::KEYWORD_BETWEEN ||
-           PeekToken(1).type == TokenType::KEYWORD_IN))) {
+           PeekToken(1).type == TokenType::KEYWORD_IN ||
+           PeekToken(1).type == TokenType::KEYWORD_LIKE ||
+           PeekToken(1).type == TokenType::KEYWORD_ILIKE ||
+           PeekToken(1).type == TokenType::KEYWORD_REGEXP ||
+           PeekToken(1).type == TokenType::KEYWORD_RLIKE ||
+           PeekToken(1).type == TokenType::KEYWORD_SIMILAR))) {
         return left;
     }
 
@@ -2153,10 +2158,27 @@ ExprPtr Parser::ParseComparisonExpr() {
         return try_is_postfix();
     }
 
+    // NOT [LIKE|ILIKE|REGEXP|RLIKE|SIMILAR TO] —— 与 NOT BETWEEN / NOT IN
+    // 同形的特殊路径。旧实现守卫只放行 NOT BETWEEN / NOT IN，导致
+    // `col NOT LIKE pat` 在上面的守卫处提前 return（只剩 col），NOT LIKE
+    // 被静默丢弃，WHERE 退化为对 col 求真（VARCHAR 恒假 → 恒空结果）。
+    // 这里先消费 NOT 并记住取反标记，落入下方正常的 LIKE 解析后再包 NOT。
+    bool negated_like = false;
+    if (Check(TokenType::KEYWORD_NOT)) {
+        TokenType t1 = PeekToken(1).type;
+        if (t1 == TokenType::KEYWORD_LIKE || t1 == TokenType::KEYWORD_ILIKE ||
+            t1 == TokenType::KEYWORD_REGEXP || t1 == TokenType::KEYWORD_RLIKE ||
+            t1 == TokenType::KEYWORD_SIMILAR) {
+            Advance();  // consume NOT
+            negated_like = true;
+        }
+    }
+
     // LIKE <pattern> [ESCAPE 'x']  —— 旧路径仅在没有 ESCAPE 子句时使用，
     // 走 BinaryExpr + BinaryOperator::LIKE（默认 '\' 转义）；当显式带
     // ESCAPE 子句或使用 ILIKE / REGEXP / RLIKE 时，构建 LikeExprNode。
-    if (Check(TokenType::KEYWORD_LIKE) || Check(TokenType::KEYWORD_ILIKE) ||
+    if (negated_like || Check(TokenType::KEYWORD_LIKE) ||
+        Check(TokenType::KEYWORD_ILIKE) ||
         Check(TokenType::KEYWORD_REGEXP) || Check(TokenType::KEYWORD_RLIKE)) {
         LikeExprNode::Kind kind;
         switch (CurrentToken().type) {
@@ -2191,6 +2213,9 @@ ExprPtr Parser::ParseComparisonExpr() {
         } else {
             left = std::make_shared<LikeExprNode>(kind, left, pattern, esc, has_esc);
         }
+        if (negated_like) {
+            left = std::make_shared<UnaryExpr>(UnaryOperator::NOT, left);
+        }
         return try_is_postfix();
     }
 
@@ -2217,6 +2242,9 @@ ExprPtr Parser::ParseComparisonExpr() {
         }
         left = std::make_shared<LikeExprNode>(
             LikeExprNode::Kind::SIMILAR_TO, left, pattern, esc, has_esc);
+        if (negated_like) {
+            left = std::make_shared<UnaryExpr>(UnaryOperator::NOT, left);
+        }
         return try_is_postfix();
     }
 
