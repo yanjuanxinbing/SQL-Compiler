@@ -303,7 +303,8 @@ bool TableHeap::DeleteTuple(const RID& rid) {
 }
 
 bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple,
-                             const std::vector<ValueType>& column_types) {
+                             const std::vector<ValueType>& column_types,
+                             RID* out_new_rid) {
     if (!rid.IsValid()) return false;
     Page* page = storage_->GetPage(rid.page_id);
     if (!page) return false;
@@ -346,6 +347,9 @@ bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple,
         WriteSlot(data, rid.slot_num, off, new_len);
         page->SetDirty(true);
 
+        // 原位更新：RID 不变。
+        if (out_new_rid != nullptr) *out_new_rid = rid;
+
         // Phase B：写 UPDATE 记录（in-place，before/after 都在同一页）。
         if (log_manager_ != nullptr) {
             LogRecord rec;
@@ -367,8 +371,14 @@ bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple,
     storage_->UnpinPage(rid.page_id, false);
     // Cannot grow in place — delete and reinsert
     // 关键：DeleteTuple 和 InsertTuple 各自会写自己的 WAL 记录；这里不再单独追加。
+    // 与 in-place 路径不同：原 slot 被墓碑化，行被搬到新 slot，RID 改变。
+    // 调用方必须用 out_new_rid 拿到正确位置；否则 InsertIntoIndexes 等
+    // 基于旧 RID 的索引项会指向已墓碑化的 slot，导致后续 UPDATE 撞 PK。
     DeleteTuple(rid);
-    return InsertTuple(new_tuple, nullptr, column_types);
+    RID new_rid;
+    bool ok = InsertTuple(new_tuple, &new_rid, column_types);
+    if (ok && out_new_rid != nullptr) *out_new_rid = new_rid;
+    return ok;
 }
 
 void TableHeap::ClearAll() {

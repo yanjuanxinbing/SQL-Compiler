@@ -191,12 +191,17 @@ bool MergeExecutor::Next(Tuple* tuple) {
                                   matched_target_tuple.GetValues(), matched_rid, txn);
             }
             target_heap_->SetActiveTransaction(txn);
-            bool ok = target_heap_->UpdateTuple(matched_rid, new_t, target_column_types_);
+            // 同 UpdateExecutor：行增长时 UpdateTuple 会 delete+insert，RID
+            // 会变；后续 InsertIntoIndexes 必须用新 RID，否则索引键指向
+            // 旧 slot（已被墓碑化），下次 UPDATE 走 exclude_rid 校验失败。
+            RID new_rid = matched_rid;
+            bool ok = target_heap_->UpdateTuple(matched_rid, new_t,
+                                                target_column_types_, &new_rid);
             target_heap_->SetActiveTransaction(nullptr);
             if (ok) {
                 if (info != nullptr) {
                     InsertIntoIndexes(context_->GetCatalog(), *info,
-                                      new_t.GetValues(), matched_rid, txn);
+                                      new_t.GetValues(), new_rid, txn);
                 }
                 ++affected_rows_;
             } else if (info != nullptr) {

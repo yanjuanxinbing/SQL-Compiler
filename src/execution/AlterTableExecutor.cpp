@@ -2,12 +2,13 @@
 //
 // 四类动作的真实行为（不再是无副作用的 no-op）：
 //
-//   ADD COLUMN col TYPE[(N)]
+//   ADD COLUMN col TYPE[(N)] [DEFAULT expr]
 //     - 构造新的 ColumnInfo 并追加到 SymbolTable 的 TableInfo 列尾。
 //     - 对 TableHeap 中已有每一行：snapshot (RID, values)，用新 column_types
 //       重新 Serialize 后 InsertTuple 回去（DeleteTuple + InsertTuple 模式，避开
 //       UpdateTuple 的 in-place 增长边界）。
-//     - 新增列的初始值统一为 NULL；DEFAULT expr 仅在语法层接收，未在执行期求值。
+//     - bug9: 新增列若带 DEFAULT expr，按列声明类型 coerce 后写入所有已有行；
+//       不带 DEFAULT 时仍写 NULL（保留历史行为）。
 //     - 同步更新 sys_tables 中的元数据 blob：先删旧记录，再写新记录。
 //     - 失效（并删除）该表上的所有 B+Tree 索引——索引的 key_columns 可能引用
 //       新增列或被丢弃列，重建超出本期范围。
@@ -35,17 +36,21 @@
 //     先备份再 ALTER。
 //   - 不重建索引：ADD/DROP/MODIFY 会清空该表所有 B+Tree 索引元数据与 B+Tree
 //     页面。如需保留索引性能，请在 ALTER 后重新 CREATE INDEX。
-//   - 列级 DEFAULT expr 当前不会被求值；新增列一律填 NULL。
+//   - ADD COLUMN 的 DEFAULT expr 仅接受字面量（与 INSERT DEFAULT 一致）；
+//     表达式类默认值（如 DEFAULT nextval(seq)）当前会被拒。
 
 #include "execution/AlterTableExecutor.h"
 
 #include "common/Error.h"
+#include "execution/ExpressionEvaluator.h"
+#include "storage_engine/Tuple.h"
 #include "storage_engine/Value.h"
 
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <memory>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -61,6 +66,156 @@ std::string NormalizeType(const std::string& s) {
         out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
     }
     return out;
+}
+
+// bug11: 校验表达式是否为「常量」——即不引用任何行/上下文/带副作用的子表达式。
+// DEFAULT 子句的语义要求：仅允许由字面量、算术运算、字符串拼接、CAST、CASE、
+// EXTRACT 等纯函数构成的表达式；显式拒绝列引用、子查询、VALUES(col)、
+// NEXTVAL（带副作用）。
+//
+// 校验方式是递归扫描表达式树，命中禁止节点立即抛错；通过校验后调用方可以
+// 安全地用 ExpressionEvaluator 在一个空 Tuple / 空 column_index_map 上求值。
+void RequireConstantExpression(const ExprPtr& expr,
+                               const std::string& context_label) {
+    if (!expr) return;
+    switch (expr->GetType()) {
+        case NodeType::COLUMN_REF_EXPR:
+            throw CompilerException(
+                ErrorStage::SEMANTIC,
+                context_label + ": DEFAULT must be a constant expression "
+                "(column reference is not allowed)");
+        case NodeType::SUBQUERY_EXPR:
+            throw CompilerException(
+                ErrorStage::SEMANTIC,
+                context_label + ": DEFAULT must be a constant expression "
+                "(subquery is not allowed)");
+        case NodeType::UPSERT_VALUES_REF_EXPR:
+            throw CompilerException(
+                ErrorStage::SEMANTIC,
+                context_label + ": DEFAULT must be a constant expression "
+                "(VALUES(col) reference is not allowed)");
+        case NodeType::NEXTVAL_EXPR:
+            throw CompilerException(
+                ErrorStage::SEMANTIC,
+                context_label + ": DEFAULT must be a constant expression "
+                "(NEXTVAL has side effects and is not allowed)");
+        case NodeType::WINDOW_FUNC_EXPR:
+            throw CompilerException(
+                ErrorStage::SEMANTIC,
+                context_label + ": DEFAULT must be a constant expression "
+                "(window function is not allowed)");
+        case NodeType::BINARY_EXPR: {
+            const auto* b = static_cast<const BinaryExpr*>(expr.get());
+            RequireConstantExpression(b->left, context_label);
+            RequireConstantExpression(b->right, context_label);
+            return;
+        }
+        case NodeType::UNARY_EXPR: {
+            const auto* u = static_cast<const UnaryExpr*>(expr.get());
+            RequireConstantExpression(u->operand, context_label);
+            return;
+        }
+        case NodeType::FUNCTION_CALL_EXPR: {
+            const auto* f = static_cast<const FunctionCallExpr*>(expr.get());
+            for (const auto& a : f->arguments) {
+                RequireConstantExpression(a, context_label);
+            }
+            if (f->filter_expr) {
+                RequireConstantExpression(f->filter_expr, context_label);
+            }
+            for (const auto& o : f->within_group_order_by) {
+                RequireConstantExpression(o.expr, context_label);
+            }
+            return;
+        }
+        case NodeType::CASE_EXPR: {
+            const auto* c = static_cast<const CaseExprNode*>(expr.get());
+            RequireConstantExpression(c->subject, context_label);
+            for (const auto& w : c->whens) {
+                RequireConstantExpression(w.when_expr, context_label);
+                RequireConstantExpression(w.then_expr, context_label);
+            }
+            RequireConstantExpression(c->else_expr, context_label);
+            return;
+        }
+        case NodeType::CAST_EXPR: {
+            const auto* c = static_cast<const CastExprNode*>(expr.get());
+            RequireConstantExpression(c->expr, context_label);
+            return;
+        }
+        case NodeType::LIKE_EXPR: {
+            const auto* l = static_cast<const LikeExprNode*>(expr.get());
+            RequireConstantExpression(l->operand, context_label);
+            RequireConstantExpression(l->pattern, context_label);
+            // like_expr->escape 是字面 char，没有 Expr 子树。
+            return;
+        }
+        case NodeType::EXTRACT_EXPR: {
+            const auto* e = static_cast<const ExtractExprNode*>(expr.get());
+            RequireConstantExpression(e->source, context_label);
+            return;
+        }
+        case NodeType::INTERVAL_EXPR: {
+            // INTERVAL 字面量节点本身不持有子表达式。
+            return;
+        }
+        default:
+            return;
+    }
+}
+
+// bug11: 把 DEFAULT 表达式作为常量表达式求值。仅在 RequireConstantExpression
+// 通过校验后才调用；用一个空 Tuple 与空 column_index_map 触发 ExpressionEvaluator
+// 的递归求值。NULL/default_expr 为空时返回 NULL Value。
+Value EvaluateDefaultExpression(const ExprPtr& default_expr,
+                                const std::string& context_label) {
+    if (!default_expr) return Value::MakeNull();
+    RequireConstantExpression(default_expr, context_label);
+    const std::unordered_map<std::string, size_t> empty_map;
+    ExpressionEvaluator eval(empty_map);
+    return eval.Evaluate(default_expr, Tuple());
+}
+
+// 兼容旧调用点（仅出现在 InsertExecutor 自身）的字面量专用快捷路径——保留
+// EvaluateDefaultLiteral 名称，但语义放宽为"任意常量表达式"。
+Value EvaluateDefaultLiteral(const ExprPtr& default_expr,
+                             const std::string& col_name) {
+    return EvaluateDefaultExpression(default_expr,
+        "default expression for column '" + col_name + "'");
+}
+
+// 与 InsertExecutor::CoerceToColumnType 行为保持一致：把字面量求值结果
+// 强制转换为列声明类型，便于后续按 column_types 序列化到 TableHeap。
+Value CoerceDefaultToColumnType(const Value& v, const std::string& col_type) {
+    std::string up;
+    for (char c : col_type) up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    if (up == "INT" || up == "INTEGER" || up == "BIGINT" ||
+        up == "SMALLINT" || up == "TINYINT" || up == "BOOLEAN" || up == "BOOL") {
+        if (v.IsNull()) return v;
+        if (v.GetType() == ValueType::INTEGER) return v;
+        if (v.GetType() == ValueType::FLOAT) return Value::MakeInt(static_cast<int32_t>(v.AsFloat()));
+        if (v.GetType() == ValueType::VARCHAR) {
+            try { return Value::MakeInt(static_cast<int32_t>(std::stoi(v.AsVarchar()))); } catch (...) { return Value::MakeInt(0); }
+        }
+    } else if (up == "FLOAT" || up == "DOUBLE" || up == "REAL") {
+        if (v.IsNull()) return v;
+        if (v.GetType() == ValueType::FLOAT) return v;
+        if (v.GetType() == ValueType::INTEGER) return Value::MakeFloat(static_cast<double>(v.AsInt()));
+        if (v.GetType() == ValueType::VARCHAR) {
+            try { return Value::MakeFloat(std::stod(v.AsVarchar())); } catch (...) { return Value::MakeFloat(0.0); }
+        }
+    } else if (up == "DECIMAL" || up == "NUMERIC") {
+        if (v.IsNull()) return v;
+        if (v.GetType() == ValueType::VARCHAR) return v;
+        if (v.GetType() == ValueType::INTEGER) {
+            return Value::MakeVarchar(std::to_string(v.AsInt()));
+        }
+        if (v.GetType() == ValueType::FLOAT) {
+            return Value::MakeVarchar(FormatDecimal(v.AsFloat()));
+        }
+        return v;
+    }
+    return v;
 }
 
 // 把 ColumnDefinition 转成 ColumnInfo。ADD/MODIFY 共用。
@@ -321,7 +476,16 @@ void AlterTableExecutor::Init() {
                 keep_map[i] = static_cast<int>(i);
             }
             keep_map[new_info.columns.size() - 1] = -1;
+            // bug9: 计算新列的 backfill 默认值。若用户写了 DEFAULT <expr>，
+            // 求值后强制转换为新列的声明类型，作为所有已有行的初始值；未写
+            // DEFAULT 时仍按 NULL 填充（与历史行为兼容）。
+            Value default_value = Value::MakeNull();
+            if (ci.default_expr) {
+                Value raw = EvaluateDefaultLiteral(ci.default_expr, ci.name);
+                default_value = CoerceDefaultToColumnType(raw, ci.data_type);
+            }
             added_values.assign(new_info.columns.size(), Value::MakeNull());
+            added_values[new_info.columns.size() - 1] = default_value;
             break;
         }
         case AlterAction::RENAME_COLUMN: {

@@ -19,10 +19,13 @@ namespace sqlcompiler {
 class InsertExecutor : public Executor {
 public:
     // 常规 INSERT INTO ... VALUES (...) 路径：直接对字面表达式求值后写入。
+    // is_default_values=true 时插入一行所有列用 DEFAULT 表达式（无 DEFAULT
+    // 时为 NULL），对应 SQL 标准 INSERT ... DEFAULT VALUES。
     InsertExecutor(ExecutionContext* context, std::string table_name,
                     std::vector<std::string> columns,
                     std::vector<std::vector<ExprPtr>> values_list,
                     bool is_replace = false,
+                    bool is_default_values = false,
                     std::vector<ExprPtr> returning_exprs = {},
                     std::vector<std::string> returning_aliases = {});
 
@@ -51,10 +54,19 @@ private:
     // VALUES 路径：预先准备好的字面量表达式集合。
     std::vector<std::vector<ExprPtr>> values_list_;
     size_t current_row_ = 0;
-    // SELECT 路径：物化后的子执行器（query_plan 在 Init 时被构建一次）。
+    // SELECT 路径：构造时把 query_plan 全量执行一次得到结果缓冲，
+    // 避免 INSERT INTO t SELECT ... FROM t 这类「目标表 = 源表」在
+    // 边读边写场景下产生无限循环——读端看到本语句刚插入的行后再写，
+    // 下一轮再读到、再写，循环不止。先在构造期把源表快照固定下来，
+    // 后续 Next() 仅消费缓冲，不再触碰源 SeqScan。
     ExecutorPtr source_;
+    std::vector<Tuple> materialized_rows_;
     // 是否走 REPLACE 语义。
     bool is_replace_ = false;
+    // INSERT ... DEFAULT VALUES：插入一行所有列用 DEFAULT 表达式（无
+    // DEFAULT 时为 NULL）。当 is_default_values_ 为 true 时，values_list_
+    // 会被忽略（执行期按 info->columns.size() 构造一行 DefaultExprNode）。
+    bool is_default_values_ = false;
     // 54_dml: RETURNING 缓冲与游标。
     std::vector<ExprPtr> returning_exprs_;
     std::vector<std::string> returning_aliases_;

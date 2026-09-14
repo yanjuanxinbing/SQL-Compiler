@@ -72,9 +72,21 @@ void EnforceChildForeignKeys(SystemCatalog* catalog, const std::string& child_ta
 //     parent_cols 值集合。
 //   - exclude_child_rid 可选：当 CASCADE / SET NULL 修改子行时跳过该 RID
 //     （例如 UPDATE 同表父子关系时的子行正在被改写）。
+//
+// modified_parent_cols（默认 nullptr）用于 UPDATE 路径：
+//   - nullptr：视为「parent_cols 全部正在被移除」，与 DELETE 语义一致。
+//   - 非空：仅当某条 FK 的 parent_cols 全部出现在该集合中时才触发强制执行；
+//           即 UPDATE 真正修改了 FK 引用的父列时按 ON UPDATE 语义处理。
+//           若某 FK 的 parent_cols 与该集合无交集，说明该 UPDATE 没有改动 FK
+//           关心的列，跳过该 FK 的强制执行——
+//           这样 UPDATE 仅修改非 FK 引用列（如 credit）时，parent PK 未变，
+//           子行引用仍然合法，不会被错误地报"cannot delete parent row"。
+//           （修复 Bug-7：read-your-own-writes inside a transaction。）
 void EnforceParentForeignKeys(SystemCatalog* catalog,
                               const std::string& parent_table,
                               const std::vector<Value>& parent_row,
-                              const RID* exclude_child_rid = nullptr);
+                              const RID* exclude_child_rid = nullptr,
+                              const std::unordered_set<std::string>*
+                                  modified_parent_cols = nullptr);
 
 }  // namespace sqlcompiler

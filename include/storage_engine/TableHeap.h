@@ -48,9 +48,14 @@ public:
 
     // 根据rid更新一条记录（若新记录变长后仍能放入原slot则原地更新，
     // 否则可先DeleteTuple旧记录再InsertTuple新记录）。
+    //
+    // out_new_rid：delete+insert 路径下原 slot 被墓碑化，行被搬到新 slot。
+    // 调用方在 InsertIntoIndexes 等需要正确 RID 的场合必须使用这里输出的
+    // 新 RID；传 nullptr 时函数等价于旧 API（不返回新 RID）。
     // column_types 同 InsertTuple。
     bool UpdateTuple(const RID& rid, const Tuple& new_tuple,
-                     const std::vector<ValueType>& column_types);
+                     const std::vector<ValueType>& column_types,
+                     RID* out_new_rid = nullptr);
 
     // 清空表中的所有记录（保留表结构与首页），供 TRUNCATE TABLE 使用
     // 释放除首页外的全部溢出页，并把首页重置为空槽位目录

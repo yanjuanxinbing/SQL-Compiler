@@ -66,7 +66,11 @@ bool DeleteExecutor::Next(Tuple* tuple) {
         if (tuple) *tuple = Tuple({Value::MakeInt(affected)});
         return false;
     }
-    ExpressionEvaluator eval(column_index_map_);
+    // 三参构造：传入 ExecutionContext 让 SubqueryExprNode 可以驱动内部子计划。
+    // 单参构造会把 ctx_ 留空，导致 `WHERE col = (SELECT ...)` 中的标量子查询
+    // 在 EvaluateSubquery 的首行 nullptr 检查退化为 NULL，进而 `= NULL` 求值为
+    // UNKNOWN，所有候选行被误判为不匹配。详见 79_dml_subquery 回归用例。
+    ExpressionEvaluator eval(column_index_map_, context_, nullptr);
     while (iterator_->HasNext()) {
         Tuple t = iterator_->Next(column_types_);
         bool match = true;

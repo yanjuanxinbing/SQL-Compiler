@@ -589,7 +589,23 @@ void Parser::ParseFromClause(SelectStatement& stmt) {
             Expect(TokenType::RIGHT_PAREN, "expected ')' after derived table subquery");
             Match(TokenType::KEYWORD_AS);
             Token alias = Expect(TokenType::IDENTIFIER, "expected derived table alias");
-            stmt.derived_table = std::static_pointer_cast<SelectStatement>(sub);
+            // Bug 6 修复：sub 在经过 ParseSetOperationTail 之后可能是
+            // SetOperationStatement（带 UNION/INTERSECT/EXCEPT 链），
+            // 与 SelectStatement 之间没有继承关系；用 static_pointer_cast
+            // 互相转换是 UB，会让 planner 把 SetOp 节点按 SelectStatement
+            // 字段偏移读取，从而读到错误内存并最终 SIGSEGV。
+            // 正确做法：用 dynamic_pointer_cast 按动态类型分流到
+            // derived_table / derived_set_op 字段；planner 据此分别走
+            // PlanSelect / PlanSetOperation。
+            if (auto ss = std::dynamic_pointer_cast<SelectStatement>(sub)) {
+                stmt.derived_table = std::move(ss);
+            } else if (auto so =
+                           std::dynamic_pointer_cast<SetOperationStatement>(sub)) {
+                stmt.derived_set_op = std::move(so);
+            } else {
+                throw CompilerException(ErrorStage::SYNTAX,
+                    "derived table body must be a SELECT or set operation");
+            }
             stmt.derived_alias = alias.lexeme;
             stmt.joins = ParseJoinClauses();
             return;
@@ -765,12 +781,48 @@ StatementPtr Parser::ParseInsertStatement() {
         stmt->query = std::move(q);
         return stmt;
     }
+    // SQL 标准：INSERT ... DEFAULT VALUES —— 插入一行所有列都取其 DEFAULT
+    // 表达式（无 DEFAULT 时为 NULL）。语义上等价于 INSERT ... VALUES
+    // (DEFAULT, DEFAULT, ...) 但更紧凑。执行器在 is_default_values 为 true
+    // 时按列序构造一行 DEFAULT 表达式。
+    if (Check(TokenType::KEYWORD_DEFAULT)) {
+        Advance();
+        Expect(TokenType::KEYWORD_VALUES, "expected VALUES after DEFAULT");
+        stmt->is_default_values = true;
+        // ---- 54_dml: 可选 RETURNING 子句 ----
+        if (Check(TokenType::KEYWORD_RETURNING)) {
+            ParseReturningClause(stmt->returning_exprs, stmt->returning_aliases);
+        }
+        return stmt;
+    }
     Expect(TokenType::KEYWORD_VALUES, "expected VALUES");
     do {
         Expect(TokenType::LEFT_PAREN, "expected '(' to start VALUES row");
         std::vector<ExprPtr> row;
         while (!Check(TokenType::RIGHT_PAREN) && !IsAtEnd()) {
-            row.push_back(ParseExpression());
+            // SQL 标准：INSERT ... VALUES (..., DEFAULT) —— 列表中某个位置
+            // 显式写 DEFAULT 时，INSERT 阶段用该列的 DEFAULT 表达式（无
+            // DEFAULT 时为 NULL）。与"省略该列"语义相同，但允许在部分
+            // 列上显式列出的同时复用 DEFAULT。
+            //
+            // 同样接受 DEFAULT(col) 函数调用形式 —— 语义是"取列 col 的
+            // DEFAULT 表达式"，让执行器按列名（而不是按当前插入位置）查找
+            // default_expr；为空时回退到"当前插入位置列的 DEFAULT"。
+            if (Check(TokenType::KEYWORD_DEFAULT)) {
+                Advance();
+                if (Match(TokenType::LEFT_PAREN)) {
+                    Token col = Expect(TokenType::IDENTIFIER,
+                        "expected column name in DEFAULT(...)");
+                    Expect(TokenType::RIGHT_PAREN,
+                        "expected ')' after DEFAULT(column)");
+                    row.push_back(
+                        std::make_shared<DefaultExprNode>(col.lexeme));
+                } else {
+                    row.push_back(std::make_shared<DefaultExprNode>());
+                }
+            } else {
+                row.push_back(ParseExpression());
+            }
             if (!Match(TokenType::COMMA)) break;
         }
         Expect(TokenType::RIGHT_PAREN, "expected ')' after VALUES row");
@@ -1192,11 +1244,36 @@ StatementPtr Parser::ParseAlterTableStatement() {
     SetNodePos(stmt, alter_tok);
     stmt->table_name = std::move(table_name);
     auto parse_column_type = [](const Token& ty, ColumnDefinition* cd) {
-        if (ty.type == TokenType::KEYWORD_INT)       { cd->data_type = "INT";       }
-        else if (ty.type == TokenType::KEYWORD_VARCHAR)  { cd->data_type = "VARCHAR";  }
-        else if (ty.type == TokenType::KEYWORD_FLOAT)    { cd->data_type = "FLOAT";    }
-        else if (ty.type == TokenType::KEYWORD_DATE)     { cd->data_type = "DATE";     }
-        else if (ty.type == TokenType::KEYWORD_TIMESTAMP){ cd->data_type = "TIMESTAMP";}
+        // 与 ParseColumnDefinition 的类型识别集合对齐（bug10）：ALTER ADD COLUMN
+        // 之前只支持 INT/VARCHAR/FLOAT/DATE/TIMESTAMP/IDENTIFIER 六个分支，导致
+        // TEXT/REAL/BOOLEAN/DECIMAL/DOUBLE/SMALLINT 等常见类型在 ADD COLUMN 上
+        // 立即被语法拒绝。补齐后所有 CREATE TABLE 支持的类型在 ALTER ADD/MODIFY
+        // 上同样可用。
+        if (ty.type == TokenType::KEYWORD_INT)            { cd->data_type = "INT";      }
+        else if (ty.type == TokenType::KEYWORD_VARCHAR)   { cd->data_type = "VARCHAR";  }
+        else if (ty.type == TokenType::KEYWORD_FLOAT)     { cd->data_type = "FLOAT";    }
+        else if (ty.type == TokenType::KEYWORD_DATE)      { cd->data_type = "DATE";     }
+        else if (ty.type == TokenType::KEYWORD_TIMESTAMP) { cd->data_type = "TIMESTAMP";}
+        else if (ty.type == TokenType::KEYWORD_BOOLEAN ||
+                 ty.type == TokenType::KEYWORD_BOOL)       { cd->data_type = "BOOLEAN";  }
+        else if (ty.type == TokenType::KEYWORD_CHAR)      { cd->data_type = "CHAR";     }
+        else if (ty.type == TokenType::KEYWORD_TEXT)      { cd->data_type = "TEXT";     }
+        else if (ty.type == TokenType::KEYWORD_DECIMAL ||
+                 ty.type == TokenType::KEYWORD_NUMERIC)    { cd->data_type = "DECIMAL";  }
+        else if (ty.type == TokenType::KEYWORD_DOUBLE)    { cd->data_type = "DOUBLE";   }
+        else if (ty.type == TokenType::KEYWORD_REAL)      { cd->data_type = "REAL";     }
+        else if (ty.type == TokenType::KEYWORD_SMALLINT)  { cd->data_type = "SMALLINT"; }
+        else if (ty.type == TokenType::KEYWORD_TINYINT)   { cd->data_type = "TINYINT";  }
+        else if (ty.type == TokenType::KEYWORD_TIME)      { cd->data_type = "TIME";     }
+        else if (ty.type == TokenType::KEYWORD_JSON)      { cd->data_type = "JSON";     }
+        else if (ty.type == TokenType::KEYWORD_UUID)      { cd->data_type = "UUID";     }
+        else if (ty.type == TokenType::KEYWORD_SERIAL) {
+            // SERIAL：等价于 INT PRIMARY KEY AUTO_INCREMENT NOT NULL。
+            cd->data_type = "INT";
+            cd->is_primary_key = true;
+            cd->is_not_null = true;
+            cd->is_auto_increment = true;
+        }
         else if (ty.type == TokenType::IDENTIFIER)       { cd->data_type = ty.lexeme;  }
         else {
             throw CompilerException(ErrorStage::SYNTAX,
@@ -1224,6 +1301,12 @@ StatementPtr Parser::ParseAlterTableStatement() {
                 Advance();
             }
             Expect(TokenType::RIGHT_PAREN, "expected ')' after type parameter");
+        }
+        // bug9: ALTER ADD COLUMN 上接受可选 `DEFAULT expr`（与 CREATE TABLE
+        // 列定义对齐）。执行器会用 default_expr 计算 backfill 值；新插入
+        // 路径在 InsertExecutor::ApplyDefaults 中也会读取同一字段。
+        if (Match(TokenType::KEYWORD_DEFAULT)) {
+            cd->default_expr = ParseExpression();
         }
         stmt->column_def = cd;
     } else if (Match(TokenType::KEYWORD_DROP)) {
@@ -1967,6 +2050,65 @@ ExprPtr Parser::ParseNotExpr() {
 
 ExprPtr Parser::ParseComparisonExpr() {
     ExprPtr left = ParseAdditiveExpr();
+
+    // bug3_is_true: IS [NOT] NULL/TRUE/FALSE 是后缀单目语义，按 SQL 标准可以
+    // 跟在任何"原子或比较"表达式之后（如 `(x > 2) IS TRUE`、`x IS NULL`、
+    // `x + 1 IS NOT FALSE`）。原实现把 IS 分支放在比较运算符分支之前，因此
+    // 只对"主表达式为原子"的形态生效；遇到 `x > 2 IS TRUE` 时 IS 被吞掉、
+    // 后续 token 在 select-list 之外的 alias/FROM 探测里逐项 skip，导致
+    // 整个 SELECT 退化成无 FROM 的 1 行投影（出现 bug 中"1 行 NULL"的现象）。
+    //
+    // 修法：在 ParseComparisonExpr 的开头与每次"消费完一个比较运算符得到
+    // BinaryExpr"之后再做一次 IS 后缀检查，使 IS 能在比较结果之上继续堆叠。
+    auto try_is_postfix = [&]() -> ExprPtr {
+        if (!Check(TokenType::KEYWORD_IS)) return left;
+        Advance();  // consume IS
+        bool is_not = Check(TokenType::KEYWORD_NOT);
+        if (is_not) Advance();
+        // IS 后必须是 NULL / TRUE / FALSE 之一；按 SQL:1999 语义都作为
+        // "只看左操作数"的后缀操作，因此右侧留空。
+        if (Check(TokenType::KEYWORD_NULL)) {
+            Advance();
+            left = std::make_shared<BinaryExpr>(
+                is_not ? BinaryOperator::IS_NOT_NULL : BinaryOperator::IS_NULL,
+                left, nullptr);
+            return left;
+        }
+        if (Check(TokenType::KEYWORD_TRUE)) {
+            Advance();
+            left = std::make_shared<BinaryExpr>(
+                is_not ? BinaryOperator::IS_NOT_TRUE : BinaryOperator::IS_TRUE,
+                left, nullptr);
+            return left;
+        }
+        if (Check(TokenType::KEYWORD_FALSE)) {
+            Advance();
+            left = std::make_shared<BinaryExpr>(
+                is_not ? BinaryOperator::IS_NOT_FALSE : BinaryOperator::IS_FALSE,
+                left, nullptr);
+            return left;
+        }
+        Expect(TokenType::KEYWORD_NULL,
+               "expected NULL, TRUE, or FALSE after IS [NOT]");
+        return left;  // unreachable; Expect throws.
+    };
+
+    // 先尝试在主表达式上挂 IS（处理 `x IS NULL` / `x IS TRUE` 等无比较的形态）。
+    left = try_is_postfix();
+    if (!Check(TokenType::KEYWORD_IS) &&
+        !Check(TokenType::KEYWORD_LIKE) && !Check(TokenType::KEYWORD_ILIKE) &&
+        !Check(TokenType::KEYWORD_REGEXP) && !Check(TokenType::KEYWORD_RLIKE) &&
+        !Check(TokenType::KEYWORD_SIMILAR) &&
+        !Check(TokenType::KEYWORD_IN) && !Check(TokenType::KEYWORD_BETWEEN) &&
+        !Check(TokenType::OP_EQUAL) && !Check(TokenType::OP_NOT_EQUAL) &&
+        !Check(TokenType::OP_LESS) && !Check(TokenType::OP_LESS_EQUAL) &&
+        !Check(TokenType::OP_GREATER) && !Check(TokenType::OP_GREATER_EQUAL) &&
+        !(Check(TokenType::KEYWORD_NOT) &&
+          (PeekToken(1).type == TokenType::KEYWORD_BETWEEN ||
+           PeekToken(1).type == TokenType::KEYWORD_IN))) {
+        return left;
+    }
+
     const Token& cur = CurrentToken();
 
     // NOT BETWEEN x AND y —— 与 NOT IN 同形的特殊路径。
@@ -1982,7 +2124,9 @@ ExprPtr Parser::ParseComparisonExpr() {
         auto range = std::make_shared<FunctionCallExpr>("__BETWEEN_RANGE__",
             std::vector<ExprPtr>{low, high});
         auto between = std::make_shared<BinaryExpr>(BinaryOperator::BETWEEN, left, range);
-        return std::make_shared<UnaryExpr>(UnaryOperator::NOT, between);
+        left = std::make_shared<UnaryExpr>(UnaryOperator::NOT, between);
+        // 比较结果之上还可以再挂 IS，例如 `(a NOT BETWEEN 0 AND 10) IS TRUE`
+        return try_is_postfix();
     }
 
     // NOT IN (SELECT ...) —— 形如 col NOT IN (SELECT ...)
@@ -2005,18 +2149,8 @@ ExprPtr Parser::ParseComparisonExpr() {
             auto list_expr = std::make_shared<FunctionCallExpr>("__IN_LIST__", values);
             inner = std::make_shared<BinaryExpr>(BinaryOperator::IN_LIST, left, list_expr);
         }
-        return std::make_shared<UnaryExpr>(UnaryOperator::NOT, inner);
-    }
-
-    // IS [NOT] NULL (postfix)
-    if (Check(TokenType::KEYWORD_IS)) {
-        Advance();
-        bool is_not = Check(TokenType::KEYWORD_NOT);
-        if (is_not) Advance();
-        Expect(TokenType::KEYWORD_NULL, "expected NULL after IS [NOT]");
-        return std::make_shared<BinaryExpr>(
-            is_not ? BinaryOperator::IS_NOT_NULL : BinaryOperator::IS_NULL,
-            left, nullptr);
+        left = std::make_shared<UnaryExpr>(UnaryOperator::NOT, inner);
+        return try_is_postfix();
     }
 
     // LIKE <pattern> [ESCAPE 'x']  —— 旧路径仅在没有 ESCAPE 子句时使用，
@@ -2053,9 +2187,11 @@ ExprPtr Parser::ParseComparisonExpr() {
         if (kind == LikeExprNode::Kind::LIKE && !has_esc) {
             // 旧路径：没有显式 ESCAPE 时复用 BinaryExpr(LIKE) 以保持原
             // MatchLikePattern 默认 '\' 转义行为，避免触碰既有测试。
-            return std::make_shared<BinaryExpr>(BinaryOperator::LIKE, left, pattern);
+            left = std::make_shared<BinaryExpr>(BinaryOperator::LIKE, left, pattern);
+        } else {
+            left = std::make_shared<LikeExprNode>(kind, left, pattern, esc, has_esc);
         }
-        return std::make_shared<LikeExprNode>(kind, left, pattern, esc, has_esc);
+        return try_is_postfix();
     }
 
     // SIMILAR TO <pattern> [ESCAPE 'x']  —— SQL:1999 风格正则匹配。
@@ -2079,8 +2215,9 @@ ExprPtr Parser::ParseComparisonExpr() {
             esc = lit.lexeme[0];
             has_esc = true;
         }
-        return std::make_shared<LikeExprNode>(
+        left = std::make_shared<LikeExprNode>(
             LikeExprNode::Kind::SIMILAR_TO, left, pattern, esc, has_esc);
+        return try_is_postfix();
     }
 
     // IN (val1, val2, ...) 或 IN (SELECT ...)
@@ -2090,7 +2227,8 @@ ExprPtr Parser::ParseComparisonExpr() {
         // 子查询形式: IN (SELECT ...)
         if (Check(TokenType::KEYWORD_SELECT) || Check(TokenType::KEYWORD_WITH)) {
             // '(' 已经被 Expect 消耗；ParseSubqueryExpression 会消费 SELECT... 并在末尾消费 ')'
-            return ParseSubqueryExpression(left, "IN");
+            left = ParseSubqueryExpression(left, "IN");
+            return try_is_postfix();
         }
         std::vector<ExprPtr> values;
         if (!Check(TokenType::RIGHT_PAREN)) {
@@ -2104,7 +2242,8 @@ ExprPtr Parser::ParseComparisonExpr() {
         // We wrap the values list in a synthetic FunctionCallExpr so the
         // expression evaluator can iterate over them.
         auto list_expr = std::make_shared<FunctionCallExpr>("__IN_LIST__", values);
-        return std::make_shared<BinaryExpr>(BinaryOperator::IN_LIST, left, list_expr);
+        left = std::make_shared<BinaryExpr>(BinaryOperator::IN_LIST, left, list_expr);
+        return try_is_postfix();
     }
 
     // ANY (SELECT ...)  —— 形如 expr > ANY (SELECT ...)
@@ -2121,7 +2260,8 @@ ExprPtr Parser::ParseComparisonExpr() {
         // a FunctionCallExpr wrapping {low, high}.
         auto range = std::make_shared<FunctionCallExpr>("__BETWEEN_RANGE__",
             std::vector<ExprPtr>{low, high});
-        return std::make_shared<BinaryExpr>(BinaryOperator::BETWEEN, left, range);
+        left = std::make_shared<BinaryExpr>(BinaryOperator::BETWEEN, left, range);
+        return try_is_postfix();
     }
 
     BinaryOperator op;
@@ -2152,10 +2292,14 @@ ExprPtr Parser::ParseComparisonExpr() {
             default: op_str = "="; break;
         }
         auto sub = ParseSubqueryExpression(left, op_str);
-        return sub;
+        left = sub;
+        return try_is_postfix();
     }
     ExprPtr right = ParseAdditiveExpr();
-    return std::make_shared<BinaryExpr>(op, left, right);
+    left = std::make_shared<BinaryExpr>(op, left, right);
+    // bug3_is_true: 比较运算结果上还可以再挂 IS，例如 `(x > 2) IS TRUE`、
+    // `(a + b = c) IS NOT FALSE`。
+    return try_is_postfix();
 }
 
 ExprPtr Parser::ParseAdditiveExpr() {
@@ -2314,6 +2458,21 @@ ExprPtr Parser::ParsePrimaryExpr() {
         return std::make_shared<ColumnRefExpr>("", prefix);
     }
     if (cur.type == TokenType::IDENTIFIER) {
+        // 60_view_trigger: CURRENT_TIMESTAMP —— SQL 标准零参"当前时间戳"。
+        // Lexer 把下划线整体识别成单个 IDENTIFIER；不识别为函数调用，
+        // 否则会被当作"未注册列"而走 ColumnRefExpr 路径，撞上
+        // DEFAULT/CHECK 的「不允许列引用」校验。改造成零参
+        // FunctionCallExpr，ExecutionEvaluator 的
+        // `name == "CURRENT_TIMESTAMP"` 分支直接返回当前时间。
+        std::string up = cur.lexeme;
+        for (auto& ch : up) {
+            ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        }
+        if (up == "CURRENT_TIMESTAMP") {
+            Advance();
+            return std::make_shared<FunctionCallExpr>("CURRENT_TIMESTAMP",
+                                                      std::vector<ExprPtr>{});
+        }
         return ParseColumnRefOrFunctionCall();
     }
     // 兼容「关键字形式的函数名」: 例如 COALESCE/NULLIF/UPPER 等。
@@ -2553,7 +2712,12 @@ ExprPtr Parser::ParseColumnRefOrFunctionCall() {
         // Could be t.column or t.*
         if (Check(TokenType::OP_STAR)) {
             Advance();
-            return std::make_shared<FunctionCallExpr>("*", std::vector<ExprPtr>{});
+            // Bug 13: 透传限定表名到 FunctionCallExpr::table_qualifier，
+            // 让 Planner::ExpandSelectStarInList 能区分裸 `*` 与 `t.*`。
+            // 当前 token 是 `t.*` 中的 t，仍保留在 first.lexeme 中。
+            auto star = std::make_shared<FunctionCallExpr>("*", std::vector<ExprPtr>{});
+            star->table_qualifier = first.lexeme;
+            return star;
         }
         Token second = Expect(TokenType::IDENTIFIER, "expected column name after '.'");
         auto cr = std::make_shared<ColumnRefExpr>(first.lexeme, second.lexeme);
@@ -2639,31 +2803,73 @@ ExprPtr Parser::ParseCastExpression() {
     Expect(TokenType::LEFT_PAREN, "expected '(' after CAST");
     ExprPtr inner = ParseExpression();
     Expect(TokenType::KEYWORD_AS, "expected AS in CAST");
-    // 类型名可以是关键字 (INT/FLOAT/VARCHAR) 或普通标识符
+    // 类型名可以是关键字或普通标识符。关键字白名单涵盖 52_data_types / 60_funcs
+    // 注册的全部类型 token：INT/FLOAT/VARCHAR/BOOLEAN/BOOL/CHAR/TEXT/
+    // DECIMAL/NUMERIC/DOUBLE/REAL/SMALLINT/TINYINT/DATE/TIMESTAMP/TIME/
+    // JSON/UUID。
+    // 注：KEYWORD_DATE / KEYWORD_TIMESTAMP 在 ParsePrimaryExpr 里也用于
+    // `DATE 'YYYY-MM-DD'` / `TIMESTAMP 'YYYY-MM-DD HH:MM:SS'` 字面量解析，
+    // 但 CAST 上下文里它们就是类型名——不会紧跟 STRING_LITERAL。
     std::string ty_name;
     const Token& tc = CurrentToken();
-    if (tc.type == TokenType::KEYWORD_INT ||
-        tc.type == TokenType::KEYWORD_FLOAT ||
-        tc.type == TokenType::KEYWORD_VARCHAR) {
-        ty_name = tc.lexeme;
-        Advance();
-    } else if (tc.type == TokenType::IDENTIFIER) {
-        ty_name = tc.lexeme;
-        Advance();
-    } else {
-        throw CompilerException(ErrorStage::SYNTAX,
-            "expected type name after AS", tc.line, tc.column);
+    switch (tc.type) {
+        case TokenType::KEYWORD_INT:
+        case TokenType::KEYWORD_FLOAT:
+        case TokenType::KEYWORD_VARCHAR:
+        case TokenType::KEYWORD_BOOLEAN:
+        case TokenType::KEYWORD_BOOL:
+        case TokenType::KEYWORD_CHAR:
+        case TokenType::KEYWORD_TEXT:
+        case TokenType::KEYWORD_DECIMAL:
+        case TokenType::KEYWORD_NUMERIC:
+        case TokenType::KEYWORD_DOUBLE:
+        case TokenType::KEYWORD_REAL:
+        case TokenType::KEYWORD_SMALLINT:
+        case TokenType::KEYWORD_TINYINT:
+        case TokenType::KEYWORD_DATE:
+        case TokenType::KEYWORD_TIMESTAMP:
+        case TokenType::KEYWORD_TIME:
+        case TokenType::KEYWORD_JSON:
+        case TokenType::KEYWORD_UUID:
+            ty_name = tc.lexeme;
+            Advance();
+            break;
+        case TokenType::IDENTIFIER:
+            ty_name = tc.lexeme;
+            Advance();
+            break;
+        default:
+            throw CompilerException(ErrorStage::SYNTAX,
+                "expected type name after AS", tc.line, tc.column);
     }
     auto cast = std::make_shared<CastExprNode>(inner, ty_name);
-    // VARCHAR(N) 可选长度
+    // 可选类型参数 —— 接受以下形式：
+    //   - VARCHAR(n) / CHAR(n) / TEXT(n)：单整数 = char_length
+    //   - DECIMAL(p) / NUMERIC(p)        ：单整数 = precision，scale = -1
+    //   - DECIMAL(p, s) / NUMERIC(p, s)  ：双整数 = precision + scale
+    //   - 其它类型附带 (n) / (p, s) 也按相同规则记录（执行期按需解读）。
+    // 参数列表为空 `()` 也合法，与"无参数"等价。
     if (Match(TokenType::LEFT_PAREN)) {
+        // 第一个整数（精度 / 长度）
         if (Check(TokenType::INTEGER_LITERAL)) {
             try {
-                cast->char_length = static_cast<int32_t>(std::stol(CurrentToken().lexeme));
+                cast->char_length = static_cast<int32_t>(
+                    std::stol(CurrentToken().lexeme));
             } catch (...) {
                 cast->char_length = -1;
             }
             Advance();
+            // 可选第二整数（DECIMAL/NUMERIC 的 scale）
+            if (Match(TokenType::COMMA)) {
+                Token scale_tok = Expect(TokenType::INTEGER_LITERAL,
+                    "expected integer scale after ',' in CAST type parameter");
+                try {
+                    cast->numeric_scale = static_cast<int32_t>(
+                        std::stol(scale_tok.lexeme));
+                } catch (...) {
+                    cast->numeric_scale = -1;
+                }
+            }
         }
         Expect(TokenType::RIGHT_PAREN, "expected ')' after CAST type parameter");
     }
@@ -2903,11 +3109,13 @@ StatementPtr Parser::ParseWithClause() {
             body = ParseSetOperationTail(body);
         }
         Expect(TokenType::RIGHT_PAREN, "expected ')' to close CTE query");
-        // body 可能是 SelectStatement 或 SetOperationStatement（带 UNION 链）。
-        // 当 CTE 是 WITH RECURSIVE 时，body 若为 UNION ALL 的 SetOp，把它拆为
-        // anchor（左侧 SELECT）放进 cte_query，右侧放进 recursive_part，供
-        // Planner/CteDefineExecutor 走迭代语义。其他集合运算（UNION / INTERSECT /
-        // EXCEPT）的递归不在本期范围内，保留旧行为：cte_query 留空。
+        // bug3: 把完整 body 落到 cte_body，确保后续 Planner 始终能找到
+        // CTE 的实际查询定义——旧实现仅在 SelectStatement 或递归 UNION ALL
+        // 的左侧时设置 cte_query，其它场景（普通 CTE 带 UNION/UNION ALL/
+        // INTERSECT/EXCEPT）cte_query 为 nullptr，Planner 拿不到计划，
+        // CteDefineExecutor 于是不向 context 注册结果，SELECT * FROM c 返回 0 行。
+        cte.cte_body = body;
+        // 兼容旧逻辑：cte_query 保留给递归 CTE 的 anchor 与单 SELECT 路径。
         if (auto sop = std::dynamic_pointer_cast<SetOperationStatement>(body)) {
             if (with->is_recursive && sop->kind == SetOperationStatement::Kind::UNION_ALL) {
                 if (auto anchor = std::dynamic_pointer_cast<SelectStatement>(sop->left)) {

@@ -40,6 +40,12 @@ const char* BinaryOpToString(BinaryOperator op) {
         case BinaryOperator::BETWEEN:        return "BETWEEN";
         case BinaryOperator::IS_NULL:        return "IS NULL";
         case BinaryOperator::IS_NOT_NULL:    return "IS NOT NULL";
+        // bug3_is_true: 新增 IS [NOT] TRUE/FALSE 的 AST 字符串形式，
+        // 仅用于调试输出（\.ast / 错误消息）；不影响求值。
+        case BinaryOperator::IS_TRUE:        return "IS TRUE";
+        case BinaryOperator::IS_FALSE:       return "IS FALSE";
+        case BinaryOperator::IS_NOT_TRUE:    return "IS NOT TRUE";
+        case BinaryOperator::IS_NOT_FALSE:   return "IS NOT FALSE";
         case BinaryOperator::INTERVAL_ADD:   return "+";
         case BinaryOperator::INTERVAL_SUB:   return "-";
     }
@@ -521,7 +527,16 @@ NodeType CastExprNode::GetType() const {
 
 std::string CastExprNode::ToString() const {
     std::string inner = expr ? expr->ToString() : "?";
-    return "CAST(" + inner + " AS " + target_type + ")";
+    std::string out = "CAST(" + inner + " AS " + target_type;
+    if (char_length >= 0) {
+        out += "(" + std::to_string(char_length);
+        if (numeric_scale >= 0) {
+            out += ", " + std::to_string(numeric_scale);
+        }
+        out += ")";
+    }
+    out += ")";
+    return out;
 }
 
 // ============ WindowFuncNode ============
@@ -1246,6 +1261,22 @@ NodeType NextvalExpr::GetType() const {
 }
 std::string NextvalExpr::ToString() const {
     return "NEXTVAL FOR " + sequence_name;
+}
+
+// ============ DefaultExprNode (INSERT ... DEFAULT) ============
+
+DefaultExprNode::DefaultExprNode() {}
+
+DefaultExprNode::DefaultExprNode(std::string column_name)
+    : column_name(std::move(column_name)) {}
+
+NodeType DefaultExprNode::GetType() const {
+    return NodeType::DEFAULT_EXPR;
+}
+
+std::string DefaultExprNode::ToString() const {
+    if (column_name.empty()) return "DEFAULT";
+    return "DEFAULT(" + column_name + ")";
 }
 
 // ============ 54_dml：MERGE 语句 ============

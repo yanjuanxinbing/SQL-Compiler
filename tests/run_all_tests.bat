@@ -157,6 +157,25 @@ set /a FAILED = FAILED + 1
 set "FAILED_TESTS=!FAILED_TESTS! 62_debug_meta!"
 :debug_meta_done
 
+REM ---- Phase F: TokenTypeToString completeness smoke test (80_tokens_complete) ----
+REM 80_tokens_complete feeds a SELECT ... ORDER BY gpa DESC into the REPL, then
+REM runs \.tokens and verifies that the printed tokens include [KEYWORD_DESC]
+REM and do NOT contain any [UNKNOWN] entry. Catches the TokenTypeToString
+REM fallback-to-UNKNOWN bug that hid DESC (and 130+ other keywords).
+echo.
+echo [ RUN  ] tokens_complete (run_tokens_complete.bat)
+call "%SCRIPT_DIR%run_tokens_complete.bat" > nul 2>&1
+set "TOKENS_COMPLETE_EXITCODE=!errorlevel!"
+if !TOKENS_COMPLETE_EXITCODE! neq 0 goto :tokens_complete_fail
+set /a PASSED = PASSED + 1
+echo  [ OK ]
+goto :tokens_complete_done
+:tokens_complete_fail
+echo [FAIL] (tokens_complete exit=!TOKENS_COMPLETE_EXITCODE!)
+set /a FAILED = FAILED + 1
+set "FAILED_TESTS=!FAILED_TESTS! 80_tokens_complete!"
+:tokens_complete_done
+
 echo.
 echo ==========================================
 echo   Summary:  !PASSED! passed,  !FAILED! failed

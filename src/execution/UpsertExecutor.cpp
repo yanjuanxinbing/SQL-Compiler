@@ -290,14 +290,18 @@ void UpsertExecutor::UpdateConflictingRow(const std::vector<Value>& candidate_va
         CheckUniqueIndexes(context_->GetCatalog(), *info, row_snapshot, &existing_rid);
     }
     // Phase A：把当前事务挂到堆/索引上。
+    // 同 UpdateExecutor：UpdateTuple 在行增长时走 delete+insert，RID 会变；
+    // 必须用 out_new_rid 让 InsertIntoIndexes 指向新 slot，否则后续
+    // 命中 PK 时 exclude_rid 校验失败。
     Transaction* txn = context_->GetTransaction();
     DeleteFromIndexes(context_->GetCatalog(), *info, cur.GetValues(), existing_rid, txn);
     heap->SetActiveTransaction(txn);
-    bool ok = heap->UpdateTuple(existing_rid, new_t, column_types_);
+    RID new_rid = existing_rid;
+    bool ok = heap->UpdateTuple(existing_rid, new_t, column_types_, &new_rid);
     heap->SetActiveTransaction(nullptr);
     if (ok) {
         InsertIntoIndexes(context_->GetCatalog(), *info,
-                          new_t.GetValues(), existing_rid, txn);
+                          new_t.GetValues(), new_rid, txn);
         EmitReturning(new_t);
     } else {
         // 写堆失败：把刚摘掉的旧键放回去，避免索引凭空少一条

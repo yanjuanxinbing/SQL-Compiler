@@ -65,6 +65,11 @@ private:
     std::vector<Value> EvalExprList(const std::vector<ExprPtr>& exprs,
                                      const Tuple& tuple);
 
+    // 评估单个表达式；对 ColumnRefExpr / FunctionCallExpr 优先按 cmap 取值，
+    // 解决 ORDER BY / PARTITION BY 引用聚合输出（如 `ORDER BY sum(o.total)`）
+    // 时 ExpressionEvaluator 把聚合函数当未知函数返回 NULL 的问题。
+    Value EvalAggExpr(const ExprPtr& e, const Tuple& tuple) const;
+
     // 在分区内计算 window function（行索引在 partition.ordered_indices 内的位置 pos）
     Value ComputeWindowValue(const std::string& func_name,
                              const std::vector<ExprPtr>& args,

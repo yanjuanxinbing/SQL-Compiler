@@ -259,9 +259,26 @@ std::string UpperName(const std::string& s) {
 }
 
 // 把 Value 规范化为 double（INT 提升为 FLOAT 的实际值）
+// VARCHAR 视为 DECIMAL 数值文本，按 std::stod 解析——与 ValueToFloat
+// 行为一致；解析失败返回 0.0。这一改动让 ROUND/CEIL/FLOOR/POWER/MOD
+// 等函数对 DECIMAL 列直接生效（旧实现 VARCHAR → 0 让结果全部清零）。
 double ValueToDouble(const Value& v) {
     if (v.GetType() == ValueType::INTEGER) return static_cast<double>(v.AsInt());
     if (v.GetType() == ValueType::FLOAT) return v.AsFloat();
+    if (v.GetType() == ValueType::VARCHAR) {
+        try {
+            size_t pos = 0;
+            std::string s = v.AsVarchar();
+            while (pos < s.size() &&
+                   std::isspace(static_cast<unsigned char>(s[pos]))) {
+                ++pos;
+            }
+            if (pos >= s.size()) return 0.0;
+            return std::stod(s, &pos);
+        } catch (...) {
+            return 0.0;
+        }
+    }
     return 0.0;
 }
 
@@ -428,6 +445,12 @@ Value ExpressionEvaluator::Evaluate(const ExprPtr& expr, const Tuple& tuple) con
         case NodeType::NEXTVAL_EXPR:
             // 53_ddl: NEXTVAL FOR sequence_name —— 原子推进并返回当前值。
             return EvaluateNextval(*static_cast<const NextvalExpr*>(expr.get()));
+        case NodeType::DEFAULT_EXPR:
+            // INSERT ... VALUES (..., DEFAULT) 占位节点 —— 仅在 INSERT
+            // 路径上由 InsertExecutor 识别并替换为对应列的 default_expr。
+            // 任何其它出现位置都视为语法/语义错误，让上层抛错；evaluator
+            // 安全起见返回 NULL。
+            return Value::MakeNull();
         default:
             return Value::MakeNull();
     }
@@ -589,10 +612,44 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
         if (v.GetType() == ValueType::INTEGER) return static_cast<double>(v.AsInt());
         return v.AsFloat();
     };
+    // bug4_decimal: DECIMAL 在运行期持久化为 VARCHAR（见 ValueTypeFromString）。
+    // 当一侧是 VARCHAR（DECIMAL/DATE/TIMESTAMP/数值文本）时，把两侧解析为
+    // double 计算，结果按十进制文本输出（保留 DECIMAL 精度语义）。这避免了
+    // 旧逻辑在「DECIMAL + INT」时掉到 INTEGER 分支、用 AsInt()（VARCHAR 上
+    // 恒为 0）参与运算导致的「val + 10 → 10 / val * 2 → 0」类回归。
+    auto EvalDecimalArith = [&](BinaryOperator op) -> Value {
+        if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+        double lv = ValueToFloat(l);
+        double rv = ValueToFloat(r);
+        double out = 0.0;
+        switch (op) {
+            case BinaryOperator::ADD: out = lv + rv; break;
+            case BinaryOperator::SUB: out = lv - rv; break;
+            case BinaryOperator::MUL: out = lv * rv; break;
+            case BinaryOperator::DIV:
+                if (rv == 0.0) return Value::MakeNull();
+                out = lv / rv;
+                break;
+            case BinaryOperator::MOD:
+                if (rv == 0.0) return Value::MakeNull();
+                // SQL MOD：余数符号跟随被除数；C++ fmod 跟随左操作数，
+                // 故手动实现 floor 取模与 SQL 标准一致。
+                out = lv - std::floor(lv / rv) * rv;
+                break;
+            default:
+                return Value::MakeNull();
+        }
+        return Value::MakeVarchar(FormatDecimal(out));
+    };
     switch (expr.op) {
         case BinaryOperator::ADD: {
             // SQL 三值逻辑：算术任一操作数为 NULL 则结果为 NULL。
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            // bug4_decimal: VARCHAR 操作数（DECIMAL/DATE 等按文本持久化的数值）
+            // 走十进制路径，避免掉到 INT 分支误读 AsInt()==0。
+            if (l.GetType() == ValueType::VARCHAR || r.GetType() == ValueType::VARCHAR) {
+                return EvalDecimalArith(BinaryOperator::ADD);
+            }
             if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
                 return Value::MakeFloat(ToDouble(l) + ToDouble(r));
             }
@@ -600,6 +657,9 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
         }
         case BinaryOperator::SUB: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (l.GetType() == ValueType::VARCHAR || r.GetType() == ValueType::VARCHAR) {
+                return EvalDecimalArith(BinaryOperator::SUB);
+            }
             if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
                 return Value::MakeFloat(ToDouble(l) - ToDouble(r));
             }
@@ -607,6 +667,9 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
         }
         case BinaryOperator::MUL: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (l.GetType() == ValueType::VARCHAR || r.GetType() == ValueType::VARCHAR) {
+                return EvalDecimalArith(BinaryOperator::MUL);
+            }
             if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
                 return Value::MakeFloat(ToDouble(l) * ToDouble(r));
             }
@@ -614,6 +677,9 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
         }
         case BinaryOperator::DIV: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (l.GetType() == ValueType::VARCHAR || r.GetType() == ValueType::VARCHAR) {
+                return EvalDecimalArith(BinaryOperator::DIV);
+            }
             if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
                 double rv = ToDouble(r);
                 if (rv == 0.0) return Value::MakeNull();
@@ -627,6 +693,9 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
             // SQL MOD：除数为 0 返回 NULL；余数符号跟随被除数（与 SQL 标准 MOD 一致，
             // 区别于 C/C++ 的 % 跟随左操作数；这里采用与函数式 MOD 相同的语义）。
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (l.GetType() == ValueType::VARCHAR || r.GetType() == ValueType::VARCHAR) {
+                return EvalDecimalArith(BinaryOperator::MOD);
+            }
             if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
                 double rv = ToDouble(r);
                 if (rv == 0.0) return Value::MakeNull();
@@ -702,6 +771,23 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
             return MakeBool(l.IsNull());
         case BinaryOperator::IS_NOT_NULL:
             return MakeBool(!l.IsNull());
+        // bug3_is_true: IS [NOT] TRUE/FALSE 走与 IS NULL 同形的"只看左操作数"
+        // 路径（右子树在 parser 留 nullptr），按 SQL:1999 三值逻辑：
+        //   IS TRUE       = IsTrue(l)    // TRUE iff operand 是 TRUE；NULL/FALSE -> false
+        //   IS FALSE      = IsFalse(l)   // TRUE iff operand 是 FALSE；NULL/TRUE -> false
+        //   IS NOT TRUE   = !IsTrue(l)   // TRUE iff operand 是 FALSE 或 NULL
+        //   IS NOT FALSE  = !IsFalse(l)  // TRUE iff operand 是 TRUE 或 NULL
+        // 与 IS NULL 不同的是：IS NULL 在 NULL 上返回 TRUE；而 IS TRUE/FALSE 在 NULL
+        // 上都返回 FALSE（NULL 既不是 TRUE 也不是 FALSE），这正是 IsTrue/IsFalse 助手
+        // 已经实现的语义（对 NULL 直接返回 false）。
+        case BinaryOperator::IS_TRUE:
+            return MakeBool(IsTrue(l));
+        case BinaryOperator::IS_FALSE:
+            return MakeBool(IsFalse(l));
+        case BinaryOperator::IS_NOT_TRUE:
+            return MakeBool(!IsTrue(l));
+        case BinaryOperator::IS_NOT_FALSE:
+            return MakeBool(!IsFalse(l));
         // 45_datetime: <date_or_ts> ± INTERVAL <n> <unit>
         // 左侧求值为日期/时间字符串（DATE/TIMESTAMP 列或字面量），右侧是
         // IntervalExprNode 节点。语义见 include/common/DateTime.h 顶部注释。
@@ -783,6 +869,11 @@ Value ExpressionEvaluator::EvaluateUnary(const UnaryExpr& expr, const Tuple& tup
             return MakeBool(!IsTruthy(v));
         case UnaryOperator::NEGATE:
             if (v.IsNull()) return Value::MakeNull();
+            // bug4_decimal: DECIMAL（VARCHAR）按文本持久化，按 ValueToFloat 解析
+            // 后以 VARCHAR 十进制文本回写，保持 DECIMAL 精度语义。
+            if (v.GetType() == ValueType::VARCHAR) {
+                return Value::MakeVarchar(FormatDecimal(-ValueToFloat(v)));
+            }
             if (v.GetType() == ValueType::FLOAT) return Value::MakeFloat(-v.AsFloat());
             return Value::MakeInt(-v.AsInt());
     }
@@ -829,7 +920,8 @@ Value ExpressionEvaluator::EvaluateCast(const CastExprNode& expr, const Tuple& t
     Value v = Evaluate(expr.expr, tuple);
     if (v.IsNull()) return Value::MakeNull();
     std::string target = UpperName(expr.target_type);
-    if (target == "INT" || target == "INTEGER" || target == "BIGINT") {
+    if (target == "INT" || target == "INTEGER" || target == "BIGINT" ||
+        target == "SMALLINT" || target == "TINYINT") {
         if (v.GetType() == ValueType::INTEGER) return v;
         if (v.GetType() == ValueType::FLOAT) {
             double d = v.AsFloat();
@@ -843,7 +935,8 @@ Value ExpressionEvaluator::EvaluateCast(const CastExprNode& expr, const Tuple& t
         }
         return Value::MakeNull();
     }
-    if (target == "FLOAT" || target == "DOUBLE" || target == "DECIMAL") {
+    if (target == "FLOAT" || target == "DOUBLE" || target == "REAL" ||
+        target == "DECIMAL" || target == "NUMERIC") {
         if (v.GetType() == ValueType::FLOAT) return v;
         if (v.GetType() == ValueType::INTEGER) {
             return Value::MakeFloat(static_cast<double>(v.AsInt()));
@@ -857,8 +950,26 @@ Value ExpressionEvaluator::EvaluateCast(const CastExprNode& expr, const Tuple& t
         }
         return Value::MakeNull();
     }
-    if (target == "VARCHAR" || target == "STRING" || target == "TEXT" || target == "CHAR") {
+    if (target == "VARCHAR" || target == "STRING" || target == "TEXT" ||
+        target == "CHAR" || target == "DATE" || target == "TIMESTAMP" ||
+        target == "TIME" || target == "JSON" || target == "UUID") {
         return Value::MakeVarchar(v.ToString());
+    }
+    if (target == "BOOLEAN" || target == "BOOL") {
+        // SQL 风格：非零数字 / 非空字符串 / 非空 timestamp 均视为 TRUE。
+        // NULL / 0 / 空串视为 FALSE。已是 INTEGER 则直接转 BOOL。
+        // 注：底层没有 BOOL ValueType；MakeBool（见上方匿名命名空间）
+        // 把 bool 映射为 INTEGER 0/1，与 IS TRUE / 比较 / 输出层一致。
+        if (v.GetType() == ValueType::INTEGER) {
+            return MakeBool(v.AsInt() != 0);
+        }
+        if (v.GetType() == ValueType::FLOAT) {
+            return MakeBool(v.AsFloat() != 0.0);
+        }
+        if (v.GetType() == ValueType::VARCHAR) {
+            return MakeBool(!v.AsVarchar().empty());
+        }
+        return MakeBool(false);
     }
     return Value::MakeNull();
 }
@@ -920,6 +1031,23 @@ Value ExpressionEvaluator::EvaluateFunctionCall(const FunctionCallExpr& expr,
         if (v.IsNull()) return Value::MakeNull();
         return Value::MakeInt(static_cast<int32_t>(v.ToString().size()));
     }
+    // typeof(expr) —— 返回表达式求值结果的运行期类型名（VARCHAR）。
+    // 取的是 ValueType 而非 IsNull()：NULL 值的类型本身就是 NULL，
+    // 故 typeof(NULL) 返回 'NULL'，不传播 NULL。这是与 SQLite/MySQL
+    // 的 typeof() 一致的语义。注意：字符串字面量 / DECIMAL / DATE /
+    // TIMESTAMP 等在运行时统一表现为 VARCHAR，因此 typeof('hi') 与
+    // typeof(CAST(x AS DATE)) 都返回 'VARCHAR'。
+    if (name == "TYPEOF") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        switch (v.GetType()) {
+            case ValueType::INTEGER: return Value::MakeVarchar("INTEGER");
+            case ValueType::FLOAT:   return Value::MakeVarchar("FLOAT");
+            case ValueType::VARCHAR: return Value::MakeVarchar("VARCHAR");
+            case ValueType::NULL_TYPE: return Value::MakeVarchar("NULL");
+        }
+        return Value::MakeVarchar("NULL");
+    }
     if (name == "SUBSTR" || name == "SUBSTRING") {
         if (expr.arguments.size() < 2 || expr.arguments.size() > 3) return Value::MakeNull();
         Value v = Evaluate(expr.arguments[0], tuple);
@@ -971,6 +1099,90 @@ Value ExpressionEvaluator::EvaluateFunctionCall(const FunctionCallExpr& expr,
             out.append(s, pos, hit - pos);
             out.append(to);
             pos = hit + from.size();
+        }
+        return Value::MakeVarchar(std::move(out));
+    }
+    // ---- 字符串函数补全（Fix #3）----
+    // REVERSE / STARTS_WITH / LTRIM / RTRIM 旧实现未命中，落到 UDF
+    // fallback → NULL。Planner 的 IsStringFuncName 已接受这些名字。
+    // 全部遵循「NULL 入参 → NULL」语义，与 TRIM/REPLACE 等一致。
+    if (name == "REVERSE") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        std::string s = v.ToString();
+        std::reverse(s.begin(), s.end());
+        return Value::MakeVarchar(std::move(s));
+    }
+    // STARTS_WITH(s, prefix)：按 PostgreSQL 语义：prefix 为空串时返回 TRUE，
+    // s 长度不足时返回 FALSE。任一参数为 NULL → NULL。返回 INT(0/1)
+    // 形式以便与其它谓词函数在 SELECT 列表里行为一致。
+    if (name == "STARTS_WITH") {
+        if (expr.arguments.size() != 2) return Value::MakeNull();
+        Value s = Evaluate(expr.arguments[0], tuple);
+        Value p = Evaluate(expr.arguments[1], tuple);
+        if (s.IsNull() || p.IsNull()) return Value::MakeNull();
+        const std::string ss = s.ToString();
+        const std::string pp = p.ToString();
+        return MakeBool(ss.size() >= pp.size() &&
+                        ss.compare(0, pp.size(), pp) == 0);
+    }
+    if (name == "LTRIM") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        const std::string s = v.ToString();
+        size_t b = 0;
+        while (b < s.size() &&
+               std::isspace(static_cast<unsigned char>(s[b]))) {
+            ++b;
+        }
+        return Value::MakeVarchar(s.substr(b));
+    }
+    if (name == "RTRIM") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        const std::string s = v.ToString();
+        size_t e = s.size();
+        while (e > 0 &&
+               std::isspace(static_cast<unsigned char>(s[e - 1]))) {
+            --e;
+        }
+        return Value::MakeVarchar(s.substr(0, e));
+    }
+    // ---- Fix #4: CONCAT / CONCAT_WS 函数（MySQL 兼容）----
+    // 旧实现里 CONCAT 函数调用落到 UDF fallback → NULL；CONCAT_WS
+    // 完全没登记。这里走 MySQL 语义：跳过 NULL 参数；CONCAT_WS 第一个
+    // 参数为分隔符，分隔符 NULL 整体 NULL，全 NULL 参数 → 空串。
+    //
+    // 注意：`||` 操作符（BinaryOperator::CONCAT，EvaluateBinary:706-710）
+    // 保持 SQL 标准（任一 NULL → NULL）不变。函数调用与操作符是两条
+    // 独立路径，行为可以不同。
+    if (name == "CONCAT") {
+        if (expr.arguments.size() < 2) return Value::MakeNull();
+        std::string out;
+        for (const auto& a : expr.arguments) {
+            Value v = Evaluate(a, tuple);
+            if (v.IsNull()) continue;  // MySQL: ignore NULL
+            out += v.ToString();
+        }
+        return Value::MakeVarchar(std::move(out));
+    }
+    if (name == "CONCAT_WS") {
+        // 至少 sep + 1 个值（≥ 2 参数）。
+        if (expr.arguments.size() < 2) return Value::MakeNull();
+        Value sep = Evaluate(expr.arguments[0], tuple);
+        if (sep.IsNull()) return Value::MakeNull();  // 分隔符 NULL → 整体 NULL
+        const std::string s = sep.ToString();
+        std::string out;
+        bool first = true;
+        for (size_t i = 1; i < expr.arguments.size(); ++i) {
+            Value v = Evaluate(expr.arguments[i], tuple);
+            if (v.IsNull()) continue;  // MySQL: ignore NULL（非分隔符）
+            if (!first) out += s;
+            out += v.ToString();
+            first = false;
         }
         return Value::MakeVarchar(std::move(out));
     }
@@ -1051,6 +1263,69 @@ Value ExpressionEvaluator::EvaluateFunctionCall(const FunctionCallExpr& expr,
         double r = av - std::floor(av / bv) * bv;
         if (r < 0) r += bv;  // 与 SQL MOD 一致：返回非负余数
         return Value::MakeInt(static_cast<int32_t>(r));
+    }
+    // ---- 数学函数补全（Fix #2）----
+    // 旧实现里 SQRT/EXP/LOG/LOG10/SIGN/TRUNCATE 等只在 Planner 的
+    // IsMathFuncName 中登记，EvaluateFunctionCall 没有对应分支 → 落到
+    // UDF fallback 找不到同名函数 → 永远返回 NULL。补齐后所有这些函数
+    // 对字面量和列引用都生效；NULL 入参 → NULL；非法域（负数开方、LOG
+    // 非正数）也按 SQL 标准返回 NULL。
+    if (name == "SQRT") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        double x = ValueToDouble(v);
+        if (x < 0.0) return Value::MakeNull();
+        return Value::MakeFloat(std::sqrt(x));
+    }
+    if (name == "EXP") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        return Value::MakeFloat(std::exp(ValueToDouble(v)));
+    }
+    // LN / 单参 LOG：自然对数。PostgreSQL/MySQL 的两参 LOG(base, x) 走 Power(x, 1/base) 派生
+    // 不在本期范围，留作未来扩展点。
+    if (name == "LN" || (name == "LOG" && expr.arguments.size() == 1)) {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        double x = ValueToDouble(v);
+        if (x <= 0.0) return Value::MakeNull();
+        return Value::MakeFloat(std::log(x));
+    }
+    if (name == "LOG10") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        double x = ValueToDouble(v);
+        if (x <= 0.0) return Value::MakeNull();
+        return Value::MakeFloat(std::log10(x));
+    }
+    // SIGN(-5) = -1, SIGN(0) = 0, SIGN(7) = 1；输入 INTEGER → 输出 INTEGER，
+    // 与 ABS（ExpressionEvaluator.cpp:1125-1135）类型保留规则对齐。
+    if (name == "SIGN") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        double x = ValueToDouble(v);
+        int32_t sgn = (x > 0.0) ? 1 : ((x < 0.0) ? -1 : 0);
+        if (v.GetType() == ValueType::INTEGER) return Value::MakeInt(sgn);
+        return Value::MakeFloat(static_cast<double>(sgn));
+    }
+    // TRUNCATE(x, n) / TRUNC(x, n)：向零截断到 n 位小数。与 ROUND
+    // （EvaluateFunctionCall:1095）保留同形：n==0 → INTEGER，否则 FLOAT。
+    if (name == "TRUNCATE" || name == "TRUNC") {
+        if (expr.arguments.size() != 2) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        Value d = Evaluate(expr.arguments[1], tuple);
+        if (v.IsNull() || d.IsNull()) return Value::MakeNull();
+        int n = d.AsInt();
+        double x = ValueToDouble(v);
+        double factor = std::pow(10.0, n);
+        double r = std::trunc(x * factor) / factor;
+        if (n == 0) return Value::MakeInt(static_cast<int32_t>(r));
+        return Value::MakeFloat(r);
     }
     // ---- 日期/时间函数 ----
     if (name == "YEAR" || name == "MONTH" || name == "DAY") {

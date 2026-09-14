@@ -26,7 +26,17 @@ void SortExecutor::Init() {
         entry.keys.reserve(order_items_.size());
         entry.ascending.reserve(order_items_.size());
         for (const auto& ob : order_items_) {
-            if (!ob.expr) {
+            // SQL 标准「位置式 ORDER BY」：1-based 列位置。
+            // Planner 已把正整数 LiteralExpr 翻成 column_index；直接按位置
+            // 取值，跳过 cmap / expression-evaluator 路径。
+            if (ob.column_index > 0) {
+                size_t pos = static_cast<size_t>(ob.column_index - 1);
+                if (pos < t.ColumnCount()) {
+                    entry.keys.push_back(t.GetValue(pos));
+                } else {
+                    entry.keys.push_back(Value::MakeNull());
+                }
+            } else if (!ob.expr) {
                 entry.keys.push_back(Value::MakeNull());
             } else {
                 entry.keys.push_back(eval.Evaluate(ob.expr, t));

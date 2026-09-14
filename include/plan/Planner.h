@@ -114,6 +114,19 @@ private:
     // 最后用 UNION ALL 把它们合并。scan_input 是 FROM + WHERE + JOIN
     // 链已经建好的子计划；HAVING 复制到每个子 SELECT 内部。
     PlanNodePtr PlanGroupingSets(const SelectStatement& stmt, PlanNodePtr scan_input);
+
+    // ---- Bug 12: SELECT list 中 * 出现在其他表达式旁时的列展开 ----
+    // parser 把 * 记为 FunctionCallExpr("*", [])，ProjectExecutor 单独处理
+    // `SELECT *`（全表透传）时正确，但当 select_list 含有其他表达式时（如
+    // `SELECT 'X' AS c, * FROM p`），* 被当作普通函数调用走 EvaluateFunctionCall
+    // 返回 1，导致输出列错位。该方法在 Planner 阶段把 select_list 中的 *
+    // 原地展开为 from_table + joins 的所有列对应的 ColumnRefExpr 列表，
+    // 同步扩展 select_aliases（每列以自身列名作为别名）；这样下游 Project /
+    // Window 节点收到的 select_list 与最终输出列一一对应，cmap 映射无需修正。
+    // 仅在 from_table 非空（且无 derived_table / derived_set_op / values_rows）
+    // 时展开；其余情况保留 * 走既有路径（ProjectExecutor 的 pass-through 或
+    // WindowExecutor 的子 Tuple 透传），避免破坏 VALUES / 派生表 / UNION 链路。
+    void ExpandSelectStarInList(SelectStatement& stmt);
 };
 
 }  // namespace sqlcompiler

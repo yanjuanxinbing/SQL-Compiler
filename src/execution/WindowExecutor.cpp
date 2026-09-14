@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <sstream>
 #include <unordered_map>
 
 #include "execution/ExpressionEvaluator.h"
@@ -23,6 +24,33 @@ bool IsAggregateFunc(const std::string& name) {
            u == "MIN" || u == "MAX";
 }
 
+// 把任意 Value 转成 double 用于窗口聚合累加。DECIMAL 在本引擎里运行时
+// 是 VARCHAR（无独立 TypeId），按 double 文本解析后才能参与 SUM/AVG；
+// 直接调 Value::AsFloat/AsInt 对 VARCHAR 返回 0，window SUM(DECIMAL)
+// 因此全部归零——这是 bug1 的根因。该 helper 与 AggregateExecutor.cpp 的
+// NumericAsDouble 同源，避免重复实现不一致。
+double NumericAsDouble(const Value& v) {
+    if (v.GetType() == ValueType::FLOAT) return v.AsFloat();
+    if (v.GetType() == ValueType::INTEGER) {
+        return static_cast<double>(v.AsInt());
+    }
+    if (v.GetType() == ValueType::VARCHAR) {
+        try {
+            size_t pos = 0;
+            std::string s = v.AsVarchar();
+            while (pos < s.size() &&
+                   std::isspace(static_cast<unsigned char>(s[pos]))) {
+                ++pos;
+            }
+            if (pos >= s.size()) return 0.0;
+            return std::stod(s, &pos);
+        } catch (...) {
+            return 0.0;
+        }
+    }
+    return 0.0;
+}
+
 // 从表达式中提取内层 FUNCTION_CALL_EXPR（用于 LAG(x), SUM(salary) 等）
 ExprPtr FindFirstFunctionCall(const ExprPtr& expr) {
     if (!expr) return nullptr;
@@ -37,6 +65,159 @@ ExprPtr FindFirstFunctionCall(const ExprPtr& expr) {
         return FindFirstFunctionCall(std::static_pointer_cast<UnaryExpr>(expr)->operand);
     }
     return nullptr;
+}
+
+// 把任意 Value 序列化为 LiteralExpr，让 ExpressionEvaluator 直接读
+// LiteralExpr 求得该 Value。仅用于 WindowFuncNode 的替代——缓存的
+// 窗口结果在调 ExpressionEvaluator 之前替换为字面量。
+ExprPtr MakeLiteralFromValue(const Value& v) {
+    if (v.IsNull()) {
+        return std::make_shared<LiteralExpr>(LiteralType::NULL_VALUE, "NULL");
+    }
+    switch (v.GetType()) {
+        case ValueType::INTEGER:
+            return std::make_shared<LiteralExpr>(
+                LiteralType::INTEGER, std::to_string(v.AsInt()));
+        case ValueType::FLOAT: {
+            std::ostringstream oss;
+            oss << v.AsFloat();
+            return std::make_shared<LiteralExpr>(LiteralType::FLOAT, oss.str());
+        }
+        case ValueType::VARCHAR:
+            return std::make_shared<LiteralExpr>(LiteralType::STRING, v.AsVarchar());
+        default:
+            return std::make_shared<LiteralExpr>(LiteralType::NULL_VALUE, "NULL");
+    }
+}
+
+// 递归遍历 expr，收集所有 WindowFuncNode 指针（含嵌套在 BINARY/UNARY/
+// FUNCTION_CALL/CASE/CAST/LIKE 等子节点里的窗口函数）。旧实现只在
+// select_list_ 的顶层 SELECT 项做 IsWindowExpr(e) 探测，导致
+// `val + LAG(val) OVER (...)` 这种把窗口函数嵌在 BinaryExpr 内部
+// 的写法完全不被识别，wf_cache 为空，下游 ExpressionEvaluator 遇到
+// WINDOW_FUNC_EXPR 又落到 default → NULL，结果整列空。
+void CollectWindowFuncs(const ExprPtr& e,
+                        std::vector<ExprPtr>& out) {
+    if (!e) return;
+    switch (e->GetType()) {
+        case NodeType::WINDOW_FUNC_EXPR:
+            out.push_back(e);
+            break;
+        case NodeType::BINARY_EXPR: {
+            auto b = std::static_pointer_cast<BinaryExpr>(e);
+            CollectWindowFuncs(b->left, out);
+            CollectWindowFuncs(b->right, out);
+            break;
+        }
+        case NodeType::UNARY_EXPR:
+            CollectWindowFuncs(
+                std::static_pointer_cast<UnaryExpr>(e)->operand, out);
+            break;
+        case NodeType::FUNCTION_CALL_EXPR: {
+            auto f = std::static_pointer_cast<FunctionCallExpr>(e);
+            for (auto& a : f->arguments) CollectWindowFuncs(a, out);
+            CollectWindowFuncs(f->filter_expr, out);
+            break;
+        }
+        case NodeType::CASE_EXPR: {
+            auto c = std::static_pointer_cast<CaseExprNode>(e);
+            CollectWindowFuncs(c->subject, out);
+            for (auto& w : c->whens) {
+                CollectWindowFuncs(w.when_expr, out);
+                CollectWindowFuncs(w.then_expr, out);
+            }
+            CollectWindowFuncs(c->else_expr, out);
+            break;
+        }
+        case NodeType::CAST_EXPR:
+            CollectWindowFuncs(
+                std::static_pointer_cast<CastExprNode>(e)->expr, out);
+            break;
+        case NodeType::LIKE_EXPR: {
+            auto l = std::static_pointer_cast<LikeExprNode>(e);
+            CollectWindowFuncs(l->operand, out);
+            CollectWindowFuncs(l->pattern, out);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// 把表达式树里所有 WINDOW_FUNC_EXPR 替换为对应缓存值的 LiteralExpr。
+// 顶层 SELECT 项本身是 WindowFuncNode 的不被替换（仍走 wf_cache 取值），
+// 嵌在其它表达式里的则被改写为字面量，从而让 ExpressionEvaluator 走
+// 通用算术/比较路径，避免 default → NULL。
+ExprPtr SubstituteWindowFuncs(
+    const ExprPtr& e,
+    const std::unordered_map<const WindowFuncNode*, Value>& cache) {
+    if (!e) return nullptr;
+    if (e->GetType() == NodeType::WINDOW_FUNC_EXPR) {
+        auto wf = std::static_pointer_cast<WindowFuncNode>(e);
+        auto it = cache.find(wf.get());
+        if (it == cache.end()) return e;
+        return MakeLiteralFromValue(it->second);
+    }
+    switch (e->GetType()) {
+        case NodeType::BINARY_EXPR: {
+            auto b = std::static_pointer_cast<BinaryExpr>(e);
+            return std::make_shared<BinaryExpr>(
+                b->op,
+                SubstituteWindowFuncs(b->left, cache),
+                SubstituteWindowFuncs(b->right, cache));
+        }
+        case NodeType::UNARY_EXPR: {
+            auto u = std::static_pointer_cast<UnaryExpr>(e);
+            return std::make_shared<UnaryExpr>(
+                u->op, SubstituteWindowFuncs(u->operand, cache));
+        }
+        case NodeType::FUNCTION_CALL_EXPR: {
+            auto f = std::static_pointer_cast<FunctionCallExpr>(e);
+            std::vector<ExprPtr> new_args;
+            new_args.reserve(f->arguments.size());
+            for (auto& a : f->arguments) {
+                new_args.push_back(SubstituteWindowFuncs(a, cache));
+            }
+            auto nf = std::make_shared<FunctionCallExpr>(
+                f->function_name, std::move(new_args));
+            nf->is_distinct = f->is_distinct;
+            nf->table_qualifier = f->table_qualifier;
+            nf->filter_expr = SubstituteWindowFuncs(f->filter_expr, cache);
+            return nf;
+        }
+        case NodeType::CASE_EXPR: {
+            auto c = std::static_pointer_cast<CaseExprNode>(e);
+            auto nc = std::make_shared<CaseExprNode>();
+            nc->subject = SubstituteWindowFuncs(c->subject, cache);
+            nc->whens.reserve(c->whens.size());
+            for (auto& w : c->whens) {
+                CaseWhen nw;
+                nw.when_expr = SubstituteWindowFuncs(w.when_expr, cache);
+                nw.then_expr = SubstituteWindowFuncs(w.then_expr, cache);
+                nc->whens.push_back(std::move(nw));
+            }
+            nc->else_expr = SubstituteWindowFuncs(c->else_expr, cache);
+            return nc;
+        }
+        case NodeType::CAST_EXPR: {
+            auto c = std::static_pointer_cast<CastExprNode>(e);
+            auto nc = std::make_shared<CastExprNode>(
+                SubstituteWindowFuncs(c->expr, cache), c->target_type);
+            nc->char_length = c->char_length;
+            return nc;
+        }
+        case NodeType::LIKE_EXPR: {
+            auto l = std::static_pointer_cast<LikeExprNode>(e);
+            auto nl = std::make_shared<LikeExprNode>(
+                l->kind,
+                SubstituteWindowFuncs(l->operand, cache),
+                SubstituteWindowFuncs(l->pattern, cache),
+                l->escape_char, l->has_escape);
+            return nl;
+        }
+        default:
+            return e;
+    }
 }
 
 // 窗口聚合（MAX / MIN / SUM / AVG / COUNT）的参数若本身就是聚合调用
@@ -104,13 +285,48 @@ WindowSpec WindowExecutor::ResolveSpec(const WindowFuncNode& wf) const {
 
 std::vector<Value> WindowExecutor::EvalExprList(const std::vector<ExprPtr>& exprs,
                                                 const Tuple& tuple) {
-    ExpressionEvaluator eval(column_index_map_, context_, nullptr);
     std::vector<Value> out;
     out.reserve(exprs.size());
     for (const auto& e : exprs) {
-        out.push_back(e ? eval.Evaluate(e, tuple) : Value::MakeNull());
+        out.push_back(e ? EvalAggExpr(e, tuple) : Value::MakeNull());
     }
     return out;
+}
+
+Value WindowExecutor::EvalAggExpr(const ExprPtr& e, const Tuple& tuple) const {
+    // Bug 8：WindowSpec.order_by / partition_by 表达式经常指向
+    // AggregateExecutor 已经物化的列，例如
+    //   `ORDER BY sum(o.total) DESC`  在 `GROUP BY ... ORDER BY sum(o.total)`
+    //   之后，`sum` 这个名字已经被 ExecutionEngine 在 AggregateNode 子计划时
+    //   注册到 column_index_map 中（position -> sum 列）。ExpressionEvaluator
+    //   直接 EvaluateFunctionCall 会落入"未实现"分支并返回 NULL，从而让所有
+    //   排序键都是 NULL，最终 RANK/DENSE_RANK 把整分区压成 rank=1。
+    //
+    // 这里先按 (column name / qualified name / function name) 在 cmap 中查
+    // 一次，命中则直接返回该位置的值；未命中再走常规 ExpressionEvaluator。
+    if (!e) return Value::MakeNull();
+    if (e->GetType() == NodeType::COLUMN_REF_EXPR) {
+        auto cr = std::static_pointer_cast<ColumnRefExpr>(e);
+        auto it = column_index_map_.find(cr->column_name);
+        if (it != column_index_map_.end() && it->second < tuple.ColumnCount()) {
+            return tuple.GetValue(it->second);
+        }
+        if (!cr->table_name.empty()) {
+            std::string qk = cr->table_name + "." + cr->column_name;
+            auto itq = column_index_map_.find(qk);
+            if (itq != column_index_map_.end() && itq->second < tuple.ColumnCount()) {
+                return tuple.GetValue(itq->second);
+            }
+        }
+    } else if (e->GetType() == NodeType::FUNCTION_CALL_EXPR) {
+        auto fc = std::static_pointer_cast<FunctionCallExpr>(e);
+        auto it = column_index_map_.find(fc->function_name);
+        if (it != column_index_map_.end() && it->second < tuple.ColumnCount()) {
+            return tuple.GetValue(it->second);
+        }
+    }
+    ExpressionEvaluator eval(column_index_map_, context_, nullptr);
+    return eval.Evaluate(e, tuple);
 }
 
 void WindowExecutor::Init() {
@@ -157,7 +373,7 @@ void WindowExecutor::Init() {
         keys.reserve(primary.partition_by.size());
         std::string key_str;
         for (const auto& pe : primary.partition_by) {
-            Value v = pe ? eval.Evaluate(pe, t) : Value::MakeNull();
+            Value v = pe ? EvalAggExpr(pe, t) : Value::MakeNull();
             keys.push_back(v);
             key_str += v.ToString();
             key_str.push_back('\x1F');
@@ -194,7 +410,7 @@ void WindowExecutor::Init() {
             ent.keys.reserve(primary.order_by.size());
             ent.asc.reserve(primary.order_by.size());
             for (const auto& ob : primary.order_by) {
-                Value v = ob.expr ? eval.Evaluate(ob.expr, materialized_[ri]) : Value::MakeNull();
+                Value v = ob.expr ? EvalAggExpr(ob.expr, materialized_[ri]) : Value::MakeNull();
                 ent.keys.push_back(v);
                 ent.asc.push_back(ob.ascending);
             }
@@ -397,8 +613,9 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
             }
             if (!got) continue;
             any = true;
-            if (v.GetType() == ValueType::FLOAT) s += v.AsFloat();
-            else s += static_cast<double>(v.AsInt());
+            // bug1: 用 NumericAsDouble 兼容 DECIMAL（VARCHAR），
+            // 旧实现仅识别 FLOAT/INTEGER，导致 SUM(DECIMAL_col) OVER (...) 全 0。
+            s += NumericAsDouble(v);
         }
         if (!any) return Value::MakeNull();
         return Value::MakeFloat(s);
@@ -419,8 +636,8 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
             }
             if (!got) continue;
             ++cnt;
-            if (v.GetType() == ValueType::FLOAT) s += v.AsFloat();
-            else s += static_cast<double>(v.AsInt());
+            // bug1: 同 SUM，AVG(DECIMAL_col) OVER (...) 也需兼容 VARCHAR。
+            s += NumericAsDouble(v);
         }
         if (cnt == 0) return Value::MakeNull();
         return Value::MakeFloat(s / static_cast<double>(cnt));
@@ -474,7 +691,7 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
         std::vector<Value> cur_keys;
         cur_keys.reserve(spec.order_by.size());
         for (const auto& ob : spec.order_by) {
-            cur_keys.push_back(ob.expr ? eval.Evaluate(ob.expr,
+            cur_keys.push_back(ob.expr ? EvalAggExpr(ob.expr,
                 materialized_[partition.ordered_indices[pos]]) : Value::MakeNull());
         }
         int64_t first_pos = static_cast<int64_t>(pos);
@@ -482,7 +699,7 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
             std::vector<Value> k;
             k.reserve(spec.order_by.size());
             for (const auto& ob : spec.order_by) {
-                k.push_back(ob.expr ? eval.Evaluate(ob.expr,
+                k.push_back(ob.expr ? EvalAggExpr(ob.expr,
                     materialized_[partition.ordered_indices[i]]) : Value::MakeNull());
             }
             bool eq = true;
@@ -505,7 +722,7 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
         cur_keys.reserve(spec.order_by.size());
         cur_asc.reserve(spec.order_by.size());
         for (const auto& ob : spec.order_by) {
-            cur_keys.push_back(ob.expr ? eval.Evaluate(ob.expr,
+            cur_keys.push_back(ob.expr ? EvalAggExpr(ob.expr,
                 materialized_[partition.ordered_indices[pos]]) : Value::MakeNull());
             cur_asc.push_back(ob.ascending);
         }
@@ -514,7 +731,7 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
             std::vector<Value> k;
             k.reserve(spec.order_by.size());
             for (const auto& ob : spec.order_by) {
-                k.push_back(ob.expr ? eval.Evaluate(ob.expr,
+                k.push_back(ob.expr ? EvalAggExpr(ob.expr,
                     materialized_[partition.ordered_indices[i]]) : Value::MakeNull());
             }
             bool less = false;
@@ -555,7 +772,7 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
         std::vector<Value> cur_keys;
         cur_keys.reserve(spec.order_by.size());
         for (const auto& ob : spec.order_by) {
-            cur_keys.push_back(ob.expr ? eval.Evaluate(ob.expr,
+            cur_keys.push_back(ob.expr ? EvalAggExpr(ob.expr,
                 materialized_[partition.ordered_indices[pos]]) : Value::MakeNull());
         }
         int64_t less_cnt = 0;
@@ -563,7 +780,7 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
             std::vector<Value> k;
             k.reserve(spec.order_by.size());
             for (const auto& ob : spec.order_by) {
-                k.push_back(ob.expr ? eval.Evaluate(ob.expr,
+                k.push_back(ob.expr ? EvalAggExpr(ob.expr,
                     materialized_[partition.ordered_indices[i]]) : Value::MakeNull());
             }
             bool less = false;
@@ -585,7 +802,7 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
         std::vector<Value> cur_keys;
         cur_keys.reserve(spec.order_by.size());
         for (const auto& ob : spec.order_by) {
-            cur_keys.push_back(ob.expr ? eval.Evaluate(ob.expr,
+            cur_keys.push_back(ob.expr ? EvalAggExpr(ob.expr,
                 materialized_[partition.ordered_indices[pos]]) : Value::MakeNull());
         }
         int64_t le_cnt = 0;
@@ -593,7 +810,7 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
             std::vector<Value> k;
             k.reserve(spec.order_by.size());
             for (const auto& ob : spec.order_by) {
-                k.push_back(ob.expr ? eval.Evaluate(ob.expr,
+                k.push_back(ob.expr ? EvalAggExpr(ob.expr,
                     materialized_[partition.ordered_indices[i]]) : Value::MakeNull());
             }
             bool le = true;
@@ -721,14 +938,19 @@ bool WindowExecutor::Next(Tuple* tuple) {
     std::vector<Value> values;
     values.reserve(select_list_.size());
 
-    // 预先计算每个 WindowFuncNode 在该行上的结果（避免重复计算）
+    // 预先计算每个 WindowFuncNode 在该行上的结果（避免重复计算）。
+    // bug2: 不仅收集顶层 SELECT 项，还递归到 BINARY/UNARY/FUNCTION_CALL/
+    // CASE/CAST/LIKE 等子节点，确保 `val + LAG(val) OVER (...)` 这类把
+    // 窗口函数嵌在算术表达式内部的情况也能命中缓存。旧实现只在
+    // IsWindowExpr(e) 上做顶层探测，嵌在 BinaryExpr 里时 wf_cache 为空，
+    // ExpressionEvaluator 遇到 WINDOW_FUNC_EXPR 又落到 default → NULL。
     std::unordered_map<const WindowFuncNode*, Value> wf_cache;
-    for (const auto& e : select_list_) {
-        if (IsWindowExpr(e)) {
-            auto wf = std::static_pointer_cast<WindowFuncNode>(e);
-            if (wf_cache.find(wf.get()) == wf_cache.end()) {
-                wf_cache[wf.get()] = EvaluateWindowFunc(*wf, pos, p);
-            }
+    std::vector<ExprPtr> all_wf;
+    for (const auto& e : select_list_) CollectWindowFuncs(e, all_wf);
+    for (auto& wf_expr : all_wf) {
+        auto wf = std::static_pointer_cast<WindowFuncNode>(wf_expr);
+        if (wf_cache.find(wf.get()) == wf_cache.end()) {
+            wf_cache[wf.get()] = EvaluateWindowFunc(*wf, pos, p);
         }
     }
 
@@ -782,7 +1004,7 @@ bool WindowExecutor::Next(Tuple* tuple) {
         ext.reserve(materialized_[original_idx].ColumnCount() + values.size());
         for (const auto& v : materialized_[original_idx].GetValues()) ext.push_back(v);
         for (const auto& v : values) ext.push_back(v);
-        values.push_back(local_eval.Evaluate(e, Tuple(ext)));
+        values.push_back(local_eval.Evaluate(SubstituteWindowFuncs(e, wf_cache), Tuple(ext)));
     }
     if (tuple) *tuple = Tuple(std::move(values));
     ++cursor_;

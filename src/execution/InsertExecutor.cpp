@@ -23,6 +23,7 @@
 #include "execution/IndexMaintenance.h"
 #include "execution/ExpressionEvaluator.h"
 #include "execution/TriggerExecutor.h"
+#include "execution/TypeCoercion.h"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -31,62 +32,108 @@ namespace sqlcompiler {
 
 namespace {
 
-// 与 UpsertExecutor.cpp 中的同名函数保持一致：把值强制转换为与列声明一致的类型。
-Value CoerceToColumnType(const Value& v, const std::string& col_type) {
-    std::string up;
-    for (char c : col_type) up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-    if (up == "INT" || up == "INTEGER" || up == "BIGINT" ||
-        up == "SMALLINT" || up == "TINYINT" || up == "BOOLEAN" || up == "BOOL") {
-        if (v.IsNull()) return v;
-        if (v.GetType() == ValueType::INTEGER) return v;
-        if (v.GetType() == ValueType::FLOAT) return Value::MakeInt(static_cast<int32_t>(v.AsFloat()));
-        if (v.GetType() == ValueType::VARCHAR) {
-            try { return Value::MakeInt(static_cast<int32_t>(std::stoi(v.AsVarchar()))); } catch (...) { return Value::MakeInt(0); }
+// bug11: 校验 DEFAULT 表达式是「常量」——不允许列引用、子查询、VALUES(col)、
+// NEXTVAL（带副作用）、窗口函数等带上下文依赖或副作用的节点。
+// 与 AlterTableExecutor 中的同名校验逻辑保持完全一致；该函数在两处分别
+// 局部实现，避免跨 executor 共享的额外头文件依赖。
+void RequireConstantExpression(const ExprPtr& expr,
+                               const std::string& context_label) {
+    if (!expr) return;
+    switch (expr->GetType()) {
+        case NodeType::COLUMN_REF_EXPR:
+            throw CompilerException(
+                ErrorStage::SEMANTIC,
+                context_label + ": DEFAULT must be a constant expression "
+                "(column reference is not allowed)");
+        case NodeType::SUBQUERY_EXPR:
+            throw CompilerException(
+                ErrorStage::SEMANTIC,
+                context_label + ": DEFAULT must be a constant expression "
+                "(subquery is not allowed)");
+        case NodeType::UPSERT_VALUES_REF_EXPR:
+            throw CompilerException(
+                ErrorStage::SEMANTIC,
+                context_label + ": DEFAULT must be a constant expression "
+                "(VALUES(col) reference is not allowed)");
+        case NodeType::NEXTVAL_EXPR:
+            throw CompilerException(
+                ErrorStage::SEMANTIC,
+                context_label + ": DEFAULT must be a constant expression "
+                "(NEXTVAL has side effects and is not allowed)");
+        case NodeType::WINDOW_FUNC_EXPR:
+            throw CompilerException(
+                ErrorStage::SEMANTIC,
+                context_label + ": DEFAULT must be a constant expression "
+                "(window function is not allowed)");
+        case NodeType::BINARY_EXPR: {
+            const auto* b = static_cast<const BinaryExpr*>(expr.get());
+            RequireConstantExpression(b->left, context_label);
+            RequireConstantExpression(b->right, context_label);
+            return;
         }
-    } else if (up == "FLOAT" || up == "DOUBLE" || up == "REAL") {
-        if (v.IsNull()) return v;
-        if (v.GetType() == ValueType::FLOAT) return v;
-        if (v.GetType() == ValueType::INTEGER) return Value::MakeFloat(static_cast<double>(v.AsInt()));
-        if (v.GetType() == ValueType::VARCHAR) {
-            try { return Value::MakeFloat(std::stod(v.AsVarchar())); } catch (...) { return Value::MakeFloat(0.0); }
+        case NodeType::UNARY_EXPR: {
+            const auto* u = static_cast<const UnaryExpr*>(expr.get());
+            RequireConstantExpression(u->operand, context_label);
+            return;
         }
-    } else if (up == "DECIMAL" || up == "NUMERIC") {
-        if (v.IsNull()) return v;
-        if (v.GetType() == ValueType::VARCHAR) return v;
-        if (v.GetType() == ValueType::INTEGER) {
-            return Value::MakeVarchar(std::to_string(v.AsInt()));
+        case NodeType::FUNCTION_CALL_EXPR: {
+            const auto* f = static_cast<const FunctionCallExpr*>(expr.get());
+            for (const auto& a : f->arguments) {
+                RequireConstantExpression(a, context_label);
+            }
+            if (f->filter_expr) {
+                RequireConstantExpression(f->filter_expr, context_label);
+            }
+            for (const auto& o : f->within_group_order_by) {
+                RequireConstantExpression(o.expr, context_label);
+            }
+            return;
         }
-        if (v.GetType() == ValueType::FLOAT) {
-            return Value::MakeVarchar(FormatDecimal(v.AsFloat()));
+        case NodeType::CASE_EXPR: {
+            const auto* c = static_cast<const CaseExprNode*>(expr.get());
+            RequireConstantExpression(c->subject, context_label);
+            for (const auto& w : c->whens) {
+                RequireConstantExpression(w.when_expr, context_label);
+                RequireConstantExpression(w.then_expr, context_label);
+            }
+            RequireConstantExpression(c->else_expr, context_label);
+            return;
         }
-        return v;
+        case NodeType::CAST_EXPR: {
+            const auto* c = static_cast<const CastExprNode*>(expr.get());
+            RequireConstantExpression(c->expr, context_label);
+            return;
+        }
+        case NodeType::LIKE_EXPR: {
+            const auto* l = static_cast<const LikeExprNode*>(expr.get());
+            RequireConstantExpression(l->operand, context_label);
+            RequireConstantExpression(l->pattern, context_label);
+            return;
+        }
+        case NodeType::EXTRACT_EXPR: {
+            const auto* e = static_cast<const ExtractExprNode*>(expr.get());
+            RequireConstantExpression(e->source, context_label);
+            return;
+        }
+        case NodeType::INTERVAL_EXPR:
+            // INTERVAL 字面量节点本身不持有子表达式。
+            return;
+        default:
+            return;
     }
-    return v;
 }
 
+// bug11: 把 DEFAULT 表达式作为常量表达式求值——先用 RequireConstantExpression
+// 校验，然后用一个空 Tuple / 空 column_index_map 触发 ExpressionEvaluator
+// 的递归求值。
 Value EvaluateDefaultLiteral(const ExprPtr& default_expr,
                               const std::string& col_name) {
     if (!default_expr) return Value::MakeNull();
-    if (default_expr->GetType() != NodeType::LITERAL_EXPR) {
-        throw CompilerException(
-            ErrorStage::SEMANTIC,
-            "default expression not supported for column '" + col_name + "'");
-    }
-    const auto* lit = static_cast<const LiteralExpr*>(default_expr.get());
-    switch (lit->literal_type) {
-        case LiteralType::INTEGER:
-            return Value::MakeInt(static_cast<int32_t>(std::atoi(lit->value.c_str())));
-        case LiteralType::FLOAT:
-            return Value::MakeFloat(std::atof(lit->value.c_str()));
-        case LiteralType::STRING:
-            return Value::MakeVarchar(lit->value);
-        case LiteralType::NULL_VALUE:
-            return Value::MakeNull();
-        case LiteralType::BOOLEAN:
-            return Value::MakeInt(
-                (lit->value != "0" && lit->value != "false" && lit->value != "FALSE") ? 1 : 0);
-    }
-    return Value::MakeNull();
+    RequireConstantExpression(default_expr,
+        "default expression for column '" + col_name + "'");
+    const std::unordered_map<std::string, size_t> empty_map;
+    ExpressionEvaluator eval(empty_map);
+    return eval.Evaluate(default_expr, Tuple());
 }
 
 void ApplyDefaults(const TableInfo& info,
@@ -173,11 +220,13 @@ InsertExecutor::InsertExecutor(ExecutionContext* context, std::string table_name
                                 std::vector<std::string> columns,
                                 std::vector<std::vector<ExprPtr>> values_list,
                                 bool is_replace,
+                                bool is_default_values,
                                 std::vector<ExprPtr> returning_exprs,
                                 std::vector<std::string> returning_aliases)
     : Executor(context), table_name_(std::move(table_name)),
       columns_(std::move(columns)), values_list_(std::move(values_list)),
       is_replace_(is_replace),
+      is_default_values_(is_default_values),
       returning_exprs_(std::move(returning_exprs)),
       returning_aliases_(std::move(returning_aliases)),
       current_row_(0) {
@@ -196,6 +245,21 @@ InsertExecutor::InsertExecutor(ExecutionContext* context, std::string table_name
     if (query_plan) {
         ExecutionEngine engine(context_->GetCatalog());
         source_ = engine.BuildExecutor(query_plan, context_);
+        if (source_) {
+            // 在向目标表写入任何行之前先把源表全量快照下来。这一步解决
+            // `INSERT INTO t SELECT ... FROM t`（self-INSERT）的无限循环：
+            // 没有快照时 source_->Next() 在每次 InsertRow 之后都能再次读到
+            // 刚插入的行，于是无限增长。这里的源 SeqScan 已通过
+            // InsertExecutor::Init 触发，但 InsertExecutor::Init 还没有被
+            // 调用——需要手动驱动一次 Init。
+            source_->Init();
+            Tuple t;
+            while (source_->Next(&t)) {
+                materialized_rows_.push_back(t);
+            }
+            // 释放 source_，后续 Next() 不再触碰它。
+            source_.reset();
+        }
     }
 }
 
@@ -203,7 +267,8 @@ void InsertExecutor::Init() {
     current_row_ = 0;
     pending_returning_.clear();
     pending_pos_ = 0;
-    if (source_) source_->Init();
+    // source_ 在构造期已全量物化到 materialized_rows_ 并被 release，
+    // 这里不再调用 source_->Init()，否则会触发 nullptr->Init() 崩溃。
     // 60_view_trigger: 重置 STATEMENT 级 AFTER 触发器的"已 fire"标记。
     TriggerExecutor::ResetStatementFireState(context_);
 }
@@ -343,10 +408,13 @@ bool InsertExecutor::Next(Tuple* tuple) {
     pending_returning_.clear();
     pending_pos_ = 0;
 
-    // SELECT 路径：每次 Next 从 source_ 拉一行，按列映射写入目标表。
-    if (source_) {
-        Tuple src;
-        if (!source_->Next(&src)) return false;
+    // SELECT 路径：source_ 已在构造期全量物化到 materialized_rows_，
+    // 每次 Next 从缓冲拉一行，按列映射写入目标表。源 seqScan 已不再
+    // 被触碰——避免 INSERT INTO t SELECT ... FROM t 时「读到本语句刚
+    // 插入的行」导致的无限循环。
+    if (!materialized_rows_.empty() || current_row_ < materialized_rows_.size()) {
+        if (current_row_ >= materialized_rows_.size()) return false;
+        Tuple src = materialized_rows_[current_row_];
         const TableInfo* info = context_->GetCatalog()->GetTable(table_name_);
         if (!info) {
             throw CompilerException(ErrorStage::SEMANTIC, "table not found: " + table_name_);
@@ -392,6 +460,45 @@ bool InsertExecutor::Next(Tuple* tuple) {
     }
 
     // VALUES 路径：原行为保持不变。
+    // INSERT ... DEFAULT VALUES：单次发射，按 info->columns 大小构造一行
+    // DefaultExprNode，让现有 ApplyDefaults / 单列表达式求值路径复用。
+    if (is_default_values_) {
+        const TableInfo* info = context_->GetCatalog()->GetTable(table_name_);
+        if (!info) {
+            throw CompilerException(ErrorStage::SEMANTIC,
+                "table not found: " + table_name_);
+        }
+        // 限制只插入一次（即使上游重复 Next 也不重复）。
+        if (current_row_ > 0) return false;
+        std::vector<Value> row_values(info->columns.size());
+        // DEFAULT VALUES 不允许带显式列名（SQL 标准）：必须按表列序整行填。
+        if (!columns_.empty()) {
+            throw CompilerException(ErrorStage::SEMANTIC,
+                "INSERT ... DEFAULT VALUES does not allow a column list");
+        }
+        for (size_t i = 0; i < info->columns.size(); ++i) {
+            const auto& col = info->columns[i];
+            if (col.default_expr) {
+                // 重用 ApplyDefaults 内的 EvaluateDefaultLiteral 路径：
+                // RequireConstantExpression 校验 + 空 Tuple 求值，确保
+                // DEFAULT 内可使用 NOW / 字面量等常量函数，禁列引用。
+                row_values[i] = EvaluateDefaultLiteral(col.default_expr, col.name);
+            } else {
+                row_values[i] = Value::MakeNull();
+            }
+            row_values[i] = CoerceToColumnType(row_values[i], col.data_type);
+        }
+        InsertRow(row_values, is_replace_);
+        ++current_row_;
+        if (pending_pos_ < pending_returning_.size()) {
+            if (tuple) *tuple = pending_returning_[pending_pos_++];
+            return true;
+        }
+        if (tuple) {
+            *tuple = Tuple({Value::MakeInt(1)});
+        }
+        return true;
+    }
     if (current_row_ >= values_list_.size()) return false;
     const TableInfo* info = context_->GetCatalog()->GetTable(table_name_);
     if (!info) {
@@ -418,6 +525,31 @@ bool InsertExecutor::Next(Tuple* tuple) {
                 "INSERT column count mismatch for " + table_name_);
         }
         for (size_t i = 0; i < row_exprs.size(); ++i) {
+            // INSERT ... VALUES (..., DEFAULT) —— 当前位置显式写 DEFAULT
+            // 时，INSERT 阶段用该列的 DEFAULT 表达式（无 DEFAULT 时 NULL）。
+            // 等价于省略该列，但允许在部分列上显式列出的同时复用 DEFAULT。
+            // DEFAULT(col) 则按列名查找 default_expr（SQL 标准"取列 col 的默认值"）。
+            if (row_exprs[i] && row_exprs[i]->GetType() == NodeType::DEFAULT_EXPR) {
+                auto def = std::static_pointer_cast<DefaultExprNode>(row_exprs[i]);
+                const ColumnInfo* target = nullptr;
+                if (!def->column_name.empty()) {
+                    target = info->GetColumn(def->column_name);
+                    if (!target) {
+                        throw CompilerException(ErrorStage::SEMANTIC,
+                            "DEFAULT references unknown column: " + def->column_name);
+                    }
+                } else {
+                    target = &info->columns[i];
+                }
+                if (target->default_expr) {
+                    row_values[i] = EvaluateDefaultLiteral(target->default_expr,
+                                                          target->name);
+                } else {
+                    row_values[i] = Value::MakeNull();
+                }
+                row_values[i] = CoerceToColumnType(row_values[i], info->columns[i].data_type);
+                continue;
+            }
             Value v = eval.Evaluate(row_exprs[i], Tuple());
             row_values[i] = CoerceToColumnType(v, info->columns[i].data_type);
         }
@@ -429,6 +561,30 @@ bool InsertExecutor::Next(Tuple* tuple) {
                     "unknown column: " + columns_[i]);
             }
             const auto& target_col = info->columns[it->second];
+            // INSERT ... VALUES (..., DEFAULT) —— 在显式列列表里复用该列的
+            // DEFAULT 表达式（与省略该列语义相同）。DEFAULT(col) 按列名查 default。
+            if (row_exprs[i] && row_exprs[i]->GetType() == NodeType::DEFAULT_EXPR) {
+                auto def = std::static_pointer_cast<DefaultExprNode>(row_exprs[i]);
+                const ColumnInfo* src = nullptr;
+                if (!def->column_name.empty()) {
+                    src = info->GetColumn(def->column_name);
+                    if (!src) {
+                        throw CompilerException(ErrorStage::SEMANTIC,
+                            "DEFAULT references unknown column: " + def->column_name);
+                    }
+                } else {
+                    src = &target_col;
+                }
+                if (src->default_expr) {
+                    row_values[it->second] = EvaluateDefaultLiteral(src->default_expr,
+                                                                   src->name);
+                } else {
+                    row_values[it->second] = Value::MakeNull();
+                }
+                row_values[it->second] = CoerceToColumnType(
+                    row_values[it->second], target_col.data_type);
+                continue;
+            }
             Value v = eval.Evaluate(row_exprs[i], Tuple());
             row_values[it->second] = CoerceToColumnType(v, target_col.data_type);
         }

@@ -1,6 +1,7 @@
 #include "plan/Planner.h"
 
 #include "catalog/SystemCatalog.h"
+#include "common/Error.h"
 #include "lexer/Lexer.h"
 #include "parser/Parser.h"
 
@@ -319,6 +320,43 @@ std::vector<ExprPtr> CollectUniqueAggregates(const ExprPtr& expr,
     return out;
 }
 
+// 把 ORDER BY 字面量整数（位置式 ORDER BY）翻译为 column_index 字段。
+// 与 SQL 标准一致：1-based 引用 SELECT 列表的第 N 个输出列。当 N 越界时抛
+// 语义错误。翻译完成后原 expr 仍保留（值为整数），但 SortExecutor 优先看
+// column_index；保留 expr 仅是为了让 debug 输出（.plan / .ast）反映原始语法。
+//
+// 输入按值返回：调用方拿到的是已经填好 column_index 的新 vector，
+// 这样 Planner::PlanSelect（const stmt）可以无副作用地使用。
+std::vector<OrderByItem> ResolveOrderByOrdinals(std::vector<OrderByItem> items,
+                                                const std::vector<ExprPtr>& select_list,
+                                                int plan_line, int plan_col) {
+    for (auto& ob : items) {
+        if (!ob.expr) continue;
+        if (ob.expr->GetType() != NodeType::LITERAL_EXPR) continue;
+        auto lit = std::static_pointer_cast<LiteralExpr>(ob.expr);
+        if (lit->literal_type != LiteralType::INTEGER) continue;
+        // 只接受无符号 / 无前导 +/- 的纯正整数；带符号的字面量已被
+        // ParseUnaryExpr 处理为 UnaryExpr(NEGATE, ...)，不会到这里。
+        if (lit->value.empty()) continue;
+        for (char c : lit->value) {
+            if (c < '0' || c > '9') return items;  // 不全为数字 → 不是位置式
+        }
+        long idx = 0;
+        try { idx = std::stol(lit->value); }
+        catch (...) { return items; }
+        if (idx <= 0) return items;  // SQL 标准：位置必须 >= 1
+        if (static_cast<size_t>(idx) > select_list.size()) {
+            throw CompilerException(ErrorStage::SEMANTIC,
+                "ORDER BY position " + std::to_string(idx) +
+                " is out of range of select list (size " +
+                std::to_string(select_list.size()) + ")",
+                plan_line, plan_col);
+        }
+        ob.column_index = static_cast<int>(idx);
+    }
+    return items;
+}
+
 }  // namespace
 
 Planner::Planner(SystemCatalog* catalog, SymbolTable& symbol_table)
@@ -419,6 +457,11 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
     if (catalog_) {
         TryExpandView(const_cast<SelectStatement&>(stmt));
     }
+    // Bug 12: 把 select_list 中与其它表达式并列的 * 提前展开为
+    // from_table + joins 的所有列。须在 TryExpandView 之后（视图已被替换为
+    // 派生表后不再有 from_table）、在 MarkUdfCalls / PlanSubqueries 之前（避免
+    // UDF 标记或子查询 plan 误识别 FunctionCallExpr("*")）。
+    ExpandSelectStarInList(const_cast<SelectStatement&>(stmt));
     // 标记 UDF 调用，让 ExpressionEvaluator 在执行期能从 catalog 取函数体。
     if (catalog_) {
         MarkUdfCallsInSelect(stmt);
@@ -455,7 +498,8 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
             current = proj;
         }
         if (!stmt.order_by.empty()) {
-            auto s = std::make_shared<SortNode>(stmt.order_by);
+            auto s = std::make_shared<SortNode>(ResolveOrderByOrdinals(
+                stmt.order_by, stmt.select_list, stmt.line, stmt.column));
             s->children.push_back(current);
             current = s;
         }
@@ -467,8 +511,18 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
         return current;
     }
     // 派生表 FROM (SELECT ...) AS alias —— 把子查询递归规划成子树当作 FROM。
-    if (stmt.derived_table) {
-        PlanNodePtr sub_plan = PlanSelect(*stmt.derived_table);
+    // Bug 6 修复：内层可以是 SelectStatement（derived_table）或
+    // SetOperationStatement（derived_set_op，如 UNION 链）。两种情况
+    // 都按 SeqScanNode(table_name=alias, table_alias=alias) 占位 +
+    // children[0]=子计划 的方式挂入；ExecutionEngine 在识别到占位时
+    // 会透明改走子计划。
+    if (stmt.derived_table || stmt.derived_set_op) {
+        PlanNodePtr sub_plan;
+        if (stmt.derived_set_op) {
+            sub_plan = PlanSetOperation(*stmt.derived_set_op);
+        } else {
+            sub_plan = PlanSelect(*stmt.derived_table);
+        }
         // 列引用解析走 `derived_alias.<col>` / 不限定的列名。
         // Planner 不构造额外节点，直接交给 SeqScanExecutor 是不行的，
         // 所以这里把派生表作为 SeqScanNode(target=alias) 之外的子树：
@@ -510,7 +564,8 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
             current = proj;
         }
         if (!stmt.order_by.empty()) {
-            auto s = std::make_shared<SortNode>(stmt.order_by);
+            auto s = std::make_shared<SortNode>(ResolveOrderByOrdinals(
+                stmt.order_by, stmt.select_list, stmt.line, stmt.column));
             s->children.push_back(current);
             current = s;
         }
@@ -630,7 +685,8 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
             current = proj;
         }
         if (!stmt.order_by.empty()) {
-            auto s = std::make_shared<SortNode>(stmt.order_by);
+            auto s = std::make_shared<SortNode>(ResolveOrderByOrdinals(
+                stmt.order_by, stmt.select_list, stmt.line, stmt.column));
             if (current) s->children.push_back(current);
             current = s;
         }
@@ -700,7 +756,8 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
         // 若底层包含 AggregateNode 且 ORDER BY 直接引用聚合函数，需要把
         // 聚合调用替换为对 AggregateNode 输出 tuple 的 ColumnRef 引用；
         // 否则 ExpressionEvaluator 收到原始 SUM(...)/COUNT(...) 等会返回 NULL。
-        std::vector<OrderByItem> order_items = stmt.order_by;
+        std::vector<OrderByItem> order_items = ResolveOrderByOrdinals(
+            stmt.order_by, stmt.select_list, stmt.line, stmt.column);
         std::vector<ExprPtr> aggs_for_order;
         if (needs_agg) {
             // 收集 (extended) aggregate_exprs 用于重写 ORDER BY 表达式。
@@ -767,6 +824,9 @@ PlanNodePtr Planner::PlanInsert(const InsertStatement& stmt) {
     node->is_replace = stmt.is_replace;
     node->returning_exprs = stmt.returning_exprs;
     node->returning_aliases = stmt.returning_aliases;
+    // INSERT ... DEFAULT VALUES：执行期按 info->columns.size() 构造一行
+    // DefaultExprNode，复用 ApplyDefaults 的常量表达式求值路径。
+    node->is_default_values = stmt.is_default_values;
     if (stmt.query) {
         // INSERT INTO dst SELECT ... —— 把 SELECT/WITH/SetOp 转换为内部子计划，
         // 并把它挂到 children[0] 上，作为执行期 INSERT 的"输入源"。
@@ -811,19 +871,53 @@ PlanNodePtr Planner::PlanUpdate(const UpdateStatement& stmt) {
         node->returning_exprs = stmt.returning_exprs;
         node->returning_aliases = stmt.returning_aliases;
         node->where_clause = stmt.where_clause;
+        // 79_dml_subquery: 与单表 UPDATE 同样的预编译；UpdateFromExecutor 已经
+        // 走三参构造，所以这里只补齐 planner 期的计划注入，避免 ExecuteSubquery
+        // 走懒规划分支每行重建。
+        PlanSubqueriesInExpr(node->where_clause);
+        for (auto& kv : node->assignments) {
+            PlanSubqueriesInExpr(kv.second);
+        }
+        for (auto& e : node->returning_exprs) {
+            PlanSubqueriesInExpr(e);
+        }
         node->children.push_back(joined);
         return node;
     }
-    auto node = std::make_shared<UpdateNode>(stmt.table_name, stmt.assignments, stmt.where_clause);
+    // 79_dml_subquery: 预编译 WHERE / SET 右值 / RETURNING 中的 SubqueryExprNode。
+    // 否则每行 UPDATE 评估时 EvaluateSubquery 都要走"懒规划"分支（重新跑 Planner
+    // + Optimizer），且在没有 ExecutionContext 时会直接退化为 NULL —— 见
+    // DeleteExecutor/UpdateExecutor 中三参构造修复。
+    ExprPtr predicate = stmt.where_clause;
+    PlanSubqueriesInExpr(predicate);
+    std::vector<std::pair<std::string, ExprPtr>> assignments = stmt.assignments;
+    for (auto& kv : assignments) {
+        PlanSubqueriesInExpr(kv.second);
+    }
+    std::vector<ExprPtr> returning_exprs = stmt.returning_exprs;
+    for (auto& e : returning_exprs) {
+        PlanSubqueriesInExpr(e);
+    }
+    auto node = std::make_shared<UpdateNode>(stmt.table_name, std::move(assignments),
+                                             std::move(predicate));
     node->target_alias = stmt.table_alias;
-    node->returning_exprs = stmt.returning_exprs;
+    node->returning_exprs = std::move(returning_exprs);
     node->returning_aliases = stmt.returning_aliases;
     return node;
 }
 
 PlanNodePtr Planner::PlanDelete(const DeleteStatement& stmt) {
-    auto node = std::make_shared<DeleteNode>(stmt.table_name, stmt.where_clause);
-    node->returning_exprs = stmt.returning_exprs;
+    // 79_dml_subquery: 预编译 WHERE / RETURNING 中的 SubqueryExprNode，避免
+    // ExecuteSubquery 的懒规划路径每行重建计划；同时确保 planner 期就完成
+    // 解析/优化，让 DeleteExecutor 内的求值器只关心执行。
+    ExprPtr predicate = stmt.where_clause;
+    PlanSubqueriesInExpr(predicate);
+    std::vector<ExprPtr> returning_exprs = stmt.returning_exprs;
+    for (auto& e : returning_exprs) {
+        PlanSubqueriesInExpr(e);
+    }
+    auto node = std::make_shared<DeleteNode>(stmt.table_name, std::move(predicate));
+    node->returning_exprs = std::move(returning_exprs);
     node->returning_aliases = stmt.returning_aliases;
     return node;
 }
@@ -958,6 +1052,17 @@ PlanNodePtr Planner::PlanWithClause(const WithClauseStatement& stmt) {
         auto def = std::make_shared<CteDefineNode>(cte.cte_name, false);
         if (cte.cte_query) {
             def->cte_plan = PlanSelect(*cte.cte_query);
+        } else if (cte.cte_body) {
+            // bug3: 非递归 CTE 的 body 可能是 SelectStatement 或
+            // SetOperationStatement（UNION/UNION ALL/INTERSECT/EXCEPT），
+            // 旧实现 cte_query 只在单 SELECT 时非空，导致 CTE body 为
+            // `SELECT 1 x UNION ALL SELECT 2` 时 cte_plan = nullptr，
+            // CteDefineExecutor 不向 context 注册结果，SELECT * FROM c 0 行。
+            if (auto sel = std::dynamic_pointer_cast<SelectStatement>(cte.cte_body)) {
+                def->cte_plan = PlanSelect(*sel);
+            } else if (auto sop = std::dynamic_pointer_cast<SetOperationStatement>(cte.cte_body)) {
+                def->cte_plan = PlanSetOperation(*sop);
+            }
         }
         // 对每个 CTE 自身的 cte_plan 做 hint 改写（链式 CTE 引用前 CTE）
         if (def->cte_plan && !cte_names.empty()) {
@@ -1189,7 +1294,14 @@ PlanNodePtr Planner::PlanSetOperation(const SetOperationStatement& stmt) {
     // 顶层 ORDER BY / LIMIT 包裹在 SetOpNode 之外，保证只对最终结果排序/截断。
     PlanNodePtr current = node;
     if (!stmt.order_by.empty()) {
-        auto s = std::make_shared<SortNode>(stmt.order_by);
+        // SQL 标准：UNION/INTERSECT/EXCEPT 上的 ORDER BY 位置式引用的是
+        // 左子 SELECT 的 select_list（左 SELECT 决定结果列名与列数）。
+        std::vector<ExprPtr> ordinal_base;
+        if (auto ss = std::dynamic_pointer_cast<SelectStatement>(stmt.left)) {
+            ordinal_base = ss->select_list;
+        }
+        auto s = std::make_shared<SortNode>(ResolveOrderByOrdinals(
+            stmt.order_by, ordinal_base, stmt.line, stmt.column));
         s->children.push_back(current);
         current = s;
     }
@@ -1583,6 +1695,14 @@ void Planner::MarkUdfCallsInSelect(const SelectStatement& stmt) const {
 // 收集分组列：把每个 grouping set 里的 ColumnRefExpr 列名收集到一个 set，
 // 用作"该 select list 位置是否是分组列"的判定。
 PlanNodePtr Planner::PlanGroupingSets(const SelectStatement& stmt, PlanNodePtr scan_input) {
+    // Bug 12: 在合成子 SELECT 之前先把 stmt.select_list 中的 * 展开为
+    // from_table + joins 的列；否则子 SELECT 仍按「* 单独」逻辑会得到与外层
+    // 列数不一致的 SELECT list，UNION ALL 会因列数不匹配报错。PlanSelect 入口
+    // 已对 stmt 本身调用过，但 inner 是新构造的 SelectStatement，需在此显式
+    // 再调用一次 —— 在合成之前，确保 stmt.select_list / select_aliases 是
+    // 展开后的"真列数"，让 inner 也复制得到正确的列布局。
+    SelectStatement& mutable_stmt = const_cast<SelectStatement&>(stmt);
+    ExpandSelectStarInList(mutable_stmt);
     // 1) 收集所有 grouping set 中出现的列名（作为"分组列"判定集合）。
     //    限定为 ColumnRefExpr（更复杂的列表达式不展开为 set 维度）。
     std::set<std::string> group_col_names;
@@ -1726,10 +1846,11 @@ bool IsStringFuncName(const std::string& name) {
     return name == "UPPER" || name == "LOWER" ||
            name == "SUBSTR" || name == "SUBSTRING" ||
            name == "TRIM" || name == "REPLACE" ||
-           name == "CONCAT" ||
+           name == "CONCAT" || name == "CONCAT_WS" ||
            name == "LPAD" || name == "RPAD" ||
            name == "LEFT" || name == "RIGHT" ||
-           name == "REVERSE" || name == "REPEAT" ||
+           name == "REVERSE" || name == "STARTS_WITH" ||
+           name == "REPEAT" ||
            name == "LTRIM" || name == "RTRIM" ||
            name == "CHAR" || name == "CHR";
 }
@@ -1739,7 +1860,8 @@ bool IsMathFuncName(const std::string& name) {
            name == "ROUND" || name == "CEIL" || name == "CEILING" ||
            name == "FLOOR" || name == "TRUNCATE" || name == "TRUNC" ||
            name == "MOD" || name == "POWER" || name == "POW" ||
-           name == "SQRT" || name == "EXP" || name == "LN" || name == "LOG" ||
+           name == "SQRT" || name == "EXP" || name == "LN" ||
+           name == "LOG" || name == "LOG10" ||
            name == "SIN" || name == "COS" || name == "TAN" ||
            name == "ASIN" || name == "ACOS" || name == "ATAN" ||
            name == "RAND" || name == "RANDOM";
@@ -1835,6 +1957,12 @@ std::string InferExprTypeImpl(const Expr* raw,
                 case BinaryOperator::BETWEEN:
                 case BinaryOperator::IS_NULL:
                 case BinaryOperator::IS_NOT_NULL:
+                // bug3_is_true: IS [NOT] TRUE/FALSE 与 IS NULL 同属布尔结果，
+                // 运行时通过 MakeBool(...) 返回 0/1 INTEGER，统一声明为 INT。
+                case BinaryOperator::IS_TRUE:
+                case BinaryOperator::IS_FALSE:
+                case BinaryOperator::IS_NOT_TRUE:
+                case BinaryOperator::IS_NOT_FALSE:
                     return kInt;
             }
             return kInt;
@@ -2049,6 +2177,273 @@ std::vector<ColumnDefinition> Planner::InferSelectOutputSchema(
         out.push_back(std::move(cd));
     }
     return out;
+}
+
+// Bug 12: 在 Planner 阶段把 SELECT list 中与其它表达式并列的 * 展开为
+// from_table + joins 的所有列。展开后 select_list 与 ProjectNode 输出列一一对应，
+// 现有的 column_index_map / alias 路径无需任何修正即可正确产出。
+//
+// 范围：
+//   - 处理 from_table 非空 + 无 derived_* + 无 values_rows 的"普通 FROM"
+//     情况：直接把 * 展开为 from_table + joins 的列。
+//   - 处理 derived_table / derived_set_op：先递归对内层 SELECT 调一次
+//     ExpandSelectStarInList 把内层 * 也展开，再把内层 SELECT 的输出列名
+//     作为当前 SELECT 的 * 展开目标；这样 `SELECT 'X' AS c, * FROM (SELECT
+//     id, country FROM p) AS sub` 也能正确产出 3 列。
+//   - t.* 在 AST 中已退化为同名 FunctionCallExpr("*")，无法与纯 * 区分；
+//     简化按 from_table + joins 顺序展开全部列，多表 JOIN 时若带 * 不带表限定
+//     与现有 Inferred 行为一致（"select * from a, b" 展开 a 的列再展开 b 的列）。
+//   - 仅当 select_list 含 * 时才展开（select_list 全是字面量 / 列引用则 no-op），
+//     与"SELECT *" 单独走 ProjectExecutor pass-through 的路径完全兼容。
+//   - VALUES (values_rows 非空) 时跳过：ProjectExecutor 的 pass-through 路径
+//     仍按"SELECT * 单独"工作正常。
+void Planner::ExpandSelectStarInList(SelectStatement& stmt) {
+    if (stmt.select_list.empty()) return;
+    if (!stmt.values_rows.empty()) return;
+    // 派生表 / 集合运算源：递归展开内层 SELECT 后用内层输出列名。
+    if (stmt.derived_table) {
+        ExpandSelectStarInList(*stmt.derived_table);
+    } else if (stmt.derived_set_op) {
+        // SetOperationStatement 的 left / right 都是 SelectStatement，分别
+        // 递归展开。SetOperationStatement 的输出列名取自其左侧 SELECT
+        // （标准 SQL 语义），与 ExecutionEngine::DeriveTerminalColumns 一致。
+        if (auto* ss = dynamic_cast<SelectStatement*>(stmt.derived_set_op->left.get())) {
+            ExpandSelectStarInList(*ss);
+        }
+        if (auto* ss = dynamic_cast<SelectStatement*>(stmt.derived_set_op->right.get())) {
+            ExpandSelectStarInList(*ss);
+        }
+    }
+    // 仅当 select_list 含 FunctionCallExpr("*"/"STAR") 时才进入展开逻辑。
+    bool has_star = false;
+    for (const auto& e : stmt.select_list) {
+        if (e && e->GetType() == NodeType::FUNCTION_CALL_EXPR) {
+            auto fc = std::static_pointer_cast<FunctionCallExpr>(e);
+            if (fc->function_name == "*" || fc->function_name == "STAR") {
+                has_star = true;
+                break;
+            }
+        }
+    }
+    if (!has_star) return;
+    // Bug 13: 收集 FROM + joins 的列清单（含 (qualifier_keys, real_tname) 对），
+    // 让 `t.*` 能按限定表名筛选列。qualifier_keys 是该表可被引用为限定列
+    // 引用的名字集合：真表名 + 别名。`t.*` 中的 t 命中其中任意一个即视为
+    // 该表。`column_index_map` 用真表名做 key，所以展开后 ColumnRefExpr 的
+    // 限定名仍写真表名，保证下游列索引映射工作正常。
+    struct TableColEntry {
+        std::vector<std::string> qualifier_keys;  // 可引用为 t.col / t.* 的名字
+        std::string real_tname;                   // 真表名（写入 ColumnRefExpr）
+        std::vector<std::string> col_names;       // 该表的列名（按 catalog 顺序）
+    };
+    std::vector<TableColEntry> table_entries;
+    auto register_table = [&](const std::string& tname, const std::string& alias) {
+        if (tname.empty()) return;
+        const TableInfo* info = symbol_table_.GetTable(tname);
+        if (!info) return;
+        TableColEntry entry;
+        entry.real_tname = tname;
+        entry.qualifier_keys.push_back(tname);
+        if (!alias.empty() && alias != tname) {
+            entry.qualifier_keys.push_back(alias);
+        }
+        for (const auto& c : info->columns) entry.col_names.push_back(c.name);
+        table_entries.push_back(std::move(entry));
+    };
+    // Bug 13 修复：根据每个 * 节点的 table_qualifier 决定展开列范围。
+    //   - table_qualifier 为空 (裸 `*`)：展开 FROM + joins 全部表的全部列。
+    //   - table_qualifier 非空 (`t.*`)：仅展开限定名 t 命中的那张表的列。
+    // 派生表 / 集合运算源路径下没有 FROM-JOIN 概念，仍按原行为展开。
+    // 构造展开后的 select_list / select_aliases。
+    std::vector<ExprPtr> new_list;
+    std::vector<std::string> new_aliases;
+    new_list.reserve(stmt.select_list.size());
+    new_aliases.reserve(stmt.select_list.size());
+    // 跟踪某个 * 节点是否对应裸 `*`（需先准备 FROM 上下文）。
+    bool need_from_context = false;
+    for (const auto& e : stmt.select_list) {
+        if (e && e->GetType() == NodeType::FUNCTION_CALL_EXPR) {
+            auto fc = std::static_pointer_cast<FunctionCallExpr>(e);
+            if (fc->function_name == "*" || fc->function_name == "STAR") {
+                if (fc->table_qualifier.empty()) {
+                    need_from_context = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (need_from_context) {
+        if (stmt.derived_table || stmt.derived_set_op) {
+            // 派生表 / 集合运算：用内层 SELECT 的输出列名。table_entries
+            // 此时只填一个"伪表"，qualifier_keys 与 real_tname 都设为
+            // derived_alias —— ExecutionEngine 端 BuildCombinedColumnIndexMap
+            // 对派生表占位 (table_name == table_alias) 会忽略该 key 的实际
+            // 意义，ProjectExecutor 真正取值时按 ColumnRefExpr 顺序走扩展
+            // tuple 即可。
+            const SelectStatement* inner = nullptr;
+            if (stmt.derived_table) {
+                inner = stmt.derived_table.get();
+            } else if (stmt.derived_set_op) {
+                inner = dynamic_cast<SelectStatement*>(stmt.derived_set_op->left.get());
+            }
+            TableColEntry entry;
+            entry.real_tname = stmt.derived_alias;
+            entry.qualifier_keys.push_back(stmt.derived_alias);
+            if (inner) {
+                for (size_t i = 0; i < inner->select_list.size(); ++i) {
+                    std::string col_name;
+                    if (i < inner->select_aliases.size() && !inner->select_aliases[i].empty()) {
+                        col_name = inner->select_aliases[i];
+                    } else if (inner->select_list[i] &&
+                               inner->select_list[i]->GetType() == NodeType::COLUMN_REF_EXPR) {
+                        col_name = std::static_pointer_cast<ColumnRefExpr>(
+                                       inner->select_list[i])->column_name;
+                    } else if (inner->select_list[i] &&
+                               inner->select_list[i]->GetType() == NodeType::FUNCTION_CALL_EXPR) {
+                        col_name = std::static_pointer_cast<FunctionCallExpr>(
+                                       inner->select_list[i])->function_name;
+                    } else {
+                        col_name = "col" + std::to_string(i);
+                    }
+                    entry.col_names.push_back(col_name);
+                }
+            }
+            if (!entry.col_names.empty()) table_entries.push_back(std::move(entry));
+        } else if (!stmt.from_table.empty()) {
+            // 普通 FROM：注册 FROM 表 + 每个 JOIN 表（含别名）。注意 derived_table
+            // 也允许 `FROM (SELECT ...) AS sub`，这里 `from_table` 为空时走上面
+            // 的 derived_table 路径，不会落到这里。
+            register_table(stmt.from_table, stmt.from_table_alias);
+            for (const auto& j : stmt.joins) {
+                if (!j.table_name.empty()) {
+                    register_table(j.table_name, j.table_alias);
+                }
+            }
+        }
+    } else {
+        // 没有任何裸 `*`，但有 `t.*`：仅注册能匹配 qualifier 的表。表注册逻辑
+        // 见下方的迭代。
+    }
+    if (table_entries.empty() && !stmt.from_table.empty()) {
+        // 仍然没有 entries（极少见：所有 * 都是限定且未命中任何表）。
+        // 不报错，让下面的循环对限定 * 仍正常跳过未命中项。
+    }
+    // Bug 13: 收集 `t.*` 涉及的限定表集合，以便按需注册 entries。
+    // 若 select_list 中存在限定 * 但无裸 *，上面不会注册任何 entry，需要在此
+    // 阶段补齐对应表的列信息。
+    std::set<std::string> needed_qualifiers;
+    for (const auto& e : stmt.select_list) {
+        if (e && e->GetType() == NodeType::FUNCTION_CALL_EXPR) {
+            auto fc = std::static_pointer_cast<FunctionCallExpr>(e);
+            if ((fc->function_name == "*" || fc->function_name == "STAR") &&
+                !fc->table_qualifier.empty()) {
+                needed_qualifiers.insert(fc->table_qualifier);
+            }
+        }
+    }
+    auto qualifier_in_entries = [&](const std::string& q) -> const TableColEntry* {
+        for (const auto& e : table_entries) {
+            for (const auto& k : e.qualifier_keys) {
+                if (k == q) return &e;
+            }
+        }
+        return nullptr;
+    };
+    // 仅当 needed_qualifiers 中存在尚未被任何 entry 覆盖的 qualifier 时才补登。
+    if (!needed_qualifiers.empty()) {
+        bool any_missing = false;
+        for (const auto& q : needed_qualifiers) {
+            if (!qualifier_in_entries(q)) { any_missing = true; break; }
+        }
+        if (any_missing) {
+            if (!stmt.from_table.empty()) {
+                register_table(stmt.from_table, stmt.from_table_alias);
+            }
+            for (const auto& j : stmt.joins) {
+                if (!j.table_name.empty()) {
+                    register_table(j.table_name, j.table_alias);
+                }
+            }
+        }
+    }
+    // 实际展开循环：对每个 select_list 项，按其类型决定追加哪些列。
+    for (size_t i = 0; i < stmt.select_list.size(); ++i) {
+        const auto& e = stmt.select_list[i];
+        if (e && e->GetType() == NodeType::FUNCTION_CALL_EXPR) {
+            auto fc = std::static_pointer_cast<FunctionCallExpr>(e);
+            if (fc->function_name == "*" || fc->function_name == "STAR") {
+                // 选择本次展开的列范围。
+                std::vector<std::pair<std::string, std::string>> expand_qualified;
+                std::vector<std::string> expand_names;
+                if (fc->table_qualifier.empty()) {
+                    // 裸 `*`：所有 table_entries 的全部列按 from_table + joins 顺序追加。
+                    // Bug 14 fix: 在 self-join（如 `FROM emp e LEFT JOIN emp m`）下，
+                    // 用真表名作限定符会让两次 emp.X 在 BuildCombinedColumnIndexMap 里
+                    // 互相覆盖，导致两边都读到右侧的列。这里若该 entry 有独立别名，
+                    // 则改用别名作为限定符（cmap 里 alias.X 与 alias.X 不会冲突）；
+                    // 单表或无别名情形仍走真表名。
+                    for (const auto& te : table_entries) {
+                        std::string q = te.real_tname;
+                        if (te.qualifier_keys.size() > 1) {
+                            q = te.qualifier_keys.back();
+                        }
+                        for (const auto& cn : te.col_names) {
+                            expand_qualified.emplace_back(q, cn);
+                            expand_names.push_back(cn);
+                        }
+                    }
+                } else {
+                    // `t.*`：仅取 qualifier 命中的 entry 的列。
+                    // Bug 14 fix: 记录命中的 qualifier（alias 或真表名）并用它作为
+                    // ColumnRefExpr 的限定符，避免 self-join 时真表名 key 在 cmap
+                    // 中被同名第二次出现覆盖。
+                    const TableColEntry* hit = nullptr;
+                    std::string hit_qualifier;
+                    for (const auto& te : table_entries) {
+                        for (const auto& k : te.qualifier_keys) {
+                            if (k == fc->table_qualifier) {
+                                hit = &te;
+                                hit_qualifier = k;
+                                break;
+                            }
+                        }
+                        if (hit) break;
+                    }
+                    if (hit) {
+                        for (const auto& cn : hit->col_names) {
+                            expand_qualified.emplace_back(hit_qualifier, cn);
+                            expand_names.push_back(cn);
+                        }
+                    }
+                    // 未命中时（限定表名不存在）：不展开任何列，下游 ProjectExecutor
+                    // 仍按原 select_list 处理；保留原节点继续传递，避免破坏语法
+                    // 解析层已经接受但执行期才报错的情况。
+                }
+                if (expand_qualified.empty()) {
+                    // 没有可展开列：保留原 * 节点（新构造以保留 qualifier 信息），
+                    // 让后续 ProjectExecutor 的 * 处理路径继续负责。
+                    auto kept = std::make_shared<FunctionCallExpr>(
+                        fc->function_name, fc->arguments);
+                    kept->table_qualifier = fc->table_qualifier;
+                    new_list.push_back(kept);
+                    new_aliases.push_back(i < stmt.select_aliases.size()
+                                              ? stmt.select_aliases[i]
+                                              : "");
+                    continue;
+                }
+                for (size_t k = 0; k < expand_qualified.size(); ++k) {
+                    new_list.push_back(std::make_shared<ColumnRefExpr>(
+                        expand_qualified[k].first, expand_qualified[k].second));
+                    new_aliases.push_back(expand_names[k]);
+                }
+                continue;
+            }
+        }
+        new_list.push_back(e);
+        new_aliases.push_back(i < stmt.select_aliases.size() ? stmt.select_aliases[i] : "");
+    }
+    stmt.select_list = std::move(new_list);
+    stmt.select_aliases = std::move(new_aliases);
 }
 
 }  // namespace sqlcompiler

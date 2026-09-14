@@ -249,6 +249,10 @@ public:
     // true 时按 MySQL REPLACE 语义：候选行在 PK/UNIQUE 上冲突，先删旧行再插新行。
     // 当前实现走 UpsertExecutor 的"删除+插入"路径。
     bool is_replace = false;
+    // INSERT ... DEFAULT VALUES —— 插入一行所有列用 DEFAULT 表达式（无
+    // DEFAULT 时为 NULL）。当 is_default_values 为 true 时，values_list
+    // 视为空，由 InsertExecutor 按 info->columns.size() 构造一行 DefaultExprNode。
+    bool is_default_values = false;
     // ---- 54_dml: RETURNING 子句 ----
     // INSERT 成功后，对新行求值 returning_exprs 并以结果集形式返回。
     std::vector<ExprPtr> returning_exprs;

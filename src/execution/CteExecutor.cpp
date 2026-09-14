@@ -1,6 +1,7 @@
 #include "execution/CteExecutor.h"
 
 #include "ast/AST.h"
+#include "catalog/SystemCatalog.h"
 #include "execution/ExecutionEngine.h"
 #include "execution/ExpressionEvaluator.h"
 
@@ -9,6 +10,24 @@
 namespace sqlcompiler {
 
 namespace {
+
+// 查找子计划里最近的 SEQ_SCAN 节点表名（含 INDEX_SCAN）。与
+// ExecutionEngine::DeriveTerminalColumns 中 `*` 展开路径同源，用于
+// `SELECT *` / `SELECT t.*` 在 CTE 物化时把 * 映射到底层真实表的列。
+std::string FindCteScanTableName(const PlanNodePtr& node) {
+    if (!node) return "";
+    if (node->GetType() == PlanNodeType::SEQ_SCAN) {
+        return std::static_pointer_cast<SeqScanNode>(node)->table_name;
+    }
+    if (node->GetType() == PlanNodeType::INDEX_SCAN) {
+        return std::static_pointer_cast<IndexScanNode>(node)->table_name;
+    }
+    for (auto& c : node->children) {
+        std::string t = FindCteScanTableName(c);
+        if (!t.empty()) return t;
+    }
+    return "";
+}
 
 // ---- 31_cte bug fix: CTE 输出列名推导 ----
 //
@@ -19,7 +38,14 @@ namespace {
 // 该函数被 CteDefineExecutor::Init 在调用 RegisterCte 之前调用，确保
 // `WHERE total >= 200` 等下推到 CTE SeqScanNode 的谓词在执行期能找到
 // 列下标映射。
-std::vector<std::string> DeriveCteOutputColumns(const PlanNodePtr& plan) {
+//
+// ---- 83_cte_select_star bug fix: catalog 扩展 * ----
+// 接受 SystemCatalog* 后，遇到 Project 列表里的 `*` / `t.*` 通配符时按底层
+// 真实表（或派生表内层计划）的列展开。否则 `WITH t AS (SELECT * FROM emp)`
+// 的 cols.size() = 1，trim 把 3 列的物化行裁到 1 列，导致外层引用 name/mgr
+// 时拿不到数据。
+std::vector<std::string> DeriveCteOutputColumns(SystemCatalog* catalog,
+                                                const PlanNodePtr& plan) {
     std::vector<std::string> cols;
     if (!plan) return cols;
     // 跳过不影响输出列的包装节点。
@@ -40,7 +66,6 @@ std::vector<std::string> DeriveCteOutputColumns(const PlanNodePtr& plan) {
     switch (p->GetType()) {
         case PlanNodeType::PROJECT: {
             auto proj = std::static_pointer_cast<ProjectNode>(p);
-            cols.reserve(proj->columns.size());
             for (size_t i = 0; i < proj->columns.size(); ++i) {
                 if (i < proj->aliases.size() && !proj->aliases[i].empty()) {
                     cols.push_back(proj->aliases[i]);
@@ -49,6 +74,31 @@ std::vector<std::string> DeriveCteOutputColumns(const PlanNodePtr& plan) {
                     cols.push_back(
                         std::static_pointer_cast<ColumnRefExpr>(proj->columns[i])
                             ->column_name);
+                } else if (proj->columns[i] &&
+                           proj->columns[i]->GetType() == NodeType::FUNCTION_CALL_EXPR) {
+                    // 83_cte_select_star: `*` / `t.*` 按底层表展开。
+                    // `t.*` 在 parser 中表达为 `*` 通配符（table 限定在执行期
+                    // 已被 ProjectExecutor 透传时丢弃），这里统一按 catalog 列
+                    // 展开。`FunctionCallExpr::function_name` 还覆盖到 `STAR`
+                    // 别名（来自某些 grammar 变体）。
+                    auto fc = std::static_pointer_cast<FunctionCallExpr>(
+                        proj->columns[i]);
+                    if (fc->function_name == "*" ||
+                        fc->function_name == "STAR") {
+                        std::string tname = FindCteScanTableName(p);
+                        const TableInfo* info =
+                            catalog ? catalog->GetTable(tname) : nullptr;
+                        if (info) {
+                            for (const auto& c : info->columns) {
+                                cols.push_back(c.name);
+                            }
+                            continue;
+                        }
+                        // 找不到表时退回函数名（与旧行为兼容，避免空名）。
+                        cols.push_back(fc->function_name);
+                    } else {
+                        cols.push_back(fc->function_name);
+                    }
                 } else if (proj->columns[i]) {
                     cols.push_back(proj->columns[i]->ToString());
                 } else {
@@ -171,11 +221,24 @@ void CteDefineExecutor::Init() {
     if (!node_->is_recursive) {
         // 普通 CTE：先物化 cte_plan 把结果注册到 context，然后构造 body
         if (node_->cte_plan) {
-            auto rows = MaterializePlan(context_, node_->cte_plan);
             // ---- 31_cte bug fix: 传入输出列名 ----
             // 让外层 SeqScanNode.predicate（被 Optimizer 下推的 WHERE / HAVING）
             // 在 CteBindExecutor 处能正确解析 CTE 输出列上的 ColumnRefExpr。
-            auto cols = DeriveCteOutputColumns(node_->cte_plan);
+            auto cols = DeriveCteOutputColumns(context_->GetCatalog(),
+                                                node_->cte_plan);
+            // ---- 81_cte_join bug fix: trim materialized rows to select_list width ----
+            // ProjectExecutor 的输出元组形状是 [select_values ++ underlying_tuple]，
+            // 但 CTE 在语义层被当作只有 select_list 列的虚拟表（见 SemanticAnalyzer
+            // 注册的 TableInfo.columns）。BuildCombinedColumnIndexMap 以「虚拟表列数」
+            // 为偏移累加 CTE 之间的 offset。
+            // 若不裁剪，物化行宽度 = select_count + base_cols，join 后 b.x 仍被
+            // cmap 指向 a.underlying_x 而不是真正的 b.x 列，导致：
+            //   - ON 条件失效（a.x = b.x 退化为 a.x = a.underlying_x 恒真变体）
+            //   - SELECT b.<non_key_col> 拿到 a.<同位列> 的值
+            // 这里按 cols.size() 截断元组，使每行宽度与语义层虚拟表一致，join 的
+            // cmap 偏移就能与真实元组布局对齐。
+            size_t strip_extra_cols = cols.size();
+            auto rows = MaterializePlan(context_, node_->cte_plan, strip_extra_cols);
             context_->RegisterCte(node_->cte_name, std::move(rows),
                                   std::move(cols));
         }
@@ -192,7 +255,7 @@ void CteDefineExecutor::Init() {
     auto anchor_rows = MaterializePlan(context_, node_->cte_plan);
     // 累计行（外层 SELECT 最终读这份）：初始 = anchor_rows。
     // 列名以 anchor 为准（递归部分的 SELECT list 与 anchor 保持同列定义）。
-    auto cols = DeriveCteOutputColumns(node_->cte_plan);
+    auto cols = DeriveCteOutputColumns(context_->GetCatalog(), node_->cte_plan);
     context_->RegisterCte(node_->cte_name, anchor_rows, std::move(cols));
 
     // 没有递归部分时退化为 anchor-only（旧语义；保留兼容）。

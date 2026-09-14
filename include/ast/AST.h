@@ -18,6 +18,11 @@ using PlanNodePtr = std::shared_ptr<PlanNode>;
 class SelectStatement;
 using SelectStatementPtr = std::shared_ptr<SelectStatement>;
 
+// 前置声明 SetOperationStatement，以便 SelectStatement 的 derived_set_op 字段
+// 引用其 shared_ptr。完整定义见本文件后部。
+class SetOperationStatement;
+using SetOperationStatementPtr = std::shared_ptr<SetOperationStatement>;
+
 // 窗口规格结构在文件后部定义，但 SelectStatement 内部需要它，
 // 故前置声明。完整定义见下方 "新增表达式节点" 区域。
 struct WindowSpec;
@@ -90,6 +95,7 @@ enum class NodeType {
     EXTRACT_EXPR,            // 45_datetime: EXTRACT(field FROM source)
     INTERVAL_EXPR,           // 45_datetime: INTERVAL <n> <unit>
     NEXTVAL_EXPR,            // 53_ddl: NEXTVAL FOR sequence_name
+    DEFAULT_EXPR,            // INSERT ... VALUES (..., DEFAULT) 与 INSERT ... DEFAULT VALUES
 
     // ---- 47_udf_trigger_view: UDF 体内部使用的语句节点 ----
     DECLARE_VAR_STMT,        // DECLARE name TYPE
@@ -195,6 +201,19 @@ enum class BinaryOperator {
     BETWEEN,
     IS_NULL,
     IS_NOT_NULL,
+    // bug3_is_true: SQL 三值 IS [NOT] TRUE / IS [NOT] FALSE。
+    // 与 IS [NOT] NULL 一样是"后缀"单目语义（right 子树不需要），
+    // 这里沿用 BinaryExpr 形态承载语义以便统一规划/求值。
+    //   IS TRUE       = operand 确定是 TRUE  -> MakeBool(IsTrue(l))
+    //   IS FALSE      = operand 确定是 FALSE -> MakeBool(IsFalse(l))
+    //   IS NOT TRUE   = operand 不是 TRUE    -> MakeBool(!IsTrue(l))
+    //   IS NOT FALSE  = operand 不是 FALSE   -> MakeBool(!IsFalse(l))
+    // NULL 在 SQL 三值逻辑下既不是 TRUE 也不是 FALSE（IsTrue(NULL)/IsFalse(NULL) 都为
+    // false），所以 `x IS TRUE` 对 NULL 操作数返回 false，与 SQL:1999 一致。
+    IS_TRUE,
+    IS_FALSE,
+    IS_NOT_TRUE,
+    IS_NOT_FALSE,
     // 45_datetime: <date_or_ts> ± INTERVAL <n> <unit>
     INTERVAL_ADD,
     INTERVAL_SUB
@@ -239,6 +258,12 @@ public:
     std::vector<ExprPtr> arguments;
     // 仅聚合函数有效：如 COUNT(DISTINCT col) / SUM(DISTINCT col)
     bool is_distinct = false;
+    // Bug 13: SELECT list 中 `t.*` 与裸 `*` 区分。前者要求展开为该限定表
+    // (table_name/table_alias) 的列；后者展开为 from_table + joins 的全部列。
+    // 解析期在 ParseColumnRefOrFunctionCall 看到 `IDENT '.' '*'` 时把限定表名
+    // (实际表名或别名) 写入此字段；裸 `*` / COUNT(*) 等场景保持为空。
+    // Planner::ExpandSelectStarInList 读取该字段决定列展开范围。
+    std::string table_qualifier;
     // ---- 60_funcs: 聚合修饰子句 ----
     // FILTER (WHERE cond)：仅当 cond 评估为 TRUE 时该聚合才把此行纳入计算。
     // 仅聚合函数（COUNT/SUM/AVG/MIN/MAX/STDDEV/...）有效；filter_expr 为 nullptr
@@ -317,9 +342,16 @@ struct JoinClause {
 };
 
 // ORDER BY 单项
+//
+// column_index —— SQL 标准「位置式 ORDER BY」支持的 1-based 输出列序号。
+// Planner 在把 ORDER BY N (N 为正整数字面量) 翻译为对 SELECT 列表第 N 列的
+// 排序时，会把 column_index 置为 N 并把 expr 置空；SortExecutor 看到非零
+// column_index 时直接按 tuple 位置取值，绕过 cmap/expression-evaluator 路径。
+// 0 表示「非位置式 ORDER BY」，按 expr 正常求值。
 struct OrderByItem {
     ExprPtr expr;
     bool ascending = true;
+    int column_index = 0;  // 0 = 非位置式；>0 = SELECT 列表 1-based 位置
 };
 
 // ============ 语句节点 ============
@@ -357,6 +389,14 @@ public:
     // 派生表 FROM (SELECT ...) AS alias：当 derived_table 非空时优先使用。
     SelectStatementPtr derived_table;
     std::string derived_alias;
+    // 派生表 FROM (SELECT ... UNION/INTERSECT/EXCEPT SELECT ...) AS alias：
+    // 当内层是集合运算（SetOperationStatement）时填到这里。derived_table 与
+    // derived_set_op 互斥 —— parser 在识别到 UNION/INTERSECT/EXCEPT 链时把
+    // 整条 SetOperationStatement 挂到本字段，planner 据此走 PlanSetOperation。
+    // 旧版 parser 直接用 static_pointer_cast<SelectStatement>(sub) 强转
+    // SetOperationStatement*，由于两者无继承关系（都只从 Statement 派生），
+    // 那是 UB；本字段 + dynamic_pointer_cast 修复该隐患。
+    SetOperationStatementPtr derived_set_op;
     // 55_query: (VALUES (a,b), (c,d)) AS t(id, name) —— VALUES 行构造器作为
     // FROM 派生表。当 values_rows 非空时，Planner 走 ValuesNode 路径，
     // 与 derived_table 互斥（同一 FROM 项只能有一种来源）。values_column_aliases
@@ -418,6 +458,10 @@ public:
     // 解析阶段：用户写 REPLACE INTO t VALUES (...) 时置位；REPLACE 共享 INSERT
     // 的列名列表与 VALUES 数据。当前 REPLACE 不支持 INSERT ... SELECT 数据源。
     bool is_replace = false;
+    // INSERT ... DEFAULT VALUES —— SQL 标准形式：插入一行，所有列都用其
+    // DEFAULT 表达式（无 DEFAULT 的列得到 NULL）。当 values_list 为空且
+    // is_default_values 为 true 时，InsertExecutor 按列序构造一行 DEFAULT。
+    bool is_default_values = false;
 };
 
 // UPDATE 语句
@@ -643,8 +687,13 @@ public:
     std::string ToString() const override;
 
     ExprPtr expr;
-    std::string target_type;   // "INT" / "FLOAT" / "VARCHAR"
-    int32_t char_length = -1;  // VARCHAR(N) 中的 N
+    std::string target_type;   // "INT" / "FLOAT" / "VARCHAR" / "DECIMAL" / ...
+    // 类型参数：
+    //   - char_length：VARCHAR(n) / CHAR(n) / DECIMAL(p) / NUMERIC(p) 中的 n
+    //     （DECIMAL 单参形式也用 char_length 承载精度，scale = -1）
+    //   - numeric_scale：DECIMAL(p, s) / NUMERIC(p, s) 中的 s，-1 表示无第二参
+    int32_t char_length = -1;
+    int32_t numeric_scale = -1;
 };
 
 // 窗口函数 frame 描述（ROWS BETWEEN ... AND ...）
@@ -825,6 +874,11 @@ struct CteDefinition {
     std::string cte_name;
     std::vector<std::string> cte_column_aliases;  // 可空：WITH t(a,b) AS (...)
     SelectStatementPtr cte_query;
+    // bug3: CTE 完整 body，可能是 SelectStatement 或 SetOperationStatement
+    // （UNION/INTERSECT/EXCEPT）。parser 总是把 body 落地到这里；非递归
+    // CTE 的 body 即 cte_plan 的输入，递归 CTE 的 cte_query / recursive_part
+    // 仍按 UNION ALL 拆解但 cte_body 同步保留，确保 SetOp body 不被丢弃。
+    StatementPtr cte_body;
     // 递归 CTE 的"递归部分"。当 CTE 体是 `anchor UNION ALL recursive` 时，
     // cte_query 承载 anchor（左侧 SELECT），recursive_part 承载递归部分（右侧）。
     // 当前实现仅支持 UNION ALL 作为连接符；其他集合运算的递归不在范围内。
@@ -1553,6 +1607,27 @@ public:
     std::string ToString() const override;
 
     std::string sequence_name;
+};
+
+// DEFAULT —— 仅出现在 INSERT ... VALUES (..., DEFAULT) 与 INSERT ... DEFAULT VALUES
+// 路径上。语义层在 RequireConstantExpression 不允许该节点出现在 DEFAULT 表达式里
+// （避免递归引用列的 DEFAULT），但 InsertExecutor 会识别它并把当前位置替换为
+// 该列声明的 default_expr（若没有声明则为 NULL）。
+//
+// column_name（可选）：当解析到 DEFAULT(col) 函数调用形式时填入该列名。
+// InsertExecutor 优先按列名查 default_expr；为空时退回到"当前位置列"。
+// SQL 标准 `DEFAULT(col)` 表示「取列 col 的默认值」而非当前位置列的默认值，
+// 两者在用户明确列出列名时通常一致；保留 column_name 字段让执行器可以做正确的
+// 跨列查找（例如 INSERT INTO t(a, b) VALUES (DEFAULT(b), 1) 表示取 b 的默认值）。
+class DefaultExprNode : public Expr {
+public:
+    DefaultExprNode();
+    explicit DefaultExprNode(std::string column_name);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string column_name;  // DEFAULT(col) 中的 col；空 = 裸 DEFAULT
 };
 
 }  // namespace sqlcompiler

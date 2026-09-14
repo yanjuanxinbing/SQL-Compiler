@@ -184,6 +184,13 @@ bool SemanticAnalyzer::AnalyzeInternal(const StatementPtr& statement, bool& ok) 
             // recursive_part，使递归 SELECT 能引用 CTE 自身。
             for (auto& cte : wc->ctes) {
                 if (cte.cte_query) ok &= AnalyzeInternal(cte.cte_query, ok);
+                // bug3: 即使 cte_query 为空也要分析 cte_body，让 UNION/INTERSECT/
+                // EXCEPT 这类 SetOp body 的列被注册到符号表。旧实现 cte_query
+                // 仅在单 SELECT 或递归 UNION ALL 左侧时非空，导致普通 CTE 的
+                // SetOp body 既不分析也没列定义。
+                if (!cte.cte_query && cte.cte_body) {
+                    ok &= AnalyzeInternal(cte.cte_body, ok);
+                }
                 TableInfo ti;
                 ti.table_name = cte.cte_name;
                 if (cte.cte_query) {
@@ -226,14 +233,63 @@ bool SemanticAnalyzer::AnalyzeInternal(const StatementPtr& statement, bool& ok) 
                             ti.columns.push_back(std::move(ci));
                         }
                     }
-                } else if (!cte.cte_column_aliases.empty()) {
-                    // 递归 CTE 但 anchor 不可达（理论上 parser 已保证 cte_query
-                    // 非空，置此分支仅为防御）。用 cte_column_aliases 兜底占位。
-                    for (const auto& alias : cte.cte_column_aliases) {
-                        ColumnInfo ci;
-                        ci.name = alias;
-                        ci.data_type = "VARCHAR";
-                        ti.columns.push_back(std::move(ci));
+                } else {
+                    // bug3: 非递归 CTE 且 body 是 SetOperationStatement 时
+                    // cte_query 为空，从 cte_body 的左侧 SELECT 派生列名——
+                    // SetOp 的列名约定与左支 SELECT 保持一致（ANSI/PG 语义）。
+                    const SelectStatement* body_select = nullptr;
+                    if (auto sop = dynamic_cast<const SetOperationStatement*>(cte.cte_body.get())) {
+                        body_select = dynamic_cast<const SelectStatement*>(sop->left.get());
+                    } else if (auto sel = dynamic_cast<const SelectStatement*>(cte.cte_body.get())) {
+                        body_select = sel;
+                    }
+                    if (body_select) {
+                        const auto& sl = body_select->select_list;
+                        const auto& sa = body_select->select_aliases;
+                        if (sl.size() == 1 && sl[0] &&
+                            ((sl[0]->GetType() == NodeType::COLUMN_REF_EXPR &&
+                              std::static_pointer_cast<ColumnRefExpr>(sl[0])->column_name == "*") ||
+                             (sl[0]->GetType() == NodeType::FUNCTION_CALL_EXPR &&
+                              (std::static_pointer_cast<FunctionCallExpr>(sl[0])->function_name == "*" ||
+                               std::static_pointer_cast<FunctionCallExpr>(sl[0])->function_name == "STAR")))) {
+                            const auto& ft = body_select->from_table;
+                            if (!ft.empty()) {
+                                const TableInfo* src = symbol_table_.GetTable(ft);
+                                if (src) {
+                                    for (const auto& c : src->columns) {
+                                        ColumnInfo ci;
+                                        ci.name = c.name;
+                                        ci.data_type = c.data_type;
+                                        ti.columns.push_back(std::move(ci));
+                                    }
+                                }
+                            }
+                        }
+                        if (ti.columns.empty()) {
+                            for (size_t i = 0; i < sl.size(); ++i) {
+                                ColumnInfo ci;
+                                if (i < cte.cte_column_aliases.size() && !cte.cte_column_aliases[i].empty()) {
+                                    ci.name = cte.cte_column_aliases[i];
+                                } else if (i < sa.size() && !sa[i].empty()) {
+                                    ci.name = sa[i];
+                                } else if (sl[i] && sl[i]->GetType() == NodeType::COLUMN_REF_EXPR) {
+                                    ci.name = std::static_pointer_cast<ColumnRefExpr>(sl[i])->column_name;
+                                } else {
+                                    ci.name = "col" + std::to_string(i);
+                                }
+                                ci.data_type = "VARCHAR";
+                                ti.columns.push_back(std::move(ci));
+                            }
+                        }
+                    } else if (!cte.cte_column_aliases.empty()) {
+                        // 递归 CTE 但 anchor 不可达（理论上 parser 已保证 cte_query
+                        // 非空，置此分支仅为防御）。用 cte_column_aliases 兜底占位。
+                        for (const auto& alias : cte.cte_column_aliases) {
+                            ColumnInfo ci;
+                            ci.name = alias;
+                            ci.data_type = "VARCHAR";
+                            ti.columns.push_back(std::move(ci));
+                        }
                     }
                 }
                 // 注册 CTE 表（递归 CTE 也无条件注册，使 recursive_part 中对

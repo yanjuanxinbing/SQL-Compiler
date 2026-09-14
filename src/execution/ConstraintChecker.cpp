@@ -609,7 +609,9 @@ void EnforceChildForeignKeys(SystemCatalog* catalog, const std::string& child_ta
 void EnforceParentForeignKeys(SystemCatalog* catalog,
                               const std::string& parent_table,
                               const std::vector<Value>& parent_row,
-                              const RID* exclude_child_rid) {
+                              const RID* exclude_child_rid,
+                              const std::unordered_set<std::string>*
+                                  modified_parent_cols) {
     if (catalog == nullptr) return;
     auto refs = catalog->GetForeignKeysReferencing(parent_table);
     if (refs.empty()) return;
@@ -621,6 +623,22 @@ void EnforceParentForeignKeys(SystemCatalog* catalog,
         // 从 parent_row 抽出 (parent_cols) 值。
         auto parent_idxs = ResolveColumns(*pt, fk.parent_cols);
         if (parent_idxs.empty()) continue;
+        // Bug-7 修复：仅当 FK 的 parent_cols 全部被本次 UPDATE 修改时才触发
+        // FK 强制执行。若 modified_parent_cols 非空且本 FK 的 parent_cols 与
+        // 之无交集，说明该 UPDATE 没有改动 FK 关心的列，parent PK 实际未变，
+        // 子行引用仍然合法——跳过该 FK 的强制执行。
+        // DELETE 路径传 nullptr（modified_parent_cols 不为空检查），等同于
+        // 旧行为：所有 FK 都要走 RESTRICT/CASCADE/SET NULL 路径。
+        if (modified_parent_cols != nullptr && !modified_parent_cols->empty()) {
+            bool any_modified = false;
+            for (const auto& pc : fk.parent_cols) {
+                if (modified_parent_cols->count(pc) > 0) {
+                    any_modified = true;
+                    break;
+                }
+            }
+            if (!any_modified) continue;
+        }
         if (FkRowHasNull(parent_row, parent_idxs)) continue;  // parent NULL → 跳过
         IndexKey key;
         key.values.reserve(parent_idxs.size());

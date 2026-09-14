@@ -18,6 +18,27 @@ std::string Upper(const std::string& s) {
     return r;
 }
 
+// bug4_decimal: DECIMAL 列在运行期持久化为 VARCHAR。聚合 (SUM / AVG / STDDEV / ...)
+// 的累加路径需要把 VARCHAR 解析为 double 才能正确累加，否则 numeric 累加器会被
+// 默默跳过，导致 SUM(DECIMAL)=0 / AVG(DECIMAL)=0。空字符串 / 非数字文本
+// 走 try/catch 退化为 0.0（与旧路径「该行被 silently 丢弃」等价）。
+double NumericAsDouble(const Value& v) {
+    if (v.GetType() == ValueType::FLOAT) return v.AsFloat();
+    if (v.GetType() == ValueType::INTEGER) return static_cast<double>(v.AsInt());
+    if (v.GetType() == ValueType::VARCHAR) {
+        try {
+            size_t pos = 0;
+            std::string s = v.AsVarchar();
+            while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+            if (pos >= s.size()) return 0.0;
+            return std::stod(s, &pos);
+        } catch (...) {
+            return 0.0;
+        }
+    }
+    return 0.0;
+}
+
 bool IsAggregateFunc(const std::string& name) {
     std::string u = Upper(name);
     // 60_funcs: 把 STDDEV / VARIANCE / MEDIAN / STRING_AGG / PERCENTILE_*
@@ -361,8 +382,9 @@ void AggregateExecutor::Init() {
                     continue;
                 }
                 // STDDEV / VARIANCE: Welford 单遍累加
-                double x = (v.GetType() == ValueType::FLOAT) ? v.AsFloat() :
-                           (v.GetType() == ValueType::INTEGER) ? static_cast<double>(v.AsInt()) : 0.0;
+                // bug4_decimal: VARCHAR（DECIMAL）按 NumericAsDouble 解析，
+                // 不再退化为 0.0 否则 DECIMAL 列的方差会全部为 0。
+                double x = NumericAsDouble(v);
                 // M2 = 0 与 n=0 是初始化约定；新样本用递推更新。
                 // 为正确处理"首次进入"分支，这里手动维护 n 而非 st.count（避免重复统计 FILTER）。
                 double n = static_cast<double>(st.collected_values.size()) + 1.0;
@@ -427,10 +449,17 @@ void AggregateExecutor::Init() {
 
             st.any_numeric = true;
 
+            // bug4_decimal: SUM / AVG 的累加器需要把 VARCHAR（DECIMAL 列）也纳入。
+            // 旧逻辑只在 INTEGER / FLOAT 时累加，VARCHAR 被默默跳过，
+            // 导致 SUM(DECIMAL)=0 / AVG(DECIMAL)=0。
             if (v.GetType() == ValueType::INTEGER) {
                 st.sum_int += static_cast<double>(v.AsInt());
             } else if (v.GetType() == ValueType::FLOAT) {
                 st.sum_float += v.AsFloat();
+            } else if (v.GetType() == ValueType::VARCHAR) {
+                // VARCHAR 数值文本：尝试按 double 解析；失败保持 0（与
+                // 非 DECIMAL 列字符串不应被聚合为数字的语义一致）。
+                st.sum_float += NumericAsDouble(v);
             }
             // MIN/MAX：所有非 NULL 值都参与（DISTINCT 不影响极值语义）
             if (!st.min_max_init) {
@@ -584,11 +613,10 @@ Value AggregateExecutor::EvalAggregateExpr(const ExprPtr& expr, const Tuple& sam
             if (n % 2 == 1) return sorted[n / 2];
             const Value& lo = sorted[n / 2 - 1];
             const Value& hi = sorted[n / 2];
-            // 取两者算术平均。类型统一为 FLOAT。
-            double lv = (lo.GetType() == ValueType::FLOAT) ? lo.AsFloat() :
-                        (lo.GetType() == ValueType::INTEGER) ? static_cast<double>(lo.AsInt()) : 0.0;
-            double hv = (hi.GetType() == ValueType::FLOAT) ? hi.AsFloat() :
-                        (hi.GetType() == ValueType::INTEGER) ? static_cast<double>(hi.AsInt()) : 0.0;
+            // 取两者算术平均。类型统一为 FLOAT。bug4_decimal: VARCHAR 走
+            // NumericAsDouble，不再把 DECIMAL 中位数错误地按 0 计入。
+            double lv = NumericAsDouble(lo);
+            double hv = NumericAsDouble(hi);
             return Value::MakeFloat((lv + hv) / 2.0);
         }
 
@@ -603,8 +631,8 @@ Value AggregateExecutor::EvalAggregateExpr(const ExprPtr& expr, const Tuple& sam
             bool p_set = false;
             for (const auto& pv : st.percentile_p_samples) {
                 if (!pv.IsNull()) {
-                    p = (pv.GetType() == ValueType::FLOAT) ? pv.AsFloat() :
-                        (pv.GetType() == ValueType::INTEGER) ? static_cast<double>(pv.AsInt()) : 0.0;
+                    // bug4_decimal: p 也可能是 VARCHAR 数值文本，统一走 NumericAsDouble。
+                    p = NumericAsDouble(pv);
                     p_set = true;
                     break;
                 }
@@ -637,10 +665,10 @@ Value AggregateExecutor::EvalAggregateExpr(const ExprPtr& expr, const Tuple& sam
             double frac = pos - static_cast<double>(lo_i);
             const Value& lo = non_null[lo_i];
             const Value& hi = non_null[hi_i];
-            double lv = (lo.GetType() == ValueType::FLOAT) ? lo.AsFloat() :
-                        (lo.GetType() == ValueType::INTEGER) ? static_cast<double>(lo.AsInt()) : 0.0;
-            double hv = (hi.GetType() == ValueType::FLOAT) ? hi.AsFloat() :
-                        (hi.GetType() == ValueType::INTEGER) ? static_cast<double>(hi.AsInt()) : 0.0;
+            // bug4_decimal: VARCHAR（DECIMAL）走 NumericAsDouble 解析，
+            // 否则百分位插值在 DECIMAL 列上会得到 0。
+            double lv = NumericAsDouble(lo);
+            double hv = NumericAsDouble(hi);
             return Value::MakeFloat(lv + (hv - lv) * frac);
         }
 

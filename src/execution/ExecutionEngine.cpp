@@ -934,6 +934,7 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             }
             return wrap(std::make_unique<InsertExecutor>(context, n->table_name, n->columns,
                                                           n->values_list, n->is_replace,
+                                                          n->is_default_values,
                                                           n->returning_exprs,
                                                           n->returning_aliases));
         }
