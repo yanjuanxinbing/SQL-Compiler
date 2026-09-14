@@ -1,0 +1,38 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> id   | name    | age  | salary
+-----+---------+------+-------
+1    | Alice   | 30   | 5000  
+2    | Bob     | 25   | 4000  
+3    | Charlie | 35   | 6000  
+4    | David   | 28   | 4500  
+NULL | Eve     | 40   | NULL  
+NULL | Frank   | NULL | 3500  
+(6 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> id   | name    | age  | salary
+-----+---------+------+-------
+1    | Alice   | 30   | 5500  
+2    | Bob     | 26   | 4200  
+3    | Charlie | 35   | 6600  
+4    | David   | 28   | 4500  
+NULL | Eve     | 40   | NULL  
+NULL | Frank   | NULL | 3500  
+(6 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> id   | name  | age  | salary
+-----+-------+------+-------
+1    | Alice | 30   | 5500  
+2    | Bob   | 26   | 4200  
+4    | David | 28   | 4500  
+NULL | Eve   | 40   | NULL  
+NULL | Frank | NULL | 3500  
+(5 rows)
+sqlcompiler> sqlcompiler> 

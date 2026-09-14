@@ -1,0 +1,95 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | name    | age | score
+---+---------+-----+------
+1  | Alice   | 20  | 88.5 
+2  | Bob     | 22  | 91   
+3  | Charlie | 19  | 76.5 
+4  | David   | 25  | 95.5 
+5  | Eve     | 21  | 82   
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | name  | age | score
+---+-------+-----+------
+2  | Bob   | 22  | 91   
+4  | David | 25  | 95.5 
+5  | Eve   | 21  | 82   
+(3 rows)
+sqlcompiler> id | name  | age | score
+---+-------+-----+------
+2  | Bob   | 22  | 91   
+4  | David | 25  | 95.5 
+5  | Eve   | 21  | 82   
+(3 rows)
+sqlcompiler> id | name    | age | score
+---+---------+-----+------
+2  | Bob     | 22  | 91   
+3  | Charlie | 19  | 76.5 
+(2 rows)
+sqlcompiler> id | name  | age | score
+---+-------+-----+------
+1  | Alice | 20  | 88.5 
+2  | Bob   | 22  | 91   
+4  | David | 25  | 95.5 
+5  | Eve   | 21  | 82   
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | name    | age | score
+---+---------+-----+------
+3  | Charlie | 19  | 76.5 
+1  | Alice   | 20  | 88.5 
+5  | Eve     | 21  | 82   
+2  | Bob     | 22  | 91   
+4  | David   | 25  | 95.5 
+(5 rows)
+sqlcompiler> id | name    | age | score
+---+---------+-----+------
+4  | David   | 25  | 95.5 
+2  | Bob     | 22  | 91   
+1  | Alice   | 20  | 88.5 
+5  | Eve     | 21  | 82   
+3  | Charlie | 19  | 76.5 
+(5 rows)
+sqlcompiler> id | name    | age | score
+---+---------+-----+------
+3  | Charlie | 19  | 76.5 
+1  | Alice   | 20  | 88.5 
+5  | Eve     | 21  | 82   
+2  | Bob     | 22  | 91   
+4  | David   | 25  | 95.5 
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | name  | age | score
+---+-------+-----+------
+1  | Alice | 20  | 88.5 
+2  | Bob   | 22  | 91   
+(2 rows)
+sqlcompiler> id | name    | age | score
+---+---------+-----+------
+2  | Bob     | 22  | 91   
+3  | Charlie | 19  | 76.5 
+(2 rows)
+sqlcompiler> id | name    | age | score
+---+---------+-----+------
+1  | Alice   | 20  | 88.5 
+2  | Bob     | 22  | 91   
+3  | Charlie | 19  | 76.5 
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> name    | age
+--------+----
+Alice   | 20 
+Bob     | 22 
+Charlie | 19 
+David   | 25 
+Eve     | 21 
+(5 rows)
+sqlcompiler> name  | score
+------+------
+Alice | 88.5 
+Bob   | 91   
+David | 95.5 
+(3 rows)
+sqlcompiler> sqlcompiler> 

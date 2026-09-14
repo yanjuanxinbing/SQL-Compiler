@@ -1,0 +1,69 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | age
+---+----
+2  | 20 
+3  | 30 
+4  | 40 
+(3 rows)
+sqlcompiler> sqlcompiler> id | age
+---+----
+1  | 10 
+5  | 50 
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> id | age
+---+----
+1  | 10 
+2  | 20 
+3  | 30 
+4  | 40 
+5  | 50 
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> id | email  
+---+--------
+3  | c@x.com
+(1 row)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> id | age
+---+----
+1  | 110
+2  | 20 
+3  | 30 
+4  | 40 
+5  | 150
+(5 rows)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | age
+---+----
+1  | 10 
+2  | 20 
+3  | 30 
+4  | 40 
+5  | 50 
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> id | age
+---+----
+1  | 10 
+5  | 50 
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | age
+---+----
+1  | 10 
+5  | 50 
+(2 rows)
+sqlcompiler> sqlcompiler> id | age
+---+----
+3  | 30 
+(1 row)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> 

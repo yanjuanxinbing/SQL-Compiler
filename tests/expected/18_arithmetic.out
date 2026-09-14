@@ -1,0 +1,90 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | a  | b  | c   | d  
+---+----+----+-----+----
+2  | 20 | 5  | 2.5 | 0.5
+3  | 30 | 7  | 3.5 | -1 
+4  | 40 | 11 | 0   | 4  
+(3 rows)
+sqlcompiler> id | a  | b | c   | d
+---+----+---+-----+--
+1  | 10 | 3 | 1.5 | 2
+(1 row)
+sqlcompiler> id | a  | b  | c   | d  
+---+----+----+-----+----
+2  | 20 | 5  | 2.5 | 0.5
+3  | 30 | 7  | 3.5 | -1 
+4  | 40 | 11 | 0   | 4  
+(3 rows)
+sqlcompiler> id | a  | b  | c   | d  
+---+----+----+-----+----
+1  | 10 | 3  | 1.5 | 2  
+2  | 20 | 5  | 2.5 | 0.5
+3  | 30 | 7  | 3.5 | -1 
+4  | 40 | 11 | 0   | 4  
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | a  | b  | c   | d
+---+----+----+-----+--
+1  | 10 | 3  | 1.5 | 2
+4  | 40 | 11 | 0   | 4
+(2 rows)
+sqlcompiler> id | a  | b | c   | d
+---+----+---+-----+--
+1  | 10 | 3 | 1.5 | 2
+(1 row)
+sqlcompiler> id | a  | b  | c   | d  
+---+----+----+-----+----
+1  | 10 | 3  | 1.5 | 2  
+2  | 20 | 5  | 2.5 | 0.5
+3  | 30 | 7  | 3.5 | -1 
+4  | 40 | 11 | 0   | 4  
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | expr1 | expr2
+---+-------+------
+1  | 16    | 26   
+2  | 30    | 50   
+3  | 44    | 74   
+4  | 62    | 102  
+(4 rows)
+sqlcompiler> id | div1 | div2    
+---+------+---------
+1  | 3    | 3.333333
+2  | 4    | 4       
+3  | 4    | 4.285714
+4  | 3    | 3.636364
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | a / 0
+---+------
+1  | NULL 
+(1 row)
+sqlcompiler> id | 0 / b
+---+------
+1  | 0    
+2  | 0    
+3  | 0    
+4  | 0    
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | neg_a
+---+------
+1  | -10  
+2  | -20  
+3  | -30  
+4  | -40  
+(4 rows)
+sqlcompiler> id | neg_sum
+---+--------
+1  | -13    
+2  | -25    
+3  | -37    
+4  | -51    
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | total
+---+------
+1  | 13   
+2  | 25   
+3  | 37   
+4  | 51   
+(4 rows)
+sqlcompiler> sqlcompiler> 

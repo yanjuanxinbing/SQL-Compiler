@@ -1,0 +1,79 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> 
+Error: [Semantic] value too long for column 's' (TEXT(5)): got 6 characters
+sqlcompiler> sqlcompiler> 
+Error: [Semantic] value too long for column 's' (TEXT(5)): got 38 characters
+sqlcompiler> id | s     | len
+---+-------+----
+1  | abc   | 3  
+2  | abcde | 5  
+3  |       | 0  
+(3 rows)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> OK
+sqlcompiler> OK
+sqlcompiler> 
+Error: [Semantic] value too long for column 'a' (VARCHAR(5)): got 6 characters
+sqlcompiler> id
+--
+1 
+(1 row)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> sqlcompiler> 
+Error: [Syntax] line=1, col=36: unexpected token in expression: 'REPEAT'
+sqlcompiler> 
+Error: [Syntax] line=1, col=36: unexpected token in expression: 'REPEAT'
+sqlcompiler> id | len
+---+----
+(0 rows)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> 
+Error: [Semantic] value too long for column 's' (TEXT(5)): got 6 characters
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | s    
+---+------
+1  | abcde
+(1 row)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> 
+Error: [Semantic] value too long for column 's' (TEXT(3)): got 4 characters
+sqlcompiler> id | s     
+---+-------
+1  | 你好  
+2  | 你好啊
+(2 rows)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> id | s   
+---+-----
+1  | NULL
+2  | NULL
+(2 rows)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> 
+Error: [Semantic] value too long for column 'a' (TEXT(5)): got 6 characters
+sqlcompiler> sqlcompiler> 
+Error: [Semantic] value too long for column 'b' (VARCHAR(10)): got 11 characters
+sqlcompiler> sqlcompiler> 
+Error: [Semantic] value too long for column 'c' (CHAR(3)): got 4 characters
+sqlcompiler> id
+--
+1 
+(1 row)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> 

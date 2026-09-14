@@ -1,0 +1,89 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> id | n          
+---+------------
+1  | -1         
+2  | -2         
+3  | -10        
+4  | -100       
+5  | -1000      
+6  | -2147483647
+7  | -2147483648
+(7 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> id | n   
+---+-----
+8  | NULL
+9  | NULL
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> neg_count
+---------
+7        
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> id | n          
+---+------------
+1  | -1         
+2  | -2         
+3  | -10        
+4  | -100       
+5  | -1000      
+6  | -2147483647
+7  | -2147483648
+(7 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> id | n          
+---+------------
+1  | -1         
+2  | -2         
+7  | -2147483648
+8  | NULL       
+9  | NULL       
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> expr_neg_one
+------------
+-1          
+(1 row)
+sqlcompiler> expr_min   
+-----------
+-2147483648
+(1 row)
+sqlcompiler> min_plus_one
+------------
+-2147483646 
+(1 row)
+sqlcompiler> five_neg
+--------
+-5      
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> a           | b    | c          
+------------+------+------------
+-2147483648 | NULL | 0          
+NULL        | -1   | -2147483648
+NULL        | NULL | NULL       
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> f    | s    
+-----+------
+-1   | hello
+-0   |      
+NULL | NULL 
+(3 rows)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> 

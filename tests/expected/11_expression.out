@@ -1,0 +1,70 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> 1 | 3.14 | 'hello'
+--+------+--------
+1 | 3.14 | hello  
+1 | 3.14 | hello  
+1 | 3.14 | hello  
+1 | 3.14 | hello  
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | qty_plus_one
+---+-------------
+1  | 4           
+2  | 6           
+3  | 3           
+4  | 11          
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | subtotal
+---+---------
+1  | 30      
+2  | 100     
+3  | 17      
+4  | 1000    
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | total
+---+------
+1  | 30.5 
+2  | 101  
+3  | 17.4 
+4  | 1005 
+(4 rows)
+sqlcompiler> id | total2
+---+-------
+1  | 31.5  
+2  | 105   
+3  | 17.8  
+4  | 1050  
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | subtotal | grand_total
+---+----------+------------
+1  | 30       | 30.5       
+2  | 100      | 101        
+3  | 17       | 17.4       
+4  | 1000     | 1005       
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | neg_price
+---+----------
+1  | -10      
+2  | -20      
+3  | -8.5     
+4  | -100     
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | qty | price | tax
+---+-----+-------+----
+4  | 10  | 100   | 5  
+(1 row)
+sqlcompiler> id | qty | price | tax
+---+-----+-------+----
+2  | 5   | 20    | 1  
+4  | 10  | 100   | 5  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | subtotal
+---+---------
+4  | 1000    
+2  | 100     
+1  | 30      
+3  | 17      
+(4 rows)
+sqlcompiler> sqlcompiler> 

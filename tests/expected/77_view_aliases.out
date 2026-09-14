@@ -1,0 +1,79 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> v 
+--
+20
+30
+(2 rows)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> i | val
+--+----
+1 | 10 
+2 | 20 
+(2 rows)
+sqlcompiler> i | val
+--+----
+1 | 10 
+2 | 20 
+(2 rows)
+sqlcompiler> i | val
+--+----
+2 | 20 
+(1 row)
+sqlcompiler> i | val
+--+----
+2 | 20 
+1 | 10 
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> i | val
+--+----
+1 | 10 
+2 | 20 
+(2 rows)
+sqlcompiler> i
+-
+1
+2
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> i | next_v
+--+-------
+1 | 11    
+2 | 21    
+3 | 31    
+(3 rows)
+sqlcompiler> i | next_v
+--+-------
+2 | 21    
+3 | 31    
+(2 rows)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> val
+---
+20 
+(1 row)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> i | val
+--+----
+(0 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        -> OK
+sqlcompiler> i | val
+--+----
+1 | 10 
+2 | 20 
+3 | 30 
+(3 rows)
+sqlcompiler> i | val
+--+----
+2 | 20 
+3 | 30 
+(2 rows)
+sqlcompiler> 
+Error: [Syntax] line=1, col=6: expected TABLE (got 'MATERIALIZED')
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> 

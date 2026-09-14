@@ -1,0 +1,52 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> COUNT
+-----
+8    
+(1 row)
+sqlcompiler> COUNT | SUM  | AVG  | MIN | MAX 
+------+------+------+-----+-----
+8     | 9600 | 1200 | 600 | 2000
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> dept  | COUNT
+------+------
+IT    | 4    
+HR    | 2    
+Sales | 2    
+(3 rows)
+sqlcompiler> dept  | COUNT | total
+------+-------+------
+IT    | 4     | 4500 
+HR    | 2     | 1300 
+Sales | 2     | 3800 
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> dept  | region | COUNT | SUM 
+------+--------+-------+-----
+IT    | East   | 2     | 1800
+IT    | West   | 1     | 1500
+HR    | East   | 1     | 600 
+HR    | West   | 1     | 700 
+Sales | East   | 1     | 2000
+Sales | West   | 1     | 1800
+IT    | South  | 1     | 1200
+(7 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> dept  | COUNT
+------+------
+IT    | 4    
+HR    | 2    
+Sales | 2    
+(3 rows)
+sqlcompiler> dept  | total
+------+------
+IT    | 4500 
+Sales | 3800 
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> dept  | cnt | avg_amt
+------+-----+--------
+Sales | 2   | 1900   
+IT    | 3   | 1100   
+HR    | 2   | 650    
+(3 rows)
+sqlcompiler> sqlcompiler> 

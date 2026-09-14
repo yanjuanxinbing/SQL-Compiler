@@ -1,0 +1,99 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | name | score
+---+------+------
+30 | th   | 300  
+(1 row)
+sqlcompiler> id | name | score
+---+------+------
+30 | th   | 300  
+(1 row)
+sqlcompiler> sqlcompiler> id | name | score
+---+------+------
+20 | t    | 200  
+30 | th   | 300  
+40 | f    | 400  
+(3 rows)
+sqlcompiler> id | name | score
+---+------+------
+20 | t    | 200  
+30 | th   | 300  
+40 | f    | 400  
+(3 rows)
+sqlcompiler> sqlcompiler> id | name | score
+---+------+------
+30 | th   | 300  
+40 | f    | 400  
+(2 rows)
+sqlcompiler> id | name | score
+---+------+------
+30 | th   | 300  
+40 | f    | 400  
+(2 rows)
+sqlcompiler> sqlcompiler> id | name | score
+---+------+------
+10 | j    | 100  
+20 | t    | 200  
+30 | th   | 300  
+(3 rows)
+sqlcompiler> id | name | score
+---+------+------
+10 | j    | 100  
+20 | t    | 200  
+30 | th   | 300  
+(3 rows)
+sqlcompiler> sqlcompiler> id | name | score
+---+------+------
+10 | j    | 100  
+20 | t    | 200  
+(2 rows)
+sqlcompiler> id | name | score
+---+------+------
+10 | j    | 100  
+20 | t    | 200  
+(2 rows)
+sqlcompiler> sqlcompiler> id | name | score
+---+------+------
+20 | t    | 200  
+30 | th   | 300  
+(2 rows)
+sqlcompiler> id | name | score
+---+------+------
+20 | t    | 200  
+30 | th   | 300  
+(2 rows)
+sqlcompiler> sqlcompiler> id | name | score
+---+------+------
+(0 rows)
+sqlcompiler> id | name | score
+---+------+------
+(0 rows)
+sqlcompiler> sqlcompiler> COUNT
+-----
+3    
+(1 row)
+sqlcompiler> COUNT
+-----
+3    
+(1 row)
+sqlcompiler> sqlcompiler> id | name | score
+---+------+------
+30 | th   | 300  
+(1 row)
+sqlcompiler> id | name | score
+---+------+------
+30 | th   | 300  
+(1 row)
+sqlcompiler> sqlcompiler> 

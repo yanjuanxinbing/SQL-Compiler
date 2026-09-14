@@ -1,0 +1,74 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> name    | total
+--------+------
+Alice   | 7597 
+David   | 6999 
+Charlie | 5998 
+Bob     | 4296 
+Eve     | 299  
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> city     | cnt
+---------+----
+Beijing  | 2  
+Shanghai | 2  
+Shenzhen | 1  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> name      | sold_qty | revenue
+----------+----------+--------
+Laptop    | 2        | 13998  
+Tablet    | 2        | 5998   
+Phone     | 1        | 3999   
+Headphone | 3        | 897    
+Mouse     | 3        | 297    
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> user    | city     | product   | qty | amount
+--------+----------+-----------+-----+-------
+Alice   | Beijing  | Laptop    | 1   | 6999  
+Charlie | Beijing  | Tablet    | 2   | 5998  
+Alice   | Beijing  | Headphone | 2   | 598   
+Bob     | Shanghai | Phone     | 1   | 3999  
+Eve     | Shanghai | Headphone | 1   | 299   
+Bob     | Shanghai | Mouse     | 3   | 297   
+David   | Shenzhen | Laptop    | 1   | 6999  
+(7 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> city    | cnt | total
+--------+-----+------
+Beijing | 3   | 13595
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> name      | sold
+----------+-----
+Headphone | 3   
+Mouse     | 3   
+Laptop    | 2   
+Tablet    | 2   
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> name    | order_cnt | total
+--------+-----------+------
+Alice   | 2         | 7597 
+David   | 1         | 6999 
+Charlie | 1         | 5998 
+Bob     | 2         | 4296 
+Eve     | 1         | 299  
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> id   | user_id | product_id | qty | amount
+-----+---------+------------+-----+-------
+1002 | 1       | 104        | 3   | 598   
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> id   | user_id | product_id | qty | amount
+-----+---------+------------+-----+-------
+1001 | 1       | 101        | 1   | 6999  
+1002 | 1       | 104        | 3   | 598   
+1003 | 2       | 102        | 1   | 3999  
+1005 | 3       | 103        | 2   | 5998  
+1006 | 4       | 101        | 1   | 6999  
+(5 rows)
+sqlcompiler> sqlcompiler> 

@@ -1,0 +1,90 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> val + 10
+--------
+110     
+210.5   
+(2 rows)
+sqlcompiler> val * 2
+-------
+200    
+401    
+(2 rows)
+sqlcompiler> SUM  
+-----
+300.5
+(1 row)
+sqlcompiler> AVG   
+------
+150.25
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> val - 5
+-------
+95     
+195.5  
+(2 rows)
+sqlcompiler> val / 4
+-------
+25     
+50.125 
+(2 rows)
+sqlcompiler> val + val
+---------
+200      
+401      
+(2 rows)
+sqlcompiler> val + 0.50
+----------
+100.5     
+201       
+(2 rows)
+sqlcompiler> val * 1.10
+----------
+110       
+220.55    
+(2 rows)
+sqlcompiler> -val  
+------
+-100  
+-200.5
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> val > 150
+---------
+0        
+1        
+(2 rows)
+sqlcompiler> val = 100.00
+------------
+1           
+0           
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> 7.75
+----
+7.75
+(1 row)
+sqlcompiler> 6.5
+---
+6.5
+(1 row)
+sqlcompiler> 10
+--
+10
+(1 row)
+sqlcompiler> 3
+-
+3
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> val + 10
+--------
+110     
+210.5   
+NULL    
+(3 rows)
+sqlcompiler> SUM  
+-----
+300.5
+(1 row)
+sqlcompiler> sqlcompiler> 

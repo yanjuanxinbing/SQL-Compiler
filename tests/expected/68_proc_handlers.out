@@ -1,0 +1,103 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler>        -> tag           | val
+--------------+----
+before_signal | 100
+exit_basic    | 1  
+(2 rows)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler>        -> tag          | val
+-------------+----
+after_loop   | 3  
+exit_in_loop | 3  
+(2 rows)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> tag          | val
+-------------+----
+exit_in_if   | 1  
+if_before    | 20 
+outer_after  | 40 
+outer_before | 10 
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> continue_still_works
+--------------------
+7                   
+(1 row)
+sqlcompiler> continue_still_works
+--------------------
+0                   
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> id | val
+---+----
+0  | 0  
+(1 row)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> tag | val
+----+----
+(0 rows)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> tag      | val
+---------+----
+baseline | 0  
+(1 row)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler>        -> tag             | val
+----------------+----
+caught_sqlstate | 1  
+(1 row)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> 
+Error: SIGNAL SQLSTATE '22012' MESSAGE 'rethrown'
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> tag               | val
+------------------+----
+after_failed_call | 1  
+(1 row)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> tag             | val
+----------------+----
+after_loop_only | 4  
+loop_exit       | 4  
+(2 rows)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> 

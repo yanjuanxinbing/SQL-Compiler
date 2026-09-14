@@ -1,0 +1,40 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> COUNT
+-----
+8    
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> COUNT
+-----
+8    
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> total_qty
+---------
+26       
+(1 row)
+sqlcompiler> avg_price
+---------
+2.225    
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> min_price
+---------
+0.3      
+(1 row)
+sqlcompiler> max_price
+---------
+5        
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> n | total_qty | avg_price | min_price | max_price
+--+-----------+-----------+-----------+----------
+8 | 26        | 2.225     | 0.3       | 5        
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> cust_id | COUNT
+--------+------
+101     | 3    
+102     | 2    
+103     | 1    
+104     | 2    
+(4 rows)
+sqlcompiler> sqlcompiler> 

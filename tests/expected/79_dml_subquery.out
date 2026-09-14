@@ -1,0 +1,28 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> eid | sid | course
+----+-----+-------
+101 | 1   | CS101 
+102 | 1   | MA101 
+103 | 2   | CS101 
+104 | 3   | PH101 
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | name    | gpa
+---+---------+----
+1  | Alice   | 3.5
+2  | Bob     | 3.7
+3  | Charlie | 4  
+4  | David   | 3.2
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> eid | sid | course
+----+-----+-------
+(0 rows)
+sqlcompiler> sqlcompiler> 

@@ -1,0 +1,49 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> i    | bi   | f       | d    | v                           | txt                      
+-----+------+---------+------+-----------------------------+--------------------------
+42   | NULL | NULL    | NULL | NULL                        | NULL                     
+-100 | NULL | NULL    | NULL | NULL                        | NULL                     
+3    | NULL | NULL    | NULL | NULL                        | NULL                     
+-2   | NULL | NULL    | NULL | NULL                        | NULL                     
+NULL | NULL | 100     | NULL | NULL                        | NULL                     
+NULL | NULL | 200     | NULL | NULL                        | NULL                     
+NULL | NULL | 3.14159 | NULL | NULL                        | NULL                     
+NULL | NULL | -0.0025 | NULL | NULL                        | NULL                     
+NULL | NULL | NULL    | NULL | hello                       | NULL                     
+NULL | NULL | NULL    | NULL | 中文测试                    | NULL                     
+NULL | NULL | NULL    | NULL | special: 'quotes' & symbols | NULL                     
+NULL | NULL | NULL    | NULL | NULL                        | long text content here...
+(12 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> i    | bi   | f   | d    | v    | txt 
+-----+------+-----+------+------+-----
+NULL | NULL | 200 | NULL | NULL | NULL
+(1 row)
+sqlcompiler> i    | bi   | f       | d    | v    | txt 
+-----+------+---------+------+------+-----
+NULL | NULL | 3.14159 | NULL | NULL | NULL
+(1 row)
+sqlcompiler> i | bi | f | d | v | txt
+--+----+---+---+---+----
+(0 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> i    | f       | sum  | doubled
+-----+---------+------+--------
+NULL | 100     | NULL | 200    
+NULL | 200     | NULL | 400    
+NULL | 3.14159 | NULL | 6.28318
+NULL | -0.0025 | NULL | -0.005 
+(4 rows)
+sqlcompiler> sqlcompiler> 

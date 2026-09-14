@@ -1,0 +1,44 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> id | id
+---+---
+1  | 1 
+2  | 2 
+(2 rows)
+sqlcompiler> sqlcompiler> id   | id  
+-----+-----
+1    | 1   
+2    | 2   
+3    | NULL
+NULL | 4   
+(4 rows)
+sqlcompiler> sqlcompiler> id | id
+---+---
+1  | 1 
+1  | 2 
+1  | 4 
+2  | 1 
+2  | 2 
+2  | 4 
+3  | 1 
+3  | 2 
+3  | 4 
+(9 rows)
+sqlcompiler> sqlcompiler> id
+--
+1 
+2 
+(2 rows)
+sqlcompiler> sqlcompiler> id
+--
+1 
+(1 row)
+sqlcompiler> sqlcompiler> COUNT
+-----
+2    
+(1 row)
+sqlcompiler> sqlcompiler> 

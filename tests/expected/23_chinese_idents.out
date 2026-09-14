@@ -1,0 +1,34 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> sqlcompiler> 编号 | 姓名 | 成绩
+-----+------+-----
+1    | 张三 | 88.5
+2    | 李四 | 92  
+3    | 王五 | 76.5
+(3 rows)
+sqlcompiler> 姓名 | 成绩
+-----+-----
+张三 | 88.5
+李四 | 92  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> 姓名 | 金额 
+-----+------
+张三 | 100.5
+李四 | 250  
+王五 | 75.5 
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> COUNT
+-----
+2    
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> id | name
+---+-----
+1  | 张三
+2  | 李四
+3  | 王五
+(3 rows)
+sqlcompiler> sqlcompiler> 

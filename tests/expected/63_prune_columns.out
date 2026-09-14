@@ -1,0 +1,46 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | name 
+---+------
+1  | Alice
+(1 row)
+sqlcompiler> name  | salary
+------+-------
+Alice | 7000  
+Bob   | 8500  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | name  | dept  | age | salary
+---+-------+-------+-----+-------
+1  | Alice | IT    | 25  | 7000  
+2  | Bob   | IT    | 30  | 8500  
+4  | David | Sales | 28  | 9000  
+5  | Eve   | HR    | 35  | 9500  
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> SUM  
+-----
+39000
+(1 row)
+sqlcompiler> dept  | SUM  
+------+------
+IT    | 15500
+HR    | 14500
+Sales | 9000 
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | name
+---+-----
+5  | Eve 
+2  | Bob 
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> name | id
+-----+---
+(0 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | name 
+---+------
+1  | Alice
+2  | Bob  
+(2 rows)
+sqlcompiler> sqlcompiler> 

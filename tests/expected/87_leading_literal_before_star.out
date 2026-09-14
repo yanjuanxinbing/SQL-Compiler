@@ -1,0 +1,64 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> c | id | country | credit
+--+----+---------+-------
+X | 1  | USA     | 5000  
+X | 2  | USA     | 3000  
+X | 3  | UK      | 2000  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | country | credit | c
+---+---------+--------+--
+1  | USA     | 5000   | X
+2  | USA     | 3000   | X
+3  | UK      | 2000   | X
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | c | country | credit
+---+---+---------+-------
+1  | X | USA     | 5000  
+2  | X | USA     | 3000  
+3  | X | UK      | 2000  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> c | id | country | credit
+--+----+---------+-------
+X | 2  | USA     | 3000  
+X | 3  | UK      | 2000  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> c | id | country | credit
+--+----+---------+-------
+X | 1  | USA     | 5000  
+X | 2  | USA     | 3000  
+X | 3  | UK      | 2000  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> c | id | country | credit
+--+----+---------+-------
+X | 3  | UK      | 2000  
+X | 1  | USA     | 5000  
+X | 2  | USA     | 3000  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | country | credit
+---+---------+-------
+1  | USA     | 5000  
+2  | USA     | 3000  
+3  | UK      | 2000  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> c
+-
+X
+X
+X
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> c | id | country | credit
+--+----+---------+-------
+X | 1  | USA     | 5000  
+X | 2  | USA     | 3000  
+X | 3  | UK      | 2000  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> c | id | country
+--+----+--------
+X | 1  | USA    
+X | 2  | USA    
+X | 3  | UK     
+(3 rows)
+sqlcompiler> sqlcompiler> 

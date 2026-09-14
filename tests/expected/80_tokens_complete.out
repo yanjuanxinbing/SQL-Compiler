@@ -1,0 +1,18 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | gpa | name | created_at
+---+-----+------+-----------
+(0 rows)
+sqlcompiler> [tokens] 10 token(s):
+  [KEYWORD_SELECT] 'SELECT' @line=1:col=1
+  [OP_STAR] '*' @line=1:col=8
+  [KEYWORD_FROM] 'FROM' @line=1:col=10
+  [IDENTIFIER] 't' @line=1:col=15
+  [KEYWORD_ORDER] 'ORDER' @line=1:col=17
+  [KEYWORD_BY] 'BY' @line=1:col=23
+  [IDENTIFIER] 'gpa' @line=1:col=26
+  [KEYWORD_DESC] 'DESC' @line=1:col=30
+  [SEMICOLON] ';' @line=1:col=34
+  [END_OF_FILE] '' @line=1:col=35
+sqlcompiler> 

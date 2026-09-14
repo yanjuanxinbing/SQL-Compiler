@@ -1,0 +1,59 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> id | name    | dept_label 
+---+---------+------------
+1  | Alice   | Engineering
+2  | Bob     | People     
+3  | Charlie | Engineering
+4  | David   | People     
+5  | Eve     | Other      
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> id | name    | salary_band
+---+---------+------------
+1  | Alice   | high       
+2  | Bob     | low        
+3  | Charlie | high       
+4  | David   | mid        
+5  | Eve     | mid        
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> dept | total_bonus
+-----+------------
+IT   | 1000       
+HR   | 500        
+FIN  | 0          
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        -> id | name    | bonus_or_zero
+---+---------+--------------
+1  | Alice   | 1000         
+2  | Bob     | 0            
+3  | Charlie | 0            
+4  | David   | 500          
+5  | Eve     | 0            
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> id | name    | fallback
+---+---------+---------
+1  | Alice   | 1000    
+2  | Bob     | 550     
+3  | Charlie | 800     
+4  | David   | 500     
+5  | Eve     | 700     
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> id | dept_or_null
+---+-------------
+1  | IT          
+2  | NULL        
+3  | IT          
+4  | NULL        
+5  | FIN         
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> id | name    | tier     
+---+---------+----------
+1  | Alice   | IT-senior
+2  | Bob     | non-IT   
+3  | Charlie | IT-junior
+4  | David   | non-IT   
+5  | Eve     | non-IT   
+(5 rows)
+sqlcompiler> sqlcompiler> 

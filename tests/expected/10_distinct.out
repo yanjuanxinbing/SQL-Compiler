@@ -1,0 +1,45 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> dept
+----
+IT  
+IT  
+HR  
+IT  
+HR  
+IT  
+HR  
+(7 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> dept
+----
+IT  
+HR  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> dept | score
+-----+------
+IT   | 88.5 
+IT   | 91   
+HR   | 76.5 
+HR   | 85   
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> dept
+----
+IT  
+HR  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> dept_cnt
+--------
+2       
+(1 row)
+sqlcompiler> score_cnt
+---------
+4        
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> dept | uniq_scores
+-----+------------
+HR   | 2          
+IT   | 2          
+(2 rows)
+sqlcompiler> sqlcompiler> 
