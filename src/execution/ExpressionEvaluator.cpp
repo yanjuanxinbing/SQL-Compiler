@@ -1260,8 +1260,12 @@ Value ExpressionEvaluator::EvaluateFunctionCall(const FunctionCallExpr& expr,
         double av = ValueToDouble(a);
         double bv = ValueToDouble(b);
         if (bv == 0.0) return Value::MakeNull();
-        double r = av - std::floor(av / bv) * bv;
-        if (r < 0) r += bv;  // 与 SQL MOD 一致：返回非负余数
+        // SQL MOD：余数符号跟随被除数。std::fmod 的结果符号与被除数（左操作数）
+        // 一致，与 BinaryOperator::MOD 路径（lv % rv）语义相同。
+        // 旧实现用 floor 取模（符号跟随除数）后又做 `if (r < 0) r += bv`，
+        // 除数为负时该调整恒触发，多扣一次 |bv|：
+        //   MOD(10,-3) = -5、MOD(-10,-3) = -4（均无数学意义）。
+        double r = std::fmod(av, bv);
         return Value::MakeInt(static_cast<int32_t>(r));
     }
     // ---- 数学函数补全（Fix #2）----
