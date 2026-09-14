@@ -3,6 +3,9 @@ REM ============================================================
 REM  Phase 1.5 smoke harness: REPL debug meta-commands
 REM  (test 62_debug_meta). Exercises \.tokens / \.ast / \.plan
 REM  after a normal SQL statement, verifying the cache wiring.
+REM  Note: \.plan now displays the pre-optimization plan tree
+REM  (Planner output before Optimizer runs). Use \.optimized to
+REM  see the post-optimization tree; see run_plan_optimized.bat.
 REM  Usage: run_debug_meta.bat
 REM  Notes: This file MUST be saved as CRLF + ASCII (no UTF-8 BOM).
 REM         Pure-LF line endings break cmd.exe parsing on Windows.
@@ -79,15 +82,23 @@ if !errorlevel! neq 0 (
     set "PASS=0"
 )
 
-REM ---- meta: plan command should print "Project(...)" and "SeqScan(...)"
-findstr /C:"Project" "%OUT%" >nul
+REM ---- meta: plan command should print "Project(...)" and "SeqScan(...)".
+REM      \.plan now displays the pre-optimization tree, which keeps the
+REM      Filter above SeqScan (predicate not yet pushed down). The full
+REM      \.optimized rendering is checked separately in run_plan_optimized.bat.
+findstr /I /C:"Project" "%OUT%" >nul
 if !errorlevel! neq 0 (
     echo [FAIL] expected Project plan node
     set "PASS=0"
 )
-findstr /C:"SeqScan" "%OUT%" >nul
+findstr /I /C:"SeqScan" "%OUT%" >nul
 if !errorlevel! neq 0 (
     echo [FAIL] expected SeqScan plan node
+    set "PASS=0"
+)
+findstr /I /C:"Filter" "%OUT%" >nul
+if !errorlevel! neq 0 (
+    echo [FAIL] expected standalone Filter plan node in pre-opt view
     set "PASS=0"
 )
 

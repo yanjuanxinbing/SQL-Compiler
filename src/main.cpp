@@ -15,17 +15,21 @@ namespace {
 
 // ============ 调试输出模式（Phase 1.5）============
 //
-// REPL 的三条元命令 \.tokens / \.ast / \.plan 把"最近一次成功通过对应阶段的
-// 编译产物"打印到 stdout。这里的三个 Print* 函数只负责格式化输出；底层数据
-// （tokens / AST / plan）来自 Database 的 LastTokens / LastAst / LastPlan
-// 访问器，由 ExecuteSQL 在各阶段成功后写入。
+// REPL 的四条元命令 \.tokens / \.ast / \.plan / \.optimized 把"最近一次成功
+// 通过对应阶段的编译产物"打印到 stdout。这里的四个 Print* 函数只负责格式化
+// 输出；底层数据（tokens / AST / plan / 优化前 plan 文本）来自 Database 的
+// LastTokens / LastAst / LastPlan / LastPlanBeforeOptText 访问器，由 ExecuteSQL
+// 在各阶段成功后写入。
 //
 // 输出格式：
 //   - PrintTokens：每行一个 token，格式 "[TYPE] 'lexeme' @line:col"。
 //                  超过 200 个时截断并追加 "... (N more tokens)" 行。
 //   - PrintAst：直接复用 ast::Node::ToString()，再按行输出带首行标题。
-//   - PrintPlan：复用 plan::PlanNode::ToString()（与 EXPLAIN 输出同源）；
-//                若计划为空（如纯 BEGIN/COMMIT 的 NoOpNode），打印 "(empty plan)"。
+//   - PrintPlanBeforeOpt：复用 Database 缓存的优化前 ToString() 文本；
+//                         空文本时说明「最近一条 SQL 没有产生可优化计划」。
+//   - PrintPlan：复用 plan::PlanNode::ToString()（与 EXPLAIN 输出同源），即
+//                执行器真正跑的优化后版本；若指针为空（如纯 BEGIN/COMMIT 的
+//                NoOpNode），打印 "(no plan)"。
 
 // 把任意 ASCII 控制字符（如换行）转义成可见形式，便于在 REPL 中阅读 token
 // 的 lexeme。原 \t / \n 等可能让 "sqlcompiler> Error:" 的 prompt 解析器
@@ -84,27 +88,49 @@ void PrintAst(const sqlcompiler::Statement* ast) {
     }
 }
 
-void PrintPlan(const sqlcompiler::PlanNode* plan) {
-    if (plan == nullptr) {
-        std::cout << "[plan] (no plan; the last SQL did not produce an "
-                     "optimized plan)"
-                  << std::endl;
+// 打印一行带缩进的文本：用于 plan 树的格式化输出。空文本走 "(empty ...)"
+// 兜底提示。label 在头部方括号里用作分类标签，方便用户区分 \.plan vs
+// \.optimized；body 是已经预先渲染好的 ToString() 输出。
+void PrintIndentedBlock(const std::string& label, const std::string& body,
+                        const std::string& empty_msg) {
+    if (body.empty()) {
+        std::cout << "[" << label << "] " << empty_msg << std::endl;
         return;
     }
-    std::cout << "[plan]" << std::endl;
-    // plan::PlanNode::ToString() 与 EXPLAIN 同源：每行一个节点（顶层节点无缩进，
-    // 每深一层缩进 +2 空格）。直接整段输出即可。
-    std::string s = plan->ToString();
+    std::cout << "[" << label << "]" << std::endl;
+    // plan::PlanNode::ToString() 与 EXPLAIN 同源：每行一个节点（顶层节点无缩
+    // 进，每深一层缩进 +2 空格）。直接整段逐行输出并加 2 空格视觉缩进。
     size_t pos = 0;
-    while (pos < s.size()) {
-        size_t nl = s.find('\n', pos);
+    while (pos < body.size()) {
+        size_t nl = body.find('\n', pos);
         if (nl == std::string::npos) {
-            std::cout << "  " << s.substr(pos) << std::endl;
+            std::cout << "  " << body.substr(pos) << std::endl;
             break;
         }
-        std::cout << "  " << s.substr(pos, nl - pos) << std::endl;
+        std::cout << "  " << body.substr(pos, nl - pos) << std::endl;
         pos = nl + 1;
     }
+}
+
+// \.plan：显示最近一次成功语句的「优化前」计划。文本快照由
+// Database::ExecuteSQL 在调用 Optimizer::Optimize 之前一次性 ToString() 写
+// 入，因此对 PredicatePushDown 的就地修改免疫。
+void PrintPlanBeforeOpt(const std::string& text) {
+    PrintIndentedBlock(
+        "plan-before-opt", text,
+        "(no plan; the last SQL did not produce a plan before optimization)");
+}
+
+// \.optimized：显示最近一次成功语句的「优化后」计划。指针为空时说明最近的
+// SQL 不走计划-优化路径（典型如纯 BEGIN/COMMIT 的 NoOpNode，或 EXPLAIN 之类
+// 在 EXPLAIN 节点内嵌子计划的语句）。
+void PrintPlan(const sqlcompiler::PlanNode* plan) {
+    if (plan == nullptr) {
+        std::cout << "[plan-optimized] (no plan; the last SQL did not "
+                     "produce an optimized plan)" << std::endl;
+        return;
+    }
+    PrintIndentedBlock("plan-optimized", plan->ToString(), "");
 }
 
 // 判断文本是否仅由空白与 SQL 行注释（-- ...）组成。
@@ -457,7 +483,7 @@ int main(int argc, char** argv) {
     std::cout << "sqlcompiler> " << std::flush;
     // Phase 1.5：首次启动时打印一行帮助，让用户知道有调试元命令可用。
     // 启动 banner 之前已在外层输出"sqlcompiler> "，这里再追加一行避免覆盖 prompt。
-    std::cout << "Meta-commands: \\.tokens, \\.ast, \\.plan "
+    std::cout << "Meta-commands: \\.tokens, \\.ast, \\.plan, \\.optimized "
               << " (show last statement's debug info)" << std::endl;
     std::cout << "Meta-commands: .source <file>  (or .read <file>) - "
               << "load and execute SQL script" << std::endl;
@@ -486,8 +512,17 @@ int main(int argc, char** argv) {
             // 调试指令 _Exit(1),保持原行为,不在 REPL 兜底。
             //
             // 顺序：先匹配已识别的元命令(\.tokens / \.ast / \.plan /
-            // .source / .read 等),否则以 '.' / '\' 开头的行回退到单行
-            // ExecuteSQL,避免误把已识别的调试命令当未知元命令丢给 parser。
+            // \.optimized / .source / .read 等),否则以 '.' / '\' 开头的行
+            // 回退到单行 ExecuteSQL,避免误把已识别的调试命令当未知元命令
+            // 丢给 parser。
+            //
+            // \.plan 与 \.optimized 的语义切分：
+            //   \.plan        —— 显示 Optimizer 改写前的原始计划树（Planner 直
+            //                   出），用来观察优化器到底改了什么。
+            //   \.optimized   —— 显示 Optimizer 改写后的计划树，也是执行器真
+            //                   正跑的那一份。
+            // 两者由 Database 在 ExecuteSQL 中分别缓存（前者一次性 ToString
+            // 成文本，规避 in-place 修改），调用方判空即可。
             if (trimmed_cmd == R"(\.tokens)") {
                 PrintTokens(database->LastTokens());
                 std::cout << "sqlcompiler> " << std::flush;
@@ -499,6 +534,11 @@ int main(int argc, char** argv) {
                 continue;
             }
             if (trimmed_cmd == R"(\.plan)") {
+                PrintPlanBeforeOpt(database->LastPlanBeforeOptText());
+                std::cout << "sqlcompiler> " << std::flush;
+                continue;
+            }
+            if (trimmed_cmd == R"(\.optimized)") {
                 PrintPlan(database->LastPlan());
                 std::cout << "sqlcompiler> " << std::flush;
                 continue;

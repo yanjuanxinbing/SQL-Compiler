@@ -55,7 +55,7 @@ set "PASS=1"
 REM ---- Semantic: sort by DESC puts 3.9 first ---------------------
 findstr /C:"3.9" "%OUT%" >nul
 if !errorlevel! neq 0 (
-    echo [FAIL] expected '3.9' (top of DESC sort) in SELECT output
+    echo [FAIL] expected 3.9 to be top of DESC sort in SELECT output
     set "PASS=0"
 )
 

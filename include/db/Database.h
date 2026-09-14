@@ -88,12 +88,25 @@ public:
 
     // ---- Phase 1.5: 调试输出模式 ----
     // 最近一次成功完成对应阶段的 SQL 编译产物，用于 REPL 的 \.tokens / \.ast
-    // / \.plan 元命令展示。每条 ExecuteSQL 调用开始时都会重置这三个缓存，并在
-    // 各阶段成功后写入新值；阶段失败时该条目保持为空指针 / 空向量，
-    // 调用方应判空再决定如何打印。
+    // / \.plan / \.optimized 元命令展示。每条 ExecuteSQL 调用开始时都会重置这
+    // 三个缓存，并在各阶段成功后写入新值；阶段失败时该条目保持为空指针 /
+    // 空向量，调用方应判空再决定如何打印。
+    //
+    // 计划缓存拆成两份：
+    //   LastPlan()         —— Optimizer::Optimize 完成后的最终计划（执行器真正跑的）。
+    //   LastPlanBeforeOptText() —— Planner::CreatePlan 刚返回、Optimizer 尚未
+    //                            改写前的原始计划树的 ToString() 序列化文本。
+    // 用「文本快照」而非「PlanNode 指针」的原因：Optimizer::PushDownPredicates
+    // 会就地改写 SeqScanNode::predicate（line 224），并可能改写 Filter 与子树
+    // 的拓扑；若仅靠 aliasing shared_ptr 抓原根，会观察到优化后的状态。文本
+    // 快照在调用 Optimize 前一次性渲染，规避了就地修改问题，且不需要为每个
+    // PlanNode / Expr 派生类实现 Clone()。
     const std::vector<Token>& LastTokens() const { return last_tokens_; }
     const Statement* LastAst() const { return last_ast_.get(); }
     const PlanNode* LastPlan() const { return last_plan_.get(); }
+    const std::string& LastPlanBeforeOptText() const {
+        return last_plan_before_opt_text_;
+    }
 
 private:
     // storage_ 必须声明在 disk_manager_ / buffer_pool_manager_ 之前：成员按
@@ -120,7 +133,12 @@ private:
     // 既保证本字段的指针有效，又不会重复释放底层对象。
     std::vector<Token> last_tokens_;
     std::shared_ptr<Statement> last_ast_;
+    // 优化后的计划（执行器真正跑的）。PlanNode 树通过 aliasing shared_ptr 与
+    // Optimizer::Optimize 返回值共享所有权，避免双重释放。
     std::shared_ptr<PlanNode> last_plan_;
+    // 优化前的计划：Planner::CreatePlan 刚返回时一次性渲染成 ToString() 文本
+    // 缓存。文本而不是 PlanNode 指针的原因见 LastPlanBeforeOptText() 注释。
+    std::string last_plan_before_opt_text_;
     void ResetLastArtifacts();
 
     // ---- Phase B：崩溃注入状态 ----

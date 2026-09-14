@@ -192,6 +192,9 @@ void Database::ResetLastArtifacts() {
     last_tokens_.clear();
     last_ast_.reset();
     last_plan_.reset();
+    // 同时清掉"优化前"快照，确保失败语句不会把陈旧计划残留下来
+    // —— \.plan 与 \.optimized 都依赖最近一次成功的编译。
+    last_plan_before_opt_text_.clear();
 }
 
 ExecutionResult Database::ExecuteSQL(const std::string& sql) {
@@ -291,6 +294,12 @@ ExecutionResult Database::ExecuteSQL(const std::string& sql) {
             }
             Planner planner(catalog_.get(), catalog_->GetSymbolTable());
             auto plan = planner.CreatePlan(statement);
+            // 在 Optimizer 改写前一次性把计划树渲染成文本快照。
+            // 必须用「立即 ToString」而不是抓一个 PlanNode*：Optimizer 既会
+            // 改写拓扑（Filter→SeqScan → IndexScan 之类整体替换），又会就地
+            // 修改 SeqScanNode::predicate（见 Optimizer.cpp:224），任何延迟
+            // 读取都会看到优化后的状态。文本快照没有这个问题。
+            last_plan_before_opt_text_ = plan ? plan->ToString() : std::string();
             Optimizer optimizer(catalog_.get());
             plan = optimizer.Optimize(plan);
             // 计划成功：缓存计划树（共享所有权）。

@@ -176,6 +176,24 @@ set /a FAILED = FAILED + 1
 set "FAILED_TESTS=!FAILED_TESTS! 80_tokens_complete!"
 :tokens_complete_done
 
+REM ---- Phase G: pre-/post-optimization plan split smoke test (92_plan_optimized) ----
+REM 92_plan_optimized runs a simple SELECT ... WHERE in the REPL, then verifies
+REM that \.plan shows the unoptimized Filter->SeqScan tree while \.optimized
+REM shows the predicate pushed into SeqScanNode by Optimizer::PushDownPredicates.
+echo.
+echo [ RUN  ] plan_optimized (run_plan_optimized.bat)
+call "%SCRIPT_DIR%run_plan_optimized.bat" > nul 2>&1
+set "PLAN_OPTIMIZED_EXITCODE=!errorlevel!"
+if !PLAN_OPTIMIZED_EXITCODE! neq 0 goto :plan_optimized_fail
+set /a PASSED = PASSED + 1
+echo  [ OK ]
+goto :plan_optimized_done
+:plan_optimized_fail
+echo [FAIL] (plan_optimized exit=!PLAN_OPTIMIZED_EXITCODE!)
+set /a FAILED = FAILED + 1
+set "FAILED_TESTS=!FAILED_TESTS! 92_plan_optimized!"
+:plan_optimized_done
+
 echo.
 echo ==========================================
 echo   Summary:  !PASSED! passed,  !FAILED! failed
