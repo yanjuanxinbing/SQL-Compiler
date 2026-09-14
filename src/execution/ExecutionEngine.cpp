@@ -44,6 +44,44 @@ namespace sqlcompiler {
 
 namespace {
 
+// BUG-20：把子执行器的输出元组截断到前 width 列。
+// ProjectExecutor 为了支持 ORDER BY 引用未投影列（隐藏列设计），输出元组为
+// [select_values ++ underlying_tuple]，实际宽度大于派生表/视图占位的声明宽度。
+// 单源场景（Project 直连占位）下尾部多余列被忽略、无影响；但 JOIN / APPLY 等
+// 多源算子按声明宽度计算各源列偏移 —— 占位实际发射更宽的元组会让后续源的
+// 列下标整体错位（ON 条件两侧撞槽、投影读错列）。占位扫描统一包一层切片，
+// 保证「占位输出的元组宽度 == DeriveTerminalColumns 声明的宽度」。
+class SliceExecutor : public Executor {
+public:
+    SliceExecutor(ExecutionContext* context, ExecutorPtr child, size_t width)
+        : Executor(context), child_(std::move(child)), width_(width) {
+    }
+
+    void Init() override {
+        if (child_) child_->Init();
+    }
+
+    bool Next(Tuple* tuple) override {
+        if (!child_) return false;
+        Tuple in;
+        if (!child_->Next(&in)) return false;
+        if (!tuple) return true;
+        if (in.ColumnCount() <= width_) {
+            *tuple = std::move(in);
+            return true;
+        }
+        std::vector<Value> vals;
+        vals.reserve(width_);
+        for (size_t i = 0; i < width_; ++i) vals.push_back(in.GetValue(i));
+        *tuple = Tuple(std::move(vals));
+        return true;
+    }
+
+private:
+    ExecutorPtr child_;
+    size_t width_;
+};
+
 std::string FindScanTableName(const PlanNodePtr& node) {
     if (!node) return "";
     if (node->GetType() == PlanNodeType::SEQ_SCAN) {
@@ -338,8 +376,13 @@ std::unordered_map<std::string, size_t> BuildCombinedColumnIndexMapWithDerived(
     SystemCatalog* catalog,
     const PlanNodePtr& plan_node,
     const std::vector<std::pair<std::string, std::string>>& table_info) {
-    auto m = BuildCombinedColumnIndexMap(catalog, table_info);
-    if (!plan_node) return m;
+    // BUG-20 修复：不再按 table_info 预注册（CollectScanTableNames 会跳过
+    // 派生表/视图占位节点，导致占位之后的真实表被错误地分配从 0 起的列下标，
+    // 与 JOIN 组合元组的真实布局错位 —— ON 条件两侧撞槽恒真）。全部列改为在
+    // walk 内按执行序（offset 累计）注册，普通表/索引扫描与占位节点用同一套
+    // 偏移规则。
+    (void)table_info;
+    std::unordered_map<std::string, size_t> m;
     std::function<void(const PlanNodePtr&, size_t&)> walk =
         [&](const PlanNodePtr& n, size_t& offset) {
         if (!n) return;
@@ -359,15 +402,40 @@ std::unordered_map<std::string, size_t> BuildCombinedColumnIndexMapWithDerived(
                 offset += cols.size();
                 return;
             }
-            // 普通表：catalog 已有对应列，下标已在 m 中；只需推进 offset
+            // 普通表：注册 <真名>.<col> / <别名>.<col> / <col>（first-wins），
+            // 并推进 offset。
             const TableInfo* info = catalog->GetTable(s->table_name);
-            if (info) offset += info->columns.size();
+            if (info) {
+                for (size_t i = 0; i < info->columns.size(); ++i) {
+                    const std::string& cname = info->columns[i].name;
+                    m[s->table_name + "." + cname] = offset + i;
+                    if (!s->table_alias.empty() && s->table_alias != s->table_name) {
+                        m[s->table_alias + "." + cname] = offset + i;
+                    }
+                    if (m.find(cname) == m.end()) {
+                        m[cname] = offset + i;
+                    }
+                }
+                offset += info->columns.size();
+            }
             return;
         }
         if (n->GetType() == PlanNodeType::INDEX_SCAN) {
             auto s = std::static_pointer_cast<IndexScanNode>(n);
             const TableInfo* info = catalog->GetTable(s->table_name);
-            if (info) offset += info->columns.size();
+            if (info) {
+                for (size_t i = 0; i < info->columns.size(); ++i) {
+                    const std::string& cname = info->columns[i].name;
+                    m[s->table_name + "." + cname] = offset + i;
+                    if (!s->table_alias.empty() && s->table_alias != s->table_name) {
+                        m[s->table_alias + "." + cname] = offset + i;
+                    }
+                    if (m.find(cname) == m.end()) {
+                        m[cname] = offset + i;
+                    }
+                }
+                offset += info->columns.size();
+            }
             return;
         }
         // 55_query: LATERAL ApplyNode ——右子查询的输出列按「派生表」语义
@@ -608,11 +676,19 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
                 return wrap(std::make_unique<CteBindExecutor>(
                     context, std::move(cte_name), n->predicate, std::move(cte_cmap)));
             }
-            // 派生表占位（FROM (SELECT ...) AS alias）：table_name == alias 且
+            // 派生表占位（FROM (SELECT ...) / 视图 / JOIN 视图）：table_name == alias 且
             // children[0] 挂有 Planner 递归生成的子计划。让真正的子计划替代占位 SeqScan。
+            // BUG-20：子计划顶层常为 ProjectExecutor，会追加底层元组（隐藏列），
+            // 实际元组宽度 > 声明宽度；切片到声明宽度，保证 JOIN/APPLY 等多源
+            // 组合时列偏移与 cmap 一致。
             if (!n->table_alias.empty() && n->table_alias == n->table_name &&
                 !plan_node->children.empty()) {
-                return BuildExecutor(plan_node->children[0], context, wrap_timing);
+                ExecutorPtr sub = BuildExecutor(plan_node->children[0], context, wrap_timing);
+                size_t declared = DeriveTerminalColumns(catalog_, plan_node->children[0]).size();
+                if (declared > 0) {
+                    return std::make_unique<SliceExecutor>(context, std::move(sub), declared);
+                }
+                return sub;
             }
             // 递归 CTE 在递归部分里以 `JOIN cte_name alias` 形式引用 CTE。
             // Planner 没有改写这种带别名的 SeqScanNode，于是这里补一次检查：

@@ -516,6 +516,51 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
     // 都按 SeqScanNode(table_name=alias, table_alias=alias) 占位 +
     // children[0]=子计划 的方式挂入；ExecutionEngine 在识别到占位时
     // 会透明改走子计划。
+    // BUG-18 修复：派生表 / 集合运算源不再在此分支内自带 WINDOW/PROJECT/
+    // SORT/LIMIT 尾部并提前 return，而是只构建占位扫描（+ 子计划），随后
+    // 落入与普通 FROM 共享的尾部（Aggregate / HAVING / Window / Project /
+    // Sort / Limit）。
+    //
+    // 旧实现的问题：外层对派生表的聚合与分组完全失效 ——
+    //   SELECT COUNT(*) FROM (SELECT ...) t;      -- COUNT 按行求值 → NULL，行数不折叠
+    //   SELECT MAX(t.s) FROM (SELECT grp, SUM(v) AS s ... GROUP BY grp) t;
+    //   SELECT t.grp, COUNT(*) FROM (...) t GROUP BY t.grp;  -- 每行自成一组
+    // 因为聚合节点（AggregateNode）的构造位于主路径共享尾部，早退分支
+    // 根本走不到。
+    // BUG-20：视图作 JOIN 一侧（或 FROM 视图 + JOIN 并存）时，TryExpandView
+    // 的单表展开不生效（带 joins 直接放弃）—— 视图名被当作真实表扫描，
+    // 表不存在导致整条查询静默返回 0 行。这里把 JOIN 位置（以及带 JOIN 时
+    // 的 FROM 位置）上的视图展开为「派生表占位 SeqScan + 视图查询子计划」，
+    // 复用派生表的列映射机制（BuildCombinedColumnIndexMapWithDerived /
+    // DeriveTerminalColumns 均已支持占位）。返回 nullptr 表示不是视图，
+    // 调用方退回普通 SeqScan。
+    auto make_view_scan = [&](const std::string& tname,
+                              const std::string& talias) -> PlanNodePtr {
+        if (!catalog_) return nullptr;
+        const SystemCatalog::MaterializedViewInfo* mv =
+            catalog_->LookupMaterializedView(tname);
+        if (mv != nullptr) {
+            // 物化视图：直接扫 backing table。
+            return std::make_shared<SeqScanNode>(mv->backing_table, talias);
+        }
+        const SystemCatalog::ViewDefinition* view = catalog_->LookupView(tname);
+        if (view == nullptr || view->query == nullptr) {
+            return nullptr;
+        }
+        // 注意：不能用 catalog_->HasTable(tname) 判断"真表"—— symbol_table_
+        // 同样注册视图名，HasTable 对视图也返回 true（与 TryExpandView 的
+        // 查找顺序保持一致：物化视图 → 普通视图）。
+        // 复制视图 AST —— PlanSelect 内部有 const_cast 原位改写（如
+        // ExpandSelectStarInList），不能让改动落到 catalog 存储的定义上。
+        auto view_copy = std::make_shared<SelectStatement>(*view->query);
+        PlanNodePtr view_plan = PlanSelect(*view_copy);
+        std::string alias = talias.empty() ? tname : talias;
+        auto ph = std::make_shared<SeqScanNode>(alias, alias);
+        ph->children.push_back(view_plan);
+        return ph;
+    };
+
+    PlanNodePtr current;
     if (stmt.derived_table || stmt.derived_set_op) {
         PlanNodePtr sub_plan;
         if (stmt.derived_set_op) {
@@ -524,67 +569,25 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
             sub_plan = PlanSelect(*stmt.derived_table);
         }
         // 列引用解析走 `derived_alias.<col>` / 不限定的列名。
-        // Planner 不构造额外节点，直接交给 SeqScanExecutor 是不行的，
-        // 所以这里把派生表作为 SeqScanNode(target=alias) 之外的子树：
         // 用 SeqScanNode(table_name=derived_alias, table_alias=derived_alias) 作为占位，
-        // 但实际数据来自子查询。最简单的实现：把子查询当作 alias 的 ScanExecutor。
-        // 为避免重写 SeqScanExecutor，这里把子查询计划用一个 SeqScanNode + 显式
-        // 路径替代：直接让 outer PlanSelect 使用子查询的输出元组。
-        // 我们用「借用 SeqScanNode 占位」+ ExecutionEngine 内部识别 derived_alias
-        // 并改走子查询计划的方式实现。为了不改动 ExecutionEngine，最简洁的
-        // 做法是：在 outer PlanSelect 中再插入一个节点（伪 ScanNode），但
-        // ExecutionEngine 构造 SeqScan 时若 table_name == "<derived_alias>" 则替换
-        // 为子查询计划。这条改动在 ExecutionEngine.cpp 里做（见对应 case）。
+        // 子计划挂在 children[0]；ExecutionEngine 在 SEQ_SCAN 分支识别到占位
+        // （table_name == table_alias 且 children 非空）时透明改走子计划。
         auto scan = std::make_shared<SeqScanNode>(stmt.derived_alias, stmt.derived_alias);
-        // 把子计划「挂」到该 SeqScan 的 children 上是不规范的，但 ExecutionEngine
-        // 在识别到 derived_alias 时会忽略 SeqScanNode 的 table_name 而改走子计划。
         scan->children.push_back(sub_plan);
-        PlanNodePtr current = scan;
-        // outer WHERE
-        if (stmt.where_clause) {
-            auto f = std::make_shared<FilterNode>(stmt.where_clause);
-            f->children.push_back(current);
-            current = f;
+        current = scan;
+    } else if (!stmt.from_table.empty()) {
+        // 带 JOIN 时 TryExpandView 不展开 FROM 视图（见 BUG-20 注释），在此兜底。
+        current = make_view_scan(stmt.from_table, stmt.from_table_alias);
+        if (!current) {
+            current = std::make_shared<SeqScanNode>(stmt.from_table, stmt.from_table_alias);
         }
-        // outer SELECT list 可能含窗口函数，递归走 PlanSelect 头部逻辑。
-        // 复制当前 SelectStatement 把 from_table 留空（derived_table 已显式置位）
-        // 的简化路径：直接构造 inner-aware 的后续逻辑：
-        // 由于外层 SELECT 的列引用走 `alias.col`，column_index_map 由 ExecutionEngine
-        // 通过 derived_alias 映射到子查询输出位置。这里不需要从子表列表中收集表。
-        // 直接走与简单 SELECT 相同的尾段（PROJECT / WINDOW / ORDER BY / LIMIT）。
-        bool has_window = SelectHasWindowFunc(stmt);
-        if (has_window) {
-            auto wn = std::make_shared<WindowNode>(stmt.select_list, stmt.select_aliases,
-                                                   stmt.named_windows);
-            wn->children.push_back(current);
-            current = wn;
-        } else {
-            auto proj = std::make_shared<ProjectNode>(stmt.select_list, stmt.select_aliases, stmt.is_distinct);
-            proj->children.push_back(current);
-            current = proj;
-        }
-        if (!stmt.order_by.empty()) {
-            auto s = std::make_shared<SortNode>(ResolveOrderByOrdinals(
-                stmt.order_by, stmt.select_list, stmt.line, stmt.column));
-            s->children.push_back(current);
-            current = s;
-        }
-        if (stmt.limit >= 0) {
-            auto l = std::make_shared<LimitNode>(stmt.limit, stmt.limit_offset);
-            l->children.push_back(current);
-            current = l;
-        }
-        return current;
-    }
-
-    PlanNodePtr current;
-    if (!stmt.from_table.empty()) {
-        current = std::make_shared<SeqScanNode>(stmt.from_table, stmt.from_table_alias);
     }
     // Joins: each join produces a JoinNode with two children
     //   children[0] = previous chain (left side)
     //   children[1] = new SeqScanNode(j.table_name) (right side)
+    // 派生表 / 集合运算源下沿用历史行为：不展开 JOIN 子句（保持既有测试兼容）。
     for (const auto& j : stmt.joins) {
+        if (stmt.derived_table || stmt.derived_set_op) break;
         ExprPtr effective_condition = j.on_condition;
         // USING / NATURAL 翻译为合成 ON 条件：a.col = b.col AND ...
         if (!j.using_columns.empty() || j.is_natural) {
@@ -658,7 +661,12 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
         }
         auto join = std::make_shared<JoinNode>(j.join_type, effective_condition);
         join->children.push_back(current);
-        join->children.push_back(std::make_shared<SeqScanNode>(j.table_name, j.table_alias));
+        // BUG-20：JOIN 右侧是视图时展开为派生表占位（见上方 make_view_scan）。
+        PlanNodePtr right = make_view_scan(j.table_name, j.table_alias);
+        if (!right) {
+            right = std::make_shared<SeqScanNode>(j.table_name, j.table_alias);
+        }
+        join->children.push_back(right);
         current = join;
     }
     // WHERE

@@ -362,7 +362,11 @@ StatementPtr Parser::ParseSelectStatement(bool consume_trailers) {
                 alias = t.lexeme;
                 Advance();
             } else if (t.type == TokenType::KEYWORD_CUME_DIST ||
-                       t.type == TokenType::KEYWORD_PERCENT_RANK) {
+                       t.type == TokenType::KEYWORD_PERCENT_RANK ||
+                       t.type == TokenType::KEYWORD_FOUND) {
+                // 上下文关键字可作别名：CUME_DIST / PERCENT_RANK（窗口函数名）、
+                // FOUND（仅 HANDLER FOR NOT FOUND 使用，普通查询里作别名合法，
+                // 如 `SELECT (SELECT ...) AS found` —— BUG-17）。
                 alias = t.lexeme;
                 Advance();
             } else {

@@ -61,6 +61,10 @@ private:
     // 后续 Next() 仅消费缓冲，不再触碰源 SeqScan。
     ExecutorPtr source_;
     std::vector<Tuple> materialized_rows_;
+    // BUG-19：源 SELECT 的"声明输出列数"。ProjectExecutor 会把底层元组追加在
+    // SELECT 值之后（ORDER BY 隐藏列设计），物化元组的实际宽度可能大于源
+    // SELECT 的列数；INSERT 只应消费前 source_width_ 列。0 = 未知（不裁剪）。
+    size_t source_width_ = 0;
     // 是否走 REPLACE 语义。
     bool is_replace_ = false;
     // INSERT ... DEFAULT VALUES：插入一行所有列用 DEFAULT 表达式（无

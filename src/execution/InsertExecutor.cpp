@@ -32,6 +32,36 @@ namespace sqlcompiler {
 
 namespace {
 
+// BUG-19：计算源查询计划的"声明输出列数"（源 SELECT 列表的宽度）。
+// ProjectExecutor 为了支持 ORDER BY 引用未投影列（隐藏列），会把底层元组
+// 追加在 SELECT 值之后 —— 物化元组的实际宽度因此大于源 SELECT 的列数。
+// INSERT ... SELECT 只应消费声明宽度内的列；多余部分是内部实现细节。
+// 返回 0 表示无法确定（调用方退回旧行为，不裁剪）。
+size_t DeclaredOutputWidth(const PlanNodePtr& n) {
+    if (!n) return 0;
+    switch (n->GetType()) {
+        case PlanNodeType::PROJECT:
+            return std::static_pointer_cast<ProjectNode>(n)->columns.size();
+        case PlanNodeType::SET_OP:
+        case PlanNodeType::SORT:
+        case PlanNodeType::LIMIT:
+        case PlanNodeType::FILTER:
+            if (n->children.empty()) return 0;
+            return DeclaredOutputWidth(n->children[0]);
+        case PlanNodeType::AGGREGATE:
+            return std::static_pointer_cast<AggregateNode>(n)->aggregate_exprs.size();
+        case PlanNodeType::WINDOW:
+            return std::static_pointer_cast<WindowNode>(n)->select_list.size();
+        case PlanNodeType::VALUES: {
+            auto v = std::static_pointer_cast<ValuesNode>(n);
+            if (!v->column_aliases.empty()) return v->column_aliases.size();
+            return v->rows.empty() ? 0 : v->rows[0].size();
+        }
+        default:
+            return 0;
+    }
+}
+
 // bug11: 校验 DEFAULT 表达式是「常量」——不允许列引用、子查询、VALUES(col)、
 // NEXTVAL（带副作用）、窗口函数等带上下文依赖或副作用的节点。
 // 与 AlterTableExecutor 中的同名校验逻辑保持完全一致；该函数在两处分别
@@ -243,6 +273,9 @@ InsertExecutor::InsertExecutor(ExecutionContext* context, std::string table_name
       returning_aliases_(std::move(returning_aliases)),
       current_row_(0) {
     if (query_plan) {
+        // BUG-19：先记录源 SELECT 的声明输出列数，供 Next() 裁剪 ProjectExecutor
+        // 追加的底层隐藏列。
+        source_width_ = DeclaredOutputWidth(query_plan);
         ExecutionEngine engine(context_->GetCatalog());
         source_ = engine.BuildExecutor(query_plan, context_);
         if (source_) {
@@ -420,9 +453,16 @@ bool InsertExecutor::Next(Tuple* tuple) {
             throw CompilerException(ErrorStage::SEMANTIC, "table not found: " + table_name_);
         }
         const size_t N = columns_.empty() ? info->columns.size() : columns_.size();
-        if (src.ColumnCount() < N) {
+        // BUG-19：ProjectExecutor 会把底层元组追加在 SELECT 值之后（ORDER BY
+        // 隐藏列设计），物化元组宽度可能大于源 SELECT 的声明列数。INSERT 只
+        // 消费声明宽度内的列；声明的合法宽度不足目标列数时按 SQL 标准报错。
+        size_t avail = src.ColumnCount();
+        size_t usable = (source_width_ > 0 && source_width_ < avail) ? source_width_ : avail;
+        if (usable < N) {
             throw CompilerException(ErrorStage::SEMANTIC,
-                "INSERT ... SELECT column count mismatch for " + table_name_);
+                "INSERT ... SELECT column count mismatch for " + table_name_ +
+                ": source has " + std::to_string(usable) + " columns, target needs " +
+                std::to_string(N));
         }
         std::vector<Value> row_values(info->columns.size());
         if (columns_.empty()) {
