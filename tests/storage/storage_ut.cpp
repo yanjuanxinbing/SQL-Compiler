@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -4540,6 +4541,1127 @@ static void TestT4Diagnostics() {
     }
 }
 
+// ============================================================================
+// Phase 6 U1：删除后下溢再平衡（单线程正确性 + 可观测性）
+//
+// 验证：
+//   * 树超过单叶（height>=2）后，局部删除一段连续键会让部分叶子下溢；
+//   * 再分配触发后不丢键、不重复：剩余恰好是未删区间、每条一次、升序；
+//   * 被删键 FindFirst 返回 INVALID，未删边界键可查；
+//   * 树高不因删除增长；叶页数不增长（再分配不新建页）；
+//   * 利用率观测输出可用（avg/min 不塌缩）。
+// ============================================================================
+static void TestBPlusTreeRebalance() {
+    const std::string path = "storage_ut_u1_rebalance.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(256, &dm);
+        auto tree = BPlusTree::Create(&bpm, {ValueType::INTEGER}, /*is_unique=*/false);
+        CHECK(tree != nullptr);
+
+        const int N = 2000;
+        for (int i = 0; i < N; ++i) {
+            RID rid; rid.page_id = i + 1; rid.slot_num = 0;
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(i)}), rid));
+        }
+        CHECK(tree->GetHeight() >= 2);           // 必须是多叶/多层
+        double min0 = 0, avg0 = 0; uint64_t l0 = 0, i0 = 0;
+        tree->ComputeUtilization(&min0, &avg0, &l0, &i0);
+        CHECK(l0 >= 8 && i0 >= 1);
+
+        // 局部删除连续键 [100, 500)：让部分叶子下溢、右侧邻居仍满 → 再分配恢复。
+        for (int i = 100; i < 500; ++i) {
+            RID rid; rid.page_id = i + 1; rid.slot_num = 0;
+            CHECK(tree->Delete(IndexKey({Value::MakeInt(i)}), rid));
+        }
+
+        CHECK(tree->GetHeight() <= 2);           // 树高不增长
+        double min1, avg1; uint64_t l1 = 0, i1 = 0;
+        tree->ComputeUtilization(&min1, &avg1, &l1, &i1);
+        CHECK(l1 <= l0);                          // 再分配不新建页
+
+        // 正确性：剩余就该是 [0,100) ∪ [500,2000)，各一次、升序。
+        std::vector<int> got;
+        auto cur = tree->Begin();
+        IndexKey k; RID r;
+        while (cur && cur->Next(&k, &r)) got.push_back(k.values[0].AsInt());
+        CHECK(static_cast<int>(got.size()) == N - 400);
+        bool ok_order = true;
+        for (size_t j = 0; j < got.size(); ++j) {
+            const int v = got[j];
+            if (!(v < 100 || v >= 500)) ok_order = false;
+            if (j > 0 && got[j - 1] >= v) ok_order = false;   // 严格升序、无重复
+        }
+        CHECK(ok_order);
+
+        // 点查边界
+        CHECK(tree->FindFirst(IndexKey({Value::MakeInt(99)})).IsValid());
+        CHECK(!tree->FindFirst(IndexKey({Value::MakeInt(100)})).IsValid());
+        CHECK(!tree->FindFirst(IndexKey({Value::MakeInt(499)})).IsValid());
+        CHECK(tree->FindFirst(IndexKey({Value::MakeInt(500)})).IsValid());
+        CHECK(tree->FindFirst(IndexKey({Value::MakeInt(1999)})).IsValid());
+
+        // 观测输出（不作为硬断言，仅确保路径可调用且数值合理）
+        std::printf("[U1] height=%d leaf_pages=%llu avg=%.3f min=%.3f\n",
+                    tree->GetHeight(), (unsigned long long)l1, avg1, min1);
+        CHECK(avg1 > 0.05 && min1 > 0.0);
+
+        tree->Destroy(&bpm, tree->GetRootPageId());
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// ============================================================================
+// Phase 6 U1：删除触发再平衡的并发正确性
+//
+// 线程交错：删除线程只删自己的键使叶子下溢，扫描线程持续全扫；多轮结束后校验
+// 总数与集合精确，证明「再分配 + 分隔键更新」在并发下无丢键、无重复、无撕裂。
+// ============================================================================
+static void TestBPlusTreeRebalanceConcurrency() {
+    const std::string path = "storage_ut_u1_rebal_conc.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm);
+        auto tree = BPlusTree::Create(&bpm, {ValueType::INTEGER}, /*is_unique=*/false);
+        CHECK(tree != nullptr);
+
+        const int kThreads = 4;
+        const int kPerThread = 600;      // 共 2400 键 → 多层、多叶
+        for (int t = 0; t < kThreads; ++t) {
+            for (int i = 0; i < kPerThread; ++i) {
+                int key = t * kPerThread + i;
+                RID rid; rid.page_id = key + 1; rid.slot_num = 0;
+                tree->Insert(IndexKey({Value::MakeInt(key)}), rid);
+            }
+        }
+
+        std::atomic<bool> stop{false};
+        std::thread scanner([&] {
+            int guard = 0;
+            while (!stop.load() && guard++ < 400000) {
+                auto cur = tree->LowerBound(IndexKey({Value::MakeInt(0)}));
+                IndexKey k; RID r;
+                while (cur && cur->Next(&k, &r)) {}
+            }
+        });
+
+        // 每个线程删除其前半段键（局部下溢 → 并发再分配），反复多轮。
+        for (int round = 0; round < 60; ++round) {
+            std::vector<std::thread> del;
+            for (int t = 0; t < kThreads; ++t) {
+                del.emplace_back([&, t] {
+                    for (int i = 0; i < kPerThread / 2; ++i) {
+                        int key = t * kPerThread + i;
+                        RID rid; rid.page_id = key + 1; rid.slot_num = 0;
+                        tree->Delete(IndexKey({Value::MakeInt(key)}), rid);
+                    }
+                });
+            }
+            for (auto& th : del) th.join();
+        }
+        stop.store(true);
+        scanner.join();
+        // 恢复删除键再插入（复用注入），避免键表变化无常——这里仅做最终正确性断言：
+        // 每线程剩后半段：key ∈ [t*kPerThread + kPerThread/2, (t+1)*kPerThread)
+        std::set<int> seen;
+        int count = 0;
+        auto cur = tree->Begin();
+        IndexKey k; RID r;
+        while (cur && cur->Next(&k, &r)) { ++count; seen.insert(k.values[0].AsInt()); }
+        CHECK(count == kThreads * (kPerThread / 2));
+        CHECK(static_cast<int>(seen.size()) == count);   // 无重复
+        for (int t = 0; t < kThreads; ++t) {
+            for (int i = kPerThread / 2; i < kPerThread; ++i) {
+                int key = t * kPerThread + i;
+                CHECK(seen.count(key) == 1);              // 无丢键
+            }
+        }
+
+        tree->Destroy(&bpm, tree->GetRootPageId());
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// ============================================================================
+// Phase 6 U1b：内节点合并 + 物理删页 + 级联回收
+//
+// 删除一个大区间诱发：叶下溢 → 叶合并（物理回收被并叶）→ 内节点合并 → 级联。
+// 断言：
+//   1) 正确性：剩余键集合精确、升序、无重复/漏发；
+//   2) 树高不增长（合并控制树高）；
+//   3) 树的叶子+内节点页数净减少（物理删页）；
+//   4) DiskManager 空闲页数增加，且被回收页可被 AllocatePage 重新分配（.fpl 复用）。
+// ============================================================================
+static void TestBPlusTreeMerge() {
+    const std::string path = "storage_ut_u1b_merge.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(512, &dm);
+        auto tree = BPlusTree::Create(&bpm, {ValueType::INTEGER}, /*is_unique=*/false);
+        CHECK(tree != nullptr);
+
+        const int N = 52000;                          // 多层（h>=3）：触发内节点合并级联
+        for (int i = 0; i < N; ++i) {
+            RID rid; rid.page_id = i + 1; rid.slot_num = 0;
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(i)}), rid));
+        }
+        const int h0 = tree->GetHeight();
+        CHECK(h0 >= 3);                               // 三层以上 → 有多个内节点
+        double m0 = 0, a0 = 0; uint64_t l0 = 0, i0 = 0;
+        tree->ComputeUtilization(&m0, &a0, &l0, &i0);
+        const int free0 = dm.GetNumFreePages();
+
+        // 删除居中大区间 [20000, 50000)：两侧叶/内节点变稀疏 → 兄弟合并 → 级联回收。
+        for (int i = 20000; i < 50000; ++i) {
+            RID rid; rid.page_id = i + 1; rid.slot_num = 0;
+            CHECK(tree->Delete(IndexKey({Value::MakeInt(i)}), rid));
+        }
+
+        const int h1 = tree->GetHeight();
+        double m1 = 0, a1 = 0; uint64_t l1 = 0, i1 = 0;
+        tree->ComputeUtilization(&m1, &a1, &l1, &i1);
+        const int free1 = dm.GetNumFreePages();
+
+        // 正确性：剩余恰好 [0,20000) ∪ [50000,52000)
+        std::vector<int> got;
+        auto cur = tree->Begin();
+        IndexKey k; RID r;
+        while (cur && cur->Next(&k, &r)) got.push_back(k.values[0].AsInt());
+        CHECK(static_cast<int>(got.size()) == 20000 + (52000 - 50000));
+        bool ok_order = true;
+        for (size_t j = 0; j < got.size(); ++j) {
+            const int v = got[j];
+            if (!(v < 20000 || v >= 50000)) ok_order = false;
+            if (j > 0 && got[j - 1] >= v) ok_order = false;   // 严格升序、无重复
+        }
+        CHECK(ok_order);
+        // 边界点查
+        for (int vg : {19999, 50000, 51999}) CHECK(tree->FindFirst(IndexKey({Value::MakeInt(vg)})).IsValid());
+        for (int vg : {20000, 49999}) CHECK(!tree->FindFirst(IndexKey({Value::MakeInt(vg)})).IsValid());
+
+        // U1b 目标断言
+        CHECK(h1 <= h0);                        // 树高不增长（内节点合并控制树高）
+        CHECK(i1 <= i0);                        // 内节点页数不增
+        CHECK(free1 > free0);                   // 发生了物理删页（页回归空闲池）
+        const uint64_t total0 = l0 + i0, total1 = l1 + i1;
+        CHECK(total1 <= total0);                // 页数不增
+        // 被回收的空闲页可被重新分配（.fpl 复用）
+        const int nfree = free1 - free0;
+        std::vector<page_id_t> recycled;
+        recycled.reserve(static_cast<size_t>(nfree));
+        for (int i = 0; i < nfree; ++i) {
+            page_id_t p = dm.AllocatePage();
+            if (p < 0) break;
+            recycled.push_back(p);
+        }
+        CHECK(static_cast<int>(recycled.size()) == nfree);   // 每个空闲页都可复用
+        for (page_id_t p : recycled) dm.DeallocatePage(p);
+        CHECK(dm.GetNumFreePages() == free1);
+
+        std::printf("[U1b] merge: h %d->%d  pages %llu->%llu (leaf %llu->%llu, int %llu->%llu)  free %d->%d\n",
+                    h0, h1, (unsigned long long)total0, (unsigned long long)total1,
+                    (unsigned long long)l0, (unsigned long long)l1,
+                    (unsigned long long)i0, (unsigned long long)i1,
+                    free0, free1);
+
+        tree->Destroy(&bpm, tree->GetRootPageId());
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// ============================================================================
+// Phase 6 U1b：根收缩收树高（CollapseRootIfNeeded）
+//
+// 删除到只残留一小簇键，反复合并 + 级联后树根收缩为单叶 → 树高降为 1。
+// 断言剩余键集合精确、树高 1（根为叶）、空闲页数以百计增多（大量物理回收）。
+// ============================================================================
+static void TestBPlusTreeCollapseRoot() {
+    const std::string path = "storage_ut_u1b_collapse.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(128, &dm);
+        auto tree = BPlusTree::Create(&bpm, {ValueType::INTEGER}, /*is_unique=*/false);
+        CHECK(tree != nullptr);
+
+        const int N = 1200;
+        for (int i = 0; i < N; ++i) {
+            RID rid; rid.page_id = i + 1; rid.slot_num = 0;
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(i)}), rid));
+        }
+        const int h0 = tree->GetHeight();
+        CHECK(h0 >= 2);             // 多叶/多层，收树到 1 需至少 2 层
+        const int free0 = dm.GetNumFreePages();
+
+        // 删除除 [500,503) 外全部键
+        for (int i = 0; i < N; ++i) {
+            if (i >= 500 && i < 503) continue;
+            RID rid; rid.page_id = i + 1; rid.slot_num = 0;
+            CHECK(tree->Delete(IndexKey({Value::MakeInt(i)}), rid));
+        }
+
+        const int h1 = tree->GetHeight();
+        const int free1 = dm.GetNumFreePages();
+
+        // 正确性：仅剩 500,501,502，升序各一次
+        std::vector<int> got;
+        auto cur = tree->Begin();
+        IndexKey k; RID r;
+        while (cur && cur->Next(&k, &r)) got.push_back(k.values[0].AsInt());
+        CHECK(static_cast<int>(got.size()) == 3);
+        bool ok = (got.size() == 3 && got[0] == 500 && got[1] == 501 && got[2] == 502);
+        CHECK(ok);
+        for (int vg : {500, 501, 502}) CHECK(tree->FindFirst(IndexKey({Value::MakeInt(vg)})).IsValid());
+
+        // U1b 目标断言：级联合并对整棵树收树到单叶根
+        CHECK(h1 == 1);                          // 根收缩 → 树高 1
+        CHECK(free1 > free0);                    // 大量物理回收
+
+        std::printf("[U1b] collapse: h %d->%d  free %d->%d\n", h0, h1, free0, free1);
+
+        tree->Destroy(&bpm, tree->GetRootPageId());
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// ============================================================================
+// Phase 6 U1b：合并 + 物理删页的并发正确性
+//
+// 扫描线程持续全扫（会踩中被并/被回收/被复用的叶页），删除线程删除各自的连续
+// 区间诱发大量叶合并、级联与物理删页。结束后整体校验：剩余键恰好为保留区间的
+// 并集、升序、无重复、无丢键——证明「游标重下降恢复」在物理删页并发下不丢/不重。
+// ============================================================================
+static void TestBPlusTreeMergeConcurrency() {
+    const std::string path = "storage_ut_u1b_merge_conc.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm);
+        auto tree = BPlusTree::Create(&bpm, {ValueType::INTEGER}, /*is_unique=*/false);
+        CHECK(tree != nullptr);
+
+        const int kThreads = 4;
+        const int kPerThread = 500;                 // 共 2000 键，多层
+        for (int t = 0; t < kThreads; ++t) {
+            for (int i = 0; i < kPerThread; ++i) {
+                int key = t * kPerThread + i;
+                RID rid; rid.page_id = key + 1; rid.slot_num = 0;
+                tree->Insert(IndexKey({Value::MakeInt(key)}), rid);
+            }
+        }
+        CHECK(tree->GetHeight() >= 2);      // 多叶/多层（2000 键达 2 层即可触发页回收）
+
+        std::atomic<bool> stop{false};
+        std::thread scanner([&] {
+            int guard = 0;
+            while (!stop.load() && guard++ < 300000) {
+                auto cur = tree->Begin();
+                IndexKey k; RID r;
+                while (cur && cur->Next(&k, &r)) {}
+            }
+        });
+
+        // 各线程删除各自前半段（[t*pt, t*pt+pt/2)）→ 局部下溢 → 并发合并 + 回收
+        for (int round = 0; round < 30; ++round) {
+            std::vector<std::thread> del;
+            for (int t = 0; t < kThreads; ++t) {
+                del.emplace_back([&, t] {
+                    for (int i = 0; i < kPerThread / 2; ++i) {
+                        int key = t * kPerThread + i;
+                        RID rid; rid.page_id = key + 1; rid.slot_num = 0;
+                        tree->Delete(IndexKey({Value::MakeInt(key)}), rid);
+                    }
+                });
+            }
+            for (auto& th : del) th.join();
+        }
+        stop.store(true);
+        scanner.join();
+
+        // 最终：每线程剩后半段 [t*pt + pt/2, (t+1)*pt)
+        std::set<int> seen;
+        int count = 0;
+        auto cur = tree->Begin();
+        IndexKey k; RID r;
+        while (cur && cur->Next(&k, &r)) { ++count; seen.insert(k.values[0].AsInt()); }
+        CHECK(count == kThreads * (kPerThread / 2));
+        CHECK(static_cast<int>(seen.size()) == count);   // 无重复
+        for (int t = 0; t < kThreads; ++t) {
+            for (int i = kPerThread / 2; i < kPerThread; ++i) {
+                int key = t * kPerThread + i;
+                CHECK(seen.count(key) == 1);              // 无丢键
+            }
+        }
+
+        tree->Destroy(&bpm, tree->GetRootPageId());
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// ============================================================================
+// Phase 6 U1c：物理删页可靠回收（无泄漏不变量）
+//
+// 无泄漏不变量：live = GetNumPages() - GetNumFreePages() == 树的 leaf+internal。
+// 若被并页回收被 best-effort 跳过、或延迟队列未排空，live 会大于树的真实页数
+// （页面仍分配但已从树中摘除 → 空间泄漏）。先触发合并回收，再做一次 Insert+Delete
+// 触发安全点排空，最后校验不变量成立且第二轮后 live 稳定（不随排空而增长）。
+// ============================================================================
+static void TestBPlusTreeReliableReclaim() {
+    const std::string path = "storage_ut_u1c_reclaim.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(512, &dm);
+        auto tree = BPlusTree::Create(&bpm, {ValueType::INTEGER}, /*is_unique=*/false);
+        CHECK(tree != nullptr);
+
+        const int N = 52000;
+        for (int i = 0; i < N; ++i) {
+            RID rid; rid.page_id = i + 1; rid.slot_num = 0;
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(i)}), rid));
+        }
+        CHECK(tree->GetHeight() >= 3);
+
+        // 大区间删除 → 叶/内节点合并 + 物理回收（部分可能延迟入队）
+        for (int i = 20000; i < 50000; ++i) {
+            RID rid; rid.page_id = i + 1; rid.slot_num = 0;
+            CHECK(tree->Delete(IndexKey({Value::MakeInt(i)}), rid));
+        }
+
+        // 触发安全点排空：一次临时插入 + 删除（不改变键集合）
+        RID tmp_r; tmp_r.page_id = 1; tmp_r.slot_num = 0;
+        CHECK(tree->Insert(IndexKey({Value::MakeInt(-1)}), tmp_r));
+        CHECK(tree->Delete(IndexKey({Value::MakeInt(-1)}), tmp_r));
+
+        double m = 0, a = 0; uint64_t lf = 0, in = 0;
+        tree->ComputeUtilization(&m, &a, &lf, &in);
+        int live = dm.GetNumPages() - dm.GetNumFreePages();
+        // 无泄漏：已分配未释放页 == 树的叶+内节点页数
+        CHECK(live == static_cast<int>(lf + in));
+        std::printf("[U1c] reclaim: live=%d tree_pages=%llu leaf=%llu int=%llu free=%d\n",
+                    live, (unsigned long long)(lf + in), (unsigned long long)lf,
+                    (unsigned long long)in, dm.GetNumFreePages());
+
+        // 第二轮 churn 后排空应不再释放新的叶（live 不增）→ 证明没有卡死的被弃页
+        for (int round = 0; round < 3; ++round) {
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(-2 - round)}), tmp_r));
+            CHECK(tree->Delete(IndexKey({Value::MakeInt(-2 - round)}), tmp_r));
+        }
+        double m2 = 0, a2 = 0; uint64_t lf2 = 0, in2 = 0;
+        tree->ComputeUtilization(&m2, &a2, &lf2, &in2);
+        int onLive2 = dm.GetNumPages() - dm.GetNumFreePages();
+        CHECK(onLive2 == live);   // 结构未变，live 稳定
+
+        tree->Destroy(&bpm, tree->GetRootPageId());
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// ============================================================================
+// Phase 6 U1c：合并 + 物理删页并发下的可靠回收（延迟队列兜底回收）
+//
+// 扫描线程持续持/放叶页 pin，使删除线程合并时的被并页 TryFreePage 大概率失败入
+// 队；扫描停止后再做一次写操作触发排空，最终校验无泄漏不变量
+// live == leaf+internal 成立——证明被并发读者 pin 暂时禁止的删页最终都能回到 .fpl。
+// ============================================================================
+static void TestBPlusTreeReliableReclaimConcurrent() {
+    const std::string path = "storage_ut_u1c_reclaim_conc.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(64, &dm);
+        auto tree = BPlusTree::Create(&bpm, {ValueType::INTEGER}, /*is_unique=*/false);
+        CHECK(tree != nullptr);
+
+        const int N = 4000;
+        for (int i = 0; i < N; ++i) {
+            RID rid; rid.page_id = i + 1; rid.slot_num = 0;
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(i)}), rid));
+        }
+        std::atomic<bool> stop{false};
+        std::thread scanner([&] {
+            int guard = 0;
+            while (!stop.load() && guard++ < 200000) {
+                auto cur = tree->Begin();
+                IndexKey k; RID r;
+                while (cur && cur->Next(&k, &r)) {}
+            }
+        });
+
+        std::vector<std::thread> del;
+        for (int t = 0; t < 4; ++t) {
+            del.emplace_back([&, t] {
+                // 各线程删除各自中段，诱发局部下溢 → 合并 → 物理删页
+                for (int i = t * (N / 4); i < t * (N / 4) + (N / 4) / 2; ++i) {
+                    RID rid; rid.page_id = i + 1; rid.slot_num = 0;
+                    tree->Delete(IndexKey({Value::MakeInt(i)}), rid);
+                }
+            });
+        }
+        for (auto& th : del) th.join();
+        stop.store(true);
+        scanner.join();
+
+        // 扫描停止后触发排空，让延迟入队的被并页回到 .fpl
+        RID tmp_r; tmp_r.page_id = 1; tmp_r.slot_num = 0;
+        int probe = 900000;
+        CHECK(tree->Insert(IndexKey({Value::MakeInt(probe)}), tmp_r));
+        CHECK(tree->Delete(IndexKey({Value::MakeInt(probe)}), tmp_r));
+
+        double m = 0, a = 0; uint64_t lf = 0, in = 0;
+        tree->ComputeUtilization(&m, &a, &lf, &in);
+        int live = dm.GetNumPages() - dm.GetNumFreePages();
+        CHECK(live == static_cast<int>(lf + in));   // 无泄漏不变量
+        std::printf("[U1c] reclaim-conc: live=%d tree_pages=%llu free=%d\n",
+                    live, (unsigned long long)(lf + in), dm.GetNumFreePages());
+
+        tree->Destroy(&bpm, tree->GetRootPageId());
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// ============================================================================
+// Phase 6 U1d：乐观重启校验优化（结构计数短路，N2）
+//
+// 验证「校验成本随树高 O(h)」降为常见路径 O(1)：
+//   1) 纯读阶段（期间无结构改写）：所有校验都命中结构计数短路（fast 增长、full 不增），
+//      证明祖先页版本不需逐页重取；
+//   2) 再插入触发结构改写：结构变更计数递增，且后续读校验仍正确；
+//   3) 正确性守恒：插入/删除后所有键仍可精确检索（短路不跳校验更宽松）。
+// ============================================================================
+static void TestBPlusTreeOptimisticRestartOpt() {
+    const std::string path = "storage_ut_u1d_opt.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        DiskManager dm(path);
+        BufferPoolManager bpm(128, &dm);
+        auto tree = BPlusTree::Create(&bpm, {ValueType::INTEGER}, /*is_unique=*/false);
+        CHECK(tree != nullptr);
+
+        const int N = 6000;
+        for (int i = 0; i < N; ++i) {
+            RID rid; rid.page_id = i + 1; rid.slot_num = 0;
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(i)}), rid));
+        }
+        CHECK(tree->GetHeight() >= 2);
+        uint32_t mod0 = 0; tree->GetOptimisticStats(nullptr, nullptr, nullptr, &mod0);
+        CHECK(mod0 > 0);   // 插入已诱发若干结构改写（分裂/收根）
+
+        // 清空统计后进入纯读阶段
+        {
+            uint64_t f0 = 0, fu0 = 0, r0 = 0;
+            tree->GetOptimisticStats(&f0, &fu0, &r0, nullptr);
+            // 点查 + 范围查各来一批（无并发写 → 无结构改写）
+            for (int round = 0; round < 50; ++round)
+                for (int i = 0; i < N; i += 7)
+                    CHECK(tree->FindFirst(IndexKey({Value::MakeInt(i)})).IsValid());
+            for (int i = 0; i < N; i += 11) {
+                int got = -1;
+                auto cur = tree->LowerBound(IndexKey({Value::MakeInt(i)}));
+                IndexKey k; RID r;
+                if (cur && cur->Next(&k, &r)) got = k.values[0].AsInt();
+                CHECK(got == i);                       // 自 i 起的首条即 i 本身
+            }
+            uint64_t f1 = 0, fu1 = 0, r1 = 0;
+            tree->GetOptimisticStats(&f1, &fu1, &r1, nullptr);
+            CHECK(f1 > f0);                            // 纯读命中结构计数短路
+            CHECK(fu1 == fu0);                         // 无结构改写 → 不见回退逐页校验
+            std::printf("[U1d] read: fast_validate +%llu  full +%llu  restart +%llu\n",
+                        (unsigned long long)(f1 - f0), (unsigned long long)(fu1 - fu0),
+                        (unsigned long long)(r1 - r0));
+        }
+
+        // 再插入触发结构改写 → 结构计数递增；随后读仍正确（短路不引入误判）
+        uint32_t modA = 0; tree->GetOptimisticStats(nullptr, nullptr, nullptr, &modA);
+        for (int i = N; i < N + 1500; ++i) {           // 触发更多分裂
+            RID rid; rid.page_id = i + 1; rid.slot_num = 0;
+            CHECK(tree->Insert(IndexKey({Value::MakeInt(i)}), rid));
+        }
+        uint32_t modB = 0; tree->GetOptimisticStats(nullptr, nullptr, nullptr, &modB);
+        CHECK(modB > modA);                            // 分裂自增结构计数
+
+        // 正确性守恒：全部键精确可检索（增长后的树也如此）
+        for (int i = 0; i < N + 1500; ++i)
+            CHECK(tree->FindFirst(IndexKey({Value::MakeInt(i)})).IsValid());
+
+        tree->Destroy(&bpm, tree->GetRootPageId());
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// U2-2 锁等待观测：验证 GetLockWaitStats 计数与锁管理器实际行为自洽（计数对账）。
+//   * 立即授权（无冲突）不计量等待；
+//   * 非阻塞探针 kWouldBlock 计入 would_block、不计入等待事件；
+//   * 阻塞后获授计入 1 个等待事件 + 累计时长 + 当前等待者观测；
+//   * 阻塞超时计入 timeout 且同时计入等待事件（含被阻塞时长）。
+static void TestLockWaitObservation() {
+    LockManager lm;
+
+    // (1) 立即授权（S-S 兼容、无冲突）不产生任何等待计数。
+    CHECK(lm.TryLockShared(1, 100) == LockResult::kGranted);
+    auto s0 = lm.GetLockWaitStats();
+    CHECK(s0.wait_episodes == 0);
+    CHECK(s0.would_block_count == 0);
+    CHECK(s0.timeout_count == 0);
+
+    // (2) 非阻塞探针冲突：计入 would_block、不计入等待事件。
+    CHECK(lm.LockExclusive(10, 200, 0) == LockResult::kGranted);
+    CHECK(lm.TryLockShared(11, 200) == LockResult::kWouldBlock);
+    auto s1 = lm.GetLockWaitStats();
+    CHECK(s1.would_block_count == 1);
+    CHECK(s1.wait_episodes == 0);   // 探针未阻塞，不入等待事件
+    lm.UnlockAll(10);
+
+    // (3) 真阻塞后获授（跨线程）：等待事件/时长/当前等待者逐项对账。
+    CHECK(lm.LockExclusive(1, 300, 0) == LockResult::kGranted);
+    std::atomic<bool> granted{false};
+    std::thread worker([&]() {
+        granted.store(
+            lm.LockExclusive(2, 300, 3000) == LockResult::kGranted);
+    });
+    // 等待 worker 登记为等待者（轮询观测接口，验证 current_waiters 能反映阻塞者）。
+    bool saw_waiter = false;
+    for (int i = 0; i < 5000 && !saw_waiter; ++i) {
+        if (lm.GetLockWaitStats().current_waiters >= 1) saw_waiter = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(saw_waiter);
+    auto mid = lm.GetLockWaitStats();
+    CHECK(mid.current_waiters >= 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));  // 让阻塞持续一段
+    lm.UnlockAll(1);
+    worker.join();
+    CHECK(granted.load());
+    auto s2 = lm.GetLockWaitStats();
+    CHECK(s2.wait_episodes >= 1);       // 该阻塞请求计 1 个等待事件
+    CHECK(s2.wait_episodes_x >= 1);     // 独占锁模式分桶命中
+    CHECK(s2.wait_us > 0);              // 累计等待时长为正
+    CHECK(s2.current_waiters == 0);     // 获授后无残留等待者
+
+    // (4) 阻塞超时：计入 timeout 且并入等待事件（含被阻塞时长）。被超时者为一共享
+    // 锁请求（被已有 X 挡住），故按模式分桶应计入 timeout_s、不影响 timeout_x。
+    CHECK(lm.LockExclusive(20, 400, 0) == LockResult::kGranted);
+    auto before = lm.GetLockWaitStats();
+    CHECK(lm.LockShared(21, 400, 50) == LockResult::kTimeout);
+    auto s3 = lm.GetLockWaitStats();
+    CHECK(s3.timeout_count == before.timeout_count + 1);
+    CHECK(s3.timeout_s == before.timeout_s + 1);  // 共享锁请求超时
+    CHECK(s3.timeout_x == before.timeout_x);      // 无独占锁超时
+    CHECK(s3.wait_episodes == s2.wait_episodes + 1);  // 超时也并入等待事件
+    CHECK(s3.wait_us > s2.wait_us);
+    lm.UnlockAll(20);
+
+    // 全清后对账：剩余计数各字段自洽（wait_episodes == S+X 之和）。
+    auto s4 = lm.GetLockWaitStats();
+    CHECK(s4.wait_episodes == s4.wait_episodes_s + s4.wait_episodes_x);
+    std::printf("[U2-2] lock waits: ep=%zu(s=%zu,x=%zu) us=%llu timeout=%zu"
+                " deadlock=%zu wouldblock=%zu cur=%zu pred=%zu\n",
+                s4.wait_episodes, s4.wait_episodes_s, s4.wait_episodes_x,
+                (unsigned long long)s4.wait_us, s4.timeout_count,
+                s4.deadlock_count, s4.would_block_count, s4.current_waiters,
+                s4.predicate_wait_episodes);
+}
+
+// ===== U3-1 JOIN 顺序启发式：小表驱动重排（Database→Planner→Optimizer→执行全链路）=====
+//
+// 覆盖三组断言：
+//  (1) 3 表全 INNER 链：估计基数小表驱动在前（EXPLAIN 文本中 t_small 先于 t_big）；
+//  (2) 3 表 join 结果集与未重排语义一致（count 正确）；
+//  (3) 含 OUTER 的链不被误重排（all-INNER 守卫），结果仍正确。
+static void TestJoinReorder() {
+    const std::string path = "storage_ut_joinreorder.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto s = db.CreateSession();
+        CHECK(db.ExecuteSQL("CREATE TABLE t_big(a INT)", s.get()).success);
+        CHECK(db.ExecuteSQL("CREATE TABLE t_med(b INT)", s.get()).success);
+        CHECK(db.ExecuteSQL("CREATE TABLE t_small(c INT)", s.get()).success);
+
+        // 规模刻意不同：big=30, med=10, small=3，用于验证小表驱动。
+        std::string insert_big = "INSERT INTO t_big VALUES ";
+        std::string insert_med = "INSERT INTO t_med VALUES ";
+        std::string insert_small = "INSERT INTO t_small VALUES ";
+        for (int i = 1; i <= 30; ++i) {
+            if (i > 1) { insert_big += ","; }
+            insert_big += "(" + std::to_string(i) + ")";
+        }
+        for (int i = 1; i <= 10; ++i) {
+            if (i > 1) { insert_med += ","; }
+            insert_med += "(" + std::to_string(i) + ")";
+        }
+        for (int i = 1; i <= 3; ++i) {
+            if (i > 1) { insert_small += ","; }
+            insert_small += "(" + std::to_string(i) + ")";
+        }
+        CHECK(db.ExecuteSQL(insert_big, s.get()).success);
+        CHECK(db.ExecuteSQL(insert_med, s.get()).success);
+        CHECK(db.ExecuteSQL(insert_small, s.get()).success);
+
+        // (1) 3 表重排：t_small(3) / t_med(10) 驱动在前，t_big(30) 最后接入。
+        auto plan3 = db.ExecuteSQL(
+            "EXPLAIN SELECT b.a, m.b, s.c FROM t_big b "
+            "JOIN t_med m ON b.a = m.b JOIN t_small s ON m.b = s.c", s.get());
+        CHECK(plan3.success);
+        CHECK(!plan3.rows.empty());
+        std::string t3 = plan3.rows[0].GetValue(0).ToString();
+        const size_t small3 = t3.find("SeqScan(t_small)");
+        const size_t big3 = t3.find("SeqScan(t_big)");
+        CHECK(small3 != std::string::npos);
+        CHECK(big3 != std::string::npos);
+        CHECK(small3 < big3);  // 小表驱动在前
+
+        // (2) 重排后结果集与语义正确一致：a(1..30)=b(1..10)=c(1..3) → 交集 1,2,3 → 3 行。
+        auto r3 = db.ExecuteSQL("SELECT count(*) FROM t_big b "
+            "JOIN t_med m ON b.a = m.b JOIN t_small s ON m.b = s.c", s.get());
+        CHECK(r3.success);
+        CHECK(!r3.rows.empty());
+        CHECK(r3.rows[0].GetValue(0).AsInt() == 3);
+
+        // (3) 含 OUTER 的链不触发重排，结果仍正确（保留 LEFT 补空语义）。
+        auto r_left = db.ExecuteSQL("SELECT count(*) FROM t_small s "
+            "LEFT JOIN t_med m ON s.c = m.b LEFT JOIN t_big b ON m.b = b.a", s.get());
+        CHECK(r_left.success);
+        CHECK(r_left.rows[0].GetValue(0).AsInt() == 3);
+
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// ===== U3-2 聚合下推：Aggregate → PreAggScan（Database→Planner→Optimizer→执行全链路）=====
+//
+// 覆盖断言：
+//  (1) 合格形态改写：单表裸 COUNT/SUM 聚合（含 GROUP BY）EXPLAIN 中出现 PreAggScan；
+//  (2) 语义等价：COUNT(*)/COUNT(col)/SUM(col) 与 AggregateExecutor 结果一致（NULL 列不计数、
+//      SUM 遇 NULL 输出 NULL、WHERE 过滤后计数、HAVING 过滤组、ORDER BY 排序）；
+//  (3) 不合格形态零改写：AVG、COUNT(DISTINCT)、COALESCE(SUM(x),0) 标量包装、多表 JOIN 聚合
+//      —— EXPLAIN 中不含 PreAggScan，仍走 Aggregate（结果正确）；
+//  (4) 空表：COUNT(*)=0 / SUM(x)=NULL（PreAggScan 空输入仍发射初始状态行）。
+static void TestPreAggPushDown() {
+    const std::string path = "storage_ut_preagg.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto s = db.CreateSession();
+
+        CHECK(db.ExecuteSQL("CREATE TABLE t(a INT, grp INT, val INT)", s.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO t VALUES (1,10,100)", s.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO t VALUES (2,10,200)", s.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO t VALUES (3,20,NULL)", s.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO t VALUES (4,30,300)", s.get()).success);
+
+        // ---- (1) 合格形态改写 ----
+        auto e1 = db.ExecuteSQL("EXPLAIN SELECT COUNT(*) FROM t", s.get());
+        CHECK(e1.success && !e1.rows.empty());
+        CHECK(e1.rows[0].GetValue(0).ToString().find("PreAggScan") != std::string::npos);
+
+        auto e2 = db.ExecuteSQL("EXPLAIN SELECT grp, COUNT(*), SUM(val) FROM t GROUP BY grp", s.get());
+        CHECK(e2.success && !e2.rows.empty());
+        CHECK(e2.rows[0].GetValue(0).ToString().find("PreAggScan") != std::string::npos);
+
+        // ---- (2) 语义等价 ----
+        auto r1 = db.ExecuteSQL("SELECT COUNT(*) FROM t", s.get());
+        CHECK(r1.success && !r1.rows.empty());
+        CHECK(r1.rows[0].GetValue(0).AsInt() == 4);
+
+        auto r2 = db.ExecuteSQL("SELECT COUNT(val) FROM t", s.get());
+        CHECK(r2.success && !r2.rows.empty());
+        CHECK(r2.rows[0].GetValue(0).AsInt() == 3);  // NULL 不计
+
+        auto r3 = db.ExecuteSQL("SELECT SUM(val) FROM t", s.get());
+        CHECK(r3.success && !r3.rows.empty());
+        CHECK(std::fabs(r3.rows[0].GetValue(0).AsFloat() - 600.0) < 1e-6);
+
+        auto r4 = db.ExecuteSQL(
+            "SELECT grp, COUNT(*), SUM(val) FROM t GROUP BY grp ORDER BY grp", s.get());
+        CHECK(r4.success);
+        CHECK(r4.rows.size() == 3);
+        CHECK(r4.rows[0].GetValue(0).AsInt() == 10 && r4.rows[0].GetValue(1).AsInt() == 2);
+        CHECK(std::fabs(r4.rows[0].GetValue(2).AsFloat() - 300.0) < 1e-6);
+        CHECK(r4.rows[1].GetValue(0).AsInt() == 20 && r4.rows[1].GetValue(1).AsInt() == 1);
+        CHECK(r4.rows[1].GetValue(2).IsNull());  // SUM(NULL) → NULL
+        CHECK(r4.rows[2].GetValue(0).AsInt() == 30 && r4.rows[2].GetValue(1).AsInt() == 1);
+        CHECK(std::fabs(r4.rows[2].GetValue(2).AsFloat() - 300.0) < 1e-6);
+
+        // WHERE + GROUP BY：Filter 保留在 PreAggScan 之下，先过滤后聚合。
+        auto r5 = db.ExecuteSQL(
+            "SELECT grp, COUNT(*) FROM t WHERE val > 100 GROUP BY grp ORDER BY grp", s.get());
+        CHECK(r5.success);
+        CHECK(r5.rows.size() == 2);  // 200 与 300 各一组
+        CHECK(r5.rows[0].GetValue(1).AsInt() == 1);
+        CHECK(r5.rows[1].GetValue(1).AsInt() == 1);
+
+        // HAVING：Filter 在 PreAggScan 之上，作用于聚合输出。
+        auto r6 = db.ExecuteSQL(
+            "SELECT grp, SUM(val) FROM t GROUP BY grp HAVING SUM(val) > 100 ORDER BY grp", s.get());
+        CHECK(r6.success);
+        CHECK(r6.rows.size() == 2);  // 10:300 与 30:300，20 组被过滤
+        CHECK(r6.rows[0].GetValue(0).AsInt() == 10);
+        CHECK(r6.rows[1].GetValue(0).AsInt() == 30);
+
+        // ---- (3) 不合格形态零改写（结果仍正确）----
+        auto e3 = db.ExecuteSQL("EXPLAIN SELECT AVG(val) FROM t", s.get());
+        CHECK(e3.success && !e3.rows.empty());
+        CHECK(e3.rows[0].GetValue(0).ToString().find("PreAggScan") == std::string::npos);
+
+        auto e4 = db.ExecuteSQL("EXPLAIN SELECT COUNT(DISTINCT grp) FROM t", s.get());
+        CHECK(e4.success && !e4.rows.empty());
+        CHECK(e4.rows[0].GetValue(0).ToString().find("PreAggScan") == std::string::npos);
+
+        auto e5 = db.ExecuteSQL("EXPLAIN SELECT COALESCE(SUM(val), 0) FROM t", s.get());
+        CHECK(e5.success && !e5.rows.empty());
+        CHECK(e5.rows[0].GetValue(0).ToString().find("PreAggScan") == std::string::npos);
+        auto r5b = db.ExecuteSQL("SELECT COALESCE(SUM(val), 0) FROM t", s.get());
+        CHECK(r5b.success && !r5b.rows.empty());
+        CHECK(std::fabs(r5b.rows[0].GetValue(0).AsFloat() - 600.0) < 1e-6);
+
+        // 多表 JOIN 聚合：全 INNER 链不改写，结果正确。
+        CHECK(db.ExecuteSQL("CREATE TABLE j1(x INT)", s.get()).success);
+        CHECK(db.ExecuteSQL("CREATE TABLE j2(y INT)", s.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO j1 VALUES (1),(2)", s.get()).success);
+        CHECK(db.ExecuteSQL("INSERT INTO j2 VALUES (1),(2),(3)", s.get()).success);
+        auto e6 = db.ExecuteSQL("EXPLAIN SELECT COUNT(*) FROM j1 JOIN j2 ON j1.x = j2.y", s.get());
+        CHECK(e6.success && !e6.rows.empty());
+        CHECK(e6.rows[0].GetValue(0).ToString().find("PreAggScan") == std::string::npos);
+        auto r7 = db.ExecuteSQL("SELECT COUNT(*) FROM j1 JOIN j2 ON j1.x = j2.y", s.get());
+        CHECK(r7.success && !r7.rows.empty());
+        CHECK(r7.rows[0].GetValue(0).AsInt() == 2);
+
+        // ---- (4) 空表：COUNT(*)=0 / SUM(x)=NULL ----
+        CHECK(db.ExecuteSQL("CREATE TABLE t_empty(x INT)", s.get()).success);
+        auto r8 = db.ExecuteSQL("SELECT COUNT(*) FROM t_empty", s.get());
+        CHECK(r8.success && !r8.rows.empty());
+        CHECK(r8.rows[0].GetValue(0).AsInt() == 0);
+        auto r9 = db.ExecuteSQL("SELECT SUM(x) FROM t_empty", s.get());
+        CHECK(r9.success && !r9.rows.empty());
+        CHECK(r9.rows[0].GetValue(0).IsNull());
+
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// ===== U3-3 子查询去关联：EXISTS/NOT EXISTS/IN/ANY → SEMI/ANTI 连接 =====
+//
+// 走 Database→Planner→Optimizer→执行全链路，EXPLAIN 断言与结果断言相互印证。
+// 覆盖断言：
+//  (1) 相关 EXISTS          → EXPLAIN 出现 Join(SEMI)，相关子句进入连接条件；
+//  (2) 相关 NOT EXISTS      → Join(ANTI)，内层非相关子句保留在 Filter（o.amount > 100）；
+//  (3) IN                   → Join(SEMI, 外列 = 内列)，未限定外列在左侧单表时解析正确；
+//  (4) ANY                  → Join(SEMI, 外列 op 内列)；
+//  (5) 混合合取（city='BJ' AND EXISTS）→ 左子保留 Filter(city='BJ')，结果 = 交集；
+//  (6) NOT IN 保守不改写（NULL 语义与 ANTI 不等价）→ 保持 Filter(NOT (… IN …))；
+//  (7) 非相关 EXISTS         → SEMI 无条件连接（右表非空即全部输出）；
+//  (8) 空表                 → EXISTS 空表 = 0 行；NOT EXISTS 空表 = 全部行；
+//  (9) NULL 语义            → 外列 NULL 经 SEMI 按 UNKNOWN 过滤（IN 语义精确）；
+// (10) 嵌套相关子查询        → 第二层也被递归去关联为内层 SEMI 连接（Join(SEMI ≥ 2 次）。
+static void TestSubqueryDecorrelation() {
+    const std::string path = "storage_ut_subqdec.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto s = db.CreateSession();
+
+        CHECK(db.ExecuteSQL(
+            "CREATE TABLE customers(id INT, name VARCHAR, city VARCHAR)", s.get()).success);
+        CHECK(db.ExecuteSQL(
+            "CREATE TABLE orders(id INT, cust_id INT, amount FLOAT)", s.get()).success);
+        CHECK(db.ExecuteSQL(
+            "INSERT INTO customers VALUES "
+            "(1,'Alice','BJ'),(2,'Bob','SH'),(3,'Charlie','BJ'),(4,'David','GZ'),(5,'Eve','SH')",
+            s.get()).success);
+        CHECK(db.ExecuteSQL(
+            "INSERT INTO orders VALUES "
+            "(1,1,100.0),(2,1,50.0),(3,2,200.0),(4,3,80.0),(5,3,60.0),(6,5,300.0)",
+            s.get()).success);
+
+        // ---- (1) 相关 EXISTS → SEMI ----
+        auto e1 = db.ExecuteSQL(
+            "EXPLAIN SELECT name FROM customers c WHERE EXISTS "
+            "(SELECT 1 FROM orders o WHERE o.cust_id = c.id)", s.get());
+        CHECK(e1.success && !e1.rows.empty());
+        std::string t1 = e1.rows[0].GetValue(0).ToString();
+        CHECK(t1.find("Join(SEMI") != std::string::npos);
+        CHECK(t1.find("o.cust_id = c.id") != std::string::npos);
+        auto r1 = db.ExecuteSQL(
+            "SELECT name FROM customers c WHERE EXISTS "
+            "(SELECT 1 FROM orders o WHERE o.cust_id = c.id) ORDER BY id", s.get());
+        CHECK(r1.success && r1.rows.size() == 4);
+        CHECK(r1.rows[0].GetValue(0).ToString() == "Alice");
+        CHECK(r1.rows[3].GetValue(0).ToString() == "Eve");
+
+        // ---- (2) 相关 NOT EXISTS → ANTI，内层非相关子句保留在 Filter ----
+        auto e2 = db.ExecuteSQL(
+            "EXPLAIN SELECT name FROM customers c WHERE NOT EXISTS "
+            "(SELECT 1 FROM orders o WHERE o.cust_id = c.id AND o.amount > 100)", s.get());
+        CHECK(e2.success && !e2.rows.empty());
+        std::string t2 = e2.rows[0].GetValue(0).ToString();
+        CHECK(t2.find("Join(ANTI") != std::string::npos);
+        CHECK(t2.find("Filter((o.amount > 100))") != std::string::npos);
+        auto r2 = db.ExecuteSQL(
+            "SELECT name FROM customers c WHERE NOT EXISTS "
+            "(SELECT 1 FROM orders o WHERE o.cust_id = c.id AND o.amount > 100) ORDER BY id",
+            s.get());
+        CHECK(r2.success && r2.rows.size() == 3);
+        CHECK(r2.rows[0].GetValue(0).ToString() == "Alice");
+        CHECK(r2.rows[2].GetValue(0).ToString() == "David");
+
+        // ---- (3) IN → SEMI（外列未限定、内层单表时解析正确）----
+        auto e3 = db.ExecuteSQL(
+            "EXPLAIN SELECT name FROM customers WHERE id IN "
+            "(SELECT cust_id FROM orders WHERE amount >= 100)", s.get());
+        CHECK(e3.success && !e3.rows.empty());
+        std::string t3 = e3.rows[0].GetValue(0).ToString();
+        CHECK(t3.find("Join(SEMI") != std::string::npos);
+        CHECK(t3.find("id = orders.cust_id") != std::string::npos);
+        auto r3 = db.ExecuteSQL(
+            "SELECT name FROM customers WHERE id IN "
+            "(SELECT cust_id FROM orders WHERE amount >= 100) ORDER BY id", s.get());
+        CHECK(r3.success && r3.rows.size() == 3);
+        CHECK(r3.rows[0].GetValue(0).ToString() == "Alice");
+        CHECK(r3.rows[1].GetValue(0).ToString() == "Bob");
+        CHECK(r3.rows[2].GetValue(0).ToString() == "Eve");
+
+        // ---- (4) ANY → SEMI ----
+        auto e4 = db.ExecuteSQL(
+            "EXPLAIN SELECT name FROM customers WHERE id > ANY "
+            "(SELECT cust_id FROM orders WHERE amount >= 100)", s.get());
+        CHECK(e4.success && !e4.rows.empty());
+        std::string t4 = e4.rows[0].GetValue(0).ToString();
+        CHECK(t4.find("Join(SEMI") != std::string::npos);
+        CHECK(t4.find("id > orders.cust_id") != std::string::npos);
+        auto r4 = db.ExecuteSQL(
+            "SELECT name FROM customers WHERE id > ANY "
+            "(SELECT cust_id FROM orders WHERE amount >= 100) ORDER BY id", s.get());
+        CHECK(r4.success && r4.rows.size() == 4);  // id ∈ {2,3,4,5}
+        CHECK(r4.rows[0].GetValue(0).ToString() == "Bob");
+
+        // ---- (5) 混合合取：city='BJ' AND EXISTS → 左子保留 Filter ----
+        auto e5 = db.ExecuteSQL(
+            "EXPLAIN SELECT name FROM customers WHERE city = 'BJ' AND EXISTS "
+            "(SELECT 1 FROM orders o WHERE o.cust_id = customers.id)", s.get());
+        CHECK(e5.success && !e5.rows.empty());
+        std::string t5 = e5.rows[0].GetValue(0).ToString();
+        CHECK(t5.find("Join(SEMI") != std::string::npos);
+        CHECK(t5.find("Filter((city = 'BJ'))") != std::string::npos);
+        auto r5 = db.ExecuteSQL(
+            "SELECT name FROM customers WHERE city = 'BJ' AND EXISTS "
+            "(SELECT 1 FROM orders o WHERE o.cust_id = customers.id) ORDER BY id", s.get());
+        CHECK(r5.success && r5.rows.size() == 2);
+        CHECK(r5.rows[0].GetValue(0).ToString() == "Alice");
+        CHECK(r5.rows[1].GetValue(0).ToString() == "Charlie");
+
+        // ---- (6) NOT IN 保守不改写（结果仍正确）----
+        auto e6 = db.ExecuteSQL(
+            "EXPLAIN SELECT name FROM customers WHERE id NOT IN "
+            "(SELECT cust_id FROM orders WHERE amount >= 200)", s.get());
+        CHECK(e6.success && !e6.rows.empty());
+        std::string t6 = e6.rows[0].GetValue(0).ToString();
+        CHECK(t6.find("Join(SEMI") == std::string::npos);
+        CHECK(t6.find("Join(ANTI") == std::string::npos);
+        CHECK(t6.find("NOT ((id IN") != std::string::npos);  // 保持原 Filter 形态
+        auto r6 = db.ExecuteSQL(
+            "SELECT name FROM customers WHERE id NOT IN "
+            "(SELECT cust_id FROM orders WHERE amount >= 200) ORDER BY id", s.get());
+        CHECK(r6.success && r6.rows.size() == 3);  // id ∈ {1,3,4}
+        CHECK(r6.rows[0].GetValue(0).ToString() == "Alice");
+
+        // ---- (7) 非相关 EXISTS → SEMI 无条件（右表非空 → 全部输出）----
+        auto e7 = db.ExecuteSQL(
+            "EXPLAIN SELECT name FROM customers WHERE EXISTS (SELECT 1 FROM orders)", s.get());
+        CHECK(e7.success && !e7.rows.empty());
+        CHECK(e7.rows[0].GetValue(0).ToString().find("Join(SEMI") != std::string::npos);
+        auto r7 = db.ExecuteSQL(
+            "SELECT name FROM customers WHERE EXISTS (SELECT 1 FROM orders) ORDER BY id",
+            s.get());
+        CHECK(r7.success && r7.rows.size() == 5);
+
+        // ---- (8) 空表：EXISTS = 0 行，NOT EXISTS = 全部行 ----
+        CHECK(db.ExecuteSQL("CREATE TABLE empty_t(x INT)", s.get()).success);
+        auto r8 = db.ExecuteSQL(
+            "SELECT count(*) FROM customers WHERE EXISTS (SELECT 1 FROM empty_t)", s.get());
+        CHECK(r8.success && !r8.rows.empty());
+        CHECK(r8.rows[0].GetValue(0).AsInt() == 0);
+        auto r9 = db.ExecuteSQL(
+            "SELECT count(*) FROM customers WHERE NOT EXISTS (SELECT 1 FROM empty_t)", s.get());
+        CHECK(r9.success && !r9.rows.empty());
+        CHECK(r9.rows[0].GetValue(0).AsInt() == 5);
+
+        // ---- (9) NULL 语义：外列 NULL 经 SEMI 按 UNKNOWN 过滤 ----
+        CHECK(db.ExecuteSQL(
+            "CREATE TABLE cust_null(id INT, name VARCHAR)", s.get()).success);
+        CHECK(db.ExecuteSQL(
+            "INSERT INTO cust_null VALUES (1,'A'),(NULL,'B')", s.get()).success);
+        auto r10 = db.ExecuteSQL(
+            "SELECT name FROM cust_null WHERE id IN (SELECT cust_id FROM orders) ORDER BY name",
+            s.get());
+        CHECK(r10.success && r10.rows.size() == 1);
+        CHECK(r10.rows[0].GetValue(0).ToString() == "A");
+
+        // ---- (10) 嵌套相关子查询：两层均被递归去关联 ----
+        auto e11 = db.ExecuteSQL(
+            "EXPLAIN SELECT name FROM customers c WHERE EXISTS "
+            "(SELECT 1 FROM orders o WHERE o.cust_id = c.id AND EXISTS "
+            "(SELECT 1 FROM customers c2 WHERE c2.id = o.cust_id))", s.get());
+        CHECK(e11.success && !e11.rows.empty());
+        std::string t11 = e11.rows[0].GetValue(0).ToString();
+        size_t pos = 0, semi_cnt = 0;
+        while ((pos = t11.find("Join(SEMI", pos)) != std::string::npos) {
+            ++semi_cnt;
+            pos += 9;
+        }
+        CHECK(semi_cnt >= 2);  // 外层 + 内层各一个 SEMI
+        auto r11 = db.ExecuteSQL(
+            "SELECT name FROM customers c WHERE EXISTS "
+            "(SELECT 1 FROM orders o WHERE o.cust_id = c.id AND EXISTS "
+            "(SELECT 1 FROM customers c2 WHERE c2.id = o.cust_id)) ORDER BY id", s.get());
+        // c2.id = o.cust_id 恒真（o.cust_id 都是 customers 的 id）→ 与 (1) 同结果
+        CHECK(r11.success && r11.rows.size() == 4);
+        CHECK(r11.rows[0].GetValue(0).ToString() == "Alice");
+
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// ===== U3-3 非相关子查询物化缓存（u2）：跨语句白盒计数断言 =====
+// 非相关标量子查询与当前外层行无关：5 外层行只物化 1 次、缓存命中 4 次；
+// 相关标量子查询逐行求值、不入缓存（计数不变）。计数经 Database 级 sink
+// 跨语句累计（与 \stats 的 subquery cache 行同源）。
+static void TestSubqueryMaterialization() {
+    const std::string path = "storage_ut_subqmat.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto s = db.CreateSession();
+
+        CHECK(db.ExecuteSQL(
+            "CREATE TABLE customers(id INT, name VARCHAR, city VARCHAR)", s.get()).success);
+        CHECK(db.ExecuteSQL(
+            "CREATE TABLE orders(id INT, cust_id INT, amount FLOAT)", s.get()).success);
+        CHECK(db.ExecuteSQL(
+            "INSERT INTO customers VALUES "
+            "(1,'Alice','BJ'),(2,'Bob','SH'),(3,'Charlie','BJ'),(4,'David','GZ'),(5,'Eve','SH')",
+            s.get()).success);
+        CHECK(db.ExecuteSQL(
+            "INSERT INTO orders VALUES "
+            "(1,1,100.0),(2,1,50.0),(3,2,200.0),(4,3,80.0),(5,3,60.0),(6,5,300.0)",
+            s.get()).success);
+
+        // DDL/DML 无子查询：计数保持 0。
+        CHECK(db.GetSubqueryCacheStats().materialize_count.load() == 0);
+        CHECK(db.GetSubqueryCacheStats().hit_count.load() == 0);
+
+        // (1) 非相关标量子查询：5 外层行只物化 1 次、命中 4 次，结果恒为 6。
+        auto r = db.ExecuteSQL(
+            "SELECT name, (SELECT count(*) FROM orders) AS cnt FROM customers ORDER BY id",
+            s.get());
+        CHECK(r.success && r.rows.size() == 5);
+        for (int i = 0; i < 5; ++i) {
+            CHECK(r.rows[i].GetValue(1).AsInt() == 6);
+        }
+        CHECK(db.GetSubqueryCacheStats().materialize_count.load() == 1);
+        CHECK(db.GetSubqueryCacheStats().hit_count.load() == 4);
+
+        // (2) 相关标量子查询：逐行求值、不入缓存 → 计数不变。
+        auto r2 = db.ExecuteSQL(
+            "SELECT name, (SELECT max(amount) FROM orders o WHERE o.cust_id = c.id) AS mx "
+            "FROM customers c ORDER BY id",
+            s.get());
+        CHECK(r2.success && r2.rows.size() == 5);
+        CHECK(r2.rows[0].GetValue(1).AsFloat() == 100.0);
+        CHECK(r2.rows[2].GetValue(1).AsFloat() == 80.0);
+        CHECK(r2.rows[3].GetValue(1).IsNull());  // David 无订单 → NULL
+        CHECK(db.GetSubqueryCacheStats().materialize_count.load() == 1);
+        CHECK(db.GetSubqueryCacheStats().hit_count.load() == 4);
+
+        // (3) 第二条非相关子查询（不同子计划，限定列引用）：再物化 1 次、再命中 4 次。
+        auto r3 = db.ExecuteSQL(
+            "SELECT name, (SELECT count(*) FROM orders o WHERE o.amount > 100) AS big "
+            "FROM customers ORDER BY id",
+            s.get());
+        CHECK(r3.success && r3.rows.size() == 5);
+        CHECK(r3.rows[0].GetValue(1).AsInt() == 2);  // 200/300 > 100 共 2 条
+        CHECK(db.GetSubqueryCacheStats().materialize_count.load() == 2);
+        CHECK(db.GetSubqueryCacheStats().hit_count.load() == 8);
+
+        // (4) 未限定列的子查询被保守视为相关（WalkExprForOuterRefs 无法在不做
+        // schema 解析时排除歧义）→ 逐行重跑、不入缓存，计数不变。设计取舍：
+        // 宁可多跑也不能缓存到错误结果（见 ExpressionEvaluator.cpp）。
+        auto r4 = db.ExecuteSQL(
+            "SELECT name, (SELECT count(*) FROM orders WHERE amount > 100) AS big2 "
+            "FROM customers ORDER BY id",
+            s.get());
+        CHECK(r4.success && r4.rows.size() == 5);
+        CHECK(r4.rows[0].GetValue(1).AsInt() == 2);
+        CHECK(db.GetSubqueryCacheStats().materialize_count.load() == 2);
+        CHECK(db.GetSubqueryCacheStats().hit_count.load() == 8);
+
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
+// ===== U3-3 递归 CTE 迭代边界失效子查询缓存（u4）=====
+// 递归项内的标量子查询 (SELECT max(acc.n) FROM acc) 引用本轮 CTE 工作集且
+// 限定列（acc.n ∈ 内层表 → 非相关）→ 进入物化缓存。若迭代边界不清缓存，
+// 第 1 轮物化的 max=1 会在第 2 轮复用 → 序列 1,2,3,4,5 (cnt=5,mx=5)；
+// CteDefineExecutor 每轮 ClearSubqueryCache 后重算 → 序列 1,2,4,8 (cnt=4,mx=8)。
+// 白盒计数印证：3 次真实物化（4 轮迭代中第 4 轮 WHERE n<5 先过滤空输入、
+// 未求值子查询），而非 1 次物化 3 次命中——证明每轮都在重新物化。
+static void TestRecursiveCteCacheInvalidation() {
+    const std::string path = "storage_ut_ctecache.bin";
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+    {
+        Database db(path, 64);
+        auto s = db.CreateSession();
+        auto r = db.ExecuteSQL(
+            "WITH RECURSIVE acc AS ("
+            " SELECT 1 AS n"
+            " UNION ALL"
+            " SELECT n + (SELECT max(acc.n) FROM acc) FROM acc WHERE n < 5"
+            ") SELECT count(*) AS cnt, max(n) AS mx FROM acc",
+            s.get());
+        CHECK(r.success && !r.rows.empty());
+        CHECK(r.rows[0].GetValue(0).AsInt() == 4);
+        CHECK(r.rows[0].GetValue(1).AsInt() == 8);
+        CHECK(db.GetSubqueryCacheStats().materialize_count.load() == 3);
+        CHECK(db.GetSubqueryCacheStats().hit_count.load() == 0);
+        db.Shutdown();
+    }
+    RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
+    RemoveFile(path + ".fpl");
+}
+
 int main() {
     TestDiskManager();
     TestFreePagePersistence();
@@ -4583,10 +5705,24 @@ int main() {
     TestRowLockEscalation();
     TestAdaptiveLockEscalation();
     TestLockManagerShardThroughput();
+    TestLockWaitObservation();
+    TestJoinReorder();
+    TestPreAggPushDown();
+    TestSubqueryDecorrelation();
+    TestSubqueryMaterialization();
+    TestRecursiveCteCacheInvalidation();
     TestPredicateLockMerge();
     TestRowLevelConcurrency();
     TestBPlusTreeConcurrency();
     TestOptimisticSplitConcurrency();
+    TestBPlusTreeRebalance();
+    TestBPlusTreeRebalanceConcurrency();
+    TestBPlusTreeMerge();
+    TestBPlusTreeCollapseRoot();
+    TestBPlusTreeMergeConcurrency();
+    TestBPlusTreeReliableReclaim();
+    TestBPlusTreeReliableReclaimConcurrent();
+    TestBPlusTreeOptimisticRestartOpt();
     TestSerializablePredicatePhantom();
     TestSerializablePredicateNonPkPhantom();
     TestCompositeIndexRangeConvergence();

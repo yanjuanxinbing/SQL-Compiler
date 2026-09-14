@@ -4,6 +4,8 @@
 /.vscode
 /tests/tmp
 /tests/tmp_sweep*
+/tests/tmp_bench*
+/tests/tmp_gc*
 /*.log
 # runtime artifacts
 sqlcompiler.db*

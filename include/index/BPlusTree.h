@@ -1,8 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -110,8 +113,11 @@ public:
 
     private:
         bool LoadLeaf(page_id_t pid);
-        bool ReloadCurrentLeaf();
         bool CurrentLeafUnchanged() const;
+        // U1b 物理删页安全恢复：当前叶子被并发合并/物理释放（或 next 页消失）
+        // 而无法快速续扫时，按最近发出的条目（或扫描起点锚点）重新下降定位并续扫。
+        // 返回 false 表示重试耗尽后仍无法定位（调用方终止迭代）。
+        bool RelocateRestart();
 
         const BPlusTree* tree_ = nullptr;
         page_id_t leaf_pid_ = INVALID_PAGE_ID;
@@ -125,12 +131,36 @@ public:
         bool has_last_ = false;
         IndexKey last_key_;
         RID last_rid_;
+        // 扫描起点锚点：尚未发出任何条目时，RelocateRestart 据此回到原起点续扫
+        // （begin=true 回到最左叶；否则定位到第一个 >= anchor_key_ 的条目）。
+        bool anchor_begin_ = true;
+        IndexKey anchor_key_;
     };
 
     // 定位到第一个 >= key 的位置
     std::unique_ptr<Cursor> LowerBound(const IndexKey& key) const;
     // 定位到最左端
     std::unique_ptr<Cursor> Begin() const;
+
+    // ---- U1 可观测性（只读）----
+    // 返回树高（单叶树=1）。沿最左路径读闩下降计数。
+    int GetHeight() const;
+    // 统计全树叶/内节点的利用率：min_ratio、avg_ratio（已用字节/页），
+    // 并输出叶、内节点的页数。用于验证「删除后利用率不持续下降」与 `\stats`。
+    void ComputeUtilization(double* min_ratio, double* avg_ratio,
+                            uint64_t* leaf_pages, uint64_t* internal_pages) const;
+
+    // ---- U1d 可观测性（只读）：乐观重启校验统计 ----
+    // fast=结构计数短路命中的校验次数（O(1)）；full=回退全路径逐页校验次数；
+    // restarts=校验失败导致的重启次数；mod=当前结构变更计数。用于测试与观测
+    // 「校验成本随树高线性增长」的缓解效果。
+    void GetOptimisticStats(uint64_t* fast, uint64_t* full, uint64_t* restarts,
+                            uint32_t* mod) const {
+        if (fast) *fast = stat_fast_validate_.load();
+        if (full) *full = stat_full_validate_.load();
+        if (restarts) *restarts = stat_restarts_.load();
+        if (mod) *mod = structure_mod_.load();
+    }
 
 private:
     // 乐观下降路径上记录的 (页号, 版本号) 快照，供遍历结束后校验。
@@ -139,14 +169,37 @@ private:
         uint32_t version;
     };
 
+    // U1d/N2：乐观分布的完整快照。除路径逐页版本外，还记录**下降开始时的树级结构
+    // 变更计数**（mod_at_descent）和命中叶子的版本。若下降期间结构计数未变，则整个
+    // 祖先链路必然未被改写，校验只需复核叶子版本（O(1)），无需重取每个祖先页——
+    // 把「校验成本随树高线性增长」降为常见路径 O(1)。
+    struct DescPath {
+        std::vector<PathEntry> entries;
+        uint32_t mod_at_descent = 0;
+        bool IsEmpty() const { return entries.empty(); }
+        page_id_t leaf_pid() const { return entries.empty() ? INVALID_PAGE_ID : entries.back().pid; }
+        uint32_t leaf_version() const { return entries.empty() ? 0 : entries.back().version; }
+    };
+
     // 乐观只读下降：逐页取共享闩记录版本号，返回 (key, rid) 所属的叶子页。
     // 失败（页不存在/环路/损坏）返回 INVALID_PAGE_ID。
     page_id_t OptimisticFindLeafPage(const IndexKey& key, const RID& rid,
-                                     std::vector<PathEntry>* path) const;
+                                     DescPath* path) const;
     // 乐观只读下降：一直取第一个孩子，返回最左叶子页（Begin 用）。
-    page_id_t OptimisticLeftmostLeafPage(std::vector<PathEntry>* path) const;
-    // 校验下降路径上所有页版本号未变；任一变化返回 false（调用方重启遍历）。
-    bool ValidatePath(const std::vector<PathEntry>& path) const;
+    page_id_t OptimisticLeftmostLeafPage(DescPath* path) const;
+    // 校验下降路径：先走结构计数短路——若下降期间无任何结构改写，仅复核叶子版本
+    //（O(1)）；否则回退全路径逐页版本复核（O(树高)）。任一失败返回 false（调用方
+    // 重启遍历）。绝不比逐页复核更宽松：结构改写必自增计数，计数未变 ⇒ 祖先未变。
+    bool ValidatePath(const DescPath& path) const;
+
+    // ---- U1d：结构变更计数与校验统计（用于短路 + 可观测）----
+    // 每次分裂/拆分/再平衡/收根等**结构改写**自增。读路径据此判定"下降期间有
+    // 无结构改写"，从而跳过昂贵的全路径版本重取。
+    void BumpStructureCounter() { structure_mod_ = structure_mod_.load() + 1; }
+    mutable std::atomic<uint32_t> structure_mod_{0};
+    mutable std::atomic<uint64_t> stat_fast_validate_{0};  // 结构计数短路命中（O(1) 校验）
+    mutable std::atomic<uint64_t> stat_full_validate_{0};  // 回退全路径逐页校验
+    mutable std::atomic<uint64_t> stat_restarts_{0};       // 校验失败导致的重启
 
     // 向已持写闩的叶子页插入一条记录（合并 + 整页重写 + 版本号自增 + undo/WAL）。
     // 调用方负责在插入前完成唯一性检查与 MarkDirty。
@@ -173,12 +226,41 @@ private:
     // 直接返回成功（并回收误分配的新页），由调用方继续下降。
     bool SplitRoot(size_t reserve);
 
+    // ---- U1/U1b：删除后下溢再平衡 ----
+    // Delete / Vacuum 在目标节点下溢（<40%）后调用，把该子树与同一父节点下的
+    // 相邻兄弟合并/再分配，级联处理父节点下溢，根单子时收缩（收树高）。合并会
+    // 物理回收被并页（BPM 删除页 → .fpl 空闲位图）；child_pid 为刚变小的节点
+    // 页号，key 用于带写闩下降定位其父节点（按 key 路由必然经过该子树）。
+    // 返回本趟发生的结构变更次数（用于测试/观测对账）；并发冲突或损坏时保守
+    // 放弃（返回 0），绝不破坏一致性。
+    int RebalanceAfterDelete(page_id_t child_pid, const IndexKey& key);
+    // 若根是仅含一个孩子的内部节点，把根就地改写为该子树的拷贝并回收原孩子页
+    //（树高降 1）。根页 id 恒定不变（复用 SplitRoot 约定）。返回是否发生收缩。
+    // 自身会调用 BPM（回收孩子页），因此只能在**不持任何页闩**时调用。
+    bool CollapseRootIfNeeded();
+
+    // ---- U1c：物理删页可靠回收 ----
+    // 合并/根收缩后回收被并页须等并发读者 Unpin 之后才能成功。这里用「挂起队列 +
+    // 安全点排空」：DeletePage 失败（页仍被 pin）时先把页号暂存（此时页仍分配于 BPM、
+    // 不会被 AllocatePage 复用，延迟回收安全），待后续写操作入口（不持任何页闩时）
+    // 重试排空，保证被弃页最终回到 .fpl 空闲位图。
+    //
+    // TryFreePage：尝试立即物理回收；失败（并发 pin）则入挂起队列。
+    // DrainPendingFrees：对挂起队列整体重试一次；仍失败者回队。必须在**不持任何页闩**
+    // （不持任何 BPM pin）时调用——DeletePage 内部会取 BPM 全局锁。
+    void TryFreePage(page_id_t pid);
+    void DrainPendingFrees();
+
     BufferPoolManager* bpm_;
     std::vector<ValueType> key_schema_;
     bool is_unique_;
     page_id_t root_page_id_;
     Transaction* active_txn_ = nullptr;
     LogManager* log_manager_ = nullptr;  // Phase B：可选 WAL 写出器
+    // U1c：等待重试的被弃页队列（去重），见 TryFreePage / DrainPendingFrees。
+    std::mutex pending_free_mutex_;
+    std::vector<page_id_t> pending_free_vec_;
+    std::unordered_set<page_id_t> pending_free_set_;
     // 注：树级锁已移除（Phase 1 乐观页级并发）。并发安全由「页级读写闩 + 版本号
     // 校验 + 乐观重启」保证：读路径校验版本、写路径只锁目标叶子/分裂路径。
 };

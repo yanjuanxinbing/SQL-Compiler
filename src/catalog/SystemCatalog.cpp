@@ -829,6 +829,24 @@ BPlusTree* SystemCatalog::GetIndexTree(const std::string& index_name) {
     return it == index_trees_.end() ? nullptr : it->second.get();
 }
 
+std::vector<SystemCatalog::IndexStat> SystemCatalog::CollectIndexStats() const {
+    std::vector<IndexStat> out;
+    out.reserve(index_trees_.size());
+    for (const auto& kv : index_trees_) {
+        const BPlusTree* tree = kv.second.get();
+        if (tree == nullptr) continue;
+        IndexStat s;
+        s.name = kv.first;
+        s.height = tree->GetHeight();
+        tree->ComputeUtilization(&s.min_ratio, &s.avg_ratio,
+                                 &s.leaf_pages, &s.internal_pages);
+        out.push_back(std::move(s));
+    }
+    std::sort(out.begin(), out.end(),
+              [](const IndexStat& a, const IndexStat& b) { return a.name < b.name; });
+    return out;
+}
+
 std::vector<const IndexInfo*> SystemCatalog::GetIndexesForTable(
     const std::string& table_name) const {
     std::vector<const IndexInfo*> out;

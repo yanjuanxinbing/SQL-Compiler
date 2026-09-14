@@ -217,7 +217,10 @@ struct ColumnDefinition {
 };
 
 // JOIN 类型
-enum class JoinType { INNER, LEFT, RIGHT, FULL_OUTER, CROSS };
+// SEMI/ANTI 由 U3-3 子查询去关联改写产生（EXISTS/IN → SEMI，NOT EXISTS → ANTI），
+// 不来自 SQL 语法：SEMI 每个左行在右子树存在匹配时输出一次左行（半连接，
+// 精确等价 EXISTS/IN 的 WHERE 语义）；ANTI 在右子树无匹配时输出左行（NOT EXISTS）。
+enum class JoinType { INNER, LEFT, RIGHT, FULL_OUTER, CROSS, SEMI, ANTI };
 
 // JOIN 子句
 struct JoinClause {

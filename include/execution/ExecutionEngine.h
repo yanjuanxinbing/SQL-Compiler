@@ -29,8 +29,12 @@ struct ExecutionResult {
 // 转换为算子树（Executor Tree）并以火山模型驱动其运行，产出最终结果
 class ExecutionEngine {
 public:
+    // subquery_stats: U3-3 非相关子查询物化缓存的数据库级观测 sink（可空）。
+    // Execute() 内部创建的 ExecutionContext 会把物化/命中计数累计到该 sink，
+    // 供 Database 的 \stats 与白盒单元测试断言使用。
     explicit ExecutionEngine(SystemCatalog* catalog,
-                             TransactionManager* txn_manager = nullptr);
+                             TransactionManager* txn_manager = nullptr,
+                             SubqueryCacheStats* subquery_stats = nullptr);
 
     // 执行入口：输入一棵逻辑计划树，返回执行结果
     ExecutionResult Execute(const PlanNodePtr& plan);
@@ -49,6 +53,7 @@ public:
 private:
     SystemCatalog* catalog_;
     TransactionManager* txn_manager_;
+    SubqueryCacheStats* subquery_stats_ = nullptr;
 
     // 根据表结构构建"列名 -> 下标"的映射，供表达式求值使用
     std::unordered_map<std::string, size_t> BuildColumnIndexMap(const std::string& table_name);

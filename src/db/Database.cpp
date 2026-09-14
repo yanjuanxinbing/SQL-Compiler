@@ -12,13 +12,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <system_error>
+#include <thread>
 
 namespace sqlcompiler {
 
@@ -189,7 +192,8 @@ Database::Database(const std::string& db_file, size_t buffer_pool_size,
     }
 
     execution_engine_ = std::make_unique<ExecutionEngine>(catalog_.get(),
-                                                         txn_manager_.get());
+                                                         txn_manager_.get(),
+                                                         &subquery_cache_stats_);
 
     // Phase B：每次 Database 启动都让 LogManager 的 durable_lsn 至少推进到当前
     // 文件末尾。AppendRecord 一条占位记录后 Flush，让后续 FlushPage 的 LSN 检查
@@ -251,6 +255,21 @@ std::shared_ptr<Session> Database::CreateSession() {
 
 ExecutionResult Database::ExecuteSQLImpl(const std::string& sql,
                                          TransactionManager* txn_mgr) {
+    // \bench —— U2 进程内多会话并发读写混合负载基准。须在所有 \crash 调试分支之前
+    // 独立识别（\bench 是长时间并发负载，不能落入崩溃注入语义）。
+    {
+        size_t i0 = 0;
+        while (i0 < sql.size() && (sql[i0] == ' ' || sql[i0] == '\t')) ++i0;
+        if (sql.compare(i0, 6, "\\bench") == 0) {
+            bool is_bench = (i0 + 6 >= sql.size()) ||
+                            (sql[i0 + 6] == ' ' || sql[i0 + 6] == '\t' ||
+                             sql[i0 + 6] == ';' || sql[i0 + 6] == '\r' ||
+                             sql[i0 + 6] == '\n');
+            if (is_bench) {
+                return RunBenchCommand(sql, txn_mgr);
+            }
+        }
+    }
     // \stats —— 输出存储子系统诊断信息（缓冲池/页分配/替换日志）。
     // \analyze —— T4 诊断：输出页映射/介质/CRC 校验信息。
     // 均需在通用 \crash 处理之前识别。
@@ -358,7 +377,8 @@ ExecutionResult Database::ExecuteSQLImpl(const std::string& sql,
             const bool session_exec = (txn_mgr != nullptr && txn_mgr != txn_manager_.get());
             ExecutionResult exec_result;
             if (session_exec) {
-                ExecutionContext session_ctx(catalog_.get(), txn_mgr);
+                ExecutionContext session_ctx(catalog_.get(), txn_mgr,
+                                             &subquery_cache_stats_);
                 session_ctx.SetTransaction(txn_mgr->GetCurrentTransaction());
                 exec_result = execution_engine_->ExecuteSubplan(plan, &session_ctx);
             } else {
@@ -605,6 +625,35 @@ std::string Database::GetStorageStats() const {
     oss << "wal fsyncs           : "
         << (log_manager_ != nullptr ? log_manager_->GetSyncCount() : 0)
         << "\n";
+    // ---- U3-3 非相关子查询物化缓存观测（跨语句累计）----
+    oss << "subquery cache       : materialize="
+        << subquery_cache_stats_.materialize_count.load()
+        << "  hits=" << subquery_cache_stats_.hit_count.load() << "\n";
+    // ---- U2-2 锁等待观测：等待次数/平均时长/超时/死锁/当前等待者/谓词等待 ----
+    if (lock_manager_ != nullptr) {
+        const LockManager::LockWaitStats lw = lock_manager_->GetLockWaitStats();
+        const double avg_us =
+            (lw.wait_episodes > 0)
+                ? static_cast<double>(lw.wait_us) / lw.wait_episodes
+                : 0.0;
+        const double pavg_us =
+            (lw.predicate_wait_episodes > 0)
+                ? static_cast<double>(lw.predicate_wait_us) /
+                      lw.predicate_wait_episodes
+                : 0.0;
+        oss << "lock waits           : " << lw.wait_episodes
+            << "  (avg " << std::fixed << std::setprecision(1) << avg_us
+            << " us, in-flight=" << lw.current_waiters << ")\n";
+        oss << "lock waits S/X       : S=" << std::setprecision(0) << lw.wait_episodes_s
+            << "  X=" << lw.wait_episodes_x << "\n";
+        oss << "lock timeout         : " << lw.timeout_count
+            << "  (S=" << lw.timeout_s << ", X=" << lw.timeout_x << ")\n";
+        oss << "lock deadlock/block  : deadlock_victim=" << lw.deadlock_count
+            << "  trylock_wouldblock=" << lw.would_block_count << "\n";
+        oss << "predicate waits      : " << lw.predicate_wait_episodes
+            << "  (avg " << std::fixed << std::setprecision(1) << pavg_us
+            << " us, timeout=" << lw.predicate_timeout_count << ")\n";
+    }
     oss << "background flush     : "
         << (buffer_pool_manager_->IsBackgroundFlushEnabled()
                 ? "every " +
@@ -647,7 +696,218 @@ std::string Database::GetStorageStats() const {
             << "   loaded=pid " << e.loaded_page_id
             << (e.evicted_was_dirty ? "   [dirty]" : "") << "\n";
     }
+    // ---- U1：索引健康（树高 / 页利用率 / 页构成）----
+    if (catalog_ != nullptr) {
+        auto idx = catalog_->CollectIndexStats();
+        oss << "indexes               : " << idx.size() << "\n";
+        for (const auto& s : idx) {
+            oss << "    [" << s.name << "] height=" << s.height
+                << " avg=" << std::fixed << std::setprecision(3) << s.avg_ratio
+                << " min=" << std::fixed << std::setprecision(3) << s.min_ratio
+                << " leaf=" << s.leaf_pages << " int=" << s.internal_pages << "\n";
+        }
+    }
     return oss.str();
+}
+
+// U2 基准：\bench <threads> <ops_per_thread> —— 进程内多会话并发读写混合负载。
+// 在共享表 bench(id INT PRIMARY KEY, val INT) 上做 60% 点查 / 10% 范围查 /
+// 10% UPDATE / 10% INSERT / 10% DELETE，统计吞吐与分类型 avg/p95 延迟及命中率。
+ExecutionResult Database::RunBenchCommand(const std::string& sql,
+                                          TransactionManager* txn_mgr) {
+    ExecutionResult ok;
+    ok.success = true;
+    (void)txn_mgr;  // 建表/预填充统一走默认会话，workers 各自用 CreateSession() 新会话
+
+    // ---- 解析线程数与每线程操作数（含省略的默认值） ----
+    int threads = 4;
+    int ops_per_thread = 1000;
+    {
+        std::istringstream iss(sql);
+        std::string tok;
+        iss >> tok;               // "\bench"
+        int a = 0, b = 0;
+        bool have_a = false, have_b = false;
+        if (iss >> a) have_a = true;
+        if (have_a && (iss >> b)) have_b = true;
+        if (have_a && a > 0) threads = a;
+        if (have_b && b > 0) ops_per_thread = b;
+        threads = std::min(threads, 64);
+        ops_per_thread = std::min(ops_per_thread, 1 << 20);
+    }
+
+    std::ostringstream oss;
+    const int kBenchSize = 3000;  // 预填充行数（受 WAL 单行 ~24KB 约束，勿超 3k）
+    // 块作用域 static：worker lambda（需访问 kProps）无需捕获它。
+    static const int kProps[5] = {60, 10, 10, 10, 10};  // point/range/update/insert/delete
+
+    // ---- 单线程建表 + 预填充（并发负载开始前完成） ----
+    auto run_default = [this](const std::string& s) {
+        return ExecuteSQL(s);  // 默认会话（本 Database 的默认 txn）
+    };
+    if (catalog_ != nullptr && catalog_->HasTable("bench")) {
+        run_default("DROP TABLE bench;");
+    }
+    run_default("CREATE TABLE bench(id INT PRIMARY KEY, val INT);");
+    for (int b = 0; b * 250 < kBenchSize; ++b) {
+        std::ostringstream values;
+        for (int k = 0; k < 250 && b * 250 + k < kBenchSize; ++k) {
+            int id = b * 250 + k;
+            if (k) values << ", ";
+            values << "(" << id << ", " << id << ")";
+        }
+        run_default("INSERT INTO bench VALUES " + values.str() + ";");
+    }
+    // 使用后立即落盘，保证 \bench 多次运行（复用同一库文件）不互相干扰观测。
+    buffer_pool_manager_->FlushAllPages();
+
+    // 提交跟踪器已注入共享实例；快照基准缓冲池统计，用于报告负载期间命中率增量。
+    const BufferPoolStats begin_stats = buffer_pool_manager_->GetStats();
+
+    // ---- 并发工作线程：每线程独立会话 + 独立 RNG ----
+    enum { kPoint = 0, kRange, kUpdate, kInsert, kDelete };
+    struct WorkerReport {
+        size_t cnt[5] = {0, 0, 0, 0, 0};
+        long long sum_us[5] = {0, 0, 0, 0, 0};
+        long long err = 0;
+        std::vector<long long> lat[5];  // 各类型取样延迟（us），用于分类型 p95
+        std::vector<long long> all;     // 全部操作延迟，用于 overall p95
+    };
+    std::vector<WorkerReport> reports(static_cast<size_t>(threads));
+
+    std::atomic<int> start_flag{0};
+    std::atomic<long long> next_insert{kBenchSize};
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(threads));
+
+    for (int t = 0; t < threads; ++t) {
+        auto session = CreateSession();
+        workers.emplace_back([this, session, t, ops_per_thread, &start_flag,
+                              &next_insert, &reports]() {
+            while (start_flag.load() != 1) {
+                std::this_thread::yield();
+            }
+            WorkerReport& rep = reports[static_cast<size_t>(t)];
+            // 以 线程id + 时间 作随机种子，避免各线程产生相同操作序列（否则并发偏移失准）。
+            std::mt19937 rng(static_cast<unsigned>(
+                                 std::chrono::high_resolution_clock::now()
+                                     .time_since_epoch().count()) ^
+                             static_cast<unsigned>(t * 2654435761u));
+            std::uniform_int_distribution<int> dice(0, 99);
+            std::uniform_int_distribution<int> key(0, kBenchSize - 1);
+            for (int i = 0; i < ops_per_thread; ++i) {
+                const int r = dice(rng);
+                int type = kPoint;
+                int acc = 0;
+                for (int c = 0; c < 5; ++c) { acc += kProps[c]; if (r < acc) { type = c; break; } }
+                std::string q;
+                if (type == kPoint) {
+                    q = "SELECT val FROM bench WHERE id=" + std::to_string(key(rng)) + ";";
+                } else if (type == kRange) {
+                    int a = key(rng);
+                    q = "SELECT val FROM bench WHERE id BETWEEN " + std::to_string(a) +
+                        " AND " + std::to_string(a + 20) + " ORDER BY id LIMIT 20;";
+                } else if (type == kUpdate) {
+                    q = "UPDATE bench SET val=val+1 WHERE id=" + std::to_string(key(rng)) + ";";
+                } else if (type == kInsert) {
+                    // 独立全局号段，避免并发唯一键冲突
+                    q = "INSERT INTO bench VALUES (" + std::to_string(next_insert.fetch_add(1)) +
+                        ", 0);";
+                } else {
+                    q = "DELETE FROM bench WHERE id=" + std::to_string(key(rng)) + ";";
+                }
+                const auto t0 = std::chrono::high_resolution_clock::now();
+                ExecutionResult res = ExecuteSQL(q, session.get());
+                const auto t1 = std::chrono::high_resolution_clock::now();
+                const long long us = static_cast<long long>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+                ++rep.cnt[type];
+                rep.sum_us[type] += us;
+                rep.lat[type].push_back(us);
+                rep.all.push_back(us);
+                if (!res.success) ++rep.err;
+            }
+        });
+    }
+
+    // ---- 栅栏释放 + 计时 ----
+    const auto wall_t0 = std::chrono::steady_clock::now();
+    start_flag.store(1);
+    for (auto& w : workers) w.join();
+    const auto wall_t1 = std::chrono::steady_clock::now();
+    const double wall_s =
+        std::chrono::duration<double>(wall_t1 - wall_t0).count();
+
+    const BufferPoolStats end_stats = buffer_pool_manager_->GetStats();
+    const long long d_hits = end_stats.hit_count - begin_stats.hit_count;
+    const long long d_miss = end_stats.miss_count - begin_stats.miss_count;
+    const long long d_total = d_hits + d_miss;
+    const double hit_ratio =
+        d_total > 0 ? (100.0 * d_hits) / d_total : 0.0;
+
+    WorkerReport total;
+    for (const auto& rep : reports) {
+        for (int c = 0; c < 5; ++c) {
+            total.cnt[c] += rep.cnt[c];
+            total.sum_us[c] += rep.sum_us[c];
+        }
+        total.err += rep.err;
+        total.all.insert(total.all.end(), rep.all.begin(), rep.all.end());
+    }
+    long long ok_ops = 0;
+    for (int c = 0; c < 5; ++c) ok_ops += static_cast<long long>(total.cnt[c]);
+    const long long all_ops = ok_ops + total.err;
+
+    auto p95 = [](std::vector<long long> v) -> long long {
+        if (v.empty()) return 0;
+        std::sort(v.begin(), v.end());
+        return v[static_cast<size_t>((v.size() * 95) / 100)];
+    };
+    auto report_type = [&](const char* name, int c) {
+        if (total.cnt[c] == 0) {
+            oss << "  " << name << " : 0\n";
+            return;
+        }
+        const double avg = static_cast<double>(total.sum_us[c]) / total.cnt[c];
+        long long p;
+        {
+            std::vector<long long> v;
+            for (const auto& rep : reports) v.insert(v.end(), rep.lat[c].begin(), rep.lat[c].end());
+            p = p95(v);
+        }
+        oss << "  " << name << " : n=" << total.cnt[c]
+            << "  avg=" << std::fixed << std::setprecision(2) << avg
+            << "us  p95=" << std::fixed << std::setprecision(0) << static_cast<double>(p)
+            << "us\n";
+    };
+
+    oss << "--- bench report ---\n";
+    oss << "threads      : " << threads << "\n";
+    oss << "ops/thread   : " << ops_per_thread << "\n";
+    oss << "total ops    : " << all_ops << "  (ok=" << ok_ops
+        << " err=" << total.err << ")\n";
+    oss << "elapsed      : " << std::fixed << std::setprecision(2) << wall_s << " s\n";
+    oss << "throughput   : " << std::fixed << std::setprecision(1)
+        << (wall_s > 0 ? all_ops / wall_s : 0.0) << " ops/s\n";
+    oss << "hit ratio    : " << std::fixed << std::setprecision(2) << hit_ratio << "%\n";
+    oss << "op breakdown :\n";
+    report_type("point", kPoint);
+    report_type("range", kRange);
+    report_type("update", kUpdate);
+    report_type("insert", kInsert);
+    report_type("delete", kDelete);
+    {
+        const long long all_sum =
+            total.sum_us[kPoint] + total.sum_us[kRange] + total.sum_us[kUpdate] +
+            total.sum_us[kInsert] + total.sum_us[kDelete];
+        const double avg = ok_ops > 0 ? static_cast<double>(all_sum) / ok_ops : 0.0;
+        oss << "overall      : n=" << ok_ops
+            << "  avg=" << std::fixed << std::setprecision(2) << avg
+            << "us  p95=" << std::fixed << std::setprecision(0)
+            << static_cast<double>(p95(total.all)) << "us\n";
+    }
+    ok.message = oss.str();
+    return ok;
 }
 
 // T4 诊断（\analyze）：页映射 / 介质 / CRC 校验信息。

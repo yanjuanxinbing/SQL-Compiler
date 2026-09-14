@@ -191,6 +191,22 @@ LockResult LockManager::Acquire(int64_t txn_id, int64_t res_id, LockMode mode,
             ? std::chrono::steady_clock::now() +
                   std::chrono::milliseconds(wait_ms)
             : std::chrono::steady_clock::time_point::max();
+    // U2-2 观测：是否进入过阻塞（机会性一次性计 1 个等待事件）及首阻塞起点。
+    // 只在放行授权/超时返回时结算；非阻塞探针（block_try）与死锁分支不经过此结算。
+    bool metering = false;
+    std::chrono::steady_clock::time_point wait_start;
+    const auto mark_wait = [&]() {
+        if (!metering) { metering = true;
+            wait_start = std::chrono::steady_clock::now(); }
+    };
+    const auto accrue_wait = [&]() {
+        wait_episodes_++;
+        if (mode == LockMode::kShared) ++wait_episodes_s_;
+        else ++wait_episodes_x_;
+        wait_us_ += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_start).count());
+    };
 
     for (;;) {
         LockState& st = s.locks[res_id];
@@ -201,6 +217,7 @@ LockResult LockManager::Acquire(int64_t txn_id, int64_t res_id, LockMode mode,
             // 此刻它已不再等待任何人，残留边会污染后续死锁检测）。
             st.holders.emplace(txn_id, mode);
             { std::lock_guard<std::mutex> m(meta_mutex_); waits_on_.erase(txn_id); }
+            if (metering) accrue_wait();  // 结算被阻塞的等待事件
             return LockResult::kGranted;
         }
 
@@ -219,13 +236,16 @@ LockResult LockManager::Acquire(int64_t txn_id, int64_t res_id, LockMode mode,
                 if (it->first == txn_id) { st.waiters.erase(it); break; }
             }
             UnlinkWaitEdges(txn_id);
+            ++deadlock_count_;  // 观测：新增死锁 victim
             return LockResult::kDeadlock;
         }
 
         if (block_try) {
             // 非阻塞探针：不阻塞、保留等待登记，返回 WouldBlock。
+            ++would_block_count_;  // 观测：探针冲突未被授予
             return LockResult::kWouldBlock;
         }
+        mark_wait();  // 进入阻塞等待（结算点：授权或超时）
         if (wait_ms == 0) {
             // 无限阻塞等待至可授予（死锁已在上面提前返回）。
             s.cv.wait(lk);
@@ -237,6 +257,9 @@ LockResult LockManager::Acquire(int64_t txn_id, int64_t res_id, LockMode mode,
                 if (it->first == txn_id) { st.waiters.erase(it); break; }
             }
             UnlinkWaitEdges(txn_id);
+            ++timeout_count_;  // 观测：超时被拒
+            if (mode == LockMode::kShared) ++timeout_s_; else ++timeout_x_;
+            accrue_wait();  // 超时也计入等待事件（含其被阻塞时长）
             return LockResult::kTimeout;
         }
     }
@@ -725,6 +748,19 @@ LockResult LockManager::CheckWritePredicate(int64_t txn_id, int64_t table_rid,
             ? std::chrono::steady_clock::now() +
                   std::chrono::milliseconds(wait_ms)
             : std::chrono::steady_clock::time_point::max();
+    // U2-2 观测：谓词锁阻塞等待事件结算（无 S/X 之分，单计数）。
+    bool metering = false;
+    std::chrono::steady_clock::time_point wait_start;
+    const auto mark_wait = [&]() {
+        if (!metering) { metering = true;
+            wait_start = std::chrono::steady_clock::now(); }
+    };
+    const auto accrue_wait = [&]() {
+        predicate_wait_episodes_++;
+        predicate_wait_us_ += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_start).count());
+    };
 
     for (;;) {
         // 收集其他活动事务持有、且覆盖该键的谓词 → 冲突持有者集合（去重）。
@@ -737,20 +773,27 @@ LockResult LockManager::CheckWritePredicate(int64_t txn_id, int64_t table_rid,
                         conflicts.end());
         conflicts.erase(std::remove(conflicts.begin(), conflicts.end(), txn_id),
                         conflicts.end());
-        if (conflicts.empty()) return LockResult::kGranted;
+        if (conflicts.empty()) {
+            if (metering) accrue_wait();
+            return LockResult::kGranted;
+        }
 
         // 建立本事务指向各冲突谓词持有者的等待边。
         { std::lock_guard<std::mutex> m(meta_mutex_);
           for (int64_t c : conflicts) waits_on_[txn_id].insert(c); }
         if (DeadlockCycle(txn_id)) {
             UnlinkWaitEdges(txn_id);
+            ++deadlock_count_;  // 观测：谓词构成死锁的 victim
             return LockResult::kDeadlock;
         }
+        mark_wait();
         if (wait_ms == 0) {
             // 无限阻塞至谓词持有者提交（UnlockAll 唤醒后重试）。
             s.cv.wait(lk);
         } else if (s.cv.wait_until(lk, deadline) == std::cv_status::timeout) {
             UnlinkWaitEdges(txn_id);
+            ++predicate_timeout_count_;  // 观测：谓词锁等待超时
+            accrue_wait();
             return LockResult::kTimeout;
         }
         // 被唤醒后清除指向冲突持有者的边，重查谓词集合（可能已提交）。
@@ -771,6 +814,19 @@ LockResult LockManager::CheckWritePredicateRow(int64_t txn_id, int64_t table_rid
             ? std::chrono::steady_clock::now() +
                   std::chrono::milliseconds(wait_ms)
             : std::chrono::steady_clock::time_point::max();
+    // U2-2 观测：整行谓词锁阻塞等待结算（同单列谓词）。
+    bool metering = false;
+    std::chrono::steady_clock::time_point wait_start;
+    const auto mark_wait = [&]() {
+        if (!metering) { metering = true;
+            wait_start = std::chrono::steady_clock::now(); }
+    };
+    const auto accrue_wait = [&]() {
+        predicate_wait_episodes_++;
+        predicate_wait_us_ += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_start).count());
+    };
 
     for (;;) {
         // 整行写检查：表级全表谓词命中任意写；逐列对该列值做区间树 stabbing。
@@ -795,19 +851,26 @@ LockResult LockManager::CheckWritePredicateRow(int64_t txn_id, int64_t table_rid
                         conflicts.end());
         conflicts.erase(std::remove(conflicts.begin(), conflicts.end(), txn_id),
                         conflicts.end());
-        if (conflicts.empty()) return LockResult::kGranted;
+        if (conflicts.empty()) {
+            if (metering) accrue_wait();
+            return LockResult::kGranted;
+        }
 
         // 建立本事务指向各冲突谓词持有者的等待边（与单列检查同一套死锁/超时逻辑）。
         { std::lock_guard<std::mutex> m(meta_mutex_);
           for (int64_t c : conflicts) waits_on_[txn_id].insert(c); }
         if (DeadlockCycle(txn_id)) {
             UnlinkWaitEdges(txn_id);
+            ++deadlock_count_;
             return LockResult::kDeadlock;
         }
+        mark_wait();
         if (wait_ms == 0) {
             s.cv.wait(lk);
         } else if (s.cv.wait_until(lk, deadline) == std::cv_status::timeout) {
             UnlinkWaitEdges(txn_id);
+            ++predicate_timeout_count_;
+            accrue_wait();
             return LockResult::kTimeout;
         }
         { std::lock_guard<std::mutex> m(meta_mutex_);
@@ -1195,6 +1258,30 @@ size_t LockManager::GetPredicateInsertSteps() const {
 void LockManager::ResetPredicateInsertCounters() {
     predicate_rebuild_count_.store(0);
     predicate_insert_steps_.store(0);
+}
+
+LockManager::LockWaitStats LockManager::GetLockWaitStats() const {
+    LockWaitStats st;
+    st.wait_episodes = wait_episodes_.load();
+    st.wait_episodes_s = wait_episodes_s_.load();
+    st.wait_episodes_x = wait_episodes_x_.load();
+    st.wait_us = wait_us_.load();
+    st.timeout_count = timeout_count_.load();
+    st.timeout_s = timeout_s_.load();
+    st.timeout_x = timeout_x_.load();
+    st.deadlock_count = deadlock_count_.load();
+    st.would_block_count = would_block_count_.load();
+    st.predicate_wait_episodes = predicate_wait_episodes_.load();
+    st.predicate_wait_us = predicate_wait_us_.load();
+    st.predicate_timeout_count = predicate_timeout_count_.load();
+    // 当前阻塞中的等待者：逐分片持锁汇总（观测路径，非热路径，逐片加锁可接受）。
+    size_t waiters = 0;
+    for (size_t i = 0; i < kLockShardCount; ++i) {
+        std::lock_guard<std::mutex> lk(shards_[i].mutex);
+        for (const auto& kv : shards_[i].locks) waiters += kv.second.waiters.size();
+    }
+    st.current_waiters = waiters;
+    return st;
 }
 
 }  // namespace sqlcompiler

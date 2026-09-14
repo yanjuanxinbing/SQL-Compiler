@@ -106,6 +106,18 @@ public:
     BPlusTree* GetPrimaryKeyIndexTree(const std::string& table_name,
                                       const std::vector<std::string>& pk_columns);
 
+    // ---- U1 索引健康观测（供 \stats 与监控）----
+    struct IndexStat {
+        std::string name;
+        int height = 0;          // 树高（单叶=1）
+        double min_ratio = 0.0;  // 全树最小页利用率（已用字节/页）
+        double avg_ratio = 0.0;  // 全树平均页利用率
+        uint64_t leaf_pages = 0;
+        uint64_t internal_pages = 0;
+    };
+    // 汇总全部索引树的树高与利用率（只读；按索引名排序）。
+    std::vector<IndexStat> CollectIndexStats() const;
+
     // ---- 40_txn_view_udf：视图 / UDF / 触发器注册表 ----
     //
     // 视图：CREATE VIEW name AS <select>。我们保存原始 SELECT 语句的 AST 副本，

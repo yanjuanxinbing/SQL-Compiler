@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -26,10 +27,18 @@ struct CteMaterialization {
 };
 
 // 执行上下文：贯穿整个查询执行过程，向各算子提供目录与存储访问入口
+// U3-3：非相关子查询物化缓存的数据库级观测统计（跨语句累计）。ExecutionContext
+// 每语句一个，物化/命中计数通过该 sink 汇入 Database 的 \stats（原子，多会话安全）。
+struct SubqueryCacheStats {
+    std::atomic<int64_t> materialize_count{0};
+    std::atomic<int64_t> hit_count{0};
+};
+
 class ExecutionContext {
 public:
     explicit ExecutionContext(SystemCatalog* catalog,
-                             TransactionManager* txn_manager = nullptr);
+                             TransactionManager* txn_manager = nullptr,
+                             SubqueryCacheStats* subquery_stats = nullptr);
 
     SystemCatalog* GetCatalog() const;
 
@@ -78,6 +87,19 @@ public:
     const std::unordered_map<std::string, Value>* GetUpsertValuesBind() const {
         return upsert_values_bind_;
     }
+
+    // ---- U3-3：非相关子查询物化缓存（语句级生命周期）----
+    // 非相关子查询（IsSubqueryCorrelated=false）的结果与当前外层行无关：首次求值
+    // 物化一次并缓存，后续外层行直接复用（每条语句每个子查询只执行一次子计划）。
+    // 键 = SubqueryExprNode.subquery_plan 指针（同一语句内唯一）。
+    // 递归 CTE 每轮迭代的工作集会变化，CteDefineExecutor 在迭代边界调用
+    // ClearSubqueryCache() 使缓存失效，避免陈旧结果（见 CteExecutor.cpp）。
+    void CacheSubqueryRows(const void* key, std::vector<Tuple> rows);
+    const std::vector<Tuple>* GetCachedSubqueryRows(const void* key);
+    void ClearSubqueryCache() { subquery_cache_.clear(); }
+    // 观测：物化（真正执行子计划）次数 / 缓存命中次数（白盒测试断言用）。
+    int64_t GetSubqueryMaterializeCount() const { return subquery_materialize_count_; }
+    int64_t GetSubqueryCacheHitCount() const { return subquery_cache_hit_count_; }
 
     // ---- Phase A：当前事务 ----
     // nullptr 表示当前没有显式事务（隐式 auto-commit）；DML 算子据此判断
@@ -134,6 +156,12 @@ private:
     Transaction* txn_ = nullptr;
     // Phase A：所属事务管理器（由 ExecutionEngine 在构造 ctx 时注入）。
     TransactionManager* txn_manager_ = nullptr;
+    // U3-3：非相关子查询物化缓存（键 = subquery_plan 指针）+ 观测计数。
+    std::unordered_map<const void*, std::vector<Tuple>> subquery_cache_;
+    int64_t subquery_materialize_count_ = 0;
+    int64_t subquery_cache_hit_count_ = 0;
+    // U3-3：数据库级观测 sink（可空）；非空时物化/命中同时累计到 Database 的 \stats。
+    SubqueryCacheStats* subquery_stats_ = nullptr;
     // T2：当前语句已取得、需按 READ COMMITTED 语句末释放的行读锁。
     // 元素为 (行锁资源 id, 所属表资源 id)：释放时按表提示路由分片。
     std::vector<std::pair<int64_t, int64_t>> statement_row_read_locks_;

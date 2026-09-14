@@ -1,11 +1,11 @@
 ==== Phase 5 周期4 一键复现证据包 ====
-time: 2026-09-14 15:30:36
+time: 2026-09-14 17:43:06
 
 ---- [1/4] build ----
 build: OK
 
 ---- [2/4] storage_ut ----
-storage_ut: PASS (58953 checks / 0 fails)
+storage_ut: PASS (62569 checks / 0 fails)
 
 ---- [3/4] sql regression (incl. crash injection) ----
 sql regression: PASS (55 passed / 0 failed)
@@ -17,7 +17,7 @@ param sweep: PASS (log: param_sweep.log)
 charts: PASS (5 PNGs)
 
 ==== Summary ====
-storage_ut   : PASS (58953 checks)
+storage_ut   : PASS (62569 checks)
 sql regression: PASS (55/55)
 param sweep  : PASS
 charts/shot  : PASS (5 PNGs)

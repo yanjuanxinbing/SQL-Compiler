@@ -11,6 +11,10 @@ const char* JoinTypeName(JoinType t) {
         case JoinType::INNER: return "INNER";
         case JoinType::LEFT:  return "LEFT";
         case JoinType::RIGHT: return "RIGHT";
+        case JoinType::FULL_OUTER: return "FULL_OUTER";
+        case JoinType::CROSS: return "CROSS";
+        case JoinType::SEMI:  return "SEMI";
+        case JoinType::ANTI:  return "ANTI";
         default: return "?";
     }
 }
@@ -68,6 +72,22 @@ std::string NodeBodyToString(const PlanNode& node, int depth) {
         case PlanNodeType::AGGREGATE: {
             auto& n = static_cast<const AggregateNode&>(node);
             oss << "Aggregate(";
+            oss << "GROUP BY [";
+            for (size_t i = 0; i < n.group_by_exprs.size(); ++i) {
+                if (i) oss << ", ";
+                oss << (n.group_by_exprs[i] ? n.group_by_exprs[i]->ToString() : "?");
+            }
+            oss << "], AGG [";
+            for (size_t i = 0; i < n.aggregate_exprs.size(); ++i) {
+                if (i) oss << ", ";
+                oss << (n.aggregate_exprs[i] ? n.aggregate_exprs[i]->ToString() : "?");
+            }
+            oss << "])";
+            break;
+        }
+        case PlanNodeType::PRE_AGG_SCAN: {
+            auto& n = static_cast<const PreAggScanNode&>(node);
+            oss << "PreAggScan(";
             oss << "GROUP BY [";
             for (size_t i = 0; i < n.group_by_exprs.size(); ++i) {
                 if (i) oss << ", ";
@@ -284,6 +304,23 @@ PlanNodeType AggregateNode::GetType() const {
 }
 
 std::string AggregateNode::ToString() const {
+    return NodeBodyToString(*this, 0);
+}
+
+// ============ PreAggScanNode（U3-2 扫描内预聚合）============
+
+PreAggScanNode::PreAggScanNode(std::vector<ExprPtr> group_by_exprs,
+                               std::vector<ExprPtr> aggregate_exprs,
+                               std::vector<std::string> aliases)
+    : AggregateNode(std::move(group_by_exprs), std::move(aggregate_exprs),
+                    std::move(aliases)) {
+}
+
+PlanNodeType PreAggScanNode::GetType() const {
+    return PlanNodeType::PRE_AGG_SCAN;
+}
+
+std::string PreAggScanNode::ToString() const {
     return NodeBodyToString(*this, 0);
 }
 

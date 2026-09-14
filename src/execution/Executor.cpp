@@ -20,12 +20,27 @@ constexpr int kPredicateWaitMs = 5000;
 }  // namespace
 
 ExecutionContext::ExecutionContext(SystemCatalog* catalog,
-                                   TransactionManager* txn_manager)
-    : catalog_(catalog), txn_manager_(txn_manager) {
+                                   TransactionManager* txn_manager,
+                                   SubqueryCacheStats* subquery_stats)
+    : catalog_(catalog), txn_manager_(txn_manager), subquery_stats_(subquery_stats) {
 }
 
 SystemCatalog* ExecutionContext::GetCatalog() const {
     return catalog_;
+}
+
+void ExecutionContext::CacheSubqueryRows(const void* key, std::vector<Tuple> rows) {
+    subquery_cache_[key] = std::move(rows);
+    ++subquery_materialize_count_;
+    if (subquery_stats_ != nullptr) ++subquery_stats_->materialize_count;
+}
+
+const std::vector<Tuple>* ExecutionContext::GetCachedSubqueryRows(const void* key) {
+    auto it = subquery_cache_.find(key);
+    if (it == subquery_cache_.end()) return nullptr;
+    ++subquery_cache_hit_count_;
+    if (subquery_stats_ != nullptr) ++subquery_stats_->hit_count;
+    return &it->second;
 }
 
 void ExecutionContext::RegisterCte(const std::string& name, std::vector<Tuple> rows) {

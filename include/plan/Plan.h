@@ -20,6 +20,7 @@ enum class PlanNodeType {
     SORT,          // 排序（对应 ORDER BY）
     LIMIT,         // 限制返回行数
     AGGREGATE,     // 聚合（对应 GROUP BY / 聚合函数）
+    PRE_AGG_SCAN,  // U3-2：扫描内预聚合（COUNT/SUM 下推至扫描层，输出形状与 AGGREGATE 一致）
     INSERT,        // 插入
     UPDATE,        // 更新
     DELETE,        // 删除
@@ -190,6 +191,24 @@ public:
     // 与 aggregate_exprs 平行的别名（来自 SELECT list 的 alias），用于 HAVING/ORDER BY
     // 通过别名引用对应的聚合输出位置。
     std::vector<std::string> aliases;
+};
+
+// U3-2：扫描内预聚合节点。
+//
+// 由 Optimizer::PushDownAggregates 把「单表 + 裸 COUNT/SUM 聚合」的 AggregateNode
+// 改写而来：输出形状与 AggregateNode 完全一致（按 aggregate_exprs 逐项输出），
+// 上层 Project / Filter(HAVING) / Sort / Window 可透明复用既有列映射逻辑。
+// 差异仅在执行器：PreAggScanExecutor 直接在扫描循环内累计 COUNT/SUM 状态，
+// 并以哈希分组（O(1) 分组查找），替代 AggregateExecutor 的线性扫描分组。
+// 继承 AggregateNode 是为了让 ExecutionEngine 中所有按 AggregateNode 读取
+// aggregate_exprs/aliases 的下游代码（列名推导、HAVING/Project/Sort 的 cmap）可复用。
+class PreAggScanNode : public AggregateNode {
+public:
+    PreAggScanNode(std::vector<ExprPtr> group_by_exprs, std::vector<ExprPtr> aggregate_exprs,
+                   std::vector<std::string> aliases = {});
+
+    PlanNodeType GetType() const override;
+    std::string ToString() const override;
 };
 
 // 插入节点

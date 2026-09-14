@@ -93,6 +93,13 @@ public:
     bool IsBackgroundVacuumEnabled() const;
     long GetBackgroundVacuumTicks() const;  // 被唤醒并执行真空的次数（可观测）
 
+    // ---- U3-3：非相关子查询物化缓存观测（跨语句累计）----
+    // 每条语句的 ExecutionContext 通过 ExecutionEngine 把物化/命中计数汇入此 sink，
+    // 供 \stats 展示与白盒单元测试断言（多会话并发时原子累计）。
+    const SubqueryCacheStats& GetSubqueryCacheStats() const {
+        return subquery_cache_stats_;
+    }
+
 private:
     std::unique_ptr<DiskManager> disk_manager_;
     // Phase B：LogManager 必须声明在 BufferPoolManager 之前——成员逆序析构时
@@ -104,11 +111,17 @@ private:
     std::unique_ptr<SystemCatalog> catalog_;
     std::unique_ptr<ExecutionEngine> execution_engine_;
     std::unique_ptr<TransactionManager> txn_manager_;
+    // U3-3：非相关子查询物化缓存观测 sink（Engine 构造时注入，见 Database.cpp）。
+    SubqueryCacheStats subquery_cache_stats_;
     std::unique_ptr<RecoveryManager> recovery_;      // Phase B：启动期 ARIES 恢复
     // T2：跨会话共享的事务级锁管理器（隔离级别 + 死锁回收）。
     std::unique_ptr<LockManager> lock_manager_;
     // MVCC 快照隔离：跨会话共享的提交跟踪器（CSN 注入 + 版本可见性判定）。
     std::unique_ptr<CommitTracker> commit_tracker_;
+
+    // ---- U2 基准：\bench 命令 ----
+    // 进程内多会话并发读写混合负载吞吐/延迟基准（由 \bench <threads> <ops> 触发）。
+    ExecutionResult RunBenchCommand(const std::string& sql, TransactionManager* txn_mgr);
 
     // T2 并发会话：全局 txn_id 序列器 + 会话所有权容器 + 会话执行器私有辅助。
     TxnIdSequencer txn_seq_;

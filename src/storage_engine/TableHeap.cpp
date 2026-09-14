@@ -856,6 +856,21 @@ void TableHeap::ClearAll() {
     }
 }
 
+uint64_t TableHeap::GetApproxRowCount() const {
+    uint64_t total = 0;
+    page_id_t pid = first_page_id_;
+    std::unordered_set<page_id_t> visited;
+    while (pid != INVALID_PAGE_ID && pid >= 0 && visited.insert(pid).second) {
+        PageReadGuard guard = PageReadGuard::Fetch(buffer_pool_manager_, pid);
+        if (!guard.Valid()) return 0;
+        int32_t next_pid, slot_count, free_off;
+        ReadPageHeader(guard.Data(), next_pid, slot_count, free_off);
+        if (slot_count > 0) total += static_cast<uint64_t>(slot_count);
+        pid = next_pid;
+    }
+    return total;
+}
+
 bool TableHeap::FindNextRid(RID current, RID* next) {
     page_id_t pid = current.IsValid() ? current.page_id : first_page_id_;
     int slot_num = current.IsValid() ? current.slot_num + 1 : 0;

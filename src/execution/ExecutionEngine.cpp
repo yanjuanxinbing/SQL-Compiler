@@ -17,6 +17,7 @@
 #include "execution/JoinExecutor.h"
 #include "execution/LimitExecutor.h"
 #include "execution/NoOpExecutor.h"
+#include "execution/PreAggScanExecutor.h"
 #include "execution/ProjectExecutor.h"
 #include "execution/SeqScanExecutor.h"
 #include "execution/ShowExecutor.h"
@@ -567,7 +568,8 @@ std::vector<std::string> DeriveTerminalColumns(SystemCatalog* catalog,
         }
         return cols;
     }
-    if (p->GetType() == PlanNodeType::AGGREGATE) {
+    if (p->GetType() == PlanNodeType::AGGREGATE ||
+        p->GetType() == PlanNodeType::PRE_AGG_SCAN) {
         auto agg = std::static_pointer_cast<AggregateNode>(p);
         cols.reserve(agg->aggregate_exprs.size());
         for (size_t i = 0; i < agg->aggregate_exprs.size(); ++i) {
@@ -694,12 +696,13 @@ std::unordered_map<std::string, size_t> BuildCombinedColumnIndexMapWithDerived(
 
 }  // namespace
 
-ExecutionEngine::ExecutionEngine(SystemCatalog* catalog, TransactionManager* txn_manager)
-    : catalog_(catalog), txn_manager_(txn_manager) {
+ExecutionEngine::ExecutionEngine(SystemCatalog* catalog, TransactionManager* txn_manager,
+                                 SubqueryCacheStats* subquery_stats)
+    : catalog_(catalog), txn_manager_(txn_manager), subquery_stats_(subquery_stats) {
 }
 
 ExecutionResult ExecutionEngine::Execute(const PlanNodePtr& plan) {
-    ExecutionContext ctx(catalog_, txn_manager_);
+    ExecutionContext ctx(catalog_, txn_manager_, subquery_stats_);
     // Phase A：让新 ctx 自动挂上当前事务，使 DML 算子的写路径抓到正确的 undo。
     // BEGIN/COMMIT/ROLLBACK/SAVEPOINT 等事务控制语句本身也通过此 ctx
     // 看到当前 txn。
@@ -790,6 +793,7 @@ ExecutionResult ExecutionEngine::ExecuteSubplan(const PlanNodePtr& plan,
                          plan->GetType() == PlanNodeType::SORT ||
                          plan->GetType() == PlanNodeType::LIMIT ||
                          plan->GetType() == PlanNodeType::AGGREGATE ||
+                         plan->GetType() == PlanNodeType::PRE_AGG_SCAN ||
                          plan->GetType() == PlanNodeType::SUBQUERY ||
                          plan->GetType() == PlanNodeType::CTE_BIND ||
                          plan->GetType() == PlanNodeType::CTE_DEFINE ||
@@ -873,7 +877,8 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             // in the output tuple. We map aggregate function calls to positions.
             std::unordered_map<std::string, size_t> cmap;
             if (!plan_node->children.empty() &&
-                plan_node->children[0]->GetType() == PlanNodeType::AGGREGATE) {
+                (plan_node->children[0]->GetType() == PlanNodeType::AGGREGATE ||
+                 plan_node->children[0]->GetType() == PlanNodeType::PRE_AGG_SCAN)) {
                 auto agg = std::static_pointer_cast<AggregateNode>(plan_node->children[0]);
                 for (size_t i = 0; i < agg->aggregate_exprs.size(); ++i) {
                     const auto& e = agg->aggregate_exprs[i];
@@ -888,7 +893,8 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             }
             // HAVING / 上层 Filter 引用 SELECT 别名时，把别名映射到对应位置。
             if (!plan_node->children.empty() &&
-                plan_node->children[0]->GetType() == PlanNodeType::AGGREGATE) {
+                (plan_node->children[0]->GetType() == PlanNodeType::AGGREGATE ||
+                 plan_node->children[0]->GetType() == PlanNodeType::PRE_AGG_SCAN)) {
                 auto agg = std::static_pointer_cast<AggregateNode>(plan_node->children[0]);
                 for (size_t i = 0; i < agg->aggregate_exprs.size(); ++i) {
                     if (i < agg->aliases.size() && !agg->aliases[i].empty()) {
@@ -924,7 +930,8 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             if (!child) return nullptr;
             // If child is an Aggregate, the aggregate already produced tuples
             // matching the SELECT list; pass through unchanged.
-            if (plan_node->children[0]->GetType() == PlanNodeType::AGGREGATE) {
+            if (plan_node->children[0]->GetType() == PlanNodeType::AGGREGATE ||
+                plan_node->children[0]->GetType() == PlanNodeType::PRE_AGG_SCAN) {
                 if (n->is_distinct) {
                     // AggregateExecutor 的输出列数 == aggregate_exprs 数，
                     // 没有 underlying 追加；DISTINCT 仍按全部列参与去重。
@@ -937,7 +944,8 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             // through unchanged.
             if (plan_node->children[0]->GetType() == PlanNodeType::FILTER &&
                 plan_node->children[0]->children.size() > 0 &&
-                plan_node->children[0]->children[0]->GetType() == PlanNodeType::AGGREGATE) {
+                (plan_node->children[0]->children[0]->GetType() == PlanNodeType::AGGREGATE ||
+                 plan_node->children[0]->children[0]->GetType() == PlanNodeType::PRE_AGG_SCAN)) {
                 if (n->is_distinct) {
                     return std::make_unique<DistinctExecutor>(context, std::move(child),
                                                               n->columns.size());
@@ -1105,6 +1113,18 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             if (!child) return nullptr;
             auto cmap = BuildCombinedColumnIndexMapWithDerived(catalog_, plan_node, CollectScanTableNames(plan_node));
             return std::make_unique<AggregateExecutor>(context, std::move(child),
+                                                        n->group_by_exprs, n->aggregate_exprs,
+                                                        cmap);
+        }
+        case PlanNodeType::PRE_AGG_SCAN: {
+            // U3-2：扫描内预聚合。与 AGGREGATE 同构（PreAggScanNode 继承 AggregateNode），
+            // 仅执行器不同：PreAggScanExecutor 在扫描循环内直接累计 COUNT/SUM 状态并以
+            // 哈希分组，替代 AggregateExecutor 的线性扫描分组。cmap 面向子扫描的列序构建。
+            auto n = std::static_pointer_cast<PreAggScanNode>(plan_node);
+            auto child = BuildExecutor(plan_node->children.empty() ? nullptr : plan_node->children[0], context);
+            if (!child) return nullptr;
+            auto cmap = BuildCombinedColumnIndexMapWithDerived(catalog_, plan_node, CollectScanTableNames(plan_node));
+            return std::make_unique<PreAggScanExecutor>(context, std::move(child),
                                                         n->group_by_exprs, n->aggregate_exprs,
                                                         cmap);
         }

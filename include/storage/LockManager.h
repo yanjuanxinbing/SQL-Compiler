@@ -178,6 +178,26 @@ public:
     // 同时清零重建次数与插入步数（供基准对照）。
     void ResetPredicateInsertCounters();
 
+    // ---- U2-2 锁等待观测：分布式量化指标 ----
+    // 供 `\stats` 输出「锁等待分布」。计数由原子维护，仅在阻塞路径自增
+    //（授权热路径零开销，不稀释行锁热路径的分片收益）。
+    struct LockWaitStats {
+        size_t wait_episodes = 0;      // 请求「确实阻塞等待后获授」的事件数（含超时后结束者）
+        size_t wait_episodes_s = 0;    // 其中的共享锁请求（含超时）
+        size_t wait_episodes_x = 0;    // 其中的独占锁请求（含超时）
+        uint64_t wait_us = 0;          // 上述事件的累计被阻塞时长（微秒）
+        size_t timeout_count = 0;      // 阻塞等待超时被拒的次数
+        size_t timeout_s = 0, timeout_x = 0;   // 按锁模式分的超时次数
+        size_t deadlock_count = 0;     // 作为死锁 victim 被中止的次数
+        size_t would_block_count = 0;  // 非阻塞探针(TryLock*)返回 kWouldBlock 的次数
+        size_t current_waiters = 0;    // 快照时刻各分片阻塞中的等待者总数
+        size_t predicate_wait_episodes = 0;  // 谓词锁阻塞等待事件数
+        uint64_t predicate_wait_us = 0;      // 谓词锁累计等待时长（微秒）
+        size_t predicate_timeout_count = 0;  // 谓词锁阻塞超时次数
+    };
+    // 快照锁等待统计（逐分片取等待者计数；其余为无锁原子读取）。
+    LockWaitStats GetLockWaitStats() const;
+
     // ---- 自适应锁升级阈值（v3）----
     // 固定阈值（128 行）对所有表一刀切并不合适：小表（几十行）批量写时行锁条目数
     // 已占表的大半，应提前升级收敛；大表（上万行）128 行远未覆盖足够比例，过早升级
@@ -278,6 +298,22 @@ private:
     mutable std::atomic<size_t> predicate_query_comparisons_{0};  // 累计键比较次数（观测用）
     mutable std::atomic<size_t> predicate_rebuild_count_{0};      // 周期 2：累计整树重建次数
     mutable std::atomic<size_t> predicate_insert_steps_{0};       // 周期 2：增量插入累计二分步数
+
+    // ---- U2-2 锁等待观测计数器（原子，见 GetLockWaitStats）----
+    // 仅在请求真正进入阻塞等待（放入等待队列后 cv.wait/wait_until）或超时/死锁/
+    // 探针拒绝路径自增；「直接授权」的热路径不做任何计数，行锁热路径不被稀释。
+    mutable std::atomic<size_t> wait_episodes_{0};
+    mutable std::atomic<size_t> wait_episodes_s_{0};
+    mutable std::atomic<size_t> wait_episodes_x_{0};
+    mutable std::atomic<uint64_t> wait_us_{0};
+    mutable std::atomic<size_t> timeout_count_{0};
+    mutable std::atomic<size_t> timeout_s_{0};
+    mutable std::atomic<size_t> timeout_x_{0};
+    mutable std::atomic<size_t> deadlock_count_{0};
+    mutable std::atomic<size_t> would_block_count_{0};
+    mutable std::atomic<size_t> predicate_wait_episodes_{0};
+    mutable std::atomic<uint64_t> predicate_wait_us_{0};
+    mutable std::atomic<size_t> predicate_timeout_count_{0};
 
     LockResult Acquire(int64_t txn_id, int64_t res_id, LockMode mode,
                        int wait_ms, bool block_try, int64_t table_hint = -1);

@@ -97,6 +97,11 @@ public:
     // 的次数；测试与技术文档用）。
     uint64_t GetTombstoneReuseCount() const { return tombstone_reuse_count_.load(); }
 
+    // U3-1：廉价行数估探针。沿页链逐个读页头，累计 slot_count（含墓碑与 MVCC
+    // 版本槽，非逻辑活行数，但作为「表规模相对大小」的粗估足够驱动 JOIN 重排）。
+    // 仅供优化器估基数用；页链读闩短路，不在持锁期间调用其他 BPM 接口。
+    uint64_t GetApproxRowCount() const;
+
     // 惰性真空回收：回收所有 begin_csn < oldest_active_csn 的「已被替代/删除」
     // 非 head 旧版本槽位（写墓碑）。以最老活动快照为界，避免误删仍可能被读取的版本。
     void Vacuum(int64_t oldest_active_csn);

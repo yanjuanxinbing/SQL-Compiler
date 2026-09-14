@@ -51,9 +51,10 @@
 [ OK ] 50_undo_clr
 [ OK ] 51_nested_savepoint
 [ OK ] 52_set_isolation
+[ OK ] 53_subquery_decorrelate
 [ OK ] 49_acid_recovery
 [ OK ] 50_undo_clr
 
 ==== Summary ====
-passed: 55   failed: 0   elapsed: 4.5389482s
+passed: 56   failed: 0   elapsed: 5.04627s
 ==== End ====
