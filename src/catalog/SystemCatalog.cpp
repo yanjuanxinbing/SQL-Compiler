@@ -1,10 +1,46 @@
 #include "catalog/SystemCatalog.h"
 
+#include "lexer/Lexer.h"
+#include "parser/Parser.h"
+#include "txn/LogManager.h"
+
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 
 namespace sqlcompiler {
 
 namespace {
+
+// 把落盘的 CHECK / DEFAULT 文本重新解析为 AST。失败时返回 nullptr 并让
+// 调用方静默继续 —— CHECK/DEFAULT 是"约束增强"，缺失不应阻塞表被打开。
+// 抛异常的代价是下次启动后所有用户都拿不到这张表，这与"约束可选"的语义
+// 不符。
+ExprPtr ReParseExprOrNull(const std::string& text) {
+    if (text.empty()) return nullptr;
+    try {
+        // 落盘内容来自 Expr::ToString()，不是完整语句；而 Parser 的入口
+        // Parse() 只接受语句。因此直接把表达式包成 "SELECT <expr>" 走
+        // 完整语句解析，再从 SelectStatement 的 select_list 取回第一个
+        // 表达式。（不要先对裸表达式做一次 Parse —— 语句级解析对裸表达式
+        // 必然失败，会导致后面的包装路径永远执行不到。）
+        std::string wrapped = "SELECT " + text;
+        Lexer l2(wrapped);
+        std::vector<Token> t2 = l2.Tokenize();
+        if (t2.empty() || t2.back().type != TokenType::END_OF_FILE) {
+            t2.emplace_back(TokenType::END_OF_FILE, "", 0, 0);
+        }
+        Parser p2(std::move(t2));
+        StatementPtr s2 = p2.Parse();
+        if (!s2) return nullptr;
+        if (s2->GetType() != NodeType::SELECT_STMT) return nullptr;
+        auto* sel = static_cast<SelectStatement*>(s2.get());
+        if (sel->select_list.empty()) return nullptr;
+        return sel->select_list[0];
+    } catch (...) {
+        return nullptr;
+    }
+}
 
 constexpr const char* kSysTablesKey = "__sys_tables__";
 
