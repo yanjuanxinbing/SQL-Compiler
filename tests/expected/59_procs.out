@@ -1,0 +1,97 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> tag      | val
+---------+----
+loop_sum | 15 
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> repeat_test
+-----------
+5          
+(1 row)
+sqlcompiler> repeat_test
+-----------
+1          
+(1 row)
+sqlcompiler> repeat_test
+-----------
+1          
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> case_body
+---------
+positive 
+(1 row)
+sqlcompiler> case_body
+---------
+zero     
+(1 row)
+sqlcompiler> case_body
+---------
+negative 
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> case_body_simple
+----------------
+one             
+(1 row)
+sqlcompiler> case_body_simple
+----------------
+two             
+(1 row)
+sqlcompiler> case_body_simple
+----------------
+other           
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> divide
+------
+5     
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> safe_divide
+-----------
+5          
+(1 row)
+sqlcompiler> safe_divide
+-----------
+-1         
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> safe_divide_typed
+-----------------
+5                
+(1 row)
+sqlcompiler> safe_divide_typed
+-----------------
+-42              
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> cursor_sum
+----------
+60        
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> tag  | val
+-----+----
+prod | 12 
+sum  | 7  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> 

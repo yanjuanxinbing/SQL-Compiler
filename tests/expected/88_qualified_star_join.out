@@ -1,0 +1,62 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> j | id | country | credit | x  
+--+----+---------+--------+----
+j | 1  | USA     | 5000   | 100
+j | 2  | USA     | 3000   | 200
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> j | id | country | credit
+--+----+---------+-------
+j | 1  | USA     | 5000  
+j | 2  | USA     | 3000  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> j | id | country | credit | x  
+--+----+---------+--------+----
+j | 1  | USA     | 5000   | 100
+j | 2  | USA     | 3000   | 200
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | country | credit | x  
+---+---------+--------+----
+1  | USA     | 5000   | 100
+2  | USA     | 3000   | 200
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> pid | x  
+----+----
+1   | 100
+2   | 200
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> j | id | x  
+--+----+----
+j | 1  | 100
+j | 2  | 200
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> j | id | country | credit | pid
+--+----+---------+--------+----
+j | 1  | USA     | 5000   | 1  
+j | 2  | USA     | 3000   | 2  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | country | credit
+---+---------+-------
+1  | USA     | 5000  
+2  | USA     | 3000  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> pid | x   | id | country | credit
+----+-----+----+---------+-------
+1   | 100 | 1  | USA     | 5000  
+2   | 200 | 2  | USA     | 3000  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> j | id | country | credit
+--+----+---------+-------
+j | 1  | USA     | 5000  
+j | 2  | USA     | 3000  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> j | id | country | credit | x  
+--+----+---------+--------+----
+j | 1  | USA     | 5000   | 100
+j | 2  | USA     | 3000   | 200
+(2 rows)
+sqlcompiler> sqlcompiler> 

@@ -1,0 +1,64 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        -> b | id | name | mgr_id | mgr 
+--+----+------+--------+-----
+B | 1  | CEO  | NULL   | NULL
+B | 2  | VP   | 1      | CEO 
+B | 3  | Dev  | 2      | VP  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        -> x | id | name | mgr_id | mgr 
+--+----+------+--------+-----
+X | 1  | CEO  | NULL   | NULL
+X | 2  | VP   | 1      | CEO 
+X | 3  | Dev  | 2      | VP  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | name | mgr_id
+---+------+-------
+1  | CEO  | NULL  
+2  | VP   | 1     
+3  | Dev  | 2     
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | name | mgr_id | name
+---+------+--------+-----
+1  | CEO  | NULL   | NULL
+2  | VP   | 1      | CEO 
+3  | Dev  | 2      | VP  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> x | id | name | mgr_id
+--+----+------+-------
+X | 1  | CEO  | NULL  
+X | 2  | VP   | 1     
+X | 3  | Dev  | 2     
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id   | name | mgr_id
+-----+------+-------
+NULL | NULL | NULL  
+1    | CEO  | NULL  
+2    | VP   | 1     
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | id | name | mgr_id | name
+---+----+------+--------+-----
+1  | 1  | CEO  | NULL   | NULL
+2  | 2  | VP   | 1      | CEO 
+3  | 3  | Dev  | 2      | VP  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | name | mgr_id | id   | name | mgr_id
+---+------+--------+------+------+-------
+1  | CEO  | NULL   | NULL | NULL | NULL  
+2  | VP   | 1      | 1    | CEO  | NULL  
+3  | Dev  | 2      | 2    | VP   | 1     
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> x | id | name | mgr_id | name
+--+----+------+--------+-----
+X | 2  | VP   | 1      | CEO 
+X | 3  | Dev  | 2      | VP  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> id | name | mgr_id | '|' | id   | name | mgr_id
+---+------+--------+-----+------+------+-------
+1  | CEO  | NULL   | |   | NULL | NULL | NULL  
+2  | VP   | 1      | |   | 1    | CEO  | NULL  
+3  | Dev  | 2      | |   | 2    | VP   | 1     
+(3 rows)
+sqlcompiler> sqlcompiler> 

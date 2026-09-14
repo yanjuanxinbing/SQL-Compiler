@@ -1,0 +1,44 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> region | cnt
+-------+----
+East   | 3  
+West   | 3  
+South  | 2  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> region | total
+-------+------
+West   | 440  
+South  | 380  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> region | cnt | avg_amt   
+-------+-----+-----------
+South  | 2   | 190       
+West   | 3   | 146.666667
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> region | cnt
+-------+----
+South  | 2  
+East   | 3  
+West   | 3  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> region | product | cnt | total_qty
+-------+---------+-----+----------
+East   | Egg     | 1   | 10       
+East   | Banana  | 1   | 5        
+South  | Apple   | 1   | 6        
+West   | Apple   | 1   | 4        
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> region | top_sale
+-------+---------
+South  | 300     
+West   | 200     
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> region | total
+-------+------
+West   | 440  
+South  | 380  
+(2 rows)
+sqlcompiler> sqlcompiler> 

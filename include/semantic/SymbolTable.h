@@ -17,6 +17,13 @@ struct ColumnInfo {
     int32_t char_length = -1;
     bool is_primary_key = false;
     bool is_not_null = false;
+    // 52_data_types: 列级 UNIQUE 约束。区别于 CREATE UNIQUE INDEX 的索引形式：
+    // 本字段标记的列在写入路径上同样要求唯一；执行层把它转译为等价的隐式唯一索引。
+    bool is_unique = false;
+    // 52_data_types: AUTO_INCREMENT / SERIAL / IDENTITY 列标记。
+    // 用户 INSERT 时若显式 NULL 或 0（或未列在 INSERT 列名列表里），执行层
+    // 自动填入下一个递增 id；非空且非 0 时按用户值落库。
+    bool is_auto_increment = false;
     // 列级 CHECK (expr)：执行期在 INSERT/UPDATE 路径上强制校验；
     // NULL 求值结果不视为违反约束（SQL 标准三值逻辑）。
     ExprPtr check_expr;
@@ -24,6 +31,9 @@ struct ColumnInfo {
     // 由执行层自动填入。允许的字面类型：int / float / string / NULL；
     // 函数调用、子查询等"非字面表达式"在执行期会抛 "default expression not supported"。
     ExprPtr default_expr;
+    // 58_constraints: 列级 CHECK 的可选命名。仅当用户用 `CONSTRAINT name
+    // CHECK (...)` 显式命名时填写。错误消息优先显示名称，便于定位。
+    std::string constraint_name;
 };
 
 // 表元信息
@@ -33,6 +43,17 @@ struct TableInfo {
     // 主键组。单列主键为一个只含一列的组；PRIMARY KEY(a, b) 为一个含两列的组。
     // 保留分组信息是必要的：复合主键要求「组合」唯一，而不是每列各自唯一。
     std::vector<std::vector<std::string>> primary_keys;
+    // 52_data_types: 表级 UNIQUE 约束。CreateTableExecutor 把它与列级 UNIQUE
+    // 合并为「统一唯一索引列表」自动创建。
+    std::vector<std::vector<std::string>> unique_constraints;
+    // 58_constraints: 表级 CHECK 约束列表（每条带可选 constraint_name）。
+    // 写入路径上对每条 CHECK 用当前行求值；NULL 视为通过，仅 FALSE 拒绝。
+    // 与列级 check_expr 互不替代——列级 CHECK 仅能引用该列，表级 CHECK 可跨列。
+    struct TableCheck {
+        std::string constraint_name;
+        ExprPtr expr;
+    };
+    std::vector<TableCheck> table_checks;
 
     bool HasColumn(const std::string& column_name) const;
     const ColumnInfo* GetColumn(const std::string& column_name) const;

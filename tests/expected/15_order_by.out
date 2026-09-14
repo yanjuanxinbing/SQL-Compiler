@@ -1,0 +1,83 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | group_id | name    | score | age
+---+----------+---------+-------+----
+3  | 2        | Charlie | 76.5  | 19 
+1  | 2        | Alice   | 88.5  | 20 
+5  | 2        | Eve     | 82    | 21 
+2  | 1        | Bob     | 91    | 22 
+6  | 1        | Frank   | 88.5  | 23 
+4  | 1        | David   | 95.5  | 25 
+(6 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | group_id | name    | score | age
+---+----------+---------+-------+----
+3  | 2        | Charlie | 76.5  | 19 
+1  | 2        | Alice   | 88.5  | 20 
+5  | 2        | Eve     | 82    | 21 
+2  | 1        | Bob     | 91    | 22 
+6  | 1        | Frank   | 88.5  | 23 
+4  | 1        | David   | 95.5  | 25 
+(6 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | group_id | name    | score | age
+---+----------+---------+-------+----
+4  | 1        | David   | 95.5  | 25 
+2  | 1        | Bob     | 91    | 22 
+1  | 2        | Alice   | 88.5  | 20 
+6  | 1        | Frank   | 88.5  | 23 
+5  | 2        | Eve     | 82    | 21 
+3  | 2        | Charlie | 76.5  | 19 
+(6 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | group_id | name    | score | age
+---+----------+---------+-------+----
+4  | 1        | David   | 95.5  | 25 
+2  | 1        | Bob     | 91    | 22 
+6  | 1        | Frank   | 88.5  | 23 
+1  | 2        | Alice   | 88.5  | 20 
+5  | 2        | Eve     | 82    | 21 
+3  | 2        | Charlie | 76.5  | 19 
+(6 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | group_id | name  | score | age
+---+----------+-------+-------+----
+4  | 1        | David | 95.5  | 25 
+2  | 1        | Bob   | 91    | 22 
+1  | 2        | Alice | 88.5  | 20 
+(3 rows)
+sqlcompiler> id | group_id | name  | score | age
+---+----------+-------+-------+----
+1  | 2        | Alice | 88.5  | 20 
+6  | 1        | Frank | 88.5  | 23 
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | group_id | name  | score | age
+---+----------+-------+-------+----
+2  | 1        | Bob   | 91    | 22 
+6  | 1        | Frank | 88.5  | 23 
+4  | 1        | David | 95.5  | 25 
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> name    | score
+--------+------
+David   | 95.5 
+Bob     | 91   
+Alice   | 88.5 
+Frank   | 88.5 
+Eve     | 82   
+Charlie | 76.5 
+(6 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | s   
+---+-----
+4  | 95.5
+2  | 91  
+1  | 88.5
+6  | 88.5
+5  | 82  
+3  | 76.5
+(6 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | group_id | name | score | age
+---+----------+------+-------+----
+(0 rows)
+sqlcompiler> id | group_id | name  | score | age
+---+----------+-------+-------+----
+1  | 2        | Alice | 88.5  | 20 
+(1 row)
+sqlcompiler> sqlcompiler> 

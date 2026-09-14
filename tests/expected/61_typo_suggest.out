@@ -1,0 +1,12 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> 
+Error: semantic error [TableNotFound] line=1, col=1: table not found: students Did you mean: 'student'?
+sqlcompiler> 
+Error: semantic error [ColumnNotFound] line=1, col=8: column not found: nmae Did you mean: 'name'?
+sqlcompiler> 
+Error: semantic error [ColumnNotFound] line=1, col=8: column not found: nmae Did you mean: 'name'?; semantic error [ColumnNotFound] line=1, col=14: column not found: agee Did you mean: 'age'?
+sqlcompiler> OK
+sqlcompiler> 

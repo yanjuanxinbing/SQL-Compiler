@@ -93,7 +93,18 @@ bool SymbolTable::AddTableFromCreateStatement(const CreateTableStatement& stmt) 
         // 校验 / 替换默认。两者均为可空，未声明时此指针为空。
         ci.check_expr = cd.check_expr;
         ci.default_expr = cd.default_expr;
+        // 58_constraints: 列级 CONSTRAINT name CHECK 命名同步。空字符串代表
+        // 匿名 CHECK，错误消息沿用 <table>.<col> 形式。
+        ci.constraint_name = cd.constraint_name;
         info.columns.push_back(std::move(ci));
+    }
+    // 58_constraints: 表级 CHECK 约束。语法层已经按出现顺序填入 stmt.table_checks，
+    // 这里原样落到 TableInfo 上供执行期逐行求值；命名约束随 expr 一起保留。
+    for (const auto& tc : stmt.table_checks) {
+        TableInfo::TableCheck catalog_tc;
+        catalog_tc.constraint_name = tc.constraint_name;
+        catalog_tc.expr = tc.expr;
+        info.table_checks.push_back(std::move(catalog_tc));
     }
     // 表级 PRIMARY KEY(a, b, ...) 原样保留为一个主键组（复合主键要求组合唯一），
     // 同时投影到每列的 is_primary_key，便于既有执行路径（如 InsertExecutor 的

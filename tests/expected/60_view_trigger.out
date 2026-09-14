@@ -1,0 +1,63 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> id
+--
+1 
+2 
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | name
+---+-----
+1  | a   
+2  | b   
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> total
+-----
+300  
+(1 row)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> total
+-----
+300  
+(1 row)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> total
+-----
+350  
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | val
+---+----
+1  | 10 
+2  | 20 
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> 
+Error: [Semantic] table heap missing: v_check
+sqlcompiler> id | val
+---+----
+1  | 10 
+2  | 20 
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        -> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> 

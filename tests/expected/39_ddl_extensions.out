@@ -1,0 +1,14 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> 
+Error: semantic error [TableNotFound] line=1, col=1: table not found: t
+sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> 
+Error: semantic error [TableNotFound] line=1, col=1: table not found: t; semantic error [ColumnNotFound] line=1, col=26: column not found: id
+sqlcompiler> sqlcompiler> 

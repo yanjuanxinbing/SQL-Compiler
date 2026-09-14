@@ -72,17 +72,6 @@ void WriteU32(char* d, size_t off, uint32_t v) {
     std::memcpy(d + off, &v, sizeof(uint32_t));
 }
 
-// ---- Phase 1：乐观并发版本号（页头 offset 12 保留字段） ----
-// 每个页内容被修改（整页重写或邻居指针改写）时版本号自增一次。读路径记录
-// 遍历路径上各页版本号，结束后校验未变则认为遍历期间结构未被扰动。
-// 版本号只用于进程内并发控制，单调递增杜绝 ABA；不改页格式，落盘/恢复不受影响。
-uint32_t ReadVersion(const char* d) {
-    return static_cast<uint32_t>(ReadI32(d, 12));
-}
-void BumpVersion(char* d) {
-    WriteI32(d, 12, ReadI32(d, 12) + 1);
-}
-
 PageType GetPageType(const char* d) {
     uint8_t t = static_cast<uint8_t>(d[0]);
     if (t == 1) return PageType::kInternal;
@@ -180,13 +169,11 @@ size_t LeafBytesNeeded(const std::vector<LeafEntry>& entries) {
 }
 
 // 整页重写。放不下返回 false（调用方据此触发分裂）。
-// 版本号保留并自增：InitLeaf 会把页清零，先取出版本号再写回（乐观并发用）。
 bool WriteLeafEntries(char* d, const std::vector<LeafEntry>& entries,
                       page_id_t next_leaf, page_id_t prev_leaf) {
     if (entries.size() > static_cast<size_t>(kMaxLeafSlots)) return false;
     if (LeafBytesNeeded(entries) > PAGE_SIZE) return false;
 
-    const uint32_t version = ReadVersion(d);
     InitLeaf(d);
     SetNextLeaf(d, next_leaf);
     SetPrevLeaf(d, prev_leaf);
@@ -206,7 +193,6 @@ bool WriteLeafEntries(char* d, const std::vector<LeafEntry>& entries,
     }
     SetKeyCount(d, static_cast<uint16_t>(entries.size()));
     SetFreeOffset(d, static_cast<uint16_t>(free_off));
-    WriteI32(d, 12, static_cast<int32_t>(version + 1));
     return true;
 }
 
@@ -246,7 +232,6 @@ bool WriteInternalEntries(char* d, page_id_t first_child,
     if (entries.size() > static_cast<size_t>(kMaxInternalSlots)) return false;
     if (InternalBytesNeeded(entries) > PAGE_SIZE) return false;
 
-    const uint32_t version = ReadVersion(d);
     InitInternal(d);
     SetFirstChild(d, first_child);
     size_t free_off = PAGE_SIZE;
@@ -266,7 +251,6 @@ bool WriteInternalEntries(char* d, page_id_t first_child,
     }
     SetKeyCount(d, static_cast<uint16_t>(entries.size()));
     SetFreeOffset(d, static_cast<uint16_t>(free_off));
-    WriteI32(d, 12, static_cast<int32_t>(version + 1));
     return true;
 }
 
@@ -306,72 +290,16 @@ page_id_t ChooseChild(const char* d, const std::vector<InternalEntry>& entries,
     return child;
 }
 
-// 叶子页中是否已存在相同 key 的条目（唯一性检查）。墓碑条目已从
-// ReadLeafEntries 过滤，因此不参与唯一性判定（与旧实现 FindFirst 语义一致）。
-bool KeyExistsInLeaf(const char* d, const std::vector<ValueType>& schema,
-                     const IndexKey& key) {
-    std::vector<LeafEntry> entries;
-    if (!ReadLeafEntries(d, schema, &entries)) return false;
-    for (const auto& e : entries) {
-        int c = CompareKeyOnly(e.key, key);
-        if (c == 0) return true;
-        if (c > 0) break;
-    }
-    return false;
-}
-
 // ============================================================================
-// U1：删除后下溢的再平衡阈值与纯判定
+// 删除再平衡的占用阈值
 //
-// 设计取舍：只做「兄弟合并 / 再分配」两种操作，不改页格式（沿用整页重写 + 版本
-// 号自增），因此与既有乐观并发完全兼容——读者照常校验版本、写者照常整页发布。
-//   - 下溢判定：页利用率（已占用字节 / PAGE_SIZE）低于 kUnderfullRatio 即视为
-//     下溢，触发与兄弟的合并/再分配。
-//   - 合并可行性：兄弟两页内容合并到一页后仍放得下，且合并后利用率不超过
-//     kMaxMergeRatio——避免刚合并又因插入立刻膨胀再分裂，来回抖动。
-//   - 兄弟取「同一父节点下的相邻孩子」：合并/再分配只会在单一父节点内完成，
-//     天然规避跨父边界合并需级联调整多个父分隔键的复杂度。
+// 用法：删除后某非根节点的 key_count 跌破阈值，则 RedistributeOrMerge。
+// 「四分之一上限」是工程里常用的简单策略——比 B 树经典的「一半」宽松得多，
+// 因为我们用的是预分裂策略，节点本来就偏满，下界放到 1/4 既能回收大多数空页
+// 又避免一次删除触发长链合并。
 // ============================================================================
-constexpr double kUnderfullRatio = 0.40;  // 页利用率 < 40% 视为下溢
-constexpr double kMaxMergeRatio = 0.75;   // 合并后利用率上限，防「合即分」抖动
-
-size_t LeafUsedBytes(const std::vector<LeafEntry>& entries) {
-    size_t total = kLeafHeaderBytes;
-    for (const auto& e : entries) total += kLeafSlotBytes + e.key_bytes.size();
-    return total;
-}
-bool LeafUnderfull(const std::vector<LeafEntry>& entries) {
-    return LeafUsedBytes(entries) <
-           kUnderfullRatio * static_cast<double>(PAGE_SIZE);
-}
-bool LeavesMergeFeasible(const std::vector<LeafEntry>& a,
-                         const std::vector<LeafEntry>& b) {
-    if (a.size() + b.size() > static_cast<size_t>(kMaxLeafSlots)) return false;
-    const size_t used = LeafUsedBytes(a) + LeafUsedBytes(b) - kLeafHeaderBytes;
-    if (used > PAGE_SIZE) return false;  // 合到一页放不下
-    return used <= kMaxMergeRatio * static_cast<double>(PAGE_SIZE);
-}
-
-size_t InternalUsedBytes(const std::vector<InternalEntry>& entries) {
-    size_t total = kInternalHeaderBytes;
-    for (const auto& e : entries) total += kInternalSlotBytes + e.key_bytes.size();
-    return total;
-}
-bool InternalUnderfull(const std::vector<InternalEntry>& entries) {
-    return InternalUsedBytes(entries) <
-           kUnderfullRatio * static_cast<double>(PAGE_SIZE);
-}
-bool InternalsMergeFeasible(const std::vector<InternalEntry>& a,
-                            const InternalEntry& sep,
-                            const std::vector<InternalEntry>& b) {
-    if (a.size() + 1 + b.size() > static_cast<size_t>(kMaxInternalSlots))
-        return false;
-    const size_t used = InternalUsedBytes(a) + InternalUsedBytes(b) -
-                        kInternalHeaderBytes +
-                        (kInternalSlotBytes + sep.key_bytes.size());
-    if (used > PAGE_SIZE) return false;
-    return used <= kMaxMergeRatio * static_cast<double>(PAGE_SIZE);
-}
+constexpr int kLeafMinOccupancy = (kMaxLeafSlots + 1) / 4;       // ≈ 63
+constexpr int kInternalMinOccupancy = (kMaxInternalSlots + 1) / 4;  // ≈ 51
 
 }  // namespace
 
@@ -437,250 +365,116 @@ void BPlusTree::Destroy(BufferPoolManager* bpm, page_id_t root_page_id) {
 }
 
 // ============================================================================
-// 乐观下降（Phase 1）
-//
-// 读路径统一采用「共享闩逐页下降 + 版本号校验 + 乐观重启」：
-//   - 每个节点只在读取的瞬间持共享闩（作用域结束即释放），记录其版本号后下降；
-//   - 遍历结束后 ValidatePath 复查路径上每页版本号，任一变化说明遍历期间有
-//     结构改动（分裂/改写），本次结果作废、重来；
-//   - 因此读不阻塞写（读闩与写闩互斥但都极短），写不阻塞读（冲突靠重启消化），
-//     无等待环，与事务死锁检测正交。
+// 下降
 // ============================================================================
 
-page_id_t BPlusTree::OptimisticFindLeafPage(const IndexKey& key, const RID& rid,
-                                            DescPath* path) const {
-    const uint32_t mod = structure_mod_.load();        // U1d：记录下降起点结构计数
+page_id_t BPlusTree::FindLeafPage(const IndexKey& key, const RID& rid) const {
     page_id_t pid = root_page_id_;
     std::unordered_set<page_id_t> visited;
-    for (int steps = 0; steps < 128; ++steps) {
+    while (pid >= 0) {
         if (!visited.insert(pid).second) return INVALID_PAGE_ID;  // 环路防御
-        PageReadGuard g = PageReadGuard::Fetch(bpm_, pid);
+        PageGuard g = PageGuard::Fetch(bpm_, pid);
         if (!g.Valid()) return INVALID_PAGE_ID;
         const char* d = g.Data();
-        path->entries.push_back(PathEntry{pid, ReadVersion(d)});
-        if (GetPageType(d) == PageType::kLeaf) {
-            path->mod_at_descent = mod;
-            return pid;
-        }
+        if (GetPageType(d) == PageType::kLeaf) return pid;
         std::vector<InternalEntry> entries;
         if (!ReadInternalEntries(d, key_schema_, &entries)) return INVALID_PAGE_ID;
         pid = ChooseChild(d, entries, key, rid);
-        // g 在此作用域结束（下一轮 Fetch 之前）释放页锁并 Unpin——遵守锁序。
     }
     return INVALID_PAGE_ID;
 }
 
-page_id_t BPlusTree::OptimisticLeftmostLeafPage(DescPath* path) const {
-    const uint32_t mod = structure_mod_.load();        // U1d
+page_id_t BPlusTree::LeftmostLeafPage() const {
     page_id_t pid = root_page_id_;
     std::unordered_set<page_id_t> visited;
-    for (int steps = 0; steps < 128; ++steps) {
+    while (pid >= 0) {
         if (!visited.insert(pid).second) return INVALID_PAGE_ID;
-        PageReadGuard g = PageReadGuard::Fetch(bpm_, pid);
+        PageGuard g = PageGuard::Fetch(bpm_, pid);
         if (!g.Valid()) return INVALID_PAGE_ID;
         const char* d = g.Data();
-        path->entries.push_back(PathEntry{pid, ReadVersion(d)});
-        if (GetPageType(d) == PageType::kLeaf) {
-            path->mod_at_descent = mod;
-            return pid;
-        }
+        if (GetPageType(d) == PageType::kLeaf) return pid;
         if (!IsValidHeader(d, PageType::kInternal)) return INVALID_PAGE_ID;
         pid = GetFirstChild(d);
     }
     return INVALID_PAGE_ID;
 }
 
-bool BPlusTree::ValidatePath(const DescPath& path) const {
-    if (path.entries.empty()) return false;
-    // U1d：结构计数短路——下降期间无任何结构改写 ⇒ 祖先链路必然未被改写，只复核
-    // 叶子版本（O(1)）即可。结构改写必自增结构计数，故短路绝不比逐页复核更宽松。
-    if (structure_mod_.load() == path.mod_at_descent) {
-        // 复核叶子版本确认为当前值（叶子内容未被并发改写）。
-        PageReadGuard g = PageReadGuard::Fetch(bpm_, path.leaf_pid());
-        if (!g.Valid()) return false;
-        if (ReadVersion(g.Data()) != path.leaf_version()) {
-            ++stat_restarts_;
-            return false;
-        }
-        ++stat_fast_validate_;
-        return true;
-    }
-    ++stat_full_validate_;
-    for (const auto& e : path.entries) {
-        PageReadGuard g = PageReadGuard::Fetch(bpm_, e.pid);
-        if (!g.Valid()) return false;
-        if (ReadVersion(g.Data()) != e.version) {
-            ++stat_restarts_;
-            return false;
-        }
-    }
-    return true;
-}
-
 // ============================================================================
-// 插入：乐观快路径 + 预分裂慢路径（Phase 1）
+// 插入：下降途中预分裂
 //
-// 快路径（常见情况，叶子放得下）：
-//   乐观下降记录路径版本 → 校验路径 → 只对目标叶子取独占写闩 → 复核叶版本 →
-//   唯一性检查 → 插入。不同键空间落在不同叶子，可完全并行。
-// 慢路径（叶子放不下）：
-//   沿用「下降途中预分裂」算法：自底向上分裂需要回溯父节点，一旦父节点也满就
-//   要级联向上，还要处理「根分裂」特例——三者纠缠极易写错；预分裂拉直成单向
-//   下降，进入某个节点前先保证它装得下，叶子插入永不失败、无级联。代价是节点
-//   略早分裂、填充率稍低。慢路径带写闩下降、分裂点以「先 pin 后加闩」原子发布。
+// 算法选择的理由：自底向上分裂需要回溯父节点，一旦父节点也满就要级联向上，
+// 还要处理「根分裂」这个特例——三者纠缠在一起极易写错（第一版就写歪了）。
+// 预分裂把它拉直成一条单向下降：进入某个节点之前先保证它装得下，于是叶子插入
+// 永远不会失败，也就没有级联。代价是节点会略早分裂、填充率稍低，对教学规模
+// 无影响。
 // ============================================================================
 
 bool BPlusTree::Insert(const IndexKey& key, const RID& rid) {
-    DrainPendingFrees();   // U1c：安全点排空被弃页（此时不持任何页闩）
     std::vector<char> key_bytes = SerializeKey(key, key_schema_);
     if (key_bytes.size() > kMaxKeyBytes) return false;
+    if (is_unique_ && FindFirst(key).IsValid()) return false;
 
     // 预留量按「本次要插入的键」计算，而不是按最大可能键长，
     // 这样定长小键（如 INT 主键）仍能接近填满页面。
     const size_t reserve = key_bytes.size();
 
-    // ---- 快路径：乐观下降 + 校验后只锁目标叶子 ----
-    const int kMaxAttempts = 256;
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        DescPath path;   // U1d：下降快照含结构计数，校验可 O(1) 短路
-        page_id_t leaf_pid = OptimisticFindLeafPage(key, rid, &path);
-        if (leaf_pid < 0) return false;
-        // 校验路径版本：下降期间任何结构改动都会使某页版本变化 → 重启
-        if (!ValidatePath(path)) continue;
-
-        PageWriteGuard leaf = PageWriteGuard::Fetch(bpm_, leaf_pid);
-        if (!leaf.Valid()) continue;
-        // 取到独占闩后再核一次叶版本：校验与加闩之间叶子可能已被并发改写
-        if (ReadVersion(leaf.Data()) != path.leaf_version()) continue;
-
-        if (MayOverflow(leaf.Data(), reserve)) {
-            // 叶子放不下 → 慢路径（带写闩下降、沿途预分裂）
-            leaf.Release();
-            return InsertSlowPath(key, rid, key_bytes, reserve);
+    // ---- 1) 根：装不下就先分裂。根 id 不变，因此无需回写目录元数据 ----
+    {
+        PageGuard root = PageGuard::Fetch(bpm_, root_page_id_);
+        if (!root.Valid()) return false;
+        char* rd = root.Data();
+        if (GetPageType(rd) == PageType::kUninitialized) {
+            InitLeaf(rd);  // 自愈：全零页当作空叶子
+            root.MarkDirty();
         }
-        if (is_unique_ && KeyExistsInLeaf(leaf.Data(), key_schema_, key)) {
-            leaf.Release();
-            return false;
-        }
-        if (!InsertIntoLeaf(&leaf, key, rid, std::vector<char>(key_bytes))) {
-            leaf.Release();
-            return false;
-        }
-        leaf.MarkDirty();
-        return true;
+        const bool overflow = MayOverflow(rd, reserve);
+        root.Release();
+        if (overflow && !SplitRoot()) return false;
     }
-    // 极端重启风暴（不应发生）：放弃本次插入，与旧实现的步数兜底语义一致。
-    return false;
-}
 
-bool BPlusTree::InsertSlowPath(const IndexKey& key, const RID& rid,
-                               const std::vector<char>& key_bytes, size_t reserve) {
-    // 慢路径整体可重试：分裂途中若发现结构已被并发改写（SplitChild 返回 2），
-    // 从根重新下降。重试上限兜底，正常情况一次即中。
-    const int kMaxRestarts = 32;
-    for (int restart = 0; restart < kMaxRestarts; ++restart) {
-        // ---- 1) 根：装不下就先分裂。根 id 不变，因此无需回写目录元数据 ----
-        {
-            PageWriteGuard root = PageWriteGuard::Fetch(bpm_, root_page_id_);
-            if (!root.Valid()) return false;
-            char* rd = root.Data();
-            if (GetPageType(rd) == PageType::kUninitialized) {
-                InitLeaf(rd);  // 自愈：全零页当作空叶子
-                BumpVersion(rd);
-                root.MarkDirty();
-            }
-            const bool overflow = MayOverflow(rd, reserve);
-            root.Release();  // SplitRoot 内部自行加闩（先 pin 后加闩）
-            if (overflow && !SplitRoot(reserve)) return false;
+    // ---- 2) 下降，遇到装不下的孩子就地分裂 ----
+    page_id_t pid = root_page_id_;
+    int guard_steps = 0;
+    while (true) {
+        // 每层最多重试一次（分裂后重选孩子），步数上限兜底防御损坏页导致的死循环
+        if (++guard_steps > 128) return false;
+
+        PageGuard node = PageGuard::Fetch(bpm_, pid);
+        if (!node.Valid()) return false;
+        const char* d = node.Data();
+        if (GetPageType(d) == PageType::kLeaf) break;
+
+        std::vector<InternalEntry> entries;
+        if (!ReadInternalEntries(d, key_schema_, &entries)) return false;
+        const page_id_t child_pid = ChooseChild(d, entries, key, rid);
+        node.Release();
+        if (child_pid < 0) return false;
+
+        PageGuard child = PageGuard::Fetch(bpm_, child_pid);
+        if (!child.Valid()) return false;
+        char* cd = child.Data();
+        if (GetPageType(cd) == PageType::kUninitialized) {
+            InitLeaf(cd);
+            child.MarkDirty();
         }
+        const bool overflow = MayOverflow(cd, reserve);
+        child.Release();
 
-        // ---- 2) 下降，遇到装不下的孩子就地分裂 ----
-        page_id_t pid = root_page_id_;
-        // 慢路径「父闩 → 子闩」切换间的并发防护（两层，缺一不可）：
-        //   a) 父节点回读复核：下降决策基于父节点旧状态（写闩下 ChooseChild）。
-        //      释放父写闩后，父节点可能被并发分裂，分隔键更新后键的归属叶子右移。
-        //      若只靠子页版本复核，当子页恰在窗口期被分裂、读到的已是「分裂后的
-        //      左半页」版本时无法察觉——键被插进错误的叶子，破坏「分隔键 ↔ 叶子
-        //      内容」一致性（键落错叶子、导航找不到）。因此读子页后要回读父节点
-        //      版本，变化即整体重启下降。
-        //   b) 子页版本复核：取到子写闩后核对读闩时记录的版本，覆盖「父回读之后
-        //      到子加闩之前」子页再被分裂的窗口。
-        uint32_t expected_child_ver = 0;
-        bool have_child_ver = false;
-        int guard_steps = 0;
-        while (true) {
-            // 每层最多重试一次（分裂后重选孩子），步数上限兜底防御损坏页导致的死循环
-            if (++guard_steps > 128) return false;
-
-            PageWriteGuard node = PageWriteGuard::Fetch(bpm_, pid);
-            if (!node.Valid()) return false;
-            if (have_child_ver && ReadVersion(node.Data()) != expected_child_ver) {
-                node.Release();  // 子页在下降窗口期被并发改写 → 整体重启
-                break;
-            }
-            char* d = node.Data();
-            if (GetPageType(d) == PageType::kLeaf) {
-                // ---- 3) 叶子插入。由预分裂不变式保证一定装得下 ----
-                if (is_unique_ && KeyExistsInLeaf(d, key_schema_, key)) {
-                    node.Release();
-                    return false;
-                }
-                if (!InsertIntoLeaf(&node, key, rid, std::vector<char>(key_bytes))) {
-                    node.Release();
-                    return false;
-                }
-                node.MarkDirty();
-                return true;
-            }
-
-            std::vector<InternalEntry> entries;
-            if (!ReadInternalEntries(d, key_schema_, &entries)) return false;
-            const page_id_t child_pid = ChooseChild(d, entries, key, rid);
-            const uint32_t parent_ver = ReadVersion(d);  // 记录父版本，供回读复核
-            const page_id_t parent_pid = pid;
-            node.Release();  // 释放父闩后才能取子页（持页闩期间禁止请求 BPM）
-            if (child_pid < 0) return false;
-
-            bool overflow;
-            uint32_t child_ver = 0;
-            {
-                PageReadGuard child = PageReadGuard::Fetch(bpm_, child_pid);
-                if (!child.Valid()) return false;
-                overflow = MayOverflow(child.Data(), reserve);
-                child_ver = ReadVersion(child.Data());
-            }
-
-            // 父节点回读复核（见上 a）：下降窗口期内父分隔键若被并发分裂更新，
-            // child_pid 可能已不再是 key 的归属叶子 → 整体重启下降。
-            {
-                PageReadGuard parent_check = PageReadGuard::Fetch(bpm_, parent_pid);
-                if (!parent_check.Valid()) return false;
-                if (ReadVersion(parent_check.Data()) != parent_ver) break;
-            }
-
-            if (overflow) {
-                const int r = SplitChild(pid, child_pid, reserve);
-                if (r == 0) return false;   // 硬失败
-                if (r == 2) break;          // 结构已变 → 整体重启
-                continue;                   // 分裂成功 → 重选孩子
-            }
-            pid = child_pid;
-            expected_child_ver = child_ver;  // 下一轮取子写闩后复核
-            have_child_ver = true;
+        if (overflow) {
+            // 父节点此刻一定装得下分隔键（进入本层前已保证），分裂后重选孩子
+            if (!SplitChild(pid, child_pid, reserve)) return false;
+            continue;
         }
+        pid = child_pid;
     }
-    // 极端重启风暴（不应发生）：放弃本次插入，与旧实现的步数兜底语义一致。
-    return false;
-}
 
-bool BPlusTree::InsertIntoLeaf(PageWriteGuard* leaf, const IndexKey& key,
-                               const RID& rid, std::vector<char>&& key_bytes) {
-    char* d = leaf->Data();
-    const page_id_t pid = leaf->PageId();
+    // ---- 3) 叶子插入。由不变式保证一定装得下 ----
+    PageGuard leaf = PageGuard::Fetch(bpm_, pid);
+    if (!leaf.Valid()) return false;
+    char* d = leaf.Data();
     if (!IsValidHeader(d, PageType::kLeaf)) {
-        InitLeaf(d);  // 自愈：全零页当作空叶子
-        BumpVersion(d);
-        leaf->MarkDirty();
+        InitLeaf(d);
+        leaf.MarkDirty();
     }
     // Phase A：写之前抓叶子整页 before-image。
     if (active_txn_ != nullptr && active_txn_->IsActive()) {
@@ -706,127 +500,68 @@ bool BPlusTree::InsertIntoLeaf(PageWriteGuard* leaf, const IndexKey& key,
     entries.insert(pos, std::move(ne));
 
     if (!WriteLeafEntries(d, entries, GetNextLeaf(d), GetPrevLeaf(d))) return false;
-    // WriteLeafEntries 已保留版本号并自增。
+    leaf.MarkDirty();
 
     // Phase B：写 UPDATE 记录（leaf 整页 before/after）。
     if (log_manager_ != nullptr) {
         lsn_t lsn = EmitPageImageRecord(log_manager_, pid,
-                                        leaf_before.data(), d, active_txn_);
-        leaf->SetPageLsn(lsn);
+                                       leaf_before.data(), d, active_txn_);
+        leaf.SetPageLsn(lsn);
     }
     return true;
 }
 
-// 返回值语义见头文件：1=成功，0=硬失败，2=结构已变（调用方重启慢路径）。
-int BPlusTree::SplitChild(page_id_t parent_pid, page_id_t child_pid,
-                          size_t reserve) {
-    // ---- 1) 先 pin（不持闩）。持闩阶段严禁调用 BPM，因此所有可能需要访问的页
-    //         （parent、child、可能的 next 叶）都在此一次性 pin 住。 ----
-    PageGuard parent_pin = PageGuard::Fetch(bpm_, parent_pid);
-    if (!parent_pin.Valid()) return 0;
-    PageGuard child_pin = PageGuard::Fetch(bpm_, child_pid);
-    if (!child_pin.Valid()) return 0;
-    PageGuard sib = PageGuard::New(bpm_);
-    if (!sib.Valid()) return 0;  // 缓冲池耗尽
-    const page_id_t sib_pid = sib.PageId();
-
-    // 探测 child 的类型与 next 指针，决定是否需要 pin 后继叶（prev 回链用）。
-    // 这只是「要 pin 哪些页」的提示；真正的内容一律在写闩下复读。
-    bool child_is_leaf = false;
-    page_id_t next_pid = INVALID_PAGE_ID;
-    {
-        PageReadGuard probe = PageReadGuard::LatchPinned(child_pin.GetPagePtr(),
-                                                         child_pid);
-        if (!probe.Valid()) return 0;
-        child_is_leaf = (GetPageType(probe.Data()) == PageType::kLeaf);
-        if (child_is_leaf) next_pid = GetNextLeaf(probe.Data());
-    }  // probe 析构只释放页锁，不 Unpin（pin 归 child_pin）
-
-    PageGuard next_pin;
-    if (child_is_leaf && next_pid >= 0) {
-        next_pin = PageGuard::Fetch(bpm_, next_pid);
-        if (!next_pin.Valid()) return 0;
-    }
-
-    // ---- 2) 再按固定顺序加写闩：parent → child → next。该顺序全树唯一，
-    //          其余路径单页持闩，不可能与这里形成等待环。 ----
-    PageWriteGuard parent = PageWriteGuard::LatchPinned(parent_pin.GetPagePtr(),
-                                                        parent_pid);
-    if (!parent.Valid()) return 0;
-    PageWriteGuard child = PageWriteGuard::LatchPinned(child_pin.GetPagePtr(),
-                                                       child_pid);
-    if (!child.Valid()) return 0;
-    PageWriteGuard nxt;  // 可选：prev 回链用
-    if (next_pin.Valid()) {
-        nxt = PageWriteGuard::LatchPinned(next_pin.GetPagePtr(), next_pid);
-        if (!nxt.Valid()) return 0;
-    }
-
-    char* cd = child.Data();
-
-    // Phase B：抓 child 整页 before-image（写闩下捕获，保证与 after 严格对应）。
-    std::vector<char> child_before;
-    if (log_manager_ != nullptr) {
-        child_before.assign(cd, cd + PAGE_SIZE);
-    }
-
-    // 复读 parent 内容（pin 与加闩之间可能被并发改写），并校验 child 仍是
-    // parent 的直接孩子——并发分裂可能把 child 挪到 parent 的新兄弟下，
-    // 此时不得在此分裂，返回 2 让调用方整体重启下降。
+bool BPlusTree::SplitChild(page_id_t parent_pid, page_id_t child_pid,
+                           size_t reserve) {
+    PageGuard parent = PageGuard::Fetch(bpm_, parent_pid);
+    if (!parent.Valid()) return false;
     std::vector<InternalEntry> parent_entries;
-    if (!ReadInternalEntries(parent.Data(), key_schema_, &parent_entries)) return 0;
+    if (!ReadInternalEntries(parent.Data(), key_schema_, &parent_entries)) return false;
     const page_id_t parent_first_child = GetFirstChild(parent.Data());
-    bool child_under_parent = (parent_first_child == child_pid);
-    for (const auto& e : parent_entries) {
-        if (e.child == child_pid) {
-            child_under_parent = true;
-            break;
-        }
-    }
-    if (!child_under_parent) {
-        // 结构已被并发改写：先释放所有页闩与多余 pin，回收误分配的新页，
-        // 再返回 2 让调用方整体重启下降。
-        parent.Release();
-        child.Release();
-        if (nxt.Valid()) nxt.Release();
-        sib.Release();
-        if (next_pin.Valid()) next_pin.Release();
-        bpm_->DeletePage(sib_pid);
-        return 2;
-    }
 
-    // Phase B：抓 parent 整页 before-image。
+    // Phase B：抓 parent 整页 before-image 给 WAL。
     std::vector<char> parent_before;
     if (log_manager_ != nullptr) {
         parent_before.assign(parent.Data(), parent.Data() + PAGE_SIZE);
     }
 
+    PageGuard child = PageGuard::Fetch(bpm_, child_pid);
+    if (!child.Valid()) return false;
+    char* cd = child.Data();
+
+    // Phase B：抓 child 整页 before-image。
+    std::vector<char> child_before;
+    if (log_manager_ != nullptr) {
+        child_before.assign(cd, cd + PAGE_SIZE);
+    }
+
+    PageGuard sib = PageGuard::New(bpm_);
+    if (!sib.Valid()) return false;  // 缓冲池耗尽
+    const page_id_t sib_pid = sib.PageId();
+
     InternalEntry sep;
     sep.child = sib_pid;
 
-    const bool is_leaf = (GetPageType(cd) == PageType::kLeaf);
-    if (is_leaf) {
+    if (GetPageType(cd) == PageType::kLeaf) {
         std::vector<LeafEntry> entries;
-        if (!ReadLeafEntries(cd, key_schema_, &entries)) return 0;
-        if (entries.size() < 2) return 0;
+        if (!ReadLeafEntries(cd, key_schema_, &entries)) return false;
+        if (entries.size() < 2) return false;
         const size_t mid = entries.size() / 2;
         std::vector<LeafEntry> left(entries.begin(), entries.begin() + mid);
         std::vector<LeafEntry> right(entries.begin() + mid, entries.end());
 
         const page_id_t old_next = GetNextLeaf(cd);
         const page_id_t old_prev = GetPrevLeaf(cd);
-        if (!WriteLeafEntries(sib.Data(), right, old_next, child_pid)) return 0;
+        if (!WriteLeafEntries(sib.Data(), right, old_next, child_pid)) return false;
         sib.MarkDirty();
-        if (!WriteLeafEntries(cd, left, sib_pid, old_prev)) return 0;
+        if (!WriteLeafEntries(cd, left, sib_pid, old_prev)) return false;
         child.MarkDirty();
-        // 后继叶 prev 回链：仅当探测到的 next 仍是当前 next 时才更新（并发分裂
-        // 可能已改写 child 的 next，探测值过期）。prev 不用于导航，过期即跳过，
-        // 绝不影响正确性；写它必须持锁并自增版本号（与整页重写一致的发布规则）。
-        if (old_next >= 0 && old_next == next_pid && nxt.Valid() &&
-            IsValidHeader(nxt.Data(), PageType::kLeaf)) {
-            SetPrevLeaf(nxt.Data(), sib_pid);
-            BumpVersion(nxt.Data());
-            nxt.MarkDirty();
+        if (old_next >= 0) {
+            PageGuard nxt = PageGuard::Fetch(bpm_, old_next);
+            if (nxt.Valid() && IsValidHeader(nxt.Data(), PageType::kLeaf)) {
+                SetPrevLeaf(nxt.Data(), sib_pid);
+                nxt.MarkDirty();
+            }
         }
         // 分隔键取右页第一条的完整 (key, rid)
         sep.key = right.front().key;
@@ -834,8 +569,8 @@ int BPlusTree::SplitChild(page_id_t parent_pid, page_id_t child_pid,
         sep.key_bytes = right.front().key_bytes;
     } else {
         std::vector<InternalEntry> entries;
-        if (!ReadInternalEntries(cd, key_schema_, &entries)) return 0;
-        if (entries.size() < 2) return 0;
+        if (!ReadInternalEntries(cd, key_schema_, &entries)) return false;
+        if (entries.size() < 2) return false;
         const page_id_t first_child = GetFirstChild(cd);
         const size_t mid = entries.size() / 2;
         // 内部节点分裂：中间键上推到父节点，不在两个孩子里保留
@@ -843,9 +578,9 @@ int BPlusTree::SplitChild(page_id_t parent_pid, page_id_t child_pid,
         std::vector<InternalEntry> left(entries.begin(), entries.begin() + mid);
         std::vector<InternalEntry> right(entries.begin() + mid + 1, entries.end());
 
-        if (!WriteInternalEntries(sib.Data(), up.child, right)) return 0;
+        if (!WriteInternalEntries(sib.Data(), up.child, right)) return false;
         sib.MarkDirty();
-        if (!WriteInternalEntries(cd, first_child, left)) return 0;
+        if (!WriteInternalEntries(cd, first_child, left)) return false;
         child.MarkDirty();
 
         sep.key = up.key;
@@ -853,21 +588,23 @@ int BPlusTree::SplitChild(page_id_t parent_pid, page_id_t child_pid,
         sep.key_bytes = up.key_bytes;
     }
 
-    // Phase B：先写 child 和 sib 的 UPDATE 记录（sibling 是全新页，before 视为全零）。
+    // Phase B：先写 child 和 sib 的 UPDATE 记录（两者是新增或修改页面，
+    // sibling 是全新页 before-image 视为全零）。
     if (log_manager_ != nullptr) {
+        // child 整页 UPDATE
         lsn_t child_lsn = EmitPageImageRecord(log_manager_, child_pid,
                                               child_before.data(), cd, active_txn_);
         child.SetPageLsn(child_lsn);
+        // sib 全新页面：before-image 全零，after 是当前内容。
         std::vector<char> zero_before(PAGE_SIZE, 0);
         lsn_t sib_lsn = EmitPageImageRecord(log_manager_, sib_pid,
-                                            zero_before.data(), sib.Data(),
-                                            active_txn_);
+                                            zero_before.data(), sib.Data(), active_txn_);
         sib.SetPageLsn(sib_lsn);
     }
 
-    // 父、子写闩在整个分裂期间同时持有：读者要么看到旧结构（无新分隔键），
-    // 要么看到新结构（分隔键已就位），绝不会看到「子已分裂、父还没有分隔键」
-    // 的中间态导致丢数据。
+    child.Release();
+    sib.Release();
+
     auto pos = std::lower_bound(
         parent_entries.begin(), parent_entries.end(), sep,
         [](const InternalEntry& a, const InternalEntry& b) {
@@ -877,7 +614,7 @@ int BPlusTree::SplitChild(page_id_t parent_pid, page_id_t child_pid,
 
     // 前置条件保证这里必然写得下；写不下说明不变式被破坏，宁可失败也不静默截断
     if (!WriteInternalEntries(parent.Data(), parent_first_child, parent_entries)) {
-        return 0;
+        return false;
     }
     parent.MarkDirty();
 
@@ -889,71 +626,13 @@ int BPlusTree::SplitChild(page_id_t parent_pid, page_id_t child_pid,
         parent.SetPageLsn(parent_lsn);
     }
     (void)reserve;
-    BumpStructureCounter();   // U1d：分裂改变父子结构
-    return 1;
+    return true;
 }
 
-bool BPlusTree::SplitRoot(size_t reserve) {
-    // 先 pin 根（不持闩）。持闩期间不得调用 BPM，因此新页与可能的后继叶
-    // 都先 pin 好。
-    PageGuard root_pin = PageGuard::Fetch(bpm_, root_page_id_);
-    if (!root_pin.Valid()) return false;
-
-    // 探测根的类型与 next 指针，决定是否需要 pin 后继叶（根为叶子时的 prev 回链）。
-    bool root_is_leaf = false;
-    page_id_t next_pid = INVALID_PAGE_ID;
-    {
-        PageReadGuard probe = PageReadGuard::LatchPinned(root_pin.GetPagePtr(),
-                                                         root_page_id_);
-        if (!probe.Valid()) return false;
-        root_is_leaf = (GetPageType(probe.Data()) == PageType::kLeaf);
-        if (root_is_leaf) next_pid = GetNextLeaf(probe.Data());
-    }
-    PageGuard next_pin;
-    if (root_is_leaf && next_pid >= 0) {
-        next_pin = PageGuard::Fetch(bpm_, next_pid);
-        if (!next_pin.Valid()) return false;
-    }
-
-    // 加根写闩，复读内容
-    PageWriteGuard root = PageWriteGuard::LatchPinned(root_pin.GetPagePtr(),
-                                                       root_page_id_);
+bool BPlusTree::SplitRoot() {
+    PageGuard root = PageGuard::Fetch(bpm_, root_page_id_);
     if (!root.Valid()) return false;
     char* rd = root.Data();
-    if (GetPageType(rd) == PageType::kUninitialized) {
-        InitLeaf(rd);  // 自愈：全零页当作空叶子
-        BumpVersion(rd);
-        root.MarkDirty();
-    }
-    // 并发已把根分裂/改写，根不再溢出 → 无需分裂，直接放行（调用方继续下降）
-    if (!MayOverflow(rd, reserve)) {
-        root.Release();
-        return true;
-    }
-
-    // 需要分裂：先把闩还给根，再分配两个新页（持闩期间不得请求 BPM）。
-    root.Release();
-    PageGuard moved = PageGuard::New(bpm_);
-    if (!moved.Valid()) return false;
-    const page_id_t moved_pid = moved.PageId();
-    PageGuard sib = PageGuard::New(bpm_);
-    if (!sib.Valid()) return false;
-    const page_id_t sib_pid = sib.PageId();
-
-    // 重新加闩并重读内容（分配期间根可能又被并发分裂）
-    PageWriteGuard root2 = PageWriteGuard::LatchPinned(root_pin.GetPagePtr(),
-                                                       root_page_id_);
-    if (!root2.Valid()) return false;
-    rd = root2.Data();
-    if (GetPageType(rd) != PageType::kUninitialized && !MayOverflow(rd, reserve)) {
-        // 根已被并发分裂（现在是内部节点且放得下）：归还误分配的两个新页。
-        root2.Release();  // 此刻无闩，可安全调用 BPM
-        moved.Release();
-        sib.Release();
-        bpm_->DeletePage(moved_pid);
-        bpm_->DeletePage(sib_pid);
-        return true;
-    }
     const PageType type = GetPageType(rd);
 
     // Phase B：抓 root 整页 before-image。SplitRoot 之后 root 变成新的内部节点，
@@ -964,8 +643,15 @@ bool BPlusTree::SplitRoot(size_t reserve) {
     }
 
     // 把根的全部内容搬到一个新页，根页本身改写成新的内部节点
+    PageGuard moved = PageGuard::New(bpm_);
+    if (!moved.Valid()) return false;
+    const page_id_t moved_pid = moved.PageId();
     std::memcpy(moved.Data(), rd, PAGE_SIZE);
     moved.MarkDirty();
+
+    PageGuard sib = PageGuard::New(bpm_);
+    if (!sib.Valid()) return false;
+    const page_id_t sib_pid = sib.PageId();
 
     InternalEntry sep;
     sep.child = sib_pid;
@@ -985,14 +671,10 @@ bool BPlusTree::SplitRoot(size_t reserve) {
         sib.MarkDirty();
         if (!WriteLeafEntries(moved.Data(), left, sib_pid, INVALID_PAGE_ID)) return false;
         moved.MarkDirty();
-        // 后继叶 prev 回链：仅在探测到的 next 仍是当前 next 时更新（与 SplitChild
-        // 同一规则：prev 不用于导航，过期即跳过）。
-        if (old_next >= 0 && old_next == next_pid && next_pin.Valid()) {
-            PageWriteGuard nxt = PageWriteGuard::LatchPinned(next_pin.GetPagePtr(),
-                                                             next_pid);
+        if (old_next >= 0) {
+            PageGuard nxt = PageGuard::Fetch(bpm_, old_next);
             if (nxt.Valid() && IsValidHeader(nxt.Data(), PageType::kLeaf)) {
                 SetPrevLeaf(nxt.Data(), sib_pid);
-                BumpVersion(nxt.Data());
                 nxt.MarkDirty();
             }
         }
@@ -1035,15 +717,14 @@ bool BPlusTree::SplitRoot(size_t reserve) {
 
     std::vector<InternalEntry> root_entries{std::move(sep)};
     if (!WriteInternalEntries(rd, moved_pid, root_entries)) return false;
-    root2.MarkDirty();
+    root.MarkDirty();
 
     // Phase B：写 root 的 UPDATE 记录（root 变成新内部节点，before/after 都捕获）。
     if (log_manager_ != nullptr) {
         lsn_t root_lsn = EmitPageImageRecord(log_manager_, root_page_id_,
                                              root_before.data(), rd, active_txn_);
-        root2.SetPageLsn(root_lsn);
+        root.SetPageLsn(root_lsn);
     }
-    BumpStructureCounter();   // U1d：根分裂改变根结构
     return true;
 }
 
@@ -1052,74 +733,94 @@ bool BPlusTree::SplitRoot(size_t reserve) {
 // ============================================================================
 
 RID BPlusTree::FindFirst(const IndexKey& key) const {
-    // 乐观点查：乐观下降记录路径版本 → 校验 → 读闩复核叶版本 → 在叶内定位。
-    // 任一版本变化即整体重启；读不阻塞写、写不阻塞读（冲突靠重启消化）。
-    const int kMaxAttempts = 256;
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        // RID{} 是 {-1, -1}，在 (key, rid) 全序里等价于 -inf，因此下降会落到
-        // 该键的第一条记录所在的叶子。
-        DescPath path;   // U1d：下降快照含结构计数，校验可 O(1) 短路
-        const RID min_rid;
-        page_id_t leaf_pid = OptimisticFindLeafPage(key, min_rid, &path);
-        if (leaf_pid < 0) return RID();
-        if (!ValidatePath(path)) continue;
+    // RID{} 是 {-1, -1}，在 (key, rid) 全序里等价于 -inf，因此下降会落到
+    // 该键的第一条记录所在的叶子。
+    const RID min_rid;
+    page_id_t leaf_pid = FindLeafPage(key, min_rid);
+    if (leaf_pid < 0) return RID();
 
-        PageReadGuard g = PageReadGuard::Fetch(bpm_, leaf_pid);
-        if (!g.Valid()) continue;
-        if (ReadVersion(g.Data()) != path.leaf_version()) continue;
-        std::vector<LeafEntry> entries;
-        if (!ReadLeafEntries(g.Data(), key_schema_, &entries)) return RID();
-        for (const auto& e : entries) {
-            int c = CompareKeyOnly(e.key, key);
-            if (c == 0) return e.rid;
-            if (c > 0) break;
-        }
-        // 边界情形：目标键恰好全部落在后继叶子上
-        const page_id_t next = GetNextLeaf(g.Data());
-        g.Release();
-        if (next < 0) return RID();
-        PageReadGuard g2 = PageReadGuard::Fetch(bpm_, next);
-        if (!g2.Valid()) return RID();
-        std::vector<LeafEntry> next_entries;
-        if (!ReadLeafEntries(g2.Data(), key_schema_, &next_entries)) return RID();
-        for (const auto& e : next_entries) {
-            int c = CompareKeyOnly(e.key, key);
-            if (c == 0) return e.rid;
-            if (c > 0) break;
-        }
-        return RID();
+    PageGuard g = PageGuard::Fetch(bpm_, leaf_pid);
+    if (!g.Valid()) return RID();
+    std::vector<LeafEntry> entries;
+    if (!ReadLeafEntries(g.Data(), key_schema_, &entries)) return RID();
+    for (const auto& e : entries) {
+        int c = CompareKeyOnly(e.key, key);
+        if (c == 0) return e.rid;
+        if (c > 0) break;
+    }
+    // 边界情形：目标键恰好全部落在后继叶子上
+    const page_id_t next = GetNextLeaf(g.Data());
+    if (next < 0) return RID();
+    g.Release();
+    PageGuard g2 = PageGuard::Fetch(bpm_, next);
+    if (!g2.Valid()) return RID();
+    std::vector<LeafEntry> next_entries;
+    if (!ReadLeafEntries(g2.Data(), key_schema_, &next_entries)) return RID();
+    for (const auto& e : next_entries) {
+        int c = CompareKeyOnly(e.key, key);
+        if (c == 0) return e.rid;
+        if (c > 0) break;
     }
     return RID();
 }
 
 bool BPlusTree::Delete(const IndexKey& key, const RID& rid) {
-    DrainPendingFrees();   // U1c：安全点排空被弃页（此时不持任何页闩）
-    // 乐观删除：下降路径版本校验通过后，只对目标叶子取独占写闩（写闩下复核
-    // 叶版本），重复键可能跨页则最多向后看一页。任一版本变化即整体重启。
-    const int kMaxAttempts = 256;
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        DescPath path;   // U1d：下降快照含结构计数，校验可 O(1) 短路
-        page_id_t leaf_pid = OptimisticFindLeafPage(key, rid, &path);
-        if (leaf_pid < 0) return false;
-        if (!ValidatePath(path)) continue;
+    // =====================================================================
+    // 1) Path-stack descent：边下降边记下 (parent_pid, separator_index)，
+    //    到达叶子后即可定位叶子的「父亲-我-索引」。
+    //    - 根没有父亲，用 INVALID_PAGE_ID 标记，sep_index 取 0 仅占位。
+    //    - 走 first_child 时该层 separator_index = 0（first_child 视为
+    //      child[0]，其「左分隔键」是 sentinel）；走 entries[i].child 时
+    //      separator_index = i + 1，因为 entries[i] 是该孩子与左侧兄弟的
+    //      分隔键。
+    // =====================================================================
+    struct Frame {
+        page_id_t parent_pid;
+        size_t separator_index;
+    };
+    std::vector<Frame> path;
+    path.reserve(8);
 
-        // 首叶版本不匹配时置位，交由外层重试（重新按 key 路由）。
-        bool restart = false;
-
-        // 目标可能落在相邻叶子（重复键跨页），最多向后看一页
-        for (int step = 0; step < 2 && leaf_pid >= 0; ++step) {
-            PageWriteGuard g = PageWriteGuard::Fetch(bpm_, leaf_pid);
-            if (!g.Valid()) return false;
-            // 首叶须与下降路径版本一致；后继叶持写闩下读取即一致，无需版本复核。
-            // 若首叶版本下降后已变化（并发分裂/再平衡把目标键迁移到相邻叶），
-            // 绝不能借 step==1 无复核地重读同一首叶——那会在旧叶找不到键而静默漏删
-            // 或错删，亦不能直接 return false 放弃（键仍在树中，只是换了叶子）。
-            // 正确做法是整体重启下降：重新按 key 路由定位目标叶。
-            if (step == 0 && ReadVersion(g.Data()) != path.leaf_version()) {
-                g.Release();
-                restart = true;
+    page_id_t pid = root_page_id_;
+    while (true) {
+        PageGuard node = PageGuard::Fetch(bpm_, pid);
+        if (!node.Valid()) return false;
+        const char* d = node.Data();
+        const PageType type = GetPageType(d);
+        if (type == PageType::kLeaf) {
+            node.Release();
+            break;
+        }
+        if (type != PageType::kInternal) return false;
+        std::vector<InternalEntry> entries;
+        if (!ReadInternalEntries(d, key_schema_, &entries)) return false;
+        // 找到要去的 child 索引：0 = first_child，i+1 = entries[i].child
+        size_t idx = 0;
+        page_id_t child_pid = GetFirstChild(d);
+        for (size_t i = 0; i < entries.size(); ++i) {
+            if (CompareKeyThenRid(key, rid, entries[i].key, entries[i].rid) >= 0) {
+                ++idx;
+                child_pid = entries[i].child;
+            } else {
                 break;
             }
+        }
+        path.push_back(Frame{pid, idx});
+        node.Release();
+        pid = child_pid;
+    }
+
+    // =====================================================================
+    // 2) 在叶子层做实际删除。重复键跨页时最多往后看一页，沿用旧 Delete 的语义。
+    // =====================================================================
+    bool deleted = false;
+    size_t after_count = 0;
+    page_id_t erased_leaf = INVALID_PAGE_ID;
+    {
+        page_id_t leaf_pid = pid;
+        for (int attempt = 0; attempt < 2 && leaf_pid >= 0; ++attempt) {
+            PageGuard g = PageGuard::Fetch(bpm_, leaf_pid);
+            if (!g.Valid()) return false;
             char* d = g.Data();
             std::vector<LeafEntry> entries;
             if (!ReadLeafEntries(d, key_schema_, &entries)) return false;
@@ -1141,6 +842,8 @@ bool BPlusTree::Delete(const IndexKey& key, const RID& rid) {
                         return false;
                     }
                     g.MarkDirty();
+                    after_count = entries.size();
+                    erased_leaf = leaf_pid;
                     // Phase B：写 UPDATE 记录。
                     if (log_manager_ != nullptr) {
                         lsn_t lsn = EmitPageImageRecord(log_manager_, leaf_pid,
@@ -1148,531 +851,712 @@ bool BPlusTree::Delete(const IndexKey& key, const RID& rid) {
                                                        active_txn_);
                         g.SetPageLsn(lsn);
                     }
-                    // U1：删除后若叶子下溢，先归还目标叶写闩，再触发兄弟再分配。
-                    const bool underfull = LeafUnderfull(entries);
-                    g.Release();
-                    if (underfull) {
-                        RebalanceAfterDelete(leaf_pid, key);
-                    }
-                    return true;
+                    deleted = true;
+                    break;
                 }
             }
-            const page_id_t next = GetNextLeaf(d);
-            g.Release();
-            leaf_pid = next;
+            if (deleted) break;
+            leaf_pid = GetNextLeaf(d);
         }
-        if (restart) continue;   // 首叶版本已变 → 整体重启下降
-        return false;
     }
-    return false;
-}
+    if (!deleted) return false;
 
-// Phase 3（t4）：低频索引真空。遍历所有叶子，用 is_dead 谓词逐条判定索引项是否
-// 可回收，可回收则从叶子里物理删除（整页重写 + 版本号自增）。
-//
-// 并发/一致性设计：
-//   - 单叶处理 = 持叶写闩下完成「判定 + 重写」。判定期间 is_dead 会顺带回表取行页
-//     短读闩，不会与写路径死锁：执行器写堆（持行页写闩）与写索引（持叶写闩）是
-//     顺序调用、从不同时持两种闩；本函数持叶写闩 + 行页读闩与既有锁序无环。
-//   - 判据单调：is_dead 的 kRemove 判据（TableHeap::DecideIndexEntry）只依赖
-//     end_csn / 头键等一经提交即不可变的信息，判定为死即恒死，无需二次复核。
-//   - best-effort 遍历：沿 next_leaf 推进前读指针、放锁再取下一页（同 Delete）；
-//     并发分裂导致跳页/重读时靠 visited 防环，遗漏留给下一趟。删条目不合并节点。
-uint64_t BPlusTree::Vacuum(const std::function<bool(const RID&, const IndexKey&)>& is_dead) {
-    if (!is_dead) return 0;
-    DrainPendingFrees();   // U1c：安全点排空被弃页（此时不持任何页闩）
-    uint64_t removed = 0;
-    // 定位最左叶子（乐观下降，版本校验失败重试有限次后放弃本趟）。
-    page_id_t leaf_pid = INVALID_PAGE_ID;
-    for (int attempt = 0; attempt < 16; ++attempt) {
-        DescPath path;   // U1d：下降快照含结构计数，校验可 O(1) 短路
-        leaf_pid = OptimisticLeftmostLeafPage(&path);
-        if (leaf_pid < 0) return removed;
-        if (ValidatePath(path)) break;
+    // =====================================================================
+    // 3) 自底向上修 underflow。仅当叶子的 key_count 跌破阈值才需要处理，
+    //    否则说明删得还不够狠，无需无谓改动兄弟。
+    // =====================================================================
+    if (after_count >= static_cast<size_t>(kLeafMinOccupancy)) {
+        // 路径上叶子仍是健康的，无需 redistribute/merge，直接返回
+        return true;
     }
-    if (leaf_pid < 0) return removed;
 
-    std::unordered_set<page_id_t> visited;
-    while (leaf_pid >= 0) {
-        if (!visited.insert(leaf_pid).second) break;  // 环保护
-        PageWriteGuard g = PageWriteGuard::Fetch(bpm_, leaf_pid);
-        if (!g.Valid()) break;
-        char* d = g.Data();
-        std::vector<LeafEntry> entries;
-        if (!ReadLeafEntries(d, key_schema_, &entries)) break;
-        // U1：捕获一个落在本叶键区间的探针键（再分配用按 key 定位父节点）。
-        const bool have_probe = !entries.empty();
-        const IndexKey probe_key = have_probe ? entries.front().key : IndexKey();
-        std::vector<LeafEntry> keep;
-        keep.reserve(entries.size());
-        bool changed = false;
-        for (const auto& e : entries) {
-            if (is_dead(e.rid, e.key)) {
-                ++removed;
-                changed = true;
-            } else {
-                keep.push_back(e);
+    // 叶子是根（path 为空）时无需处理——根无最小占用
+    if (path.empty()) {
+        // 即使叶子空了也允许：root_page_id 保持有效，下次插入会重新激活
+        return true;
+    }
+
+    // 从 path 末尾往上修。栈顶就是叶子的直接父亲。
+    // 每处理一层，要检查该层的父亲（也就是上一层 frame 的 parent）是否也
+    // 因为合并/借出而 underflow；若是，则再向上走一级。
+    size_t level = path.size() - 1;
+    while (true) {
+        const Frame& frame = path[level];
+        if (!RedistributeOrMerge(frame.parent_pid, frame.separator_index)) {
+            // 修复失败：保守地返回 false，调用方按未删除处理（数据一致性不会破坏）
+            return false;
+        }
+        // 处理到根或顶层：尝试塌缩
+        if (frame.parent_pid == root_page_id_ || level == 0) {
+            (void)CollapseRoot();
+            break;
+        }
+        // 检查父（上一层 frame.parent_pid）是否因我们刚才的合并而 underflow。
+        // 若 underflow，则 frame.parent_pid 仍为 deficient，让上一层处理它。
+        const page_id_t upper_parent = path[level - 1].parent_pid;
+        {
+            PageGuard pg = PageGuard::Fetch(bpm_, upper_parent);
+            if (!pg.Valid()) {
+                // 拿不到父：保守返回 false
+                return false;
             }
-        }
-        const page_id_t next = GetNextLeaf(d);
-        if (changed) {
-            // keep 是 entries 的子集，空间必够（放不下说明页损坏，放弃本页）。
-            if (!WriteLeafEntries(d, keep, GetNextLeaf(d), GetPrevLeaf(d))) break;
-            g.MarkDirty();
-            // U1：真空移除后叶子下溢触达兄弟再分配（先归还本叶写闩）。
-            const bool underfull =
-                keep.empty() || LeafUnderfull(keep);
-            g.Release();
-            if (underfull && have_probe) {
-                RebalanceAfterDelete(leaf_pid, probe_key);
-            }
-        } else {
-            g.Release();
-        }
-        leaf_pid = next;
-    }
-    return removed;
-}
-
-// ============================================================================
-// U1 / U1b：删除后下溢再平衡（合并 + 再分配 + 物理删页）
-//
-// 触发：Delete / Vacuum 移除条目后目标节点利用率 < 40%（下溢）。
-// 做法：带写闩下降定位其父节点，把该节点与**同一父节点下的相邻兄弟**平衡：
-//   - 合并（U1b）：兄弟两页内容合到一页仍放得下（<= kMaxMergeRatio）时，合并兄弟
-//     内容到靠左一页，物理回收被并合的靠右一页（bpm->DeletePage → 回归 .fpl 空闲
-//     位图，可被后续 AllocatePage 复用），并从父删除指向被并页的槽。父因此少一个
-//     孩子，可能再次下溢 → 级联向上。若父为根且收缩到单子，则收树高（下滑一层）。
-//   - 再分配：仅局部借条目，不新建/删除页，分隔键更新不影响父孩子数 → 不级联。
-//
-// 并发/一致性设计（U1b 对物理删页的取舍）：
-//   - 只对「活页对」做迁移：合并总是把被并页内容整批写进保留页并自增版本，被改动
-//     页（保留页、父）版本号自增，游标跨叶前进前校验当前叶版本（CurrentLeafUnchanged）
-//     即可感知并重定位，无重复、无丢键。
-//   - 物理销毁的被并页：一旦从父摘除并 unlink，任何新读者都不会再路由到它；旧的
-//     乐观游标若仍持有它（已物化其内容或把其 pid 当作 next_leaf_），Cursor::Next 在
-//     重读校验失败 / target 装载失败时会 **重下降定位**（RelocateRestart），绝不会把
-//     被 BPM 复用的页误当合法叶续扫 → 不重复、不漏发。因此在「乐观游标重下降恢复」
-//     就位后，物理删页是安全的，不再需要全局 epoch。
-//   - 兄弟取同一父节点下的相邻孩子；合并恒保留靠左页、回收靠右页，父只需删一个
-//     槽，无需级联改多个分隔键。
-//   - 闩序：父 → 左 → 右，与 SplitChild「先 pin 后加闩」一致；回收前先释放全部页
-//     闩与 pin，再调 bpm->DeletePage（DeletePage 内部取 BPM 全局锁，持页闩时不得调用）。
-//
-// 返回本趟发生的结构变更次数（合并会级联，再分配为局部修复不向上传播）。
-int BPlusTree::RebalanceAfterDelete(page_id_t node_pid, const IndexKey& key) {
-    if (node_pid < 0 || node_pid == root_page_id_) return 0;
-
-    const int kMaxLevels = 16;
-    int changes = 0;
-    page_id_t curtgt = node_pid;
-    for (int level = 0; level < kMaxLevels; ++level) {
-        if (curtgt == root_page_id_) break;
-        // ---- 1) 带写闩下降，定位 curtgt 的直接父 ----
-        page_id_t pid = root_page_id_;
-        page_id_t parent_pid = INVALID_PAGE_ID;
-        std::unordered_set<page_id_t> vv;
-        for (int steps = 0; steps < 128; ++steps) {
-            if (!vv.insert(pid).second) return changes;   // 环路防御
-            PageWriteGuard g = PageWriteGuard::Fetch(bpm_, pid);
-            if (!g.Valid()) return changes;
-            char* d = g.Data();
-            if (GetPageType(d) == PageType::kInternal) {
-                std::vector<InternalEntry> ents;
-                if (!ReadInternalEntries(d, key_schema_, &ents)) { g.Release(); return changes; }
-                const page_id_t fc = GetFirstChild(d);
-                if (fc == curtgt) { parent_pid = pid; g.Release(); break; }
-                for (size_t i = 0; i < ents.size(); ++i) {
-                    if (ents[i].child == curtgt) { parent_pid = pid; break; }
+            const char* ud = pg.Data();
+            if (GetPageType(ud) == PageType::kInternal) {
+                const int cnt = GetKeyCount(ud);
+                if (cnt < kInternalMinOccupancy) {
+                    --level;
+                    continue;
                 }
-                if (parent_pid >= 0) { g.Release(); break; }
-                pid = ChooseChild(d, ents, key, RID());
-                g.Release();
-                if (pid < 0) return changes;
-            } else {
-                g.Release();
-                break;   // curtgt 已是叶子根，无父可平衡
             }
+            // 父未 underflow，但它的孩子减少了，仍可能在 root 一层需要塌缩
         }
-        if (parent_pid < 0) return changes;
-
-        // ---- 2) 在父下定位左右兄弟（父内容复读） ----
-        PageReadGuard pre = PageReadGuard::Fetch(bpm_, parent_pid);
-        if (!pre.Valid()) return changes;
-        std::vector<InternalEntry> pents;
-        if (!ReadInternalEntries(pre.Data(), key_schema_, &pents)) return changes;
-        const page_id_t pfc = GetFirstChild(pre.Data());
-        const int pn = (int)pents.size();               // 孩子总数 = pn+1
-        int c = -1;
-        if (pfc == curtgt) c = 0;
-        else for (int i = 0; i < pn; ++i) if (pents[i].child == curtgt) { c = i + 1; break; }
-        if (c < 0) return changes;
-        page_id_t left_pid = INVALID_PAGE_ID, right_pid = INVALID_PAGE_ID;
-        if (c + 1 <= pn) {   // 有右兄弟：curtgt 为左
-            left_pid = curtgt;
-            right_pid = pents[c].child;      // child c+1 = entries[c]
-        } else if (c >= 1) { // 有左兄弟：curtgt 为右
-            left_pid = (c > 1) ? pents[c - 2].child : pfc;
-            right_pid = curtgt;
-        } else {
-            pre.Release(); return changes;   // 无兄弟（父仅一子）
-        }
-        pre.Release();
-
-        // ---- 3) 先 pin、再按 父→左→右 加写闩 ----
-        PageGuard parent_pin = PageGuard::Fetch(bpm_, parent_pid);
-        if (!parent_pin.Valid()) return changes;
-        PageGuard left_pin = PageGuard::Fetch(bpm_, left_pid);
-        if (!left_pin.Valid()) return changes;
-        PageGuard right_pin = PageGuard::Fetch(bpm_, right_pid);
-        if (!right_pin.Valid()) return changes;
-        PageWriteGuard pw = PageWriteGuard::LatchPinned(parent_pin.GetPagePtr(), parent_pid);
-        if (!pw.Valid()) return changes;
-        PageWriteGuard lw = PageWriteGuard::LatchPinned(left_pin.GetPagePtr(), left_pid);
-        if (!lw.Valid()) return changes;
-        PageWriteGuard rw = PageWriteGuard::LatchPinned(right_pin.GetPagePtr(), right_pid);
-        if (!rw.Valid()) return changes;
-
-        // ---- 4) 闩下复核：仍为父子关系、左右相邻、类型一致 ----
-        char* pd = pw.Data();
-        if (GetPageType(pd) != PageType::kInternal) return changes;
-        std::vector<InternalEntry> pents2;
-        if (!ReadInternalEntries(pd, key_schema_, &pents2)) return changes;
-        const page_id_t pfc2 = GetFirstChild(pd);
-        int li = -1, ri = -1;
-        if (pfc2 == left_pid) li = -1;
-        if (pfc2 == right_pid) ri = -1;
-        for (size_t i = 0; i < pents2.size(); ++i) {
-            if (pents2[i].child == left_pid) li = (int)i;
-            if (pents2[i].child == right_pid) ri = (int)i;
-        }
-        const int lch = li + 1, rch = ri + 1;          // child 下标
-        if (!(lch >= 0 && rch >= 1 && rch == lch + 1)) return changes;  // 相邻
-        const PageType ltype = GetPageType(lw.Data());
-        if (GetPageType(rw.Data()) != ltype) return changes;
-        if (ltype != PageType::kLeaf && ltype != PageType::kInternal) return changes;
-        const bool is_leaf = (ltype == PageType::kLeaf);
-
-        std::vector<LeafEntry> lleaf, rleaf;
-        std::vector<InternalEntry> lint, rint;
-        bool luf = false, ruf = false;
-        if (is_leaf) {
-            if (!ReadLeafEntries(lw.Data(), key_schema_, &lleaf)) return changes;
-            if (!ReadLeafEntries(rw.Data(), key_schema_, &rleaf)) return changes;
-            luf = LeafUnderfull(lleaf); ruf = LeafUnderfull(rleaf);
-        } else {
-            if (!ReadInternalEntries(lw.Data(), key_schema_, &lint)) return changes;
-            if (!ReadInternalEntries(rw.Data(), key_schema_, &rint)) return changes;
-            luf = InternalUnderfull(lint); ruf = InternalUnderfull(rint);
-        }
-        if (!luf && !ruf) return changes;   // 均不下溢：无需修复
-
-        // ---- 5) 指向右孩子的父分隔槽（right 必非 first_child） ----
-        int sep_idx = -1;
-        for (size_t i = 0; i < pents2.size(); ++i)
-            if (pents2[i].child == right_pid) { sep_idx = (int)i; break; }
-        if (sep_idx < 0) return changes;
-
-        bool merged = false;
-        if (is_leaf) {
-            merged = LeavesMergeFeasible(lleaf, rleaf);
-        } else {
-            merged = InternalsMergeFeasible(lint, pents2[sep_idx], rint);
-        }
-
-        if (merged) {
-            // 抓 before-image（须在当前内容被改前）
-            std::vector<char> lb_bf, pb_bf;
-            if (log_manager_ != nullptr) {
-                lb_bf.assign(lw.Data(), lw.Data() + PAGE_SIZE);
-                pb_bf.assign(pw.Data(), pw.Data() + PAGE_SIZE);
-            }
-            // 合并内容到 left 页
-            if (is_leaf) {
-                lleaf.insert(lleaf.end(), rleaf.begin(), rleaf.end());
-                // left.next 跳过被并的 right，直接接到 right 的原后继
-                if (!WriteLeafEntries(lw.Data(), lleaf, GetNextLeaf(rw.Data()),
-                                      GetPrevLeaf(lw.Data())))
-                    return changes;
-            } else {
-                // 内部合并：bridge = 指向 right 的父分隔槽，child 改为 right.first_child，
-                // 使 left 直接接管 right 的最左子树，子代总数不变。
-                InternalEntry bridge = pents2[sep_idx];
-                bridge.child = GetFirstChild(rw.Data());
-                lint.push_back(std::move(bridge));
-                lint.insert(lint.end(), rint.begin(), rint.end());
-                if (!WriteInternalEntries(lw.Data(), GetFirstChild(lw.Data()), lint))
-                    return changes;
-            }
-            left_pin.MarkDirty();
-            if (log_manager_ != nullptr)
-                EmitPageImageRecord(log_manager_, left_pid, lb_bf.data(), lw.Data(), active_txn_);
-
-            // 从父删除指向 right 的槽
-            pents2.erase(pents2.begin() + sep_idx);
-            if (!WriteInternalEntries(pd, pfc2, pents2)) return changes;
-            parent_pin.MarkDirty();
-            if (log_manager_ != nullptr)
-                EmitPageImageRecord(log_manager_, parent_pid, pb_bf.data(), pw.Data(), active_txn_);
-            ++changes;
-            BumpStructureCounter();   // U1d：合并删除孩子 + 改写父结构
-
-            // 回收被并页：先释放全部页闩与 pin，再物理删页（DeletePage 内部取 BPM 锁）。
-            // pin>0（并发读者仍持页）时入挂起队列，后续写操作入口的排空重试兜底回收。
-            const page_id_t freed_pid = right_pid;
-            rw.Release(); lw.Release(); pw.Release();
-            right_pin.Release(); left_pin.Release(); parent_pin.Release();
-            TryFreePage(freed_pid);
-
-            // 级联：父失去一个孩子，若仍下溢则继续与其兄弟平衡
-            curtgt = parent_pid;
-            continue;
-        }
-
-        // ---- 再分配（仅叶级局部修复，不新建/删除页，不级联）----
-        if (is_leaf && (luf != ruf)) {
-            // 借入目标 = 下溢侧；借出 = 另一侧。左/右都下溢或合并不可行则放弃。
-            std::vector<LeafEntry>* tgt; std::vector<LeafEntry>* src;
-            bool move_from_head;   // true=从 src 头部借；false=从 src 尾部借
-            if (luf) { tgt = &lleaf; src = &rleaf; move_from_head = true; }
-            else     { tgt = &rleaf; src = &lleaf; move_from_head = false; }
-            size_t need = 0;
-            {
-                std::vector<LeafEntry> probe = *tgt;
-                size_t remaining = src->size();
-                while (LeafUnderfull(probe) && remaining >= 2) {
-                    ++need;
-                    if (move_from_head) probe.push_back((*src)[need - 1]);
-                    else probe.insert(probe.begin(), (*src)[(*src).size() - need]);
-                    --remaining;
-                }
-                if (need == 0) return changes;
-            }
-            if (move_from_head) {
-                for (size_t i = 0; i < need; ++i) tgt->push_back((*src)[i]);
-                src->erase(src->begin(), src->begin() + static_cast<long>(need));
-            } else {
-                const size_t n = src->size();
-                for (size_t i = n - need; i < n; ++i) tgt->push_back((*src)[i]);
-                src->erase(src->begin() + static_cast<long>(n - need), src->end());
-                std::rotate(tgt->begin(), tgt->end() - static_cast<long>(need), tgt->end());
-            }
-            // 更新父分隔键（指向右孩子的槽）：取右孩子新第一条 key
-            InternalEntry new_sep = pents2[sep_idx];
-            new_sep.key = rleaf.front().key;
-            new_sep.rid = rleaf.front().rid;
-            new_sep.key_bytes = rleaf.front().key_bytes;
-            // 写回
-            std::vector<char> lb, rb, pb_;
-            if (log_manager_ != nullptr) {
-                lb.assign(lw.Data(), lw.Data() + PAGE_SIZE);
-                rb.assign(rw.Data(), rw.Data() + PAGE_SIZE);
-                pb_.assign(pw.Data(), pw.Data() + PAGE_SIZE);
-            }
-            if (!WriteLeafEntries(lw.Data(), lleaf, GetNextLeaf(lw.Data()), GetPrevLeaf(lw.Data()))) return changes;
-            if (!WriteLeafEntries(rw.Data(), rleaf, GetNextLeaf(rw.Data()), GetPrevLeaf(rw.Data()))) return changes;
-            pents2[sep_idx] = new_sep;
-            if (!WriteInternalEntries(pd, pfc2, pents2)) return changes;
-            // 脏标记设在真正负责 Unpin 的 PageGuard 上（前一轮已详述），而非 LatchPinned 句柄。
-            left_pin.MarkDirty(); right_pin.MarkDirty(); parent_pin.MarkDirty();
-            if (log_manager_ != nullptr) {
-                EmitPageImageRecord(log_manager_, left_pid, lb.data(), lw.Data(), active_txn_);
-                EmitPageImageRecord(log_manager_, right_pid, rb.data(), rw.Data(), active_txn_);
-                EmitPageImageRecord(log_manager_, parent_pid, pb_.data(), pw.Data(), active_txn_);
-            }
-            ++changes;
-            BumpStructureCounter();   // U1d：再分配改写父分隔键结构
-            return changes;   // 再分配不改变父孩子数 → 不向上级联
-        }
-        return changes;   // 内节点合并不可行 / 双侧下溢：本次放弃（保守）
+        (void)CollapseRoot();
+        break;
     }
-
-    // 循环退出后：根若为仅含一个孩子的内部节点，把内容下迁一层，回收原孩子页。
-    if (curtgt == root_page_id_ && CollapseRootIfNeeded()) {
-        ++changes;
-        BumpStructureCounter();   // U1d：根收缩改变根结构
-    }
-    return changes;
-}
-
-// 根收缩：若根是仅含一个孩子的内部节点，把根就地改写为该子树的拷贝并回收原孩子
-// 页，树高降 1。根页 id 恒定不变（复用 SplitRoot 的既有约定）。返回是否收树。
-// 注意：本函数会调用 BPM（DeletePage 回收孩子页），因此必须在**不持任何页闩**的
-// 时刻调用（RebalanceAfterDelete 在循环外、闩已全部释放后调用）。
-bool BPlusTree::CollapseRootIfNeeded() {
-    // 1) 只读探测根与孩子页 id（此过程不持页闩，安全）
-    PageGuard root_pin = PageGuard::Fetch(bpm_, root_page_id_);
-    if (!root_pin.Valid()) return false;
-    page_id_t child_pid = INVALID_PAGE_ID;
-    bool root_internal = false;
-    {
-        PageReadGuard probe = PageReadGuard::LatchPinned(root_pin.GetPagePtr(), root_page_id_);
-        if (!probe.Valid()) return false;
-        if (GetPageType(probe.Data()) != PageType::kInternal) return false;  // 叶根无需收缩
-        std::vector<InternalEntry> ents;
-        if (!ReadInternalEntries(probe.Data(), key_schema_, &ents)) return false;
-        if (ents.size() != 0) return false;      // 根至少有 1 个分离键 → 多个孩子，不收缩
-        child_pid = GetFirstChild(probe.Data());
-        if (child_pid < 0) return false;
-        root_internal = true;
-    }
-    if (!root_internal) return false;
-
-    // 2) pin 孩子，再按 根→孩子 顺序加写闩（父→子锁序）
-    PageGuard child_pin = PageGuard::Fetch(bpm_, child_pid);
-    if (!child_pin.Valid()) return false;
-
-    PageWriteGuard root = PageWriteGuard::LatchPinned(root_pin.GetPagePtr(), root_page_id_);
-    if (!root.Valid()) return false;
-    PageWriteGuard child = PageWriteGuard::LatchPinned(child_pin.GetPagePtr(), child_pid);
-    if (!child.Valid()) return false;
-
-    // 闩下复核：根仍为单孩子内节点
-    std::vector<InternalEntry> ents;
-    if (GetPageType(root.Data()) != PageType::kInternal) return false;
-    if (!ReadInternalEntries(root.Data(), key_schema_, &ents)) return false;
-    const page_id_t cfc = GetFirstChild(root.Data());
-    if (ents.size() != 0 || cfc != child_pid) return false;
-
-    // 抓 before-image
-    std::vector<char> root_bf;
-    if (log_manager_ != nullptr) root_bf.assign(root.Data(), root.Data() + PAGE_SIZE);
-
-    // 把孩子的全部内容原样搬进根页（孩子页 new=INVALID 也是全零，可直接清根重写）
-    bool ok = false;
-    if (GetPageType(child.Data()) == PageType::kLeaf) {
-        std::vector<LeafEntry> ce;
-        if (ReadLeafEntries(child.Data(), key_schema_, &ce))
-            ok = WriteLeafEntries(root.Data(), ce,
-                                  GetNextLeaf(child.Data()), GetPrevLeaf(child.Data()));
-    } else if (GetPageType(child.Data()) == PageType::kInternal) {
-        std::vector<InternalEntry> ce;
-        if (ReadInternalEntries(child.Data(), key_schema_, &ce))
-            ok = WriteInternalEntries(root.Data(), GetFirstChild(child.Data()), ce);
-    }
-    if (!ok) return false;
-    root_pin.MarkDirty();
-    if (log_manager_ != nullptr)
-        EmitPageImageRecord(log_manager_, root_page_id_, root_bf.data(), root.Data(), active_txn_);
-
-    // 释放闩与 pin，再回收孩子页
-    child.Release(); root.Release();
-    child_pin.Release(); root_pin.Release();
-    TryFreePage(child_pid);
     return true;
 }
 
-// ---- U1c：物理删页可靠回收（挂起队列 + 安全点排空）----
-void BPlusTree::TryFreePage(page_id_t pid) {
-    if (pid < 0) return;
-    if (bpm_->DeletePage(pid)) return;   // 立即回收成功（.fpl）
-    // 页仍被并发读者 pin：暂存待重试。此时页仍分配于 BPM、不会交给 AllocatePage，
-    // 延迟回收绝不导致页号复用错乱。
-    std::lock_guard<std::mutex> lk(pending_free_mutex_);
-    if (pending_free_set_.insert(pid).second) pending_free_vec_.push_back(pid);
-}
+// ============================================================================
+// 删除再平衡辅助
+// ============================================================================
 
-void BPlusTree::DrainPendingFrees() {
-    std::vector<page_id_t> retry;
+bool BPlusTree::RedistributeOrMerge(page_id_t parent_pid, size_t separator_index) {
+    if (parent_pid < 0 || parent_pid == root_page_id_) {
+        // parent 是根：无需做，但若根塌缩条件满足则 CollapseRoot 会处理
+        return true;
+    }
+
+    PageGuard parent = PageGuard::Fetch(bpm_, parent_pid);
+    if (!parent.Valid()) return false;
+    char* pd = parent.Data();
+    if (GetPageType(pd) != PageType::kInternal) {
+        // 父亲不是内部节点（根是叶子）—— 不需要 underflow 修复
+        return true;
+    }
+    std::vector<InternalEntry> p_entries;
+    if (!ReadInternalEntries(pd, key_schema_, &p_entries)) return false;
+    const page_id_t p_first_child = GetFirstChild(pd);
+
+    // 定位 deficient 与其兄弟。
+    // separator_index = 0 表示 deficient = first_child；separator_index > 0
+    // 表示 deficient = entries[separator_index - 1].child。
+    page_id_t deficient_pid;
+    page_id_t left_pid = INVALID_PAGE_ID;
+    page_id_t right_pid = INVALID_PAGE_ID;
+    if (separator_index == 0) {
+        deficient_pid = p_first_child;
+        if (p_entries.empty()) {
+            // 内部节点只有一个孩子：所有 underflow 都该走 CollapseRoot
+            return true;
+        }
+        right_pid = p_entries[0].child;
+    } else {
+        deficient_pid = p_entries[separator_index - 1].child;
+        if (separator_index - 1 > 0) {
+            left_pid = p_entries[separator_index - 2].child;
+        } else {
+            left_pid = p_first_child;
+        }
+        if (separator_index < p_entries.size()) {
+            right_pid = p_entries[separator_index].child;
+        }
+    }
+
+    // 选择兄弟：优先有富余的那个；都没有则合并
+    PageType deficient_type = PageType::kUninitialized;
     {
-        std::lock_guard<std::mutex> lk(pending_free_mutex_);
-        if (pending_free_vec_.empty()) return;
-        retry.swap(pending_free_vec_);
-        pending_free_set_.clear();
+        PageGuard dg = PageGuard::Fetch(bpm_, deficient_pid);
+        if (!dg.Valid()) return false;
+        deficient_type = GetPageType(dg.Data());
     }
-    for (page_id_t pid : retry) TryFreePage(pid);   // 仍失败者由 TryFreePage 重入队
-}
 
-// 树高：沿最左路径读闩下降计数（单叶=1）。
-int BPlusTree::GetHeight() const {
-    int h = 0;
-    page_id_t pid = root_page_id_;
-    std::unordered_set<page_id_t> visited;
-    for (int steps = 0; steps < 128; ++steps) {
-        if (!visited.insert(pid).second) break;
-        PageReadGuard g = PageReadGuard::Fetch(bpm_, pid);
-        if (!g.Valid()) break;
-        ++h;
-        const char* d = g.Data();
-        if (GetPageType(d) != PageType::kInternal) break;
-        if (!IsValidHeader(d, PageType::kInternal)) break;
-        pid = GetFirstChild(d);
+    // 计算 deficient 当前 key_count，决定是否真的需要修
+    int deficient_count = 0;
+    int min_occ = (deficient_type == PageType::kLeaf) ? kLeafMinOccupancy
+                                                      : kInternalMinOccupancy;
+    {
+        PageGuard dg = PageGuard::Fetch(bpm_, deficient_pid);
+        if (!dg.Valid()) return false;
+        deficient_count = GetKeyCount(dg.Data());
     }
-    return h;
-}
+    if (deficient_count >= min_occ) {
+        // 不知为何走到这一步（上层估计失误），啥都不做
+        return true;
+    }
 
-// 利用率统计：遍历全部叶与内节点，累计已用字节/页数与两者占比。
-void BPlusTree::ComputeUtilization(double* min_ratio, double* avg_ratio,
-                                   uint64_t* leaf_pages,
-                                   uint64_t* internal_pages) const {
-    if (min_ratio) *min_ratio = 1.0;
-    if (avg_ratio) *avg_ratio = 0.0;
-    if (leaf_pages) *leaf_pages = 0;
-    if (internal_pages) *internal_pages = 0;
-    uint64_t leaf_n = 0, internal_n = 0;
-    double min_u = 1.0, sum_u = 0.0, sum_internal = 0.0;
-    std::vector<page_id_t> queue{root_page_id_};
-    std::unordered_set<page_id_t> visited;
-    while (!queue.empty()) {
-        page_id_t pid = queue.back();
-        queue.pop_back();
-        if (pid < 0 || !visited.insert(pid).second) continue;
-        PageReadGuard g = PageReadGuard::Fetch(bpm_, pid);
-        if (!g.Valid()) continue;
-        const char* d = g.Data();
-        if (GetPageType(d) == PageType::kLeaf) {
-            if (!IsValidHeader(d, PageType::kLeaf)) continue;
-            std::vector<LeafEntry> e;
-            if (ReadLeafEntries(d, key_schema_, &e)) {
-                double u = (double)LeafUsedBytes(e) / (double)PAGE_SIZE;
-                min_u = std::min(min_u, u);
-                sum_u += u;
-                ++leaf_n;
-            }
-        } else if (GetPageType(d) == PageType::kInternal) {
-            if (!IsValidHeader(d, PageType::kInternal)) continue;
-            std::vector<InternalEntry> e;
-            if (ReadInternalEntries(d, key_schema_, &e)) {
-                double u = (double)(InternalUsedBytes(e) + kInternalHeaderBytes) / (double)PAGE_SIZE;
-                sum_internal += u;
-                ++internal_n;
-                queue.push_back(GetFirstChild(d));
-                for (const auto& en : e) queue.push_back(en.child);
+    // 先看右兄弟能否借出
+    auto can_borrow = [&](page_id_t sib_pid) -> bool {
+        if (sib_pid < 0) return false;
+        PageGuard sg = PageGuard::Fetch(bpm_, sib_pid);
+        if (!sg.Valid()) return false;
+        if (GetPageType(sg.Data()) != deficient_type) return false;
+        const int cnt = GetKeyCount(sg.Data());
+        return cnt > min_occ;
+    };
+
+    bool tried_left = false;
+    bool tried_right = false;
+    if (can_borrow(right_pid)) {
+        if (deficient_type == PageType::kLeaf) {
+            return RedistributeLeaf(deficient_pid, right_pid,
+                                    /*sibling_is_left=*/false,
+                                    parent_pid, separator_index);
+        } else {
+            return RedistributeInternal(deficient_pid, right_pid,
+                                        /*sibling_is_left=*/false,
+                                        parent_pid, separator_index);
+        }
+    }
+    tried_right = true;
+    (void)tried_right;
+    if (can_borrow(left_pid)) {
+        tried_left = true;
+        if (deficient_type == PageType::kLeaf) {
+            return RedistributeLeaf(deficient_pid, left_pid,
+                                    /*sibling_is_left=*/true,
+                                    parent_pid, separator_index);
+        } else {
+            return RedistributeInternal(deficient_pid, left_pid,
+                                        /*sibling_is_left=*/true,
+                                        parent_pid, separator_index);
+        }
+    }
+    (void)tried_left;
+
+    // 兄弟都没有富余：合并。优先 deficient + right；缺右就 left + deficient。
+    page_id_t merge_left, merge_right;
+    bool merging_into_left = true;  // true 表示最终结果写到 left_pid
+    if (right_pid >= 0) {
+        merge_left = deficient_pid;
+        merge_right = right_pid;
+        merging_into_left = true;
+    } else if (left_pid >= 0) {
+        merge_left = left_pid;
+        merge_right = deficient_pid;
+        merging_into_left = false;
+    } else {
+        // 不该发生：deficient 既没有左兄弟也没有右兄弟
+        return false;
+    }
+
+    // 先把两条 sibling 链上涉及的页抓牢，避免合并后还有页要写
+    const IndexKey* sep_key_ptr = nullptr;
+    const RID* sep_rid_ptr = nullptr;
+    const std::vector<char>* sep_kb_ptr = nullptr;
+    IndexKey sep_key;
+    RID sep_rid;
+    std::vector<char> sep_kb;
+    if (deficient_type == PageType::kInternal) {
+        // 计算 parent 中分隔 merge_left 与 merge_right 的条目，作为合并分隔键。
+        size_t sep_idx;
+        if (merging_into_left) {
+            sep_idx = separator_index;
+        } else {
+            sep_idx = separator_index - 1;
+        }
+        if (sep_idx >= p_entries.size()) return false;
+        sep_key = p_entries[sep_idx].key;
+        sep_rid = p_entries[sep_idx].rid;
+        sep_kb = p_entries[sep_idx].key_bytes;
+        sep_key_ptr = &sep_key;
+        sep_rid_ptr = &sep_rid;
+        sep_kb_ptr = &sep_kb;
+    }
+    if (!MergeNodes(merge_left, merge_right, deficient_type,
+                    sep_key_ptr, sep_rid_ptr, sep_kb_ptr)) {
+        return false;
+    }
+
+    // 对叶子还要修 next/prev 链：merge_left 已在 MergeNodes 内把 next 设为
+    // merge_right 的 next；还需要把 merge_right.next 的 prev 指回 merge_left。
+    if (deficient_type == PageType::kLeaf) {
+        page_id_t right_next = INVALID_PAGE_ID;
+        {
+            // 此刻 merge_right 仍在缓冲池（DeletePage 还没调），可以读
+            PageGuard rg = PageGuard::Fetch(bpm_, merge_right);
+            if (rg.Valid()) right_next = GetNextLeaf(rg.Data());
+        }
+        if (right_next >= 0) {
+            PageGuard ng = PageGuard::Fetch(bpm_, right_next);
+            if (ng.Valid()) {
+                char* nd = ng.Data();
+                if (active_txn_ != nullptr && active_txn_->IsActive()) {
+                    active_txn_->AppendUndo(right_next, nd, PAGE_SIZE,
+                                            "BPlusTree::MergeNodes(leaf-next.prev)");
+                }
+                std::vector<char> before;
+                if (log_manager_ != nullptr) before.assign(nd, nd + PAGE_SIZE);
+                SetPrevLeaf(nd, merge_left);
+                ng.MarkDirty();
+                if (log_manager_ != nullptr) {
+                    lsn_t lsn = EmitPageImageRecord(log_manager_, right_next,
+                                                   before.data(), nd, active_txn_);
+                    ng.SetPageLsn(lsn);
+                }
             }
         }
     }
-    if (leaf_n) {
-        if (min_ratio) *min_ratio = min_u;
-        if (avg_ratio) *avg_ratio = (leaf_n ? sum_u / (double)leaf_n : 0.0);
-        if (leaf_pages) *leaf_pages = leaf_n;
+
+    // 从 parent 中删除合并掉的那个分隔键
+    std::vector<char> parent_before;
+    if (log_manager_ != nullptr) {
+        parent_before.assign(pd, pd + PAGE_SIZE);
     }
-    if (internal_pages) *internal_pages = internal_n;
-    (void)sum_internal;
+    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+        active_txn_->AppendUndo(parent_pid, pd, PAGE_SIZE,
+                                "BPlusTree::MergeNodes(parent-erase-sep)");
+    }
+
+    size_t erase_idx = static_cast<size_t>(-1);
+    if (merging_into_left) {
+        // 把 right 并入 left：删除 separator_index（分隔 left 与 right 的键）
+        erase_idx = separator_index;
+    } else {
+        // 把 right=deficient 并入 left=sibling：删除 separator_index - 1
+        erase_idx = separator_index - 1;
+    }
+    if (erase_idx >= p_entries.size()) return false;
+    p_entries.erase(p_entries.begin() + static_cast<long>(erase_idx));
+    if (!WriteInternalEntries(pd, p_first_child, p_entries)) return false;
+    parent.MarkDirty();
+    if (log_manager_ != nullptr) {
+        lsn_t lsn = EmitPageImageRecord(log_manager_, parent_pid,
+                                       parent_before.data(), pd, active_txn_);
+        parent.SetPageLsn(lsn);
+    }
+    parent.Release();
+
+    // 释放被合并掉的页
+    bpm_->DeletePage(merge_right);
+
+    // 现在 parent 可能也 underflow 了；调用方（Delete 的循环）会继续向上处理
+    return true;
+}
+
+bool BPlusTree::MergeNodes(page_id_t left_pid, page_id_t right_pid,
+                          PageType /*type*/, const IndexKey* parent_sep_key,
+                          const RID* parent_sep_rid,
+                          const std::vector<char>* parent_sep_key_bytes) {
+    // Phase B：抓 before-image
+    // 合并的写入只动 left 这一页（结果在 left）。若 left 与 right 都是叶子，
+    // 我们需要分别抓两页的 before-image（因为 WAL 是整页更新）。
+    PageGuard left = PageGuard::Fetch(bpm_, left_pid);
+    if (!left.Valid()) return false;
+    PageGuard right = PageGuard::Fetch(bpm_, right_pid);
+    if (!right.Valid()) return false;
+    char* ld = left.Data();
+    char* rd = right.Data();
+
+    // Phase A：写之前抓 before-image
+    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+        active_txn_->AppendUndo(left_pid, ld, PAGE_SIZE, "BPlusTree::MergeNodes(left)");
+        active_txn_->AppendUndo(right_pid, rd, PAGE_SIZE, "BPlusTree::MergeNodes(right)");
+    }
+
+    std::vector<char> left_before;
+    std::vector<char> right_before;
+    if (log_manager_ != nullptr) {
+        left_before.assign(ld, ld + PAGE_SIZE);
+        right_before.assign(rd, rd + PAGE_SIZE);
+    }
+
+    bool ok = false;
+    if (GetPageType(ld) == PageType::kLeaf && GetPageType(rd) == PageType::kLeaf) {
+        std::vector<LeafEntry> le, re;
+        if (!ReadLeafEntries(ld, key_schema_, &le)) return false;
+        if (!ReadLeafEntries(rd, key_schema_, &re)) return false;
+        le.insert(le.end(), re.begin(), re.end());
+        if (le.size() > static_cast<size_t>(kMaxLeafSlots)) return false;
+        // 合并后 left 的 next = right.next，prev = left.prev（left 占据原位）
+        if (!WriteLeafEntries(ld, le, GetNextLeaf(rd), GetPrevLeaf(ld))) return false;
+        ok = true;
+    } else if (GetPageType(ld) == PageType::kInternal &&
+               GetPageType(rd) == PageType::kInternal) {
+        // 内部节点合并：parent_sep（parent 中分隔 left 与 right 的那条 entry）
+        // 必须出现在合并结果中，其 child = right.first_child，正好充当
+        // left 最后一项与 right 第一项之间的分隔键。
+        if (parent_sep_key == nullptr || parent_sep_rid == nullptr) return false;
+        std::vector<InternalEntry> le, re;
+        if (!ReadInternalEntries(ld, key_schema_, &le)) return false;
+        if (!ReadInternalEntries(rd, key_schema_, &re)) return false;
+        const page_id_t left_first = GetFirstChild(ld);
+        if (le.size() + 1 + re.size() > static_cast<size_t>(kMaxInternalSlots)) {
+            return false;
+        }
+        InternalEntry sep;
+        sep.key = *parent_sep_key;
+        sep.rid = *parent_sep_rid;
+        sep.child = GetFirstChild(rd);
+        if (parent_sep_key_bytes != nullptr && !parent_sep_key_bytes->empty()) {
+            sep.key_bytes = *parent_sep_key_bytes;
+        } else {
+            // parent_sep_key_bytes 缺失：调用方大概率忘了传；这里用父分隔键的
+            // 序列化补救，避免写入时缺 key_bytes 导致读取解析失败。
+            sep.key_bytes = SerializeKey(sep.key, key_schema_);
+        }
+        le.push_back(std::move(sep));
+        for (auto& r : re) {
+            le.push_back(std::move(r));
+        }
+        if (!WriteInternalEntries(ld, left_first, le)) return false;
+        ok = true;
+    } else {
+        return false;  // 类型不一致：损坏
+    }
+    if (!ok) return false;
+
+    left.MarkDirty();
+    if (log_manager_ != nullptr) {
+        lsn_t lsn_l = EmitPageImageRecord(log_manager_, left_pid,
+                                         left_before.data(), ld, active_txn_);
+        left.SetPageLsn(lsn_l);
+        // right 也写一条 UPDATE（之后 DeletePage，但 redo 时若走 right 也无害）
+        lsn_t lsn_r = EmitPageImageRecord(log_manager_, right_pid,
+                                         right_before.data(), rd, active_txn_);
+        right.SetPageLsn(lsn_r);
+    }
+    return true;
+}
+
+bool BPlusTree::RedistributeLeaf(page_id_t deficient_leaf, page_id_t sibling,
+                                bool sibling_is_left, page_id_t parent_pid,
+                                size_t separator_index) {
+    PageGuard dg = PageGuard::Fetch(bpm_, deficient_leaf);
+    if (!dg.Valid()) return false;
+    PageGuard sg = PageGuard::Fetch(bpm_, sibling);
+    if (!sg.Valid()) return false;
+    PageGuard pg = PageGuard::Fetch(bpm_, parent_pid);
+    if (!pg.Valid()) return false;
+    char* dd = dg.Data();
+    char* sd = sg.Data();
+    char* pd = pg.Data();
+
+    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+        active_txn_->AppendUndo(deficient_leaf, dd, PAGE_SIZE,
+                                "BPlusTree::RedistributeLeaf(deficient)");
+        active_txn_->AppendUndo(sibling, sd, PAGE_SIZE,
+                                "BPlusTree::RedistributeLeaf(sibling)");
+        active_txn_->AppendUndo(parent_pid, pd, PAGE_SIZE,
+                                "BPlusTree::RedistributeLeaf(parent)");
+    }
+    std::vector<char> dbefore, sbefore, pbefore;
+    if (log_manager_ != nullptr) {
+        dbefore.assign(dd, dd + PAGE_SIZE);
+        sbefore.assign(sd, sd + PAGE_SIZE);
+        pbefore.assign(pd, pd + PAGE_SIZE);
+    }
+
+    std::vector<LeafEntry> de, se;
+    if (!ReadLeafEntries(dd, key_schema_, &de)) return false;
+    if (!ReadLeafEntries(sd, key_schema_, &se)) return false;
+    if (se.empty()) return false;
+    std::vector<InternalEntry> pe;
+    if (!ReadInternalEntries(pd, key_schema_, &pe)) return false;
+    const page_id_t p_first = GetFirstChild(pd);
+
+    // 找 parent 中分隔 deficient 与 sibling 的 entry
+    size_t sep_in_parent;
+    if (sibling_is_left) {
+        if (separator_index == 0) return false;
+        sep_in_parent = separator_index - 1;
+    } else {
+        sep_in_parent = separator_index;
+    }
+    if (sep_in_parent >= pe.size()) return false;
+
+    if (sibling_is_left) {
+        // 把 sibling 最后一条搬到 deficient 的最前
+        LeafEntry moved = std::move(se.back());
+        se.pop_back();
+        de.insert(de.begin(), std::move(moved));
+        // parent sep 现在指向 deficient；deficient 头部新增了 moved（即 se 的旧
+        // 最后一条，键小于原 parent sep？不一定）。
+        // ——正确规则：parent sep 应是 sibling.first[0]，因为 sibling 仍然在
+        // 左侧，sibling 的第一条 < parent sep <= deficient 的第一条。
+        // sibling 仍然拥有 first_child 之外的孩子吗？sibling 失去的是 se.back()
+        // 这条 entry 与其 child；新 sibling 是 [first_child, ..., 旧 entries[0..N-2]]
+        // 即 children = first_child, entries[0..N-2].child. 损失了最后一个 child。
+        // sibling 的新第一条 entry 不变（即 entries[0]），但 parent sep 应改为
+        // sibling 新第一条 entry 的 (key, rid)。sibling 新第一条 entry 实际上是
+        // 原 entries[0]（即 se.front() 现在的内容）。
+        if (se.empty()) return false;
+        pe[sep_in_parent].key = se.front().key;
+        pe[sep_in_parent].rid = se.front().rid;
+        pe[sep_in_parent].key_bytes = se.front().key_bytes;
+    } else {
+        // 把 sibling 第一条搬到 deficient 的最后
+        LeafEntry moved = std::move(se.front());
+        se.erase(se.begin());
+        de.push_back(std::move(moved));
+        // parent sep 现在指向 sibling 的第一条 = 原 sibling 第二条；
+        // ——但 sibling 是右兄弟，parent sep 指向 deficient 还是 sibling？
+        // 答：separator 是分隔 deficient（左）与 sibling（右）的键，应该让
+        //     deficient 的第一条成为新 sep——deficient 获得 moved（来自
+        //     sibling），但 moved 比 sibling 的旧第一条小，所以 deficient 的
+        //     新第一条就是 moved。
+        if (de.empty()) return false;
+        pe[sep_in_parent].key = de.front().key;
+        pe[sep_in_parent].rid = de.front().rid;
+        pe[sep_in_parent].key_bytes = de.front().key_bytes;
+    }
+
+    // 保留 deficient 与 sibling 当前的 next/prev 链不变。
+    if (!WriteLeafEntries(dd, de, GetNextLeaf(dd), GetPrevLeaf(dd))) return false;
+    if (!WriteLeafEntries(sd, se, GetNextLeaf(sd), GetPrevLeaf(sd))) return false;
+    if (!WriteInternalEntries(pd, p_first, pe)) return false;
+    dg.MarkDirty();
+    sg.MarkDirty();
+    pg.MarkDirty();
+
+    if (log_manager_ != nullptr) {
+        lsn_t dl = EmitPageImageRecord(log_manager_, deficient_leaf,
+                                      dbefore.data(), dd, active_txn_);
+        dg.SetPageLsn(dl);
+        lsn_t sl = EmitPageImageRecord(log_manager_, sibling,
+                                      sbefore.data(), sd, active_txn_);
+        sg.SetPageLsn(sl);
+        lsn_t pl = EmitPageImageRecord(log_manager_, parent_pid,
+                                      pbefore.data(), pd, active_txn_);
+        pg.SetPageLsn(pl);
+    }
+    return true;
+}
+
+bool BPlusTree::RedistributeInternal(page_id_t deficient_internal, page_id_t sibling,
+                                    bool sibling_is_left, page_id_t parent_pid,
+                                    size_t separator_index) {
+    PageGuard dg = PageGuard::Fetch(bpm_, deficient_internal);
+    if (!dg.Valid()) return false;
+    PageGuard sg = PageGuard::Fetch(bpm_, sibling);
+    if (!sg.Valid()) return false;
+    PageGuard pg = PageGuard::Fetch(bpm_, parent_pid);
+    if (!pg.Valid()) return false;
+    char* dd = dg.Data();
+    char* sd = sg.Data();
+    char* pd = pg.Data();
+
+    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+        active_txn_->AppendUndo(deficient_internal, dd, PAGE_SIZE,
+                                "BPlusTree::RedistributeInternal(deficient)");
+        active_txn_->AppendUndo(sibling, sd, PAGE_SIZE,
+                                "BPlusTree::RedistributeInternal(sibling)");
+        active_txn_->AppendUndo(parent_pid, pd, PAGE_SIZE,
+                                "BPlusTree::RedistributeInternal(parent)");
+    }
+    std::vector<char> dbefore, sbefore, pbefore;
+    if (log_manager_ != nullptr) {
+        dbefore.assign(dd, dd + PAGE_SIZE);
+        sbefore.assign(sd, sd + PAGE_SIZE);
+        pbefore.assign(pd, pd + PAGE_SIZE);
+    }
+
+    std::vector<InternalEntry> de, se;
+    if (!ReadInternalEntries(dd, key_schema_, &de)) return false;
+    if (!ReadInternalEntries(sd, key_schema_, &se)) return false;
+    if (se.empty()) return false;
+    std::vector<InternalEntry> pe;
+    if (!ReadInternalEntries(pd, key_schema_, &pe)) return false;
+    const page_id_t d_first_old = GetFirstChild(dd);
+    const page_id_t s_first = GetFirstChild(sd);
+    const page_id_t p_first = GetFirstChild(pd);
+
+    // 找到 parent 中分隔 deficient 与 sibling 的那条 entry。
+    //   separator_index = 0 表示 deficient = p_first_child；
+    //   separator_index > 0 表示 deficient = pe[separator_index - 1].child。
+    //   分隔 deficient 与 sibling 的条目：
+    //     sibling 是右 → pe[separator_index]
+    //     sibling 是左 → pe[separator_index - 1]
+    size_t sep_in_parent;
+    if (sibling_is_left) {
+        if (separator_index == 0) return false;  // 左兄弟不存在
+        sep_in_parent = separator_index - 1;
+    } else {
+        sep_in_parent = separator_index;
+    }
+    if (sep_in_parent >= pe.size()) return false;
+
+    // ----- 重组 -----
+    //
+    // sibling 是左：
+    //   取 sibling.entries.last（包含一个 child = promoted_child）。
+    //   sibling 失去该 entry 与 promoted_child 这个子节点。
+    //   deficient 接纳 promoted_child 作为新的 first_child，并新增 entries[0]
+    //     其 (key, rid) 沿用旧 parent separator，child = d_first_old
+    //     （即旧 deficient.first_child，现在是新的 deficient.entries[0].child）。
+    //   parent.sep_in_parent 升级为 sibling.last 的 (key, rid)，child = promoted_child。
+    //
+    // sibling 是右：
+    //   取 sibling.entries.first（其 child = promoted_child，但 child 仍归
+    //     sibling 所有——sibling 只失 entries.first 与 promoted_child 这个子节点？
+    //     不对：sibling.entries.first 是分隔 sibling.first_child 与 promoted_child
+    //     的键。拿走该 entry 后 sibling 仍拥有 first_child 与 promoted_child
+    //     以及它们之间的「空白」（没有 entry）。再 promote promoted_child
+    //     移到 deficient 末尾。
+    //   deficient.entries 末尾追加新条目：
+    //     (key, rid) = 旧 parent sep，child = d_first_old
+    //     （即原 deficient.first_child，现在变成新条目.deficient 末尾的 child）。
+    //   deficient.first_child 保持不变。
+    //   parent.sep_in_parent 升级为 sibling.first 的 (key, rid)，child = d_first_old
+    //     （deficient 的 first_child，作为新 parent sep 右侧的孩子）。
+    //
+    // ——写时按「先记旧值再覆盖」的顺序避免丢数据。
+    if (sibling_is_left) {
+        const InternalEntry old_parent_sep = pe[sep_in_parent];
+        InternalEntry moved = std::move(se.back());
+        se.pop_back();
+        const page_id_t promoted_child = moved.child;
+
+        // 新 parent sep
+        pe[sep_in_parent].key = moved.key;
+        pe[sep_in_parent].rid = moved.rid;
+        pe[sep_in_parent].key_bytes = std::move(moved.key_bytes);
+        pe[sep_in_parent].child = promoted_child;
+
+        // 新 deficient.head = (parent_sep.key/rid, child = d_first_old)
+        InternalEntry de_head;
+        de_head.key = old_parent_sep.key;
+        de_head.rid = old_parent_sep.rid;
+        de_head.key_bytes = old_parent_sep.key_bytes;
+        de_head.child = d_first_old;
+        de.insert(de.begin(), std::move(de_head));
+
+        // 写回：deficient 用 promoted_child 作为新 first_child
+        if (!WriteInternalEntries(dd, promoted_child, de)) return false;
+        if (!WriteInternalEntries(sd, s_first, se)) return false;
+        if (!WriteInternalEntries(pd, p_first, pe)) return false;
+    } else {
+        const InternalEntry old_parent_sep = pe[sep_in_parent];
+        InternalEntry moved = std::move(se.front());
+        se.erase(se.begin());
+        // moved.child 是 sibling 失去的子节点，但 promoted_child 仍归 sibling 所有
+        // （sibling 仍持有 first_child 与 promoted_child，只是它们之间没有 entry）。
+        const page_id_t promoted_child = moved.child;
+
+        // 新 parent sep: child = d_first_old（deficient 的 first_child，是新 sep 右侧孩子）
+        pe[sep_in_parent].key = moved.key;
+        pe[sep_in_parent].rid = moved.rid;
+        pe[sep_in_parent].key_bytes = std::move(moved.key_bytes);
+        pe[sep_in_parent].child = d_first_old;
+
+        // 新 deficient.tail = (parent_sep.key/rid, child = d_first_old)
+        // ——等等，这里 child = d_first_old 就和 parent sep.child 重复。
+        // 正确语义：新 deficient.tail 的 child = promoted_child
+        // （即从 sibling 搬过来的那个 child，它在 deficient 末尾）。deficient
+        // 的 first_child 保持 d_first_old 不变。
+        InternalEntry de_tail;
+        de_tail.key = old_parent_sep.key;
+        de_tail.rid = old_parent_sep.rid;
+        de_tail.key_bytes = old_parent_sep.key_bytes;
+        de_tail.child = promoted_child;
+        de.push_back(std::move(de_tail));
+
+        // 写回：deficient 用 d_first_old（不变）作为 first_child
+        if (!WriteInternalEntries(dd, d_first_old, de)) return false;
+        if (!WriteInternalEntries(sd, s_first, se)) return false;
+        if (!WriteInternalEntries(pd, p_first, pe)) return false;
+    }
+
+    dg.MarkDirty();
+    sg.MarkDirty();
+    pg.MarkDirty();
+
+    if (log_manager_ != nullptr) {
+        lsn_t dl = EmitPageImageRecord(log_manager_, deficient_internal,
+                                      dbefore.data(), dd, active_txn_);
+        dg.SetPageLsn(dl);
+        lsn_t sl = EmitPageImageRecord(log_manager_, sibling,
+                                      sbefore.data(), sd, active_txn_);
+        sg.SetPageLsn(sl);
+        lsn_t pl = EmitPageImageRecord(log_manager_, parent_pid,
+                                      pbefore.data(), pd, active_txn_);
+        pg.SetPageLsn(pl);
+    }
+    return true;
+}
+
+bool BPlusTree::CollapseRoot() {
+    PageGuard root = PageGuard::Fetch(bpm_, root_page_id_);
+    if (!root.Valid()) return false;
+    char* rd = root.Data();
+    if (GetPageType(rd) != PageType::kInternal) return false;
+    std::vector<InternalEntry> entries;
+    if (!ReadInternalEntries(rd, key_schema_, &entries)) return false;
+    const page_id_t first_child = GetFirstChild(rd);
+
+    // root 是空内部节点（树被删空）→ 让 root 退化成空叶子，下一次插入能自愈
+    if (entries.empty() || first_child < 0) {
+        std::vector<char> rbefore;
+        if (log_manager_ != nullptr) rbefore.assign(rd, rd + PAGE_SIZE);
+        if (active_txn_ != nullptr && active_txn_->IsActive()) {
+            active_txn_->AppendUndo(root_page_id_, rd, PAGE_SIZE,
+                                    "BPlusTree::CollapseRoot(empty)");
+        }
+        InitLeaf(rd);
+        root.MarkDirty();
+        if (log_manager_ != nullptr) {
+            lsn_t lsn = EmitPageImageRecord(log_manager_, root_page_id_,
+                                           rbefore.data(), rd, active_txn_);
+            root.SetPageLsn(lsn);
+        }
+        return true;
+    }
+
+    // 只有一个孩子：把孩子搬进 root
+    if (entries.size() == 1 && entries[0].child == first_child) {
+        // 上面这个条件其实意味着 root 有「first_child == entries[0].child」
+        // 即 first_child 之外还有一个相同的 child 指针。这不应发生。
+        return false;
+    }
+    if (entries.size() != 1) return false;  // 还需两层以上，不塌缩
+
+    // 抓唯一孩子
+    PageGuard child = PageGuard::Fetch(bpm_, first_child);
+    if (!child.Valid()) return false;
+    char* cd = child.Data();
+    if (GetPageType(cd) != PageType::kInternal) return false;  // 根是叶子就不塌缩
+
+    // 把 child 的内容复制到 root
+    std::vector<char> rbefore, cbefore;
+    if (log_manager_ != nullptr) {
+        rbefore.assign(rd, rd + PAGE_SIZE);
+        cbefore.assign(cd, cd + PAGE_SIZE);
+    }
+    if (active_txn_ != nullptr && active_txn_->IsActive()) {
+        active_txn_->AppendUndo(root_page_id_, rd, PAGE_SIZE,
+                                "BPlusTree::CollapseRoot(root)");
+        active_txn_->AppendUndo(first_child, cd, PAGE_SIZE,
+                                "BPlusTree::CollapseRoot(child)");
+    }
+    std::memcpy(rd, cd, PAGE_SIZE);
+    root.MarkDirty();
+    if (log_manager_ != nullptr) {
+        lsn_t lsn_r = EmitPageImageRecord(log_manager_, root_page_id_,
+                                         rbefore.data(), rd, active_txn_);
+        root.SetPageLsn(lsn_r);
+        lsn_t lsn_c = EmitPageImageRecord(log_manager_, first_child,
+                                         cbefore.data(), cd, active_txn_);
+        child.SetPageLsn(lsn_c);
+    }
+    root.Release();
+    child.Release();
+
+    // 释放被搬走的子页
+    bpm_->DeletePage(first_child);
+    return true;
 }
 
 // ============================================================================
 // 游标
 // ============================================================================
 
-BPlusTree::Cursor::Cursor(const BPlusTree* tree, page_id_t leaf_pid,
-                          const IndexKey* lower_key)
-    : tree_(tree), leaf_pid_(leaf_pid) {
-    anchor_begin_ = (lower_key == nullptr);
-    if (lower_key != nullptr) anchor_key_ = *lower_key;
-    if (leaf_pid_ < 0 || !LoadLeaf(leaf_pid_)) {
-        entries_.clear();
-        next_leaf_ = INVALID_PAGE_ID;
-        leaf_version_ = 0;
-        return;
-    }
-    has_last_ = false;
-    index_ = 0;
-    // lower_key == nullptr 表示从页首开始（Begin）；否则定位到第一个 >= key 的条目
-    if (lower_key != nullptr) {
-        while (index_ < entries_.size() &&
-               CompareKeyOnly(entries_[index_].first, *lower_key) < 0) {
-            ++index_;
+BPlusTree::Cursor::Cursor(const BPlusTree* tree, page_id_t leaf_pid, size_t index)
+    : tree_(tree), leaf_pid_(leaf_pid), index_(index) {
+    if (leaf_pid_ >= 0) {
+        size_t want = index;
+        if (!LoadLeaf(leaf_pid_)) {
+            entries_.clear();
         }
+        index_ = want;
     }
 }
 
@@ -1681,14 +1565,11 @@ bool BPlusTree::Cursor::LoadLeaf(page_id_t pid) {
     index_ = 0;
     next_leaf_ = INVALID_PAGE_ID;
     leaf_pid_ = pid;
-    leaf_version_ = 0;
     if (tree_ == nullptr || pid < 0) return false;
-    // 读闩下装载：内容与版本号、next 指针同一次读取，天然一致
-    PageReadGuard g = PageReadGuard::Fetch(tree_->bpm_, pid);
+    PageGuard g = PageGuard::Fetch(tree_->bpm_, pid);
     if (!g.Valid()) return false;
     std::vector<LeafEntry> raw;
     if (!ReadLeafEntries(g.Data(), tree_->key_schema_, &raw)) return false;
-    leaf_version_ = ReadVersion(g.Data());
     next_leaf_ = GetNextLeaf(g.Data());
     entries_.reserve(raw.size());
     for (auto& e : raw) {
@@ -1697,117 +1578,40 @@ bool BPlusTree::Cursor::LoadLeaf(page_id_t pid) {
     return true;
 }
 
-bool BPlusTree::Cursor::CurrentLeafUnchanged() const {
-    if (tree_ == nullptr || leaf_pid_ < 0) return false;
-    PageReadGuard g = PageReadGuard::Fetch(tree_->bpm_, leaf_pid_);
-    if (!g.Valid()) return false;
-    return ReadVersion(g.Data()) == leaf_version_;
-}
-
-// U1b：物理删页并发安全的游标恢复。
-//
-// 局部合并/再分配只改写仍被链表引用的活叶，游标停在其任一侧都能靠「重读同一页
-// + 版本校验」恢复；但「物理合并 + 回收被废叶」会让被废页彻底从树里消失乃至被
-// BPM 复用。此时重读同一页读到的可能是复用后的他页内容，重定位会错序/重复。
-// 因此一旦当前叶版本校验失败或 target 叶装载失败，一律改为「重新下降定位到最近
-// 发出条目的后继」——与 FindFirst/Begin 同源的乐观下降 + 版本复核语义，保证不
-// 重复、不漏发（已被废页上的旧物化条目本就是扫描已/应覆盖的键，重新定位后
-// 严格越过）。
-bool BPlusTree::Cursor::RelocateRestart() {
-    const int kMaxAttempts = 256;
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        DescPath path;   // U1d：下降快照含结构计数，校验可 O(1) 短路
-        page_id_t pid = INVALID_PAGE_ID;
-        if (has_last_) {
-            pid = tree_->OptimisticFindLeafPage(last_key_, last_rid_, &path);
-        } else if (anchor_begin_) {
-            pid = tree_->OptimisticLeftmostLeafPage(&path);
-        } else {
-            pid = tree_->OptimisticFindLeafPage(anchor_key_, RID(), &path);
-        }
-        if (pid < 0) return false;
-        if (!tree_->ValidatePath(path)) continue;
-        if (!LoadLeaf(pid)) return false;
-        index_ = entries_.size();
-        if (has_last_) {
-            for (size_t i = 0; i < entries_.size(); ++i) {
-                if (CompareKeyThenRid(entries_[i].first, entries_[i].second,
-                                      last_key_, last_rid_) > 0) {
-                    index_ = i;
-                    break;
-                }
-            }
-        } else if (!anchor_begin_) {
-            for (size_t i = 0; i < entries_.size(); ++i) {
-                if (CompareKeyOnly(entries_[i].first, anchor_key_) >= 0) {
-                    index_ = i;
-                    break;
-                }
-            }
-        }
-        return true;
-    }
-    return false;
-}
-
 bool BPlusTree::Cursor::Next(IndexKey* key, RID* rid) {
     while (true) {
         if (index_ < entries_.size()) {
             if (key != nullptr) *key = entries_[index_].first;
             if (rid != nullptr) *rid = entries_[index_].second;
             ++index_;
-            // 记住最近发出的条目：叶子被并发改写后据此重新定位
-            has_last_ = true;
-            last_key_ = entries_[index_ - 1].first;
-            last_rid_ = entries_[index_ - 1].second;
             return true;
         }
-        // 当前叶条目发完：跨叶前进前先校验版本。并发分裂/合并会改写叶子的 next
-        // 指针，必须先据此刷新扫描位置；活叶用重读恢复，被并合释放的页用重下降。
-        if (!CurrentLeafUnchanged()) {
-            if (!RelocateRestart()) return false;
-            if (index_ < entries_.size()) continue;
-        }
         if (next_leaf_ < 0) return false;
-        if (!LoadLeaf(next_leaf_)) {
-            // target 叶已被回收/复用 → 无法原位续扫，重下降恢复
-            if (!RelocateRestart()) return false;
-            continue;
-        }
+        if (!LoadLeaf(next_leaf_)) return false;
     }
 }
 
 std::unique_ptr<BPlusTree::Cursor> BPlusTree::LowerBound(const IndexKey& key) const {
-    // 乐观定位：乐观下降 + 路径版本校验，构造游标时读闩装载叶子并复核版本。
-    const int kMaxAttempts = 256;
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        DescPath path;   // U1d：下降快照含结构计数，校验可 O(1) 短路
-        const RID min_rid;
-        page_id_t leaf_pid = OptimisticFindLeafPage(key, min_rid, &path);
-        if (leaf_pid < 0) return nullptr;
-        if (!ValidatePath(path)) continue;
+    const RID min_rid;
+    page_id_t leaf_pid = FindLeafPage(key, min_rid);
+    if (leaf_pid < 0) return nullptr;
 
-        auto c = std::make_unique<Cursor>(this, leaf_pid, &key);
-        // 游标装载的叶版本必须与下降路径末端一致，否则下降结果已过期 → 重启
-        if (c->GetLeafVersion() != path.leaf_version()) continue;
-        return c;
+    PageGuard g = PageGuard::Fetch(bpm_, leaf_pid);
+    if (!g.Valid()) return nullptr;
+    std::vector<LeafEntry> entries;
+    if (!ReadLeafEntries(g.Data(), key_schema_, &entries)) return nullptr;
+    size_t idx = 0;
+    while (idx < entries.size() && CompareKeyOnly(entries[idx].key, key) < 0) {
+        ++idx;
     }
-    return nullptr;
+    // 若本页所有键都小于目标，游标停在页尾，Next() 会自动跨到下一页
+    return std::make_unique<Cursor>(this, leaf_pid, idx);
 }
 
 std::unique_ptr<BPlusTree::Cursor> BPlusTree::Begin() const {
-    const int kMaxAttempts = 256;
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        DescPath path;   // U1d：下降快照含结构计数，校验可 O(1) 短路
-        page_id_t pid = OptimisticLeftmostLeafPage(&path);
-        if (pid < 0) return nullptr;
-        if (!ValidatePath(path)) continue;
-
-        auto c = std::make_unique<Cursor>(this, pid, nullptr);
-        if (c->GetLeafVersion() != path.leaf_version()) continue;
-        return c;
-    }
-    return nullptr;
+    page_id_t pid = LeftmostLeafPage();
+    if (pid < 0) return nullptr;
+    return std::make_unique<Cursor>(this, pid, 0);
 }
 
 }  // namespace sqlcompiler

@@ -1,0 +1,46 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> region | total
+-------+------
+West   | 350  
+South  | 380  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> region | cnt
+-------+----
+East   | 1  
+West   | 2  
+South  | 1  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> east_total | west_total
+-----------+-----------
+170        | 350       
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        -> product | total | units
+--------+-------+------
+Apple   | 600   | 12   
+Cherry  | 150   | 1    
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> region | east_with_tax
+-------+--------------
+East   | 187          
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> region | amount
+-------+-------
+West   | 200   
+West   | 150   
+South  | 300   
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        -> emp_id | name | mgr_id | depth
+-------+------+--------+------
+1      | CEO  | NULL   | 0    
+2      | VP1  | 1      | 1    
+3      | VP2  | 1      | 1    
+4      | Dir1 | 2      | 2    
+5      | Dir2 | 2      | 2    
+6      | Mgr1 | 4      | 3    
+(6 rows)
+sqlcompiler> sqlcompiler> 

@@ -18,9 +18,18 @@ using PlanNodePtr = std::shared_ptr<PlanNode>;
 class SelectStatement;
 using SelectStatementPtr = std::shared_ptr<SelectStatement>;
 
+// 前置声明 SetOperationStatement，以便 SelectStatement 的 derived_set_op 字段
+// 引用其 shared_ptr。完整定义见本文件后部。
+class SetOperationStatement;
+using SetOperationStatementPtr = std::shared_ptr<SetOperationStatement>;
+
 // 窗口规格结构在文件后部定义，但 SelectStatement 内部需要它，
 // 故前置声明。完整定义见下方 "新增表达式节点" 区域。
 struct WindowSpec;
+// 60_funcs: OrderByItem 用于 FunctionCallExpr::within_group_order_by 字段，
+// 也在 SelectStatement / WindowSpec 等处使用。前置声明以便在 FunctionCallExpr
+// 引用该类型。
+struct OrderByItem;
 
 // AST节点类型标识
 enum class NodeType {
@@ -49,8 +58,23 @@ enum class NodeType {
     DROP_VIEW_STMT,
     CREATE_TRIGGER_STMT,
     DROP_TRIGGER_STMT,
+    CREATE_MATERIALIZED_VIEW_STMT,  // 60_view_trigger (Category 9)
+    ALTER_MATERIALIZED_VIEW_STMT,  // 60_view_trigger (Category 9)
     CREATE_FUNCTION_STMT,
     DROP_FUNCTION_STMT,
+    // ---- 59_procs (Category 8)：PROCEDURE / CALL ----
+    CREATE_PROCEDURE_STMT,
+    DROP_PROCEDURE_STMT,
+    CALL_STMT,
+
+    // ---- 53_ddl: DDL 扩展（FK / SCHEMA / SEQUENCE） ----
+    CREATE_SCHEMA_STMT,      // CREATE SCHEMA name
+    DROP_SCHEMA_STMT,        // DROP SCHEMA [IF EXISTS] name
+    CREATE_SEQUENCE_STMT,    // CREATE SEQUENCE name [START n] [INCREMENT n]
+    DROP_SEQUENCE_STMT,      // DROP SEQUENCE [IF EXISTS] name
+
+    // ---- 54_dml: DML 扩展 ----
+    MERGE_STMT,              // MERGE INTO target USING source ON cond ...
 
     // ---- 46_meta: 元命令（EXPLAIN / SHOW）----
     EXPLAIN_STMT,
@@ -71,6 +95,8 @@ enum class NodeType {
     SET_OP_STMT,
     EXTRACT_EXPR,            // 45_datetime: EXTRACT(field FROM source)
     INTERVAL_EXPR,           // 45_datetime: INTERVAL <n> <unit>
+    NEXTVAL_EXPR,            // 53_ddl: NEXTVAL FOR sequence_name
+    DEFAULT_EXPR,            // INSERT ... VALUES (..., DEFAULT) 与 INSERT ... DEFAULT VALUES
 
     // ---- 47_udf_trigger_view: UDF 体内部使用的语句节点 ----
     DECLARE_VAR_STMT,        // DECLARE name TYPE
@@ -78,6 +104,18 @@ enum class NodeType {
     IF_STMT,                 // IF cond THEN ... [ELSEIF ...] [ELSE ...] END IF
     WHILE_STMT,              // WHILE cond DO ... END WHILE
     RETURN_STMT,             // RETURN [expr];
+    // ---- 59_procs (Category 8)：过程语言扩展语句 ----
+    LOOP_STMT,               // LOOP body END LOOP [label];
+    REPEAT_STMT,             // REPEAT body UNTIL cond END REPEAT [label];
+    CASE_STMT,               // 体内 CASE WHEN ... THEN ... ELSE ... END CASE
+    LEAVE_STMT,              // LEAVE label;
+    ITERATE_STMT,            // ITERATE label;
+    SIGNAL_STMT,             // SIGNAL SQLSTATE '...' SET MESSAGE_TEXT = '...';
+    DECLARE_HANDLER_STMT,    // DECLARE [type] HANDLER FOR cond stmt;
+    DECLARE_CURSOR_STMT,     // DECLARE name CURSOR FOR select;
+    CURSOR_OPEN_STMT,        // OPEN name;
+    CURSOR_FETCH_STMT,       // FETCH name INTO var [, var ...];
+    CURSOR_CLOSE_STMT,       // CLOSE name;
 };
 
 // ============ 基类 ============
@@ -88,6 +126,14 @@ public:
     virtual ~Node() = default;
     virtual NodeType GetType() const = 0;
     virtual std::string ToString() const = 0;
+
+    // 源码位置（Spec 1.3 要求语义错误携带 stage + line + column）。
+    // 由 Parser 在节点构造时通过 Token::line / Token::column 填入；
+    // -1 表示「来源未携带位置信息」（例如由执行期内部构造的临时节点）。
+    // 所有继承自 Node / Statement / Expr 的具体节点都通过基类共享这两个字段，
+    // 避免在数十种节点类上重复定义。
+    int line = -1;
+    int column = -1;
 };
 using NodePtr = std::shared_ptr<Node>;
 
@@ -108,7 +154,9 @@ public:
 
 enum class LiteralType { INTEGER, FLOAT, STRING, NULL_VALUE, BOOLEAN,
                           DATE,       // 45_datetime: 'YYYY-MM-DD'
-                          TIMESTAMP };// 45_datetime: 'YYYY-MM-DD HH:MM:SS'
+                          TIMESTAMP,  // 45_datetime: 'YYYY-MM-DD HH:MM:SS'
+                          TIME,       // 52_data_types: 'HH:MM:SS'
+                          JSON };     // 52_data_types: '{"k":1}'
 
 // 字面量表达式，如 123 / 3.14 / 'abc' / NULL
 class LiteralExpr : public Expr {
@@ -139,6 +187,7 @@ enum class BinaryOperator {
     SUB,
     MUL,
     DIV,
+    MOD,
     CONCAT,
     EQUAL,
     NOT_EQUAL,
@@ -153,6 +202,19 @@ enum class BinaryOperator {
     BETWEEN,
     IS_NULL,
     IS_NOT_NULL,
+    // bug3_is_true: SQL 三值 IS [NOT] TRUE / IS [NOT] FALSE。
+    // 与 IS [NOT] NULL 一样是"后缀"单目语义（right 子树不需要），
+    // 这里沿用 BinaryExpr 形态承载语义以便统一规划/求值。
+    //   IS TRUE       = operand 确定是 TRUE  -> MakeBool(IsTrue(l))
+    //   IS FALSE      = operand 确定是 FALSE -> MakeBool(IsFalse(l))
+    //   IS NOT TRUE   = operand 不是 TRUE    -> MakeBool(!IsTrue(l))
+    //   IS NOT FALSE  = operand 不是 FALSE   -> MakeBool(!IsFalse(l))
+    // NULL 在 SQL 三值逻辑下既不是 TRUE 也不是 FALSE（IsTrue(NULL)/IsFalse(NULL) 都为
+    // false），所以 `x IS TRUE` 对 NULL 操作数返回 false，与 SQL:1999 一致。
+    IS_TRUE,
+    IS_FALSE,
+    IS_NOT_TRUE,
+    IS_NOT_FALSE,
     // 45_datetime: <date_or_ts> ± INTERVAL <n> <unit>
     INTERVAL_ADD,
     INTERVAL_SUB
@@ -197,6 +259,22 @@ public:
     std::vector<ExprPtr> arguments;
     // 仅聚合函数有效：如 COUNT(DISTINCT col) / SUM(DISTINCT col)
     bool is_distinct = false;
+    // Bug 13: SELECT list 中 `t.*` 与裸 `*` 区分。前者要求展开为该限定表
+    // (table_name/table_alias) 的列；后者展开为 from_table + joins 的全部列。
+    // 解析期在 ParseColumnRefOrFunctionCall 看到 `IDENT '.' '*'` 时把限定表名
+    // (实际表名或别名) 写入此字段；裸 `*` / COUNT(*) 等场景保持为空。
+    // Planner::ExpandSelectStarInList 读取该字段决定列展开范围。
+    std::string table_qualifier;
+    // ---- 60_funcs: 聚合修饰子句 ----
+    // FILTER (WHERE cond)：仅当 cond 评估为 TRUE 时该聚合才把此行纳入计算。
+    // 仅聚合函数（COUNT/SUM/AVG/MIN/MAX/STDDEV/...）有效；filter_expr 为 nullptr
+    // 表示没有 FILTER 子句。FILTER 与 WITHIN GROUP 可同时出现。
+    ExprPtr filter_expr;
+    // WITHIN GROUP (ORDER BY expr)：有序集合（ordered-set）聚合使用的排序键。
+    // 仅 PERCENTILE_CONT / PERCENTILE_DISC 实际使用；
+    // STRING_AGG 也允许使用其作为拼接顺序键。
+    // 为空时表示没有 WITHIN GROUP 子句。
+    std::vector<OrderByItem> within_group_order_by;
 };
 
 // ============ 辅助结构 ============
@@ -209,11 +287,31 @@ struct ColumnDefinition {
     int32_t char_length = -1;
     bool is_primary_key = false;
     bool is_not_null = false;
+    // 52_data_types: 列级 UNIQUE 约束。区别于 CREATE UNIQUE INDEX 的索引形式：
+    // UNIQUE 约束在写入路径上做唯一性校验，索引仅加速查询。本实现把列级 /
+    // 表级 UNIQUE 都转译为隐式唯一索引（与 CREATE UNIQUE INDEX 等价）。
+    bool is_unique = false;
+    // 52_data_types: AUTO_INCREMENT / SERIAL / IDENTITY 列。
+    // 行为：当用户 INSERT 时显式 NULL（或 0）时，执行层自动填入下一个递增
+    // 值；非 NULL 时按用户值落库。非首列位置亦可作为 AUTO_INCREMENT 列。
+    bool is_auto_increment = false;
     // 列级 CHECK (expr) 约束：当前仅做语法接受度，语义层暂不强制校验。
     ExprPtr check_expr;
     // 列级 DEFAULT expr：当前仅做语法接受度，INSERT 时若显式未提供该列值
     // 由执行层决定是否替换为默认值；本任务下保留为占位即可。
     ExprPtr default_expr;
+    // 53_ddl：列级 FOREIGN KEY REFERENCES parent(col) 引用。
+    // 解析阶段记录；执行期把列级 / 表级 FK 合并，统一注册到 catalog 中。
+    struct InlineForeignKey {
+        std::string parent_table;
+        std::string parent_col;
+    };
+    std::vector<InlineForeignKey> inline_foreign_keys;
+    // 58_constraints: 列级 / 表级 CHECK 子句的可选命名。
+    // 例如 `CONSTRAINT my_check CHECK (col > 0)`。
+    // 仅在用户显式声明 CONSTRAINT name 时填写；空字符串表示匿名约束，
+    // 错误消息回退到 "<table>.<column_or_index>" 形式。
+    std::string constraint_name;
 };
 
 // JOIN 类型
@@ -235,12 +333,29 @@ struct JoinClause {
     // NATURAL JOIN —— 等价于 USING(所有左右同名列)；标记后由 Planner 按表
     // 元数据自动推导 USING 列。
     bool is_natural = false;
+    // 55_query: LATERAL 标记。当 is_lateral 为 true 时，表示这是一个 LATERAL
+    // 派生表 / 子查询形式的 join 节点，其 table_name 应理解为一个「派生表别名」，
+    // 且内层 SELECT 可以引用外层 FROM 项的列。Planner 走 ApplyNode 路径
+    // （对每条外层行重跑内层计划）。JoinClause 的 table_name 字段对 LATERAL
+    // 路径复用：table_name = derived_alias。
+    bool is_lateral = false;
+    // LATERAL 子查询：当 is_lateral 为 true 时该 SelectStatementPtr 持有
+    // 内层 SELECT（或 VALUES）。Planner 在该字段非空时把它编译为子计划挂到
+    // ApplyNode.children[1] 上。
+    SelectStatementPtr lateral_subquery;
 };
 
 // ORDER BY 单项
+//
+// column_index —— SQL 标准「位置式 ORDER BY」支持的 1-based 输出列序号。
+// Planner 在把 ORDER BY N (N 为正整数字面量) 翻译为对 SELECT 列表第 N 列的
+// 排序时，会把 column_index 置为 N 并把 expr 置空；SortExecutor 看到非零
+// column_index 时直接按 tuple 位置取值，绕过 cmap/expression-evaluator 路径。
+// 0 表示「非位置式 ORDER BY」，按 expr 正常求值。
 struct OrderByItem {
     ExprPtr expr;
     bool ascending = true;
+    int column_index = 0;  // 0 = 非位置式；>0 = SELECT 列表 1-based 位置
 };
 
 // ============ 语句节点 ============
@@ -262,6 +377,14 @@ public:
     ExprPtr where_clause;               // 可为空
     std::vector<ExprPtr> group_by;
     ExprPtr having_clause;              // 可为空
+    // ---- 60_funcs: GROUPING SETS / ROLLUP / CUBE ----
+    // 当 grouping_sets 非空时使用它替代 group_by 进行分组。
+    // 外层 vector 的每个元素是一条 grouping set（即一个分组键列表）；
+    // ROLLUP(a, b) 展开为 [(a, b), (a), ()]；
+    // CUBE(a, b)   展开为 [(a, b), (a), (b), ()]。
+    // 运行时 Planner 会按 grouping_sets 把单条 AggregateNode 拆成
+    // 多条 AggregateNode UNION ALL，并对未参与分组的维度补 NULL。
+    std::vector<std::vector<ExprPtr>> grouping_sets;
     std::vector<OrderByItem> order_by;
     int limit = -1;                     // -1 表示不限制
     int limit_offset = 0;               // LIMIT offset, count 形式
@@ -270,7 +393,39 @@ public:
     // 派生表 FROM (SELECT ...) AS alias：当 derived_table 非空时优先使用。
     SelectStatementPtr derived_table;
     std::string derived_alias;
+    // 派生表 FROM (SELECT ... UNION/INTERSECT/EXCEPT SELECT ...) AS alias：
+    // 当内层是集合运算（SetOperationStatement）时填到这里。derived_table 与
+    // derived_set_op 互斥 —— parser 在识别到 UNION/INTERSECT/EXCEPT 链时把
+    // 整条 SetOperationStatement 挂到本字段，planner 据此走 PlanSetOperation。
+    // 旧版 parser 直接用 static_pointer_cast<SelectStatement>(sub) 强转
+    // SetOperationStatement*，由于两者无继承关系（都只从 Statement 派生），
+    // 那是 UB；本字段 + dynamic_pointer_cast 修复该隐患。
+    SetOperationStatementPtr derived_set_op;
+    // 55_query: (VALUES (a,b), (c,d)) AS t(id, name) —— VALUES 行构造器作为
+    // FROM 派生表。当 values_rows 非空时，Planner 走 ValuesNode 路径，
+    // 与 derived_table 互斥（同一 FROM 项只能有一种来源）。values_column_aliases
+    // 提供列名（可选）；空时由 Planner 自动命名 col0/col1/...。
+    std::vector<std::vector<ExprPtr>> values_rows;
+    std::vector<std::string> values_column_aliases;
+    // 55_query: SELECT FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE / FOR KEY SHARE
+    // 锁提示（parse-only hint）。当前实现为单写引擎，实际不做任何加锁；语义层
+    // 不强制执行。0 = NONE, 1 = UPDATE, 2 = SHARE, 3 = NO_KEY_UPDATE, 4 = KEY_SHARE。
+    int for_update_kind = 0;
+    // 55_query: OFFSET n [ROW|ROWS] 标准形式：parser 在 OFFSET 关键字位置
+    // 同步设置 limit_offset；保留字段以便未来区分"末尾 OFFSET"与"LIMIT 逗号形式"。
+    int standard_offset = 0;            // OFFSET n ROWS 形式（与 limit_offset 同义）
+    // 55_query: 标记当前 SELECT 自身是否作为 LATERAL 子查询使用。true 时
+    // ExpressionEvaluator::CollectInnerTableNames 跳过 from_table，避免
+    // 内层 FROM 与外层表名同名时把 outer 引用错解析为 inner。
+    bool is_lateral = false;
 };
+
+// FOR UPDATE 锁提示枚举值：
+constexpr int kForUpdateNone        = 0;
+constexpr int kForUpdateUpdate      = 1;
+constexpr int kForUpdateShare       = 2;
+constexpr int kForUpdateNoKeyUpdate = 3;
+constexpr int kForUpdateKeyShare    = 4;
 
 // INSERT 语句
 class InsertStatement : public Statement {
@@ -295,6 +450,22 @@ public:
     // SET 子句：col = expr[, ...]。expr 中可出现 UpsertValuesRefExpr
     // （VALUES(col) 形式）引用本次候选行的列值；其他列引用视为目标表的现有行。
     std::vector<std::pair<std::string, ExprPtr>> upsert_assignments;
+    // ---- 54_dml: RETURNING 子句（PG 风格）----
+    // INSERT 成功后，对新写入的行计算 returning_exprs 并作为结果集返回。
+    // returning_aliases 与 returning_exprs 平行（可能为空串）。语义：
+    // INSERT RETURNING 发出"新行"——即落盘后的列值。
+    std::vector<ExprPtr> returning_exprs;
+    std::vector<std::string> returning_aliases;
+    // ---- 54_dml: REPLACE INTO 标记 ----
+    // true 时按 MySQL 语义处理：候选行若与已有行在 PRIMARY KEY / UNIQUE 上冲突，
+    // 先删除已有行，再插入新行（等价于 INSERT … ON DUPLICATE KEY UPDATE 删旧 + 插新）。
+    // 解析阶段：用户写 REPLACE INTO t VALUES (...) 时置位；REPLACE 共享 INSERT
+    // 的列名列表与 VALUES 数据。当前 REPLACE 不支持 INSERT ... SELECT 数据源。
+    bool is_replace = false;
+    // INSERT ... DEFAULT VALUES —— SQL 标准形式：插入一行，所有列都用其
+    // DEFAULT 表达式（无 DEFAULT 的列得到 NULL）。当 values_list 为空且
+    // is_default_values 为 true 时，InsertExecutor 按列序构造一行 DEFAULT。
+    bool is_default_values = false;
 };
 
 // UPDATE 语句
@@ -308,6 +479,18 @@ public:
     std::string table_name;
     std::vector<std::pair<std::string, ExprPtr>> assignments;  // SET col = expr
     ExprPtr where_clause;  // 可为空
+    // ---- 54_dml: UPDATE ... FROM source [, source2 ...] ----
+    // 当 from_sources 非空时，按 PG/Oracle 语义把 target 与 from_sources
+    // 做连接（连接条件由 where_clause 描述，from_sources 可以是基表或派生表）。
+    // 简化实现：对每个 (target, source) 组合评估 SET 赋值并写回 target 行；
+    // LHS 必须是 target 表的列；RHS 可同时引用 target 与 source。
+    std::vector<JoinClause> from_sources;
+    // target 的别名（UPDATE t AS t SET ... FROM s AS ss WHERE t.id = ss.tid）。
+    std::string table_alias;
+    // ---- 54_dml: RETURNING 子句 ----
+    // UPDATE 写回后，按 returning_exprs 对"更新后的行"求值并以结果集形式返回。
+    std::vector<ExprPtr> returning_exprs;
+    std::vector<std::string> returning_aliases;
 };
 
 // DELETE 语句
@@ -320,6 +503,45 @@ public:
 
     std::string table_name;
     ExprPtr where_clause;  // 可为空
+    // ---- 54_dml: RETURNING 子句 ----
+    // DELETE 删除前，先对"即将删除的行"按 returning_exprs 求值并以结果集
+    // 形式返回；DELETE RETURNING 发出的是"旧行"（删除前的内容）。
+    std::vector<ExprPtr> returning_exprs;
+    std::vector<std::string> returning_aliases;
+};
+
+// 53_ddl：FOREIGN KEY 约束定义。
+//
+// 支持的来源形式：
+//   - 列级：pid INT REFERENCES parent(id)
+//   - 表级：FOREIGN KEY (pid) REFERENCES parent(id) [ON DELETE CASCADE/SET NULL/RESTRICT]
+//           FOREIGN KEY (a, b) REFERENCES parent(p1, p2)
+//
+// 仅本子句的目标 side 需要显式记录子列名；父列在 child_cols 与 parent_cols 长度相等时
+// 一一对应。on_delete / on_update 默认 RESTRICT（与 SQL 标准一致）。
+struct ForeignKeyDef {
+    std::vector<std::string> child_cols;
+    std::string parent_table;
+    std::vector<std::string> parent_cols;
+    // 0=RESTRICT, 1=CASCADE, 2=SET NULL, 3=NO ACTION, 4=SET DEFAULT
+    // （为简化运行时分支，把 SET DEFAULT 视为 RESTRICT。）
+    int on_delete_action = 0;
+    int on_update_action = 0;
+};
+
+// 58_constraints: 表级 CHECK 约束定义。
+//
+// 来源形式：
+//   - 表级：CHECK (price > cost)
+//   - 表级命名：CONSTRAINT dates_ok CHECK (start_d < end_d)
+//
+// 仅出现在表约束段（PRIMARY KEY(...) / UNIQUE(...) / FOREIGN KEY ... 之外），
+// 由 CreateTableStatement::table_checks 收集。
+// constraint_name 为空表示匿名 CHECK；错误消息回退到 "<table>.check_<index>"
+// 形式以便定位。
+struct TableCheckDef {
+    std::string constraint_name;
+    ExprPtr expr;
 };
 
 // CREATE TABLE 语句
@@ -336,8 +558,19 @@ public:
     // 列内 `is_primary_key` 同时会被置位，便于既有执行路径（InsertExecutor/Schema）
     // 直接基于单列 is_primary_key 做校验/自增。
     std::vector<std::vector<std::string>> primary_keys;
+    // 52_data_types: 表级 UNIQUE 约束。每个内层 vector 表示一条
+    // UNIQUE(col1, col2, ...) 子句涉及的列名集合。执行层 (CreateTableExecutor)
+    // 把它转译为隐式 UNIQUE INDEX（与显式 CREATE UNIQUE INDEX 等价）。
+    std::vector<std::vector<std::string>> unique_constraints;
     // CREATE TABLE IF NOT EXISTS 标记：true 时若表已存在则静默成功，不报错。
     bool if_not_exists = false;
+    // 53_ddl：表级 FOREIGN KEY 约束列表。
+    std::vector<ForeignKeyDef> foreign_keys;
+    // 58_constraints: 表级 CHECK 约束列表（每条带可选 constraint_name）。
+    // 表级 CHECK 可以引用多个列（例如 CHECK (price > cost)），
+    // 写入路径在每行落盘前对每条表级 CHECK 求值；NULL 结果按 SQL 标准
+    // 三值逻辑视为通过，仅当明确为 FALSE 时拒绝。
+    std::vector<TableCheckDef> table_checks;
 };
 
 // DROP TABLE 语句
@@ -392,11 +625,12 @@ public:
 
 // ALTER TABLE 语句：DDL 扩展语法。
 //
-// 支持四种动作（与测试用例 39_ddl_extensions 对齐）：
+// 支持五种动作（与测试用例 39_ddl_extensions / 53_ddl 对齐）：
 //   - ADD COLUMN col TYPE[(N)]         （新增列定义复用 ColumnDefinition）
 //   - DROP COLUMN col                  （删除列）
 //   - RENAME TO new_table_name         （表重命名）
 //   - MODIFY COLUMN col TYPE[(N)]      （修改列类型）
+//   - RENAME COLUMN old TO new         （53_ddl：列重命名，仅修改目录 schema）
 //
 // 当前实现只要求语法可解析并通过执行（语义可走 no-op 路径，测试期望
 // ALTER 后原数据仍可被 SELECT）。
@@ -405,6 +639,7 @@ enum class AlterAction {
     DROP_COLUMN,
     RENAME_TO,
     MODIFY_COLUMN,
+    RENAME_COLUMN,  // 53_ddl
 };
 class AlterStatement : public Statement {
 public:
@@ -421,6 +656,9 @@ public:
     std::string drop_column_name;
     // RENAME TO 时填写新表名。
     std::string new_table_name;
+    // 53_ddl：RENAME COLUMN 时填写被改名列名与新列名。
+    std::string rename_column_old_name;
+    std::string rename_column_new_name;
 };
 
 // ============ 新增表达式节点（27–33 测试套件） ============
@@ -453,8 +691,13 @@ public:
     std::string ToString() const override;
 
     ExprPtr expr;
-    std::string target_type;   // "INT" / "FLOAT" / "VARCHAR"
-    int32_t char_length = -1;  // VARCHAR(N) 中的 N
+    std::string target_type;   // "INT" / "FLOAT" / "VARCHAR" / "DECIMAL" / ...
+    // 类型参数：
+    //   - char_length：VARCHAR(n) / CHAR(n) / DECIMAL(p) / NUMERIC(p) 中的 n
+    //     （DECIMAL 单参形式也用 char_length 承载精度，scale = -1）
+    //   - numeric_scale：DECIMAL(p, s) / NUMERIC(p, s) 中的 s，-1 表示无第二参
+    int32_t char_length = -1;
+    int32_t numeric_scale = -1;
 };
 
 // 窗口函数 frame 描述（ROWS BETWEEN ... AND ...）
@@ -480,6 +723,11 @@ struct WindowSpec {
     std::vector<OrderByItem> order_by;
     bool has_frame = false;
     WindowFrame frame;
+    // ---- 60_funcs: RESPECT / IGNORE NULLS 修饰 ----
+    // true = IGNORE NULLS（FIRST_VALUE/LAST_VALUE/NTH_VALUE/LAG/LEAD 在
+    //                    帧内 / 偏移方向上跳过 NULL 返回值）；
+    // false = RESPECT NULLS（默认；与"未指定"等价）。
+    bool ignore_nulls = false;
 };
 
 // OVER (...) 节点，承载在函数调用之上：window_func(name(args) OVER spec)
@@ -497,6 +745,12 @@ public:
     std::vector<ExprPtr> arguments;
     WindowSpec spec;
     std::string window_name;  // OVER w 引用命名窗口
+    // ---- 60_funcs: IGNORE NULLS / RESPECT NULLS 修饰 ----
+    // 仅 FIRST_VALUE / LAST_VALUE / NTH_VALUE / LAG / LEAD 等位置敏感窗口函数有效。
+    // 默认 false（RESPECT NULLS）：按 SQL 标准，RESPECT NULLS 与"未指定"等价。
+    // WindowSpec.ignore_nulls 在 OVER (...) 内部携带同一修饰，让聚合 / 排名窗口
+    // 函数也能表达统一的 NULL 处理意图（实际计算路径忽略该标记）。
+    bool ignore_nulls = false;
 };
 
 // 子查询表达式：标量 / IN / EXISTS / ANY
@@ -538,22 +792,28 @@ public:
     std::string column_name;
 };
 
-// ============ 44_pattern_match：LIKE / ILIKE / REGEXP / RLIKE ============
+// ============ 44_pattern_match / 56_pattern：模式匹配 ============
 //
-// 统一承载四种模式匹配运算符的可选 ESCAPE 子句参数。
-//   - kind == LIKE     ：SQL 标准 LIKE，'%' '_' 通配符，has_escape 为 true 时
-//                         以 escape_char（默认 '\'）取消其特殊含义。
-//   - kind == ILIKE    ：PostgreSQL 大小写不敏感 LIKE（其余语义同 LIKE）。
-//   - kind == REGEXP   ：POSIX ERE 风格正则子串匹配；has_escape 仅控制
-//                         错误信息字符串（保留以与 LIKE 同形）。
-//   - kind == RLIKE    ：REGEXP 的同义别名。
+// 统一承载五种模式匹配运算符的可选 ESCAPE 子句参数。
+//   - kind == LIKE        ：SQL 标准 LIKE，'%' '_' 通配符，has_escape 为 true 时
+//                            以 escape_char（默认 '\'）取消其特殊含义。
+//   - kind == ILIKE       ：PostgreSQL 大小写不敏感 LIKE（其余语义同 LIKE）。
+//   - kind == REGEXP      ：POSIX ERE 风格正则子串匹配；has_escape 仅控制
+//                            错误信息字符串（保留以与 LIKE 同形）。
+//   - kind == RLIKE       ：REGEXP 的同义别名。
+//   - kind == SIMILAR_TO  ：SQL:1999 SIMILAR TO，pattern 同时支持 LIKE 风格
+//                            通配符（%/_）与 ERE 元字符（. * + ? | () [] ^ $ {}）。
+//                            执行器把 pattern 翻译成 POSIX ERE 后再调用 std::regex。
+//                            ESCAPE 子句仅用于取消 SQL 通配符（%/ _）的特殊含义；
+//                            ERE 元字符照常作为元字符解释（与 SQL 标准一致）。
 //
 // 该节点独立于 BinaryOperator::LIKE，是为了在不破坏既有 LIKE 路径的前提
-// 下扩展 ESCAPE 子句、ILIKE/REGEXP/RLIKE 新运算符。旧 `s LIKE 'A%'` 仍走
-// BinaryExpr(LIKE) + MatchLikePattern（保留 '\' 作为默认转义字符）。
+// 下扩展 ESCAPE 子句、ILIKE/REGEXP/RLIKE/SIMILAR TO 新运算符。旧
+// `s LIKE 'A%'` 仍走 BinaryExpr(LIKE) + MatchLikePattern（保留 '\' 作为
+// 默认转义字符）。
 class LikeExprNode : public Expr {
 public:
-    enum class Kind { LIKE, ILIKE, REGEXP, RLIKE };
+    enum class Kind { LIKE, ILIKE, REGEXP, RLIKE, SIMILAR_TO };
 
     LikeExprNode(Kind kind,
                  ExprPtr operand,
@@ -567,9 +827,9 @@ public:
     Kind kind;
     ExprPtr operand;
     ExprPtr pattern;
-    // 转义字符：仅当 has_escape 为 true 时使用。LIKE/ILIKE 下由 SQL 的
-    // `ESCAPE 'x'` 子句设置；REGEXP/RLIKE 下不使用（但保留字段以保持节点
-    // 形状统一）。
+    // 转义字符：仅当 has_escape 为 true 时使用。LIKE/ILIKE/SIMILAR TO 下
+    // 由 SQL 的 `ESCAPE 'x'` 子句设置；REGEXP/RLIKE 下不使用（但保留字段
+    // 以保持节点形状统一）。
     char escape_char = '\\';
     // 是否显式通过 `ESCAPE <char>` 指定了转义字符；false 时 LIKE/ILIKE
     // 仍默认使用 '\\' 作为转义字符。
@@ -618,6 +878,11 @@ struct CteDefinition {
     std::string cte_name;
     std::vector<std::string> cte_column_aliases;  // 可空：WITH t(a,b) AS (...)
     SelectStatementPtr cte_query;
+    // bug3: CTE 完整 body，可能是 SelectStatement 或 SetOperationStatement
+    // （UNION/INTERSECT/EXCEPT）。parser 总是把 body 落地到这里；非递归
+    // CTE 的 body 即 cte_plan 的输入，递归 CTE 的 cte_query / recursive_part
+    // 仍按 UNION ALL 拆解但 cte_body 同步保留，确保 SetOp body 不被丢弃。
+    StatementPtr cte_body;
     // 递归 CTE 的"递归部分"。当 CTE 体是 `anchor UNION ALL recursive` 时，
     // cte_query 承载 anchor（左侧 SELECT），recursive_part 承载递归部分（右侧）。
     // 当前实现仅支持 UNION ALL 作为连接符；其他集合运算的递归不在范围内。
@@ -750,6 +1015,13 @@ public:
     std::string view_name;
     // 视图定义的 SELECT 语句；解析后转交 catalog 保存为文本或 AST 副本。
     SelectStatementPtr query;
+    // 60_view_trigger: CREATE OR REPLACE VIEW —— true 时若视图已存在则覆盖。
+    bool is_or_replace = false;
+    // 60_view_trigger: WITH [CASCADED|LOCAL] CHECK OPTION
+    // true 表示 INSERT/UPDATE 通过该视图写入时，必须满足视图的 WHERE 条件。
+    bool with_check_option = false;
+    // true=CASCADED, false=LOCAL。PG 默认 LOCAL；本实现与 PG 对齐。
+    bool check_option_cascaded = false;
 };
 
 // DROP VIEW [IF EXISTS] name —— 从 catalog 移除视图。
@@ -764,14 +1036,50 @@ public:
     bool if_exists = false;
 };
 
+// 60_view_trigger (Category 9):
+// CREATE MATERIALIZED VIEW name AS <select>
+//
+// 物化视图：把 SELECT 的结果一次性物化到一张真实存在的表（"backing table"，
+// 默认名 "__mv_<view_name>"）；后续 SELECT FROM <name> 直接扫描该表，无需
+// 重新执行原 SELECT。ALTER MATERIALIZED VIEW ... REFRESH 重新执行 SELECT
+// 并覆盖 backing table 的内容。
+class MaterializedViewStatement : public Statement {
+public:
+    MaterializedViewStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string view_name;
+    SelectStatementPtr query;
+    // CREATE MATERIALIZED VIEW IF NOT EXISTS
+    bool if_not_exists = false;
+};
+
+// ALTER MATERIALIZED VIEW name REFRESH
+// 60_view_trigger (Category 9)：触发对 backing table 的 truncate + 重新物化。
+class AlterMaterializedViewStatement : public Statement {
+public:
+    AlterMaterializedViewStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string view_name;
+};
+
 // 触发器时机：BEFORE / AFTER
 enum class TriggerTiming { BEFORE, AFTER };
 
 // 触发器事件：INSERT / UPDATE / DELETE
 enum class TriggerEvent { INSERT, UPDATE, DELETE };
 
+// 触发器粒度：ROW（每行触发）/ STATEMENT（每条语句触发一次）。
+// 60_view_trigger (Category 9)：新增 STATEMENT 粒度。
+enum class TriggerGranularity { ROW, STATEMENT };
+
 // CREATE TRIGGER name BEFORE|AFTER INSERT|UPDATE|DELETE ON table
-// FOR EACH ROW SET NEW.col = expr [, ...]
+// FOR EACH ROW|STATEMENT SET NEW.col = expr [, ...]
 // 最小可用：解析整段语法并把触发器记入 catalog（no-op）。
 class CreateTriggerStatement : public Statement {
 public:
@@ -784,6 +1092,9 @@ public:
     TriggerTiming timing = TriggerTiming::BEFORE;
     TriggerEvent event = TriggerEvent::INSERT;
     std::string table_name;
+    // 60_view_trigger: FOR EACH ROW（默认） / FOR EACH STATEMENT。
+    // true = ROW, false = STATEMENT。
+    bool for_each_row = true;
     // 形如 "SET NEW.col = expr [, OLD.col = expr ...]" 的赋值列表
     std::vector<std::pair<std::string, ExprPtr>> assignments;
 };
@@ -805,6 +1116,9 @@ struct FunctionParameter {
     std::string name;
     std::string data_type;
     int32_t char_length = -1;
+    // 59_procs (Category 8): 参数模式。函数/UDF 参数总是 IN（默认 0）；
+    // 过程参数可以是 IN (0) / OUT (1) / INOUT (2)。
+    int mode = 0;  // 0=IN, 1=OUT, 2=INOUT
 };
 
 // CREATE FUNCTION name(args) RETURNS type
@@ -846,8 +1160,9 @@ public:
 // 这些节点仅在 CreateFunctionStatement::body_statements 中出现，
 // 由 UdfExecutor 在调用期间解释执行。它们不参与 Planner / Catalog 的注册路径。
 
-// DECLARE name TYPE[(N)] —— 在当前函数帧中声明一个局部变量。变量类型
-// 只支持 INT / FLOAT / VARCHAR 三种，其它类型在 parser 阶段就报错。
+// DECLARE name TYPE[(N)] [DEFAULT expr] —— 在当前函数帧中声明一个局部变量。
+// 变量类型只支持 INT / FLOAT / VARCHAR 三种，其它类型在 parser 阶段就报错。
+// DEFAULT expr 可空；为空时初始为 NULL，为 expr 时初始为 expr 求值结果。
 class DeclareVarStatement : public Statement {
 public:
     DeclareVarStatement(std::string var_name, std::string data_type,
@@ -859,6 +1174,8 @@ public:
     std::string var_name;
     std::string data_type;
     int32_t char_length = -1;
+    // 59_procs (Category 8): 可选 DEFAULT expr（NULL 表示未指定）。
+    ExprPtr default_expr;
 };
 
 // SET name = expr —— 把 expr 的结果赋给当前函数帧中的 name。
@@ -919,6 +1236,228 @@ public:
     ExprPtr expr;  // 可空
 };
 
+// ============ 59_procs (Category 8)：过程语言扩展语句节点 ============
+//
+// 与 47_udf_trigger_view 的 IF/WHILE/RETURN 一样，这些节点仅在
+// CreateFunctionStatement::body_statements / CreateProcedureStatement::body_statements
+// 中出现，由 UdfExecutor 在调用期间解释执行。它们不参与 Planner / Catalog
+// 的注册路径。
+
+// LOOP body END LOOP [label]; —— 无限循环，必须用 LEAVE 退出。
+// label 可空：有 label 时由 UdfExecutor 维护 label 栈；LEAVE / ITERATE
+// 在 LOOP 入口处压栈，出口处弹栈，从而支持多层嵌套。
+class LoopStatement : public Statement {
+public:
+    LoopStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::vector<StatementPtr> body;
+    // 可空。空时意味着隐式 "$$_loop_n"，仍能通过 LEAVE n 来离开最近的
+    // 循环。推荐用户写显式 label 以保持可读性。
+    std::string label;
+};
+
+// REPEAT body UNTIL cond END REPEAT [label]; —— do-while 循环：先执行
+// body 一次，再评估 cond；若为 TRUE 则退出；否则继续循环。
+class RepeatStatement : public Statement {
+public:
+    RepeatStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::vector<StatementPtr> body;
+    ExprPtr until_expr;
+    std::string label;  // 可空
+};
+
+// CASE WHEN cond THEN stmts [WHEN ...] [ELSE stmts] END CASE;
+// 体内 CASE：每个 WHEN 分支是条件 + 语句列表，匹配时执行其语句列表；
+// ELSE 分支（可空）在没有 WHEN 匹配时执行。语义上与表达式 CASE
+// (CaseExprNode) 不同：体内 CASE 不返回值，只决定执行哪个语句序列。
+class CaseStatement : public Statement {
+public:
+    CaseStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    // 可空：NULL 表示搜索式 CASE（每个 when_condition 都是独立谓词）。
+    ExprPtr subject;
+    struct WhenClause {
+        // 简单 CASE：与 subject 比较的右值；搜索式 CASE：谓词表达式。
+        ExprPtr when_expr;
+        std::vector<StatementPtr> body;
+    };
+    std::vector<WhenClause> whens;
+    std::vector<StatementPtr> else_body;  // 可空
+};
+
+// LEAVE label; —— 离开最近的同名 label 循环。
+// 由 UdfExecutor 在执行 LOOP/WHILE/REPEAT 时维护 label 栈；
+// LEAVE 弹出直到匹配 label，然后设置 frame.control = LEAVE。
+class LeaveStatement : public Statement {
+public:
+    explicit LeaveStatement(std::string label);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string label;
+};
+
+// ITERATE label; —— 跳到最近的同名 label 循环开头。
+// UdfExecutor 看到 ITERATE 时同样设置 frame.control = ITERATE；
+// 解释循环看到此标记后立刻"重新进入"下一轮迭代，而不是逐条执行完 body。
+class IterateStatement : public Statement {
+public:
+    explicit IterateStatement(std::string label);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string label;
+};
+
+// SIGNAL SQLSTATE 'XXXXX' SET MESSAGE_TEXT = '...'; —— 抛自定义异常。
+// UdfExecutor 在执行 SIGNAL 时构造一个 RuntimeError 异常向上抛；
+// 上层若遇到匹配的 DECLARE ... HANDLER 则捕获并执行其 body；
+// 否则异常继续向上传播，最终被 ExecutionEngine 当作 ERROR 输出。
+class SignalStatement : public Statement {
+public:
+    SignalStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    // SQLSTATE 是 5 字符的字符串，如 '22012'（除零）。存储时保留外层引号。
+    std::string sqlstate;
+    std::string message_text;
+};
+
+// DECLARE {EXIT|CONTINUE|UNDO} HANDLER FOR cond stmt;
+// 在函数/过程帧的 handler 栈上注册一个 handler。
+// 条件 cond_kind 决定如何匹配：
+//   - SQLEXCEPTION 匹配任意运行时错误
+//   - SQLWARNING   匹配 SQLWARNING 类错误（V1 与 SQLEXCEPTION 合并处理）
+//   - NOT_FOUND    匹配 NOT FOUND 类错误（V1 同上）
+//   - SQLSTATE     匹配 SQLSTATE 字符串相等的错误
+// type == CONTINUE 时执行 handler body 后继续；EXIT/UNDO 解析期接受，
+// 但 V1 仅 CONTINUE 真正生效（执行器看到 EXIT/UNDO 时抛"未实现"）。
+class DeclareHandlerStatement : public Statement {
+public:
+    DeclareHandlerStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    enum class Type { CONTINUE, EXIT, UNDO };
+    Type type = Type::CONTINUE;
+
+    enum class CondKind { SQLEXCEPTION, SQLWARNING, NOT_FOUND, SQLSTATE };
+    CondKind cond_kind = CondKind::SQLEXCEPTION;
+    // 仅 CondKind == SQLSTATE 时使用；为 'XXXXX' 形式的 SQLSTATE。
+    std::string cond_sqlstate;
+
+    // handler 主体：当前 V1 限定为单条语句。
+    StatementPtr body;
+};
+
+// DECLARE name CURSOR FOR <select>; —— 在当前帧中注册一个 cursor。
+// UdfExecutor 看到此语句时把 cursor_name → query 存入 frame.cursors，
+// OPEN 时再调用 Planner/ExecutionEngine 把 query 转成执行计划并收集
+// 全部结果行。
+class DeclareCursorStatement : public Statement {
+public:
+    DeclareCursorStatement(std::string cursor_name, SelectStatementPtr query);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string cursor_name;
+    SelectStatementPtr query;
+};
+
+// OPEN name; —— 启动 cursor：把 SELECT 计划跑一遍收集全部行，
+// 把结果作为游标当前迭代器。
+class CursorOpenStatement : public Statement {
+public:
+    explicit CursorOpenStatement(std::string cursor_name);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string cursor_name;
+};
+
+// FETCH name INTO var [, var ...]; —— 把 cursor 当前行的各列值依次
+// 赋给 into_vars。行耗尽时 INTO 变量被置 NULL（NOT FOUND handler 可捕获）。
+class CursorFetchStatement : public Statement {
+public:
+    CursorFetchStatement(std::string cursor_name, std::vector<std::string> into_vars);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string cursor_name;
+    std::vector<std::string> into_vars;
+};
+
+// CLOSE name; —— 释放 cursor 持有的元组缓冲。允许再次 OPEN。
+class CursorCloseStatement : public Statement {
+public:
+    explicit CursorCloseStatement(std::string cursor_name);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string cursor_name;
+};
+
+// ============ 59_procs (Category 8)：PROCEDURE 与 CALL 语句节点 ============
+
+// CREATE PROCEDURE name(args) BEGIN body END —— 过程与函数形态相似，
+// 但过程没有返回值，可以拥有 OUT 参数。
+class CreateProcedureStatement : public Statement {
+public:
+    CreateProcedureStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string procedure_name;
+    std::vector<FunctionParameter> parameters;
+    std::vector<StatementPtr> body_statements;
+};
+
+// DROP PROCEDURE [IF EXISTS] name
+class DropProcedureStatement : public Statement {
+public:
+    DropProcedureStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string procedure_name;
+    bool if_exists = false;
+};
+
+// CALL name(arg1, arg2, ...); —— 在新函数帧里执行 procedure 的 body。
+// 实参按位置映射到形参；OUT 参数在 procedure 返回后回写到 ExecutionContext
+// 的 out_args_ 字典。
+class CallStatement : public Statement {
+public:
+    CallStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string procedure_name;
+    std::vector<ExprPtr> arguments;
+};
+
 // ============ 46_meta：元命令（EXPLAIN / SHOW）============
 //
 // EXPLAIN 是对任意 DDL/DML 语句的"包装"：它并不自己实现执行，而是在执行阶段
@@ -941,6 +1480,8 @@ public:
     std::string ToString() const override;
 
     bool analyze = false;
+    // format ∈ { "TEXT", "JSON", "SEXPR" }。默认 TEXT 与原行为一致。
+    std::string format = "TEXT";
     StatementPtr inner;
 };
 
@@ -967,6 +1508,145 @@ public:
 
     Kind kind = Kind::TABLES;
     std::string target_table;
+};
+
+// ============ 54_dml：MERGE 语句 ============
+//
+// MERGE INTO target [AS t_alias]
+// USING source [AS s_alias] ON <cond>
+// WHEN MATCHED THEN UPDATE SET col = expr [, ...]
+// WHEN NOT MATCHED THEN INSERT (cols) VALUES (exprs)
+//
+// 简化语义（V1）：
+//   - 仅支持恰好一条 WHEN MATCHED UPDATE + 一条 WHEN NOT MATCHED INSERT；
+//     多 MATCHED 链 / 多 NOT MATCHED 链不在 V1 范围内（任务文档 scope-cut）。
+//   - source 可以是普通表名或派生表 (sub_query) AS alias。
+//   - target_alias / source_alias 允许为空（无别名时回退到表名）。
+//
+// MERGE 语义：
+//   对 source 的每行：
+//     1) 用 ON 条件与 target 做匹配；
+//     2) 命中则执行 UPDATE SET（带 CHECK / UNIQUE / FK / WAL 全套约束）；
+//     3) 未命中则执行 INSERT VALUES（同样走完整约束）；
+//   当前实现按 source 行枚举顺序执行；不保证确定性顺序，调用方应让 ON 条件
+//   形成唯一匹配（PG/Oracle 同样要求）。
+class MergeStatement : public Statement {
+public:
+    MergeStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string target_table;
+    std::string target_alias;
+    // source 可以是表名 + 可选别名，或者派生表（source_query 非空时优先）。
+    std::string source_table;
+    std::string source_alias;
+    // 派生表数据源：USING (SELECT ...) AS alias 形式。
+    SelectStatementPtr source_query;
+    // ON <expr>：target 与 source 之间的连接条件。
+    ExprPtr on_condition;
+
+    // WHEN MATCHED THEN UPDATE SET col = expr [, ...]
+    bool has_matched_update = false;
+    std::vector<std::pair<std::string, ExprPtr>> matched_assignments;
+
+    // WHEN NOT MATCHED THEN INSERT (cols) VALUES (exprs)
+    bool has_not_matched_insert = false;
+    std::vector<std::string> insert_columns;
+    std::vector<ExprPtr> insert_values;  // 单行 VALUES，与 insert_columns 平行
+};
+
+// ============ 53_ddl：SCHEMA / SEQUENCE 语句 ============
+
+// CREATE SCHEMA name —— 记录 schema 存在性。DROP TABLE schema.tbl 等引用
+// 形式以此校验 schema 已存在。
+class CreateSchemaStatement : public Statement {
+public:
+    CreateSchemaStatement();
+    explicit CreateSchemaStatement(std::string name);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string schema_name;
+    // CREATE SCHEMA IF NOT EXISTS：schema 已存在时静默成功。
+    bool if_not_exists = false;
+};
+
+// DROP SCHEMA [IF EXISTS] name —— 仅当 schema 内已无表时可成功；
+// 非空时返回错误并保持 schema 存在。
+class DropSchemaStatement : public Statement {
+public:
+    DropSchemaStatement();
+    explicit DropSchemaStatement(std::string name);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string schema_name;
+    bool if_exists = false;
+};
+
+// CREATE SEQUENCE name [START n] [INCREMENT n] —— 内存态计数。
+// 缺省 START=1、INCREMENT=1。NEXTVAL FOR name 读取并原子推进。
+class CreateSequenceStatement : public Statement {
+public:
+    CreateSequenceStatement();
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string sequence_name;
+    int64_t start_value = 1;
+    int64_t increment = 1;
+    bool if_not_exists = false;
+};
+
+// DROP SEQUENCE [IF EXISTS] name —— 释放序列计数器。
+class DropSequenceStatement : public Statement {
+public:
+    DropSequenceStatement();
+    explicit DropSequenceStatement(std::string name);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string sequence_name;
+    bool if_exists = false;
+};
+
+// NEXTVAL FOR sequence_name —— 求值期由 ExpressionEvaluator 在 sequence
+// 字典里查找并原子推进；返回值是 INTEGER。若序列不存在，抛语义错误。
+class NextvalExpr : public Expr {
+public:
+    explicit NextvalExpr(std::string sequence_name);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string sequence_name;
+};
+
+// DEFAULT —— 仅出现在 INSERT ... VALUES (..., DEFAULT) 与 INSERT ... DEFAULT VALUES
+// 路径上。语义层在 RequireConstantExpression 不允许该节点出现在 DEFAULT 表达式里
+// （避免递归引用列的 DEFAULT），但 InsertExecutor 会识别它并把当前位置替换为
+// 该列声明的 default_expr（若没有声明则为 NULL）。
+//
+// column_name（可选）：当解析到 DEFAULT(col) 函数调用形式时填入该列名。
+// InsertExecutor 优先按列名查 default_expr；为空时退回到"当前位置列"。
+// SQL 标准 `DEFAULT(col)` 表示「取列 col 的默认值」而非当前位置列的默认值，
+// 两者在用户明确列出列名时通常一致；保留 column_name 字段让执行器可以做正确的
+// 跨列查找（例如 INSERT INTO t(a, b) VALUES (DEFAULT(b), 1) 表示取 b 的默认值）。
+class DefaultExprNode : public Expr {
+public:
+    DefaultExprNode();
+    explicit DefaultExprNode(std::string column_name);
+
+    NodeType GetType() const override;
+    std::string ToString() const override;
+
+    std::string column_name;  // DEFAULT(col) 中的 col；空 = 裸 DEFAULT
 };
 
 }  // namespace sqlcompiler

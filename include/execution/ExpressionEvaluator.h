@@ -36,10 +36,20 @@ public:
         outer_bind_ = bind;
     }
 
+    // 59_procs (Category 8): 设置 procedure 当前局部变量绑定。当 NULL 时
+    // 关闭回退（默认）。该绑定在 ColumnRef 解析时与 outer_bind 并列使用：
+    // outer_bind 优先；若 outer_bind 未命中且 proc_locals 非空，再回退到
+    // proc_locals；都未命中返回 NULL。
+    void SetProcLocals(const std::unordered_map<std::string, Value>* locals) {
+        proc_locals_ = locals;
+    }
+
 private:
     const std::unordered_map<std::string, size_t>& column_index_map_;
     ExecutionContext* ctx_ = nullptr;
     const std::unordered_map<std::string, Value>* outer_bind_ = nullptr;
+    // 59_procs (Category 8): procedure 局部变量绑定回退。
+    const std::unordered_map<std::string, Value>* proc_locals_ = nullptr;
 
     Value EvaluateLiteral(const LiteralExpr& expr) const;
     Value EvaluateColumnRef(const ColumnRefExpr& expr, const Tuple& tuple) const;
@@ -59,6 +69,8 @@ private:
     // 45_datetime: INTERVAL <n> <unit> 节点求值，返回保存计数与单位的
     // FunctionCallExpr 形式（沿用既有"复合结构用函数节点承载"的风格）。
     Value EvaluateInterval(const IntervalExprNode& expr, const Tuple& tuple) const;
+    // 53_ddl: NEXTVAL FOR sequence_name —— 推进序列并返回当前值。
+    Value EvaluateNextval(const NextvalExpr& expr) const;
 };
 
 }  // namespace sqlcompiler

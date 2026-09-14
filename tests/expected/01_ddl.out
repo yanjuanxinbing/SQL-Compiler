@@ -1,0 +1,28 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler>        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | name  | email       | age
+---+-------+-------------+----
+1  | Alice | alice@x.com | 20 
+(1 row)
+sqlcompiler> id  | name   | price | description    | stock
+----+--------+-------+----------------+------
+101 | Widget | 9.99  | A small widget | 1000 
+(1 row)
+sqlcompiler> id | message       
+---+---------------
+1  | system started
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> id | message         
+---+-----------------
+2  | system restarted
+(1 row)
+sqlcompiler> sqlcompiler> 

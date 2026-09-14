@@ -1,0 +1,32 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> n_rows
+------
+4     
+(1 row)
+sqlcompiler> total_score
+-----------
+313        
+(1 row)
+sqlcompiler> id | name 
+---+------
+1  | alice
+3  | carol
+(2 rows)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | name  | score
+---+-------+------
+1  | alice | 95   
+2  | bob   | 75   
+3  | carol | 93   
+4  | dave  | 60   
+(4 rows)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> n_rows_after_delete
+-------------------
+3                  
+(1 row)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> 

@@ -1,0 +1,104 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | val  | name    | score
+---+------+---------+------
+1  | NULL | Alice   | NULL 
+3  | NULL | Charlie | NULL 
+5  | NULL | Eve     | NULL 
+(3 rows)
+sqlcompiler> id | val | name  | score
+---+-----+-------+------
+2  | 10  | Bob   | 80   
+4  | 20  | David | 90   
+6  | 30  | Frank | 85   
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | val | name | score
+---+-----+------+------
+(0 rows)
+sqlcompiler> id | val  | name    | score
+---+------+---------+------
+1  | NULL | Alice   | NULL 
+2  | 10   | Bob     | 80   
+3  | NULL | Charlie | NULL 
+4  | 20   | David   | 90   
+5  | NULL | Eve     | NULL 
+6  | 30   | Frank   | 85   
+(6 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | val  | name    | score
+---+------+---------+------
+1  | NULL | Alice   | NULL 
+3  | NULL | Charlie | NULL 
+5  | NULL | Eve     | NULL 
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | val | name | score
+---+-----+------+------
+(0 rows)
+sqlcompiler> id | val | name | score
+---+-----+------+------
+(0 rows)
+sqlcompiler> id | val | name  | score
+---+-----+-------+------
+4  | 20  | David | 90   
+6  | 30  | Frank | 85   
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | val_plus_zero
+---+--------------
+1  | NULL         
+2  | 10           
+3  | NULL         
+4  | 20           
+5  | NULL         
+6  | 30           
+(6 rows)
+sqlcompiler> id | val_doubled
+---+------------
+1  | NULL       
+2  | 20         
+3  | NULL       
+4  | 40         
+5  | NULL       
+6  | 60         
+(6 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> cnt_val
+-------
+3      
+(1 row)
+sqlcompiler> cnt_all
+-------
+6      
+(1 row)
+sqlcompiler> sum_val
+-------
+60     
+(1 row)
+sqlcompiler> avg_val
+-------
+20     
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> id | val  | name    | score
+---+------+---------+------
+2  | 10   | Bob     | 80   
+4  | 20   | David   | 90   
+6  | 30   | Frank   | 85   
+1  | NULL | Alice   | NULL 
+3  | NULL | Charlie | NULL 
+5  | NULL | Eve     | NULL 
+(6 rows)
+sqlcompiler> id | val  | name    | score
+---+------+---------+------
+6  | 30   | Frank   | 85   
+4  | 20   | David   | 90   
+2  | 10   | Bob     | 80   
+1  | NULL | Alice   | NULL 
+3  | NULL | Charlie | NULL 
+5  | NULL | Eve     | NULL 
+(6 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | val  | name    | score
+---+------+---------+------
+1  | NULL | Alice   | NULL 
+2  | 10   | Bob     | 80   
+3  | NULL | Charlie | NULL 
+(3 rows)
+sqlcompiler> sqlcompiler> 

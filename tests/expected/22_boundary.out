@@ -1,0 +1,76 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | name
+---+-----
+(0 rows)
+sqlcompiler> COUNT
+-----
+0    
+(1 row)
+sqlcompiler> COUNT
+-----
+(0 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | val
+---+----
+1  | 100
+(1 row)
+sqlcompiler> id | val
+---+----
+1  | 100
+(1 row)
+sqlcompiler> id | val
+---+----
+(0 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> COUNT
+-----
+10   
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> MAX | MIN | AVG | SUM
+----+-----+-----+----
+60  | 5   | 30  | 300
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> id | msg                 
+---+---------------------
+1  | hello world         
+2  | it's a test         
+3  | 中文 + emoji-like :)
+4  |                     
+5  | line1line2          
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | group_id | score
+---+----------+------
+1  | 1        | 10   
+(1 row)
+sqlcompiler> id | group_id | score
+---+----------+------
+1  | 1        | 10   
+(1 row)
+sqlcompiler> id | group_id | score
+---+----------+------
+1  | 1        | 10   
+2  | 1        | 20   
+3  | 1        | 30   
+4  | 2        | 15   
+5  | 2        | 25   
+6  | 2        | 35   
+7  | 3        | 5    
+8  | 3        | 45   
+9  | 3        | 55   
+10 | 1        | 60   
+(10 rows)
+sqlcompiler> id | group_id | score
+---+----------+------
+10 | 1        | 60   
+(1 row)
+sqlcompiler> sqlcompiler> 

@@ -1,0 +1,69 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> id | name 
+---+------
+1  | Alice
+2  | Bob  
+3  | Carol
+4  | David
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> id | name 
+---+------
+1  | Alice
+2  | Bob  
+3  | Carol
+2  | Bob  
+3  | Carol
+4  | David
+(6 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> id | name 
+---+------
+2  | Bob  
+3  | Carol
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> id | name 
+---+------
+1  | Alice
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> id | name 
+---+------
+3  | Carol
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> id | name 
+---+------
+1  | Alice
+2  | Bob  
+3  | Carol
+4  | David
+5  | Eve  
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> id | name 
+---+------
+1  | Alice
+2  | Bob  
+3  | Carol
+2  | Bob  
+3  | Carol
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> 
+Error: semantic error [ArityMismatch] set operation column count mismatch: left has 1 columns, right has 2 columns
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> id
+--
+1 
+2 
+3 
+4 
+5 
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> id
+--
+3 
+4 
+(2 rows)
+sqlcompiler> sqlcompiler> 

@@ -1,0 +1,66 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> 
+Error: [Semantic] NOT NULL violation: nn1.x
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> 
+Error: [Semantic] NOT NULL violation: nn1.x
+sqlcompiler> sqlcompiler> sqlcompiler> 
+Error: [Semantic] NOT NULL violation: nn1.x
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | x 
+---+---
+1  | 10
+3  | 30
+4  | 40
+9  | 90
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> 
+Error: [Semantic] NOT NULL violation: nn1.x
+sqlcompiler> id | x 
+---+---
+1  | 10
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> 
+Error: [Semantic] NOT NULL violation: nn1.x
+sqlcompiler> id | x 
+---+---
+1  | 10
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> 
+Error: [Semantic] check constraint violated: orders.check_0 ((price > cost))
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> 
+Error: [Semantic] check constraint violated: orders.check_0 ((price > cost))
+sqlcompiler> id | price | cost
+---+-------+-----
+1  | 100   | 50  
+3  | 100   | NULL
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> 
+Error: [Semantic] check constraint violated: multi.check_0 (((a + b) > c))
+sqlcompiler> sqlcompiler> 
+Error: [Semantic] check constraint violated: multi.check_1 ((c > 0))
+sqlcompiler> sqlcompiler> sqlcompiler> 
+Error: [Semantic] check constraint violated: multi.check_1 ((c > 0))
+sqlcompiler> a | b | c 
+--+---+---
+5 | 6 | 10
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> 
+Error: [Semantic] check constraint violated: events.dates_ok ((start_d < end_d))
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | start_d    | end_d     
+---+------------+-----------
+1  | 2024-01-01 | 2024-12-31
+3  | NULL       | 2024-01-01
+(2 rows)
+sqlcompiler> sqlcompiler> 

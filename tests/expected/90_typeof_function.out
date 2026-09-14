@@ -1,0 +1,47 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> t_int   | t_float | t_str   | t_null | t_arith | t_concat | t_call 
+--------+---------+---------+--------+---------+----------+--------
+INTEGER | FLOAT   | VARCHAR | NULL   | INTEGER | VARCHAR  | VARCHAR
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> arith_int | arith_float | cast_float | cast_int_or_null
+----------+-------------+------------+-----------------
+INTEGER   | FLOAT       | FLOAT      | INTEGER         
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> id | name   | col_id_type | col_name_type | col_price_type | col_note_type
+---+--------+-------------+---------------+----------------+--------------
+1  | apple  | INTEGER     | VARCHAR       | FLOAT          | NULL         
+2  | banana | INTEGER     | VARCHAR       | FLOAT          | VARCHAR      
+3  | cherry | INTEGER     | VARCHAR       | FLOAT          | NULL         
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> note_type_with_null_value
+-------------------------
+NULL                     
+NULL                     
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | name  
+---+-------
+1  | apple 
+2  | banana
+3  | cherry
+(3 rows)
+sqlcompiler> id | name  
+---+-------
+1  | apple 
+2  | banana
+3  | cherry
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> id | kind      
+---+-----------
+1  | string col
+2  | string col
+3  | string col
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> updated_price_type
+------------------
+FLOAT             
+(1 row)
+sqlcompiler> sqlcompiler> 

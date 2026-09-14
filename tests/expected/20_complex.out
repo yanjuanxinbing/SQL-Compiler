@@ -1,0 +1,37 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> name  | cnt | avg_total
+------+-----+----------
+IT    | 3   | 9500     
+Sales | 2   | 8700     
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> region | total_budget | project_cnt
+-------+--------------+------------
+West   | 110000       | 2          
+East   | 50000        | 1          
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> name  | dept     | total_comp
+------+----------+-----------
+Bob   | IT       | 11000     
+Frank | Research | 11000     
+Eve   | Sales    | 9100      
+Alice | IT       | 9000      
+Grace | IT       | 8500      
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> name
+----
+(0 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> region | name     | cnt
+-------+----------+----
+East   | IT       | 3  
+East   | HR       | 1  
+West   | Sales    | 2  
+West   | Research | 1  
+(4 rows)
+sqlcompiler> sqlcompiler> 

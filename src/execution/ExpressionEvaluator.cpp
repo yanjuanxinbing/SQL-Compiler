@@ -6,7 +6,9 @@
 #include "execution/ExecutionEngine.h"
 #include "execution/Executor.h"
 #include "execution/UdfExecutor.h"
+#include "optimizer/Optimizer.h"
 #include "plan/Plan.h"
+#include "plan/Planner.h"
 
 #include <algorithm>
 #include <cctype>
@@ -15,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <random>
 #include <functional>
 #include <memory>
 #include <regex>
@@ -51,17 +54,25 @@ bool IsFalse(const Value& v) {
 }
 
 // =============================================================================
-// 模式匹配支持面（44_pattern_match）
-//   - SQL 标准 LIKE   : '%' 任意序列、'_' 单字符；默认以 '\\' 作为转义字符，
-//                       也可通过 LikeExprNode 的 has_escape/escape_char 自定义。
-//   - ILIKE           : 同 LIKE，但先对输入和模式做 ASCII 大小写折叠再匹配。
-//   - REGEXP / RLIKE  : POSIX ERE 风格的正则子串匹配（默认不锚定 ^/$）；
+// 模式匹配支持面（44_pattern_match / 56_pattern）
+//
+//   - SIMILAR TO       : SQL:1999 模式语法（see TranslateSqlLikeToEre）
+//   - LIKE             : SQL 标准 LIKE，'%' 任意序列、'_' 单字符；默认以 '\\'
+//                       作为转义字符，也可通过 LikeExprNode 的 has_escape/
+//                       escape_char 自定义。
+//   - ILIKE            : 同 LIKE，但先对输入和模式做 ASCII 大小写折叠再匹配。
+//   - REGEXP / RLIKE   : POSIX ERE 风格的正则子串匹配（默认不锚定 ^/$）；
 //                       模式按 <regex> 在每行即时编译（pattern 表达式非字面量
 //                       时无法预编译，统一在运行时编译一次以保持简单）。
-//   - 错误处理        : REGEXP 模式非法时抛出 RuntimeError，
+//                       ERE 单词字符类 `\d \D \s \S \w \W` 走 TranslateEreWordClasses
+//                       转译为对应字符类（std::regex 的 ECMAScript 也支持这些，
+//                       但我们的转译在两种语法下结果一致，并提供后备保证）。
+//
+//   - 错误处理        : REGEXP/SIMILAR TO 模式非法时抛出 RuntimeError，
 //                       文案为 "Error: invalid regex pattern: <reason>"。
+//
 // 旧 `BinaryOperator::LIKE` 路径复用 MatchLikePattern（保留 '\\' 默认转义），
-// 行为对 00–43 测试零变更。新运算符和 ESCAPE 子句全部走 LikeExprNode。
+// 行为对 00–55 测试零变更。新运算符和 ESCAPE 子句全部走 LikeExprNode。
 // =============================================================================
 
 // SQL LIKE pattern matching: '%' matches any sequence, '_' matches one char.
@@ -135,6 +146,99 @@ bool MatchLikePatternEscaped(const std::string& s, const std::string& p, char es
     return j == p.size();
 }
 
+// 56_pattern: SQL:1999 SIMILAR TO 模式 → POSIX ERE。
+//
+// 输入: SQL pattern（保留 LIKE 通配符 % / _ 与 ERE 元字符 . * + ? [] () | ^ $ {}）。
+// 输出: 可直接喂给 std::regex（ECMAScript 语法与 ERE 在这些元字符上语义相近）的
+//       ERE 等价字符串。
+//
+// 算法：单次扫描 pattern，遇到：
+//   - escape + 任意字符   : 把后一个字符视为字面量；若它同时是 ERE 元字符，
+//                            在前面再加 '\' 以保证 ERE 把它当字面量读。
+//                            例（esc='\\'）: `\\.` → ERE 里的 `\\.`（字面量 '.'）；
+//                                            `\\%` → ERE 里的 `%`（字面量 '%'）。
+//   - '%'                  : 输出 '.*'
+//   - '_'                  : 输出 '.'
+//   - 其他（ERE 元字符 / 普通字符）: 原样输出 —— SQL:1999 让 . * + ? | () []
+//                                    ^ $ {} 在 SIMILAR TO 中按 ERE 元字符
+//                                    解释；SQL 标准本身不把它们视为字面量。
+//
+// 注：SQL 标准的 SIMILAR TO 不要求锚定 ^/$（与 REGEXP/RLIKE 一致），因此
+//     翻译结果不做任何锚定处理。
+std::string TranslateSqlLikeToEre(const std::string& p, char esc) {
+    std::string out;
+    out.reserve(p.size() * 2);
+    auto is_ere_metachar = [](char c) -> bool {
+        switch (c) {
+            case '.': case '*': case '+': case '?':
+            case '|': case '(': case ')':
+            case '[': case ']': case '{': case '}':
+            case '^': case '$': case '\\':
+                return true;
+            default:
+                return false;
+        }
+    };
+    auto emit_literal = [&](char c) {
+        if (is_ere_metachar(c)) out.push_back('\\');
+        out.push_back(c);
+    };
+    for (size_t i = 0; i < p.size(); ++i) {
+        char c = p[i];
+        if (c == esc) {
+            // SQL 转义：后一个字符视为字面量。若已是模式末尾，则保留 esc 自身。
+            if (i + 1 < p.size()) {
+                emit_literal(p[i + 1]);
+                ++i;
+            } else {
+                emit_literal(c);
+            }
+            continue;
+        }
+        if (c == '%') { out += ".*"; continue; }
+        if (c == '_') { out += ".";  continue; }
+        // ERE 元字符或普通字符：原样输出。SQL 标准让 ERE 元字符在 SIMILAR
+        // TO 模式中按 ERE 元字符解释，因此不做额外转义。
+        out.push_back(c);
+    }
+    return out;
+}
+
+// 56_pattern: ERE 单词字符类翻译（保守后援）。
+//
+// std::regex 的 ECMAScript 语法本来就支持 \d \D \s \S \w \W（与 POSIX ERE
+// 行为一致）。我们仍对输入 pattern 做一次扫描：当遇到 \<wordchar> 形式时，
+// 替换为显式字符类（\d → [0-9] 等），目的：
+//   1) 与 POSIX ERE 语义对齐（即便 ECMAScript 后端被换成其他引擎也能正常工作）；
+//   2) 保持语义文档化。
+// 注意只翻译 \d \D \s \S \w \W 这六个单词类；其他 \<x>（如 \. \* \( 等）不动，
+// 以免破坏已有的转义语义。
+std::string TranslateEreWordClasses(const std::string& p) {
+    std::string out;
+    out.reserve(p.size() * 2);
+    for (size_t i = 0; i < p.size(); ++i) {
+        if (p[i] == '\\' && i + 1 < p.size()) {
+            char nx = p[i + 1];
+            switch (nx) {
+                case 'd': out += "[0-9]";              ++i; continue;
+                case 'D': out += "[^0-9]";             ++i; continue;
+                case 's': out += "[ \t\n\r\f\v]";      ++i; continue;
+                case 'S': out += "[^ \t\n\r\f\v]";     ++i; continue;
+                case 'w': out += "[A-Za-z0-9_]";       ++i; continue;
+                case 'W': out += "[^A-Za-z0-9_]";      ++i; continue;
+                default:
+                    // 其他 \<x> 原样保留（含 \\ \. \* \( 等）。
+                    out.push_back(p[i]);
+                    out.push_back(nx);
+                    ++i;
+                    continue;
+            }
+        }
+        out.push_back(p[i]);
+    }
+    return out;
+}
+
 // ASCII 小写折叠（仅 A-Z）。
 std::string AsciiLower(const std::string& s) {
     std::string out;
@@ -155,9 +259,26 @@ std::string UpperName(const std::string& s) {
 }
 
 // 把 Value 规范化为 double（INT 提升为 FLOAT 的实际值）
+// VARCHAR 视为 DECIMAL 数值文本，按 std::stod 解析——与 ValueToFloat
+// 行为一致；解析失败返回 0.0。这一改动让 ROUND/CEIL/FLOOR/POWER/MOD
+// 等函数对 DECIMAL 列直接生效（旧实现 VARCHAR → 0 让结果全部清零）。
 double ValueToDouble(const Value& v) {
     if (v.GetType() == ValueType::INTEGER) return static_cast<double>(v.AsInt());
     if (v.GetType() == ValueType::FLOAT) return v.AsFloat();
+    if (v.GetType() == ValueType::VARCHAR) {
+        try {
+            size_t pos = 0;
+            std::string s = v.AsVarchar();
+            while (pos < s.size() &&
+                   std::isspace(static_cast<unsigned char>(s[pos]))) {
+                ++pos;
+            }
+            if (pos >= s.size()) return 0.0;
+            return std::stod(s, &pos);
+        } catch (...) {
+            return 0.0;
+        }
+    }
     return 0.0;
 }
 
@@ -200,6 +321,19 @@ int32_t ValueToIntTruncate(const Value& v) {
     return 0;
 }
 
+double ValueToFloat(const Value& v) {
+    if (v.GetType() == ValueType::FLOAT) return v.AsFloat();
+    if (v.GetType() == ValueType::INTEGER) return static_cast<double>(v.AsInt());
+    if (v.GetType() == ValueType::VARCHAR) {
+        try {
+            return std::stod(v.AsVarchar());
+        } catch (...) {
+            return 0.0;
+        }
+    }
+    return 0.0;
+}
+
 std::string TrimWhitespace(const std::string& s) {
     size_t b = 0, e = s.size();
     while (b < e && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
@@ -228,11 +362,13 @@ bool ParseDateString(const std::string& s, int* year, int* month, int* day) {
         if (!any) return 0;
         return static_cast<int>(acc * sign);
     };
+    auto expect = [&](size_t& pos, char ch) -> bool {
+        if (pos < s.size() && s[pos] == ch) { ++pos; return true; }
+        return false;
+    };
     size_t pos = 0;
     int y = read_int(pos);
-    // 原写法 `pos - 1 >= 0 ? s.size() - 1 : 0` 中 pos 为无符号、恒真，
-    // 语义等价于检查字符串末字符；此处化简并消除 -Wtype-limits。
-    if (pos >= s.size() || !std::isdigit(static_cast<unsigned char>(s[s.size() - 1]))) {
+    if (pos >= s.size() || !std::isdigit(static_cast<unsigned char>(s[pos - 1 >= 0 ? s.size() - 1 : 0]))) {
         // first read_int failed
         return false;
     }
@@ -253,7 +389,8 @@ bool ParseDateString(const std::string& s, int* year, int* month, int* day) {
 
 ExpressionEvaluator::ExpressionEvaluator(
     const std::unordered_map<std::string, size_t>& column_index_map)
-    : column_index_map_(column_index_map) {
+    : column_index_map_(column_index_map), ctx_(nullptr) {
+    // 1-arg constructor：ctx/outer_bind/proc_locals 均为 nullptr。
 }
 
 ExpressionEvaluator::ExpressionEvaluator(
@@ -263,6 +400,10 @@ ExpressionEvaluator::ExpressionEvaluator(
     : column_index_map_(column_index_map), ctx_(ctx), outer_bind_(outer_bind) {
     // 调用方未显式提供 outer_bind 时，回退到 ExecutionContext 上的绑定（相关子查询传播）。
     if (!outer_bind_ && ctx_) outer_bind_ = ctx_->GetOuterBind();
+    // 59_procs (Category 8): 同样回退到 procedure 当前局部变量绑定。
+    // proc_locals 优先级低于 outer_bind：当 outer_bind 为空时，列引用优先
+    // 解析为 procedure 局部变量；否则按 outer_bind 解析。
+    if (!proc_locals_ && ctx_) proc_locals_ = ctx_->GetProcLocals();
 }
 
 Value ExpressionEvaluator::Evaluate(const ExprPtr& expr, const Tuple& tuple) const {
@@ -301,6 +442,15 @@ Value ExpressionEvaluator::Evaluate(const ExprPtr& expr, const Tuple& tuple) con
             // 这里返回一个零值（NULL）。正常路径上 INTERVAL 总是作为
             // INTERVAL_ADD / INTERVAL_SUB 的右操作数被消费。
             return EvaluateInterval(*static_cast<const IntervalExprNode*>(expr.get()), tuple);
+        case NodeType::NEXTVAL_EXPR:
+            // 53_ddl: NEXTVAL FOR sequence_name —— 原子推进并返回当前值。
+            return EvaluateNextval(*static_cast<const NextvalExpr*>(expr.get()));
+        case NodeType::DEFAULT_EXPR:
+            // INSERT ... VALUES (..., DEFAULT) 占位节点 —— 仅在 INSERT
+            // 路径上由 InsertExecutor 识别并替换为对应列的 default_expr。
+            // 任何其它出现位置都视为语法/语义错误，让上层抛错；evaluator
+            // 安全起见返回 NULL。
+            return Value::MakeNull();
         default:
             return Value::MakeNull();
     }
@@ -356,6 +506,11 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
     bool qualifier_is_outer = false;
     if (!expr.table_name.empty() && ctx_) {
         const std::unordered_set<std::string>* inner_tables = ctx_->GetInnerTables();
+        if (!inner_tables) {
+            // 55_query: LATERAL 路径下 ApplyExecutor 会注册「lateral inner tables」，
+            // 即使 EvaluateSubquery 没被调用，evaluator 也能识别哪些表名属于右子计划。
+            inner_tables = ctx_->GetLateralInnerTables();
+        }
         if (inner_tables && inner_tables->find(expr.table_name) == inner_tables->end()) {
             qualifier_is_outer = true;
         }
@@ -374,9 +529,12 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
             for (char c : kv.first) kc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
             if (kc == lc) return kv.second;
         }
-        // 限定列确认是外层引用，但 outer_bind 里没记录——保持 NULL 语义，
-        // 不再回退到裸列名（否则可能误命中内层同名列）。
-        return Value::MakeNull();
+        // 55_query: LATERAL 派生表别名（如 `sub`）不属于外层表也不属于内层表，
+        // 但在 outer_bind 里也没记录——它对应的是 Apply 右子计划的输出列。
+        // 这种情况下应回退到 column_index_map_ 的常规 cmap 查找。
+        // 若外层表别名（如 `t1` 在 LATERAL subquery 内的 from_table）也未在
+        // outer_bind 中（极少见的"用户引用了 outer 的列但 subquery 不引用"情形），
+        // 同样需要回退。
     }
     if (!expr.table_name.empty()) {
         std::string qkey = expr.table_name + "." + expr.column_name;
@@ -411,6 +569,23 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
                 if (kc == lc) return kv.second;
             }
         }
+        // 59_procs (Category 8): procedure 局部变量回退。在 outer_bind
+        // 未命中时，若当前处于 CALL 上下文，ColumnRef 可解析为 procedure
+        // 局部变量名（参数或 DECLARE 变量）。
+        if (proc_locals_) {
+            auto pl = proc_locals_->find(expr.column_name);
+            if (pl != proc_locals_->end()) return pl->second;
+        }
+        // 71_proc_out_params：会话变量 @var 回退。column_name 以 '@' 开头时
+        // 视为 session variable；去掉前缀后到 ctx_->GetSessionVar() 查值。
+        // MySQL/MariaDB 语义：未设置的 @var 视为 NULL（已由 GetSessionVar
+        // 默认行为覆盖）。
+        if (!expr.column_name.empty() && expr.column_name.front() == '@' &&
+            ctx_ != nullptr) {
+            std::string sv_name(expr.column_name.begin() + 1,
+                                expr.column_name.end());
+            return ctx_->GetSessionVar(sv_name);
+        }
         return Value::MakeNull();
     }
     if (it->second >= tuple.ColumnCount()) {
@@ -437,10 +612,44 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
         if (v.GetType() == ValueType::INTEGER) return static_cast<double>(v.AsInt());
         return v.AsFloat();
     };
+    // bug4_decimal: DECIMAL 在运行期持久化为 VARCHAR（见 ValueTypeFromString）。
+    // 当一侧是 VARCHAR（DECIMAL/DATE/TIMESTAMP/数值文本）时，把两侧解析为
+    // double 计算，结果按十进制文本输出（保留 DECIMAL 精度语义）。这避免了
+    // 旧逻辑在「DECIMAL + INT」时掉到 INTEGER 分支、用 AsInt()（VARCHAR 上
+    // 恒为 0）参与运算导致的「val + 10 → 10 / val * 2 → 0」类回归。
+    auto EvalDecimalArith = [&](BinaryOperator op) -> Value {
+        if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+        double lv = ValueToFloat(l);
+        double rv = ValueToFloat(r);
+        double out = 0.0;
+        switch (op) {
+            case BinaryOperator::ADD: out = lv + rv; break;
+            case BinaryOperator::SUB: out = lv - rv; break;
+            case BinaryOperator::MUL: out = lv * rv; break;
+            case BinaryOperator::DIV:
+                if (rv == 0.0) return Value::MakeNull();
+                out = lv / rv;
+                break;
+            case BinaryOperator::MOD:
+                if (rv == 0.0) return Value::MakeNull();
+                // SQL MOD：余数符号跟随被除数；C++ fmod 跟随左操作数，
+                // 故手动实现 floor 取模与 SQL 标准一致。
+                out = lv - std::floor(lv / rv) * rv;
+                break;
+            default:
+                return Value::MakeNull();
+        }
+        return Value::MakeVarchar(FormatDecimal(out));
+    };
     switch (expr.op) {
         case BinaryOperator::ADD: {
             // SQL 三值逻辑：算术任一操作数为 NULL 则结果为 NULL。
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            // bug4_decimal: VARCHAR 操作数（DECIMAL/DATE 等按文本持久化的数值）
+            // 走十进制路径，避免掉到 INT 分支误读 AsInt()==0。
+            if (l.GetType() == ValueType::VARCHAR || r.GetType() == ValueType::VARCHAR) {
+                return EvalDecimalArith(BinaryOperator::ADD);
+            }
             if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
                 return Value::MakeFloat(ToDouble(l) + ToDouble(r));
             }
@@ -448,6 +657,9 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
         }
         case BinaryOperator::SUB: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (l.GetType() == ValueType::VARCHAR || r.GetType() == ValueType::VARCHAR) {
+                return EvalDecimalArith(BinaryOperator::SUB);
+            }
             if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
                 return Value::MakeFloat(ToDouble(l) - ToDouble(r));
             }
@@ -455,6 +667,9 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
         }
         case BinaryOperator::MUL: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (l.GetType() == ValueType::VARCHAR || r.GetType() == ValueType::VARCHAR) {
+                return EvalDecimalArith(BinaryOperator::MUL);
+            }
             if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
                 return Value::MakeFloat(ToDouble(l) * ToDouble(r));
             }
@@ -462,6 +677,9 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
         }
         case BinaryOperator::DIV: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (l.GetType() == ValueType::VARCHAR || r.GetType() == ValueType::VARCHAR) {
+                return EvalDecimalArith(BinaryOperator::DIV);
+            }
             if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
                 double rv = ToDouble(r);
                 if (rv == 0.0) return Value::MakeNull();
@@ -471,6 +689,26 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
             if (rv == 0) return Value::MakeNull();
             return Value::MakeInt(l.AsInt() / rv);
         }
+        case BinaryOperator::MOD: {
+            // SQL MOD：除数为 0 返回 NULL；余数符号跟随被除数（与 SQL 标准 MOD 一致，
+            // 区别于 C/C++ 的 % 跟随左操作数；这里采用与函数式 MOD 相同的语义）。
+            if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (l.GetType() == ValueType::VARCHAR || r.GetType() == ValueType::VARCHAR) {
+                return EvalDecimalArith(BinaryOperator::MOD);
+            }
+            if (l.GetType() == ValueType::FLOAT || r.GetType() == ValueType::FLOAT) {
+                double rv = ToDouble(r);
+                if (rv == 0.0) return Value::MakeNull();
+                double lv = ToDouble(l);
+                double r2 = lv - std::floor(lv / rv) * rv;
+                return Value::MakeFloat(r2);
+            }
+            int32_t rv = r.AsInt();
+            if (rv == 0) return Value::MakeNull();
+            int32_t lv = l.AsInt();
+            // C++ % 的符号跟随左操作数；与 SQL MOD 语义一致。
+            return Value::MakeInt(lv % rv);
+        }
         case BinaryOperator::CONCAT: {
             // SQL标准：任一操作数为NULL则结果为NULL；非字符串操作数按其文本形式连接
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
@@ -479,31 +717,41 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
         case BinaryOperator::EQUAL: {
             // 任一为 NULL：UNKNOWN（用 NULL 表示）
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            // 跨类型且不可比（VARCHAR "IT" ↔ INT 10 等）：UNKNOWN，避免
+            // INNER JOIN ON 默默退化为 CROSS JOIN。Value::Compare 对这种
+            // 情况已返回非零，但仍需显式走 NULL 语义以保证 <>/>/<= 等
+            // 算子也按 SQL 三值逻辑给出正确结果。
+            if (!Value::CanCompare(l, r)) return Value::MakeNull();
             int c = Value::Compare(l, r);
             return MakeBool(c == 0);
         }
         case BinaryOperator::NOT_EQUAL: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (!Value::CanCompare(l, r)) return Value::MakeNull();
             int c = Value::Compare(l, r);
             return MakeBool(c != 0);
         }
         case BinaryOperator::LESS: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (!Value::CanCompare(l, r)) return Value::MakeNull();
             int c = Value::Compare(l, r);
             return MakeBool(c < 0);
         }
         case BinaryOperator::LESS_EQUAL: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (!Value::CanCompare(l, r)) return Value::MakeNull();
             int c = Value::Compare(l, r);
             return MakeBool(c <= 0);
         }
         case BinaryOperator::GREATER: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (!Value::CanCompare(l, r)) return Value::MakeNull();
             int c = Value::Compare(l, r);
             return MakeBool(c > 0);
         }
         case BinaryOperator::GREATER_EQUAL: {
             if (l.IsNull() || r.IsNull()) return Value::MakeNull();
+            if (!Value::CanCompare(l, r)) return Value::MakeNull();
             int c = Value::Compare(l, r);
             return MakeBool(c >= 0);
         }
@@ -523,6 +771,23 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
             return MakeBool(l.IsNull());
         case BinaryOperator::IS_NOT_NULL:
             return MakeBool(!l.IsNull());
+        // bug3_is_true: IS [NOT] TRUE/FALSE 走与 IS NULL 同形的"只看左操作数"
+        // 路径（右子树在 parser 留 nullptr），按 SQL:1999 三值逻辑：
+        //   IS TRUE       = IsTrue(l)    // TRUE iff operand 是 TRUE；NULL/FALSE -> false
+        //   IS FALSE      = IsFalse(l)   // TRUE iff operand 是 FALSE；NULL/TRUE -> false
+        //   IS NOT TRUE   = !IsTrue(l)   // TRUE iff operand 是 FALSE 或 NULL
+        //   IS NOT FALSE  = !IsFalse(l)  // TRUE iff operand 是 TRUE 或 NULL
+        // 与 IS NULL 不同的是：IS NULL 在 NULL 上返回 TRUE；而 IS TRUE/FALSE 在 NULL
+        // 上都返回 FALSE（NULL 既不是 TRUE 也不是 FALSE），这正是 IsTrue/IsFalse 助手
+        // 已经实现的语义（对 NULL 直接返回 false）。
+        case BinaryOperator::IS_TRUE:
+            return MakeBool(IsTrue(l));
+        case BinaryOperator::IS_FALSE:
+            return MakeBool(IsFalse(l));
+        case BinaryOperator::IS_NOT_TRUE:
+            return MakeBool(!IsTrue(l));
+        case BinaryOperator::IS_NOT_FALSE:
+            return MakeBool(!IsFalse(l));
         // 45_datetime: <date_or_ts> ± INTERVAL <n> <unit>
         // 左侧求值为日期/时间字符串（DATE/TIMESTAMP 列或字面量），右侧是
         // IntervalExprNode 节点。语义见 include/common/DateTime.h 顶部注释。
@@ -604,6 +869,11 @@ Value ExpressionEvaluator::EvaluateUnary(const UnaryExpr& expr, const Tuple& tup
             return MakeBool(!IsTruthy(v));
         case UnaryOperator::NEGATE:
             if (v.IsNull()) return Value::MakeNull();
+            // bug4_decimal: DECIMAL（VARCHAR）按文本持久化，按 ValueToFloat 解析
+            // 后以 VARCHAR 十进制文本回写，保持 DECIMAL 精度语义。
+            if (v.GetType() == ValueType::VARCHAR) {
+                return Value::MakeVarchar(FormatDecimal(-ValueToFloat(v)));
+            }
             if (v.GetType() == ValueType::FLOAT) return Value::MakeFloat(-v.AsFloat());
             return Value::MakeInt(-v.AsInt());
     }
@@ -650,7 +920,8 @@ Value ExpressionEvaluator::EvaluateCast(const CastExprNode& expr, const Tuple& t
     Value v = Evaluate(expr.expr, tuple);
     if (v.IsNull()) return Value::MakeNull();
     std::string target = UpperName(expr.target_type);
-    if (target == "INT" || target == "INTEGER" || target == "BIGINT") {
+    if (target == "INT" || target == "INTEGER" || target == "BIGINT" ||
+        target == "SMALLINT" || target == "TINYINT") {
         if (v.GetType() == ValueType::INTEGER) return v;
         if (v.GetType() == ValueType::FLOAT) {
             double d = v.AsFloat();
@@ -664,7 +935,8 @@ Value ExpressionEvaluator::EvaluateCast(const CastExprNode& expr, const Tuple& t
         }
         return Value::MakeNull();
     }
-    if (target == "FLOAT" || target == "DOUBLE" || target == "DECIMAL") {
+    if (target == "FLOAT" || target == "DOUBLE" || target == "REAL" ||
+        target == "DECIMAL" || target == "NUMERIC") {
         if (v.GetType() == ValueType::FLOAT) return v;
         if (v.GetType() == ValueType::INTEGER) {
             return Value::MakeFloat(static_cast<double>(v.AsInt()));
@@ -678,8 +950,26 @@ Value ExpressionEvaluator::EvaluateCast(const CastExprNode& expr, const Tuple& t
         }
         return Value::MakeNull();
     }
-    if (target == "VARCHAR" || target == "STRING" || target == "TEXT" || target == "CHAR") {
+    if (target == "VARCHAR" || target == "STRING" || target == "TEXT" ||
+        target == "CHAR" || target == "DATE" || target == "TIMESTAMP" ||
+        target == "TIME" || target == "JSON" || target == "UUID") {
         return Value::MakeVarchar(v.ToString());
+    }
+    if (target == "BOOLEAN" || target == "BOOL") {
+        // SQL 风格：非零数字 / 非空字符串 / 非空 timestamp 均视为 TRUE。
+        // NULL / 0 / 空串视为 FALSE。已是 INTEGER 则直接转 BOOL。
+        // 注：底层没有 BOOL ValueType；MakeBool（见上方匿名命名空间）
+        // 把 bool 映射为 INTEGER 0/1，与 IS TRUE / 比较 / 输出层一致。
+        if (v.GetType() == ValueType::INTEGER) {
+            return MakeBool(v.AsInt() != 0);
+        }
+        if (v.GetType() == ValueType::FLOAT) {
+            return MakeBool(v.AsFloat() != 0.0);
+        }
+        if (v.GetType() == ValueType::VARCHAR) {
+            return MakeBool(!v.AsVarchar().empty());
+        }
+        return MakeBool(false);
     }
     return Value::MakeNull();
 }
@@ -707,6 +997,17 @@ Value ExpressionEvaluator::EvaluateFunctionCall(const FunctionCallExpr& expr,
         if (a.IsNull() || b.IsNull()) return a;  // NULLIF(a, NULL) 返回 a；NULLIF(NULL, b) 返回 NULL
         return Value::Compare(a, b) == 0 ? Value::MakeNull() : a;
     }
+    // IIF(cond, thenValue, elseValue) — SQL Server/Access 风格的简写。
+    // 三值逻辑：cond 为 TRUE -> 求 thenValue；cond 为 FALSE/NULL -> 求 elseValue。
+    // 短路求值：未选中的分支不会被求值。
+    if (name == "IIF") {
+        if (expr.arguments.size() != 3) return Value::MakeNull();
+        Value cond = Evaluate(expr.arguments[0], tuple);
+        if (!cond.IsNull() && IsTruthy(cond)) {
+            return Evaluate(expr.arguments[1], tuple);
+        }
+        return Evaluate(expr.arguments[2], tuple);
+    }
     // ---- 字符串函数 ----
     if (name == "UPPER") {
         if (expr.arguments.size() != 1) return Value::MakeNull();
@@ -729,6 +1030,23 @@ Value ExpressionEvaluator::EvaluateFunctionCall(const FunctionCallExpr& expr,
         Value v = Evaluate(expr.arguments[0], tuple);
         if (v.IsNull()) return Value::MakeNull();
         return Value::MakeInt(static_cast<int32_t>(v.ToString().size()));
+    }
+    // typeof(expr) —— 返回表达式求值结果的运行期类型名（VARCHAR）。
+    // 取的是 ValueType 而非 IsNull()：NULL 值的类型本身就是 NULL，
+    // 故 typeof(NULL) 返回 'NULL'，不传播 NULL。这是与 SQLite/MySQL
+    // 的 typeof() 一致的语义。注意：字符串字面量 / DECIMAL / DATE /
+    // TIMESTAMP 等在运行时统一表现为 VARCHAR，因此 typeof('hi') 与
+    // typeof(CAST(x AS DATE)) 都返回 'VARCHAR'。
+    if (name == "TYPEOF") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        switch (v.GetType()) {
+            case ValueType::INTEGER: return Value::MakeVarchar("INTEGER");
+            case ValueType::FLOAT:   return Value::MakeVarchar("FLOAT");
+            case ValueType::VARCHAR: return Value::MakeVarchar("VARCHAR");
+            case ValueType::NULL_TYPE: return Value::MakeVarchar("NULL");
+        }
+        return Value::MakeVarchar("NULL");
     }
     if (name == "SUBSTR" || name == "SUBSTRING") {
         if (expr.arguments.size() < 2 || expr.arguments.size() > 3) return Value::MakeNull();
@@ -783,6 +1101,105 @@ Value ExpressionEvaluator::EvaluateFunctionCall(const FunctionCallExpr& expr,
             pos = hit + from.size();
         }
         return Value::MakeVarchar(std::move(out));
+    }
+    // ---- 字符串函数补全（Fix #3）----
+    // REVERSE / STARTS_WITH / LTRIM / RTRIM 旧实现未命中，落到 UDF
+    // fallback → NULL。Planner 的 IsStringFuncName 已接受这些名字。
+    // 全部遵循「NULL 入参 → NULL」语义，与 TRIM/REPLACE 等一致。
+    if (name == "REVERSE") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        std::string s = v.ToString();
+        std::reverse(s.begin(), s.end());
+        return Value::MakeVarchar(std::move(s));
+    }
+    // STARTS_WITH(s, prefix)：按 PostgreSQL 语义：prefix 为空串时返回 TRUE，
+    // s 长度不足时返回 FALSE。任一参数为 NULL → NULL。返回 INT(0/1)
+    // 形式以便与其它谓词函数在 SELECT 列表里行为一致。
+    if (name == "STARTS_WITH") {
+        if (expr.arguments.size() != 2) return Value::MakeNull();
+        Value s = Evaluate(expr.arguments[0], tuple);
+        Value p = Evaluate(expr.arguments[1], tuple);
+        if (s.IsNull() || p.IsNull()) return Value::MakeNull();
+        const std::string ss = s.ToString();
+        const std::string pp = p.ToString();
+        return MakeBool(ss.size() >= pp.size() &&
+                        ss.compare(0, pp.size(), pp) == 0);
+    }
+    if (name == "LTRIM") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        const std::string s = v.ToString();
+        size_t b = 0;
+        while (b < s.size() &&
+               std::isspace(static_cast<unsigned char>(s[b]))) {
+            ++b;
+        }
+        return Value::MakeVarchar(s.substr(b));
+    }
+    if (name == "RTRIM") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        const std::string s = v.ToString();
+        size_t e = s.size();
+        while (e > 0 &&
+               std::isspace(static_cast<unsigned char>(s[e - 1]))) {
+            --e;
+        }
+        return Value::MakeVarchar(s.substr(0, e));
+    }
+    // ---- Fix #4: CONCAT / CONCAT_WS 函数（MySQL 兼容）----
+    // 旧实现里 CONCAT 函数调用落到 UDF fallback → NULL；CONCAT_WS
+    // 完全没登记。这里走 MySQL 语义：跳过 NULL 参数；CONCAT_WS 第一个
+    // 参数为分隔符，分隔符 NULL 整体 NULL，全 NULL 参数 → 空串。
+    //
+    // 注意：`||` 操作符（BinaryOperator::CONCAT，EvaluateBinary:706-710）
+    // 保持 SQL 标准（任一 NULL → NULL）不变。函数调用与操作符是两条
+    // 独立路径，行为可以不同。
+    if (name == "CONCAT") {
+        if (expr.arguments.size() < 2) return Value::MakeNull();
+        std::string out;
+        for (const auto& a : expr.arguments) {
+            Value v = Evaluate(a, tuple);
+            if (v.IsNull()) continue;  // MySQL: ignore NULL
+            out += v.ToString();
+        }
+        return Value::MakeVarchar(std::move(out));
+    }
+    if (name == "CONCAT_WS") {
+        // 至少 sep + 1 个值（≥ 2 参数）。
+        if (expr.arguments.size() < 2) return Value::MakeNull();
+        Value sep = Evaluate(expr.arguments[0], tuple);
+        if (sep.IsNull()) return Value::MakeNull();  // 分隔符 NULL → 整体 NULL
+        const std::string s = sep.ToString();
+        std::string out;
+        bool first = true;
+        for (size_t i = 1; i < expr.arguments.size(); ++i) {
+            Value v = Evaluate(expr.arguments[i], tuple);
+            if (v.IsNull()) continue;  // MySQL: ignore NULL（非分隔符）
+            if (!first) out += s;
+            out += v.ToString();
+            first = false;
+        }
+        return Value::MakeVarchar(std::move(out));
+    }
+    // INSTR(haystack, needle) / POSITION(needle IN haystack)
+    // Oracle/MySQL 语义：返回 needle 在 haystack 中首次出现的位置（1-based）。
+    // 任一参数为 NULL -> NULL；needle 为空串 -> 1；needle 未找到 -> 0。
+    if (name == "INSTR" || name == "POSITION") {
+        if (expr.arguments.size() != 2) return Value::MakeNull();
+        Value h = Evaluate(expr.arguments[0], tuple);
+        Value n = Evaluate(expr.arguments[1], tuple);
+        if (h.IsNull() || n.IsNull()) return Value::MakeNull();
+        const std::string hs = h.ToString();
+        const std::string nd = n.ToString();
+        if (nd.empty()) return Value::MakeInt(1);
+        size_t pos = hs.find(nd);
+        if (pos == std::string::npos) return Value::MakeInt(0);
+        return Value::MakeInt(static_cast<int32_t>(pos + 1));
     }
     // ---- 数学函数 ----
     if (name == "ROUND") {
@@ -847,6 +1264,69 @@ Value ExpressionEvaluator::EvaluateFunctionCall(const FunctionCallExpr& expr,
         if (r < 0) r += bv;  // 与 SQL MOD 一致：返回非负余数
         return Value::MakeInt(static_cast<int32_t>(r));
     }
+    // ---- 数学函数补全（Fix #2）----
+    // 旧实现里 SQRT/EXP/LOG/LOG10/SIGN/TRUNCATE 等只在 Planner 的
+    // IsMathFuncName 中登记，EvaluateFunctionCall 没有对应分支 → 落到
+    // UDF fallback 找不到同名函数 → 永远返回 NULL。补齐后所有这些函数
+    // 对字面量和列引用都生效；NULL 入参 → NULL；非法域（负数开方、LOG
+    // 非正数）也按 SQL 标准返回 NULL。
+    if (name == "SQRT") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        double x = ValueToDouble(v);
+        if (x < 0.0) return Value::MakeNull();
+        return Value::MakeFloat(std::sqrt(x));
+    }
+    if (name == "EXP") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        return Value::MakeFloat(std::exp(ValueToDouble(v)));
+    }
+    // LN / 单参 LOG：自然对数。PostgreSQL/MySQL 的两参 LOG(base, x) 走 Power(x, 1/base) 派生
+    // 不在本期范围，留作未来扩展点。
+    if (name == "LN" || (name == "LOG" && expr.arguments.size() == 1)) {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        double x = ValueToDouble(v);
+        if (x <= 0.0) return Value::MakeNull();
+        return Value::MakeFloat(std::log(x));
+    }
+    if (name == "LOG10") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        double x = ValueToDouble(v);
+        if (x <= 0.0) return Value::MakeNull();
+        return Value::MakeFloat(std::log10(x));
+    }
+    // SIGN(-5) = -1, SIGN(0) = 0, SIGN(7) = 1；输入 INTEGER → 输出 INTEGER，
+    // 与 ABS（ExpressionEvaluator.cpp:1125-1135）类型保留规则对齐。
+    if (name == "SIGN") {
+        if (expr.arguments.size() != 1) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        if (v.IsNull()) return Value::MakeNull();
+        double x = ValueToDouble(v);
+        int32_t sgn = (x > 0.0) ? 1 : ((x < 0.0) ? -1 : 0);
+        if (v.GetType() == ValueType::INTEGER) return Value::MakeInt(sgn);
+        return Value::MakeFloat(static_cast<double>(sgn));
+    }
+    // TRUNCATE(x, n) / TRUNC(x, n)：向零截断到 n 位小数。与 ROUND
+    // （EvaluateFunctionCall:1095）保留同形：n==0 → INTEGER，否则 FLOAT。
+    if (name == "TRUNCATE" || name == "TRUNC") {
+        if (expr.arguments.size() != 2) return Value::MakeNull();
+        Value v = Evaluate(expr.arguments[0], tuple);
+        Value d = Evaluate(expr.arguments[1], tuple);
+        if (v.IsNull() || d.IsNull()) return Value::MakeNull();
+        int n = d.AsInt();
+        double x = ValueToDouble(v);
+        double factor = std::pow(10.0, n);
+        double r = std::trunc(x * factor) / factor;
+        if (n == 0) return Value::MakeInt(static_cast<int32_t>(r));
+        return Value::MakeFloat(r);
+    }
     // ---- 日期/时间函数 ----
     if (name == "YEAR" || name == "MONTH" || name == "DAY") {
         if (expr.arguments.size() != 1) return Value::MakeNull();
@@ -872,6 +1352,38 @@ Value ExpressionEvaluator::EvaluateFunctionCall(const FunctionCallExpr& expr,
                       tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                       tm.tm_hour, tm.tm_min, tm.tm_sec);
         return Value::MakeVarchar(buf);
+    }
+    // ---- 60_funcs: 标量函数 GREATEST / LEAST / RAND / RANDOM ----
+    // GREATEST(a, b, ...) 与 LEAST(a, b, ...) 至少 1 个参数；
+    // 任一参数为 NULL 时整体返回 NULL（PostgreSQL / 标准 SQL 语义）。
+    if (name == "GREATEST") {
+        if (expr.arguments.empty()) return Value::MakeNull();
+        Value best = Evaluate(expr.arguments[0], tuple);
+        if (best.IsNull()) return Value::MakeNull();
+        for (size_t i = 1; i < expr.arguments.size(); ++i) {
+            Value v = Evaluate(expr.arguments[i], tuple);
+            if (v.IsNull()) return Value::MakeNull();
+            if (Value::Compare(v, best) > 0) best = v;
+        }
+        return best;
+    }
+    if (name == "LEAST") {
+        if (expr.arguments.empty()) return Value::MakeNull();
+        Value best = Evaluate(expr.arguments[0], tuple);
+        if (best.IsNull()) return Value::MakeNull();
+        for (size_t i = 1; i < expr.arguments.size(); ++i) {
+            Value v = Evaluate(expr.arguments[i], tuple);
+            if (v.IsNull()) return Value::MakeNull();
+            if (Value::Compare(v, best) < 0) best = v;
+        }
+        return best;
+    }
+    // RAND() / RANDOM() —— 返回 [0, 1) 区间 FLOAT。
+    // 使用 thread_local mt19937_64，保证同一 SELECT 内多次调用得到的值不同。
+    if (name == "RAND" || name == "RANDOM") {
+        thread_local std::mt19937_64 rng{std::random_device{}()};
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+        return Value::MakeFloat(dist(rng));
     }
     // ---- 40_txn_view_udf：UDF 调用 ----
     // 当内置函数未命中且 ExecutionContext 中存在 catalog 时，尝试按 catalog
@@ -936,8 +1448,16 @@ bool SqlCompare(const Value& l, const std::string& op, const Value& r) {
 // 用一个 unordered_set 方便 O(1) 命中判断（限定列 ref 是否属于本层）。
 void CollectInnerTableNames(const SelectStatement& sub,
                             std::unordered_set<std::string>& out) {
-    if (!sub.from_table.empty()) {
+    // 55_query: LATERAL 子查询时 from_table 不参与 inner_tables：用户的内层
+    // FROM 表名与外层同名时（例如 `FROM t1, LATERAL (SELECT ... FROM t1 t2 ...)`
+    // 中 `t1.val` 期望引用外层），不应把内层 t1 视为屏蔽外层 t1 的标识符。
+    // 仅 from_table_alias（以及 joins / derived_alias）作为内层有效表名。
+    if (!sub.is_lateral && !sub.from_table.empty()) {
         out.insert(sub.from_table);
+        if (!sub.from_table_alias.empty()) out.insert(sub.from_table_alias);
+    } else if (sub.is_lateral) {
+        // LATERAL：仍然把 from_table_alias 作为内部别名纳入（防止别名撞 outer 表名
+        // 时反向解析），但 from_table 自身留给 outer_bind。
         if (!sub.from_table_alias.empty()) out.insert(sub.from_table_alias);
     }
     for (const auto& j : sub.joins) {
@@ -1098,8 +1618,24 @@ std::unordered_map<std::string, Value> BuildOuterBind(
 
 Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
                                             const Tuple& tuple) const {
-    if (!expr.subquery_plan) return Value::MakeNull();
     if (!ctx_) return Value::MakeNull();
+    // 71_proc_out_params：procedure 体内 SET var = (SELECT ...) / 表达式中的
+    // 子查询未经过顶层 Planner 路径，AST 上的 subquery_plan 字段为空。
+    // 在此按需 plan：复用 ctx 的 catalog + symbol_table，得到 PlanNodePtr
+    // 后照常驱动子计划。Planner/Optimizer 不修改 AST，所以不需要写回 subquery_plan。
+    PlanNodePtr plan = expr.subquery_plan;
+    if (!plan && expr.subquery) {
+        Planner planner(ctx_->GetCatalog(), ctx_->GetCatalog()->GetSymbolTable());
+        std::shared_ptr<Statement> stmt_alias(
+            const_cast<SelectStatement*>(expr.subquery.get()),
+            [](Statement*){});
+        plan = planner.CreatePlan(stmt_alias);
+        if (plan) {
+            Optimizer opt(ctx_->GetCatalog());
+            plan = opt.Optimize(std::move(plan));
+        }
+    }
+    if (!plan) return Value::MakeNull();
 
     // === 相关子查询：把当前外层行的列值推到 ExecutionContext，再跑子计划 ===
     // 跑完后恢复旧的 outer_bind，避免影响同语句后续无关的 evaluator。
@@ -1109,6 +1645,15 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
     const std::unordered_set<std::string>* saved_inner = ctx_->GetInnerTables();
     std::unique_ptr<std::unordered_set<std::string>> owned_inner_tables;
     const std::unordered_set<std::string>* use_inner = nullptr;
+    // 71_proc_out_params：procedure 体内部的子查询需要看到 frame.locals（如
+    // `WHERE val > threshold`），外层元组通常是空、列下标 cmap 也是空，
+    // BuildOuterBind 提不出任何键。本分支把父 evaluator 的 outer_bind（通常
+    // 是 UdfExecutor::frame.locals）整体塞到 ctx_->outer_bind，使子查询内部
+    // 的 evaluator 通过 EvaluateColumnRef 的 outer_bind 回退路径找到这些键。
+    if (outer_bind_ != nullptr) {
+        use_bind = outer_bind_;
+        ctx_->SetOuterBind(use_bind);
+    }
     if (expr.subquery && IsSubqueryCorrelated(*expr.subquery)) {
         // 合并子查询 AST 中所有相关位置的外层列引用：select_list / where /
         // having / order_by / join.on 都可能引用外层。把每处 expr 喂给 BuildOuterBind，
@@ -1127,6 +1672,8 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
             for (auto& kv : sub_bind) owned_bind[kv.first] = kv.second;
         }
         if (!owned_bind.empty()) {
+            // 真实相关子查询：用 owned_bind（外层元组列）覆盖父 outer_bind
+            // （procedure locals），否则相关列被 procedure locals 误命中。
             use_bind = &owned_bind;
             ctx_->SetOuterBind(use_bind);
         }
@@ -1138,24 +1685,7 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
         ctx_->SetInnerTables(use_inner);
     }
 
-    // U3-3：非相关子查询物化——结果与当前外层行无关，首次求值执行一次并缓存，
-    // 后续外层行直接复用（每条语句每个子查询只跑一次子计划）；相关子查询保持
-    // 逐行求值（结果依赖当前外层绑定，不可缓存）。
-    const bool correlated =
-        expr.subquery && IsSubqueryCorrelated(*expr.subquery);
-    std::vector<Tuple> rows;
-    if (!correlated && expr.subquery_plan) {
-        const std::vector<Tuple>* cached =
-            ctx_->GetCachedSubqueryRows(expr.subquery_plan.get());
-        if (cached) {
-            rows = *cached;
-        } else {
-            rows = RunPlanToCompletion(ctx_, expr.subquery_plan);
-            ctx_->CacheSubqueryRows(expr.subquery_plan.get(), rows);
-        }
-    } else {
-        rows = RunPlanToCompletion(ctx_, expr.subquery_plan);
-    }
+    auto rows = RunPlanToCompletion(ctx_, plan);
     if (use_bind) ctx_->SetOuterBind(saved_bind);
     if (use_inner) ctx_->SetInnerTables(saved_inner);
 
@@ -1212,7 +1742,7 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
 // 43_upsert: VALUES(col) —— 通过 ExecutionContext 上的 upsert_values_bind 取值。
 // 不在 upsert 上下文时返回 NULL（语义层应保证 VALUES(col) 不出现在其它语境）。
 Value ExpressionEvaluator::EvaluateUpsertValuesRef(const UpsertValuesRefExpr& expr,
-                                                   const Tuple& /*tuple*/) const {
+                                                   const Tuple& tuple) const {
     if (!ctx_) return Value::MakeNull();
     const auto* bind = ctx_->GetUpsertValuesBind();
     if (!bind) return Value::MakeNull();
@@ -1221,16 +1751,20 @@ Value ExpressionEvaluator::EvaluateUpsertValuesRef(const UpsertValuesRefExpr& ex
     return it->second;
 }
 
-// 44_pattern_match: 统一处理 LIKE / ILIKE / REGEXP / RLIKE（含可选 ESCAPE）。
+// 44_pattern_match / 56_pattern: 统一处理 LIKE / ILIKE / REGEXP / RLIKE / SIMILAR TO
+// （含可选 ESCAPE）。
 //
 // 设计取舍：
 //   - LIKE / ILIKE：使用本文件的 MatchLikePatternEscaped（按 escape_char
 //     转义）。ILIKE 在匹配前对两侧做 ASCII 小写折叠；REGEXP 不受 escape_char
 //     影响（C++ <regex> 自身支持 '\' 转义）。
 //   - REGEXP / RLIKE：pattern 通常是字面量，但在通用 AST 上无法保证；统一
-//     在运行时每行编译一次 std::regex（regex::ECMAScript + 关闭 implicit
-//     锚定符合 POSIX ERE 的语义）。失败时抛 RuntimeError，文案
-//     `Error: invalid regex pattern: <what()>` 满足测试期望。
+//     在运行时编译一次 std::regex（regex::ECMAScript）。\d \D \s \S \w \W 这
+//     六个 ERE 单词字符类在编译前由 TranslateEreWordClasses 转译为显式字符类
+//     （std::regex ECMAScript 自身也支持，但显式化跨引擎更稳）。失败抛
+//     RuntimeError，文案 `Error: invalid regex pattern: <what()>` 满足测试期望。
+//   - SIMILAR TO：先把 SQL pattern 经 TranslateSqlLikeToEre 翻译成 ERE，再走
+//     与 REGEXP 相同的编译路径。ESCAPE 子句在 SQL 通配符（%/ _）层面生效。
 Value ExpressionEvaluator::EvaluateLike(const LikeExprNode& expr,
                                         const Tuple& tuple) const {
     Value l = Evaluate(expr.operand, tuple);
@@ -1258,12 +1792,25 @@ Value ExpressionEvaluator::EvaluateLike(const LikeExprNode& expr,
         case LikeExprNode::Kind::RLIKE: {
             // ECMAScript + 非显式 '^' 锚定 → 子串匹配；POSIX ERE 的 '^'/'$'
             // 在 ECMAScript 下同样按位置断言，因此 metacharacter 要求可达成。
+            std::string ere = TranslateEreWordClasses(p);
             try {
-                std::regex re(p, std::regex::ECMAScript | std::regex::optimize);
+                std::regex re(ere, std::regex::ECMAScript | std::regex::optimize);
                 return MakeBool(std::regex_search(s, re));
             } catch (const std::regex_error& e) {
                 // FormatError 对 RUNTIME 阶段跳过 "[Runtime]" 前缀，main.cpp
                 // 再补 "Error: "。最终输出为 "Error: invalid regex pattern: <what()>"。
+                throw CompilerException(ErrorStage::RUNTIME,
+                    std::string("invalid regex pattern: ") + e.what());
+            }
+        }
+        case LikeExprNode::Kind::SIMILAR_TO: {
+            // 56_pattern: SQL pattern → ERE → std::regex。
+            std::string ere = TranslateSqlLikeToEre(p, esc);
+            std::string ere_with_wc = TranslateEreWordClasses(ere);
+            try {
+                std::regex re(ere_with_wc, std::regex::ECMAScript | std::regex::optimize);
+                return MakeBool(std::regex_search(s, re));
+            } catch (const std::regex_error& e) {
                 throw CompilerException(ErrorStage::RUNTIME,
                     std::string("invalid regex pattern: ") + e.what());
             }
@@ -1308,6 +1855,21 @@ Value ExpressionEvaluator::EvaluateInterval(const IntervalExprNode& expr,
     (void)tuple;
     (void)expr;
     return Value::MakeNull();
+}
+
+// 53_ddl: NEXTVAL FOR sequence_name —— 推进并返回当前值。
+// 在 ctx_ 为空或 catalog 为空时退化为 NULL；序列不存在抛 SEMANTIC 错误。
+Value ExpressionEvaluator::EvaluateNextval(const NextvalExpr& expr) const {
+    if (ctx_ == nullptr) return Value::MakeNull();
+    SystemCatalog* catalog = ctx_->GetCatalog();
+    if (catalog == nullptr) return Value::MakeNull();
+    int64_t v = 0;
+    if (!catalog->NextSequence(expr.sequence_name, &v)) {
+        throw CompilerException(
+            ErrorStage::SEMANTIC,
+            "sequence does not exist: " + expr.sequence_name);
+    }
+    return Value::MakeInt(static_cast<int32_t>(v));
 }
 
 }  // namespace sqlcompiler

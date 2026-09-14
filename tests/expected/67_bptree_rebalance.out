@@ -1,0 +1,431 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | payload
+---+--------
+80 | bbbb   
+(1 row)
+sqlcompiler> id | payload
+---+--------
+80 | bbbb   
+81 | cccc   
+82 | dddd   
+83 | eeee   
+84 | ffff   
+85 | gggg   
+86 | hhhh   
+87 | iiii   
+88 | jjjj   
+89 | kkkk   
+90 | llll   
+(11 rows)
+sqlcompiler> id  | payload
+----+--------
+76  | xxx    
+77  | yyy    
+78  | zzz    
+79  | aaaa   
+80  | bbbb   
+81  | cccc   
+82  | dddd   
+83  | eeee   
+84  | ffff   
+85  | gggg   
+86  | hhhh   
+87  | iiii   
+88  | jjjj   
+89  | kkkk   
+90  | llll   
+91  | mmmm   
+92  | nnnn   
+93  | oooo   
+94  | pppp   
+95  | qqqq   
+96  | rrrr   
+97  | ssss   
+98  | tttt   
+99  | uuuu   
+100 | vvvv   
+(25 rows)
+sqlcompiler> COUNT
+-----
+25   
+(1 row)
+sqlcompiler> COUNT
+-----
+25   
+(1 row)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> COUNT
+-----
+9    
+(1 row)
+sqlcompiler> id  | payload
+----+--------
+76  | xxx    
+77  | yyy    
+78  | zzz    
+79  | aaaa   
+96  | rrrr   
+97  | ssss   
+98  | tttt   
+99  | uuuu   
+100 | vvvv   
+(9 rows)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> COUNT
+-----
+0    
+(1 row)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> COUNT
+-----
+10   
+(1 row)
+sqlcompiler> id | payload
+---+--------
+1  | fresh1 
+2  | fresh2 
+3  | fresh3 
+4  | fresh4 
+5  | fresh5 
+6  | fresh6 
+7  | fresh7 
+8  | fresh8 
+9  | fresh9 
+10 | fresh10
+(10 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | name
+---+-----
+(0 rows)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | name 
+---+------
+4  | alpha
+(1 row)
+sqlcompiler> id | name 
+---+------
+2  | beta 
+3  | gamma
+4  | alpha
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | grp
+---+----
+(0 rows)
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> id | grp
+---+----
+10 | 1  
+11 | 1  
+(2 rows)
+sqlcompiler> id | grp
+---+----
+4  | 2  
+5  | 2  
+6  | 2  
+7  | 3  
+8  | 3  
+9  | 3  
+10 | 1  
+11 | 1  
+(8 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | val
+---+----
+5  | 50 
+7  | 70 
+9  | 90 
+11 | 110
+12 | 120
+13 | 130
+14 | 140
+15 | 150
+(8 rows)
+sqlcompiler> OK
+sqlcompiler> id | val
+---+----
+1  | 10 
+3  | 30 
+5  | 50 
+7  | 70 
+9  | 90 
+11 | 110
+13 | 130
+15 | 150
+17 | 170
+18 | 180
+19 | 190
+20 | 200
+(12 rows)
+sqlcompiler> OK
+sqlcompiler> COUNT
+-----
+8    
+(1 row)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> id | val
+---+----
+1  | 10 
+2  | 25 
+3  | 30 
+5  | 50 
+7  | 70 
+9  | 90 
+11 | 110
+13 | 130
+15 | 150
+16 | 165
+21 | 210
+22 | 220
+(12 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | payload
+---+--------
+16 | row16  
+17 | row17  
+18 | row18  
+19 | row19  
+20 | row20  
+21 | row21  
+22 | row22  
+23 | row23  
+24 | row24  
+25 | row25  
+(10 rows)
+sqlcompiler> id | payload
+---+--------
+16 | row16  
+17 | row17  
+18 | row18  
+19 | row19  
+20 | row20  
+21 | row21  
+22 | row22  
+23 | row23  
+24 | row24  
+25 | row25  
+(10 rows)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | payload
+---+--------
+17 | row17  
+19 | row19  
+21 | row21  
+23 | row23  
+25 | row25  
+(5 rows)
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> id | payload
+---+--------
+17 | row17  
+19 | row19  
+21 | row21  
+23 | row23  
+25 | row25  
+31 | row31  
+32 | row32  
+33 | row33  
+50 | row50  
+(9 rows)
+sqlcompiler> id  | payload
+----+--------
+17  | row17  
+19  | row19  
+21  | row21  
+23  | row23  
+25  | row25  
+31  | row31  
+32  | row32  
+33  | row33  
+50  | row50  
+100 | row100 
+(10 rows)
+sqlcompiler> sqlcompiler> 

@@ -1,0 +1,62 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> name  | country | spent | rk
+------+---------+-------+---
+Alice | USA     | 385   | 1 
+Bob   | USA     | 50    | 2 
+Frank | USA     | 25    | 3 
+Cara  | UK      | 418   | 1 
+Dan   | UK      | 200   | 2 
+Eve   | JP      | 500   | 2 
+Gus   | JP      | 600   | 1 
+Hana  | JP      | 88    | 3 
+(8 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> name  | country | spent | rn | drk
+------+---------+-------+----+----
+Alice | USA     | 385   | 1  | 1  
+Bob   | USA     | 50    | 2  | 2  
+Frank | USA     | 25    | 3  | 3  
+Cara  | UK      | 418   | 1  | 1  
+Dan   | UK      | 200   | 2  | 2  
+Eve   | JP      | 500   | 2  | 2  
+Gus   | JP      | 600   | 1  | 1  
+Hana  | JP      | 88    | 3  | 3  
+(8 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> name  | country | spent | g_rk
+------+---------+-------+-----
+Alice | USA     | 385   | 4   
+Bob   | USA     | 50    | 7   
+Frank | USA     | 25    | 8   
+Cara  | UK      | 418   | 3   
+Dan   | UK      | 200   | 5   
+Eve   | JP      | 500   | 2   
+Gus   | JP      | 600   | 1   
+Hana  | JP      | 88    | 6   
+(8 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> name  | country | spent | rk_asc
+------+---------+-------+-------
+Alice | USA     | 385   | 3     
+Bob   | USA     | 50    | 2     
+Frank | USA     | 25    | 1     
+Cara  | UK      | 418   | 2     
+Dan   | UK      | 200   | 1     
+Eve   | JP      | 500   | 2     
+Gus   | JP      | 600   | 3     
+Hana  | JP      | 88    | 1     
+(8 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> name  | country | spent | country_total
+------+---------+-------+--------------
+Alice | USA     | 385   | 460          
+Bob   | USA     | 50    | 460          
+Frank | USA     | 25    | 460          
+Cara  | UK      | 418   | 618          
+Dan   | UK      | 200   | 618          
+Eve   | JP      | 500   | 1188         
+Gus   | JP      | 600   | 1188         
+Hana  | JP      | 88    | 1188         
+(8 rows)
+sqlcompiler> sqlcompiler> 

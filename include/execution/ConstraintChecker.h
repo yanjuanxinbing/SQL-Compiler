@@ -36,4 +36,57 @@ void ValidateRowConstraints(SystemCatalog* catalog, const TableInfo& table_info,
 // 由列声明类型推导出运行时类型向量（序列化/反序列化用）。
 std::vector<ValueType> BuildColumnTypes(const TableInfo& table_info);
 
+// ============================================================================
+// 53_ddl: FOREIGN KEY 强制执行（外键约束）
+// ----------------------------------------------------------------------------
+// 语义（在最小可用实现下）：
+//   - 子表 INSERT / UPDATE 写入前：对每条 FK，验证 (child_cols) 在 parent 上
+//     存在匹配行。若不存在 → 抛 "foreign key violation: ..."。
+//   - 父表 DELETE：对每条引用本表的 FK，若声明 RESTRICT（默认）且存在任一
+//     子行 → 抛错拒绝 DELETE；若声明 CASCADE → 删除对应子行；若声明 SET NULL
+//     → 把子行 FK 列置 NULL（要求 FK 列可空）。
+//   - 父表 UPDATE：当前实现对 FK 列更新按 CASCADE/RESTRICT 类同 DELETE 处理。
+//
+// 备注：
+//   - "匹配行" 的判定：依次取 (child_cols[i] 值) 在 parent 上对应 PK 索引中
+//     找是否存在 RID。parent 的 PK 索引不存在时退回全表扫描；扫描时对
+//     parent_cols 的每一列做精确等值比较。
+//   - 对非空列（FK 列含 NULL）：若 child 行该列值为 NULL，按 SQL 语义跳过
+//     校验（NULL 不参与 FK 匹配）。
+// ============================================================================
+
+// 在 child_table 上的 INSERT / UPDATE 路径上调用：检查每一行即将写入的
+// (child_cols) 值都能在 parent_table 上找到匹配行。无匹配抛 SEMANTIC 错误。
+// child_table 与 table_info.table_name 必须一致；row 是即将写入的列值列表。
+void EnforceChildForeignKeys(SystemCatalog* catalog, const std::string& child_table,
+                             const std::vector<Value>& row);
+
+// 在 parent_table 的 DELETE / UPDATE 路径上调用：
+//   - 对每条引用本表的 FK 按其 on_delete_action 分支：
+//     RESTRICT：扫描子表，若有任何 child_cols 与 parent 即将删除/已删除行
+//               的 (parent_cols 值) 相等的行 → 抛错拒绝。
+//     CASCADE：扫描子表，删除 child_cols 与 parent 行匹配的子行。
+//     SET NULL：扫描子表，把 child_cols 置 NULL（要求这些列可空，否则报错）。
+//   - 当前实现一次仅处理单行（典型 DELETE WHERE pk = X 调用一次），因此
+//     passed_parent_values 应仅含一行（被删/被改的父行）即将消失的
+//     parent_cols 值集合。
+//   - exclude_child_rid 可选：当 CASCADE / SET NULL 修改子行时跳过该 RID
+//     （例如 UPDATE 同表父子关系时的子行正在被改写）。
+//
+// modified_parent_cols（默认 nullptr）用于 UPDATE 路径：
+//   - nullptr：视为「parent_cols 全部正在被移除」，与 DELETE 语义一致。
+//   - 非空：仅当某条 FK 的 parent_cols 全部出现在该集合中时才触发强制执行；
+//           即 UPDATE 真正修改了 FK 引用的父列时按 ON UPDATE 语义处理。
+//           若某 FK 的 parent_cols 与该集合无交集，说明该 UPDATE 没有改动 FK
+//           关心的列，跳过该 FK 的强制执行——
+//           这样 UPDATE 仅修改非 FK 引用列（如 credit）时，parent PK 未变，
+//           子行引用仍然合法，不会被错误地报"cannot delete parent row"。
+//           （修复 Bug-7：read-your-own-writes inside a transaction。）
+void EnforceParentForeignKeys(SystemCatalog* catalog,
+                              const std::string& parent_table,
+                              const std::vector<Value>& parent_row,
+                              const RID* exclude_child_rid = nullptr,
+                              const std::unordered_set<std::string>*
+                                  modified_parent_cols = nullptr);
+
 }  // namespace sqlcompiler

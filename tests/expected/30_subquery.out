@@ -1,0 +1,69 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> id | name    | total
+---+---------+------
+1  | Alice   | 150  
+2  | Bob     | 200  
+3  | Charlie | 140  
+4  | David   | NULL 
+5  | Eve     | 300  
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        -> name
+----
+Eve 
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler>        -> name 
+-----
+Alice
+Bob  
+Eve  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        -> name   
+-------
+Alice  
+Charlie
+David  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        -> name   
+-------
+Alice  
+Bob    
+Charlie
+Eve    
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        -> name   
+-------
+Alice  
+Charlie
+David  
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> cust_id | cnt
+--------+----
+1       | 2  
+3       | 2  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> name    | order_cnt
+--------+----------
+Alice   | 2        
+Bob     | 1        
+Charlie | 2        
+David   | 0        
+Eve     | 1        
+(5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        -> name   
+-------
+Bob    
+Charlie
+David  
+Eve    
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> name
+----
+Bob 
+Eve 
+(2 rows)
+sqlcompiler> sqlcompiler> 

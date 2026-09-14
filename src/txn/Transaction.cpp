@@ -31,7 +31,6 @@
 
 #include "txn/Transaction.h"
 
-#include <algorithm>
 #include <cstring>
 #include <utility>
 

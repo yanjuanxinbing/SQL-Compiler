@@ -1,0 +1,81 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | name  | age | status
+---+-------+-----+-------
+1  | Alice | 20  | active
+(1 row)
+sqlcompiler> id | name    | age  | status 
+---+---------+------+--------
+1  | Alice   | 20   | active 
+3  | Charlie | 30   | NULL   
+5  | Eve     | NULL | pending
+(3 rows)
+sqlcompiler> id | name    | age | status
+---+---------+-----+-------
+1  | Alice   | 20  | active
+3  | Charlie | 30  | NULL  
+(2 rows)
+sqlcompiler> id | name  | age | status
+---+-------+-----+-------
+1  | Alice | 20  | active
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> id | name    | age  | status 
+---+---------+------+--------
+1  | Alice   | 20   | active 
+3  | Charlie | 30   | NULL   
+5  | Eve     | NULL | pending
+(3 rows)
+sqlcompiler> id | name  | age | status  
+---+-------+-----+---------
+1  | Alice | 20  | active  
+2  | Bob   | 25  | inactive
+(2 rows)
+sqlcompiler> id | name  | age | status  
+---+-------+-----+---------
+1  | Alice | 20  | active  
+2  | Bob   | 25  | inactive
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | name    | age | status  
+---+---------+-----+---------
+1  | Alice   | 20  | active  
+2  | Bob     | 25  | inactive
+3  | Charlie | 30  | NULL    
+(3 rows)
+sqlcompiler> id | name    | age | status  
+---+---------+-----+---------
+2  | Bob     | 25  | inactive
+3  | Charlie | 30  | NULL    
+4  | David   | 35  | active  
+(3 rows)
+sqlcompiler> id | name    | age | status  
+---+---------+-----+---------
+1  | Alice   | 20  | active  
+2  | Bob     | 25  | inactive
+3  | Charlie | 30  | NULL    
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | name    | age | status
+---+---------+-----+-------
+3  | Charlie | 30  | NULL  
+(1 row)
+sqlcompiler> id | name | age  | status 
+---+------+------+--------
+5  | Eve  | NULL | pending
+(1 row)
+sqlcompiler> id | name  | age  | status  
+---+-------+------+---------
+1  | Alice | 20   | active  
+2  | Bob   | 25   | inactive
+4  | David | 35   | active  
+5  | Eve   | NULL | pending 
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | name  | age | status
+---+-------+-----+-------
+1  | Alice | 20  | active
+(1 row)
+sqlcompiler> sqlcompiler> 

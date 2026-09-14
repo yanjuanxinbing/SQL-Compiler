@@ -17,7 +17,7 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 
 # 收集所有源文件
 file(GLOB_RECURSE SQLCOMPILER_LIB_SOURCES
-    # ---- 编译器模块（词法/语法/语义/计划/优化/代码生成） ----
+    # ---- 编译器模块（词法/语法/语义/计划/优化） ----
     ${CMAKE_SOURCE_DIR}/src/common/*.cpp
     ${CMAKE_SOURCE_DIR}/src/lexer/*.cpp
     ${CMAKE_SOURCE_DIR}/src/ast/*.cpp
@@ -25,7 +25,6 @@ file(GLOB_RECURSE SQLCOMPILER_LIB_SOURCES
     ${CMAKE_SOURCE_DIR}/src/semantic/*.cpp
     ${CMAKE_SOURCE_DIR}/src/plan/*.cpp
     ${CMAKE_SOURCE_DIR}/src/optimizer/*.cpp
-    ${CMAKE_SOURCE_DIR}/src/codegen/*.cpp
 
     # ---- 存储子系统（页式存储 + 缓存管理） ----
     ${CMAKE_SOURCE_DIR}/src/storage/*.cpp

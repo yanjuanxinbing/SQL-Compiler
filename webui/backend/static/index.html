@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SQL-Compiler · Database Console</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <!-- ── Top bar ─────────────────────────────────────────────────────── -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">SQL</div>
+      <div class="title-block">
+        <div class="title">SQL-Compiler Console</div>
+        <div class="subtitle">C++17 &nbsp;·&nbsp; Volcano Executor &nbsp;·&nbsp; B+Tree / WAL / ARIES</div>
+      </div>
+    </div>
+    <div class="db-pill" id="db-pill" title="Click to switch database">
+      <span class="db-pill-dot" id="db-pill-dot"></span>
+      <span class="db-pill-label" id="db-pill-label">No database open</span>
+      <button class="db-pill-action" id="db-pill-action" type="button" title="Change database">Change</button>
+    </div>
+  </header>
+
+  <!-- ── Open-database modal ────────────────────────────────────────── -->
+  <div id="db-modal" class="modal hidden" role="dialog" aria-modal="true" aria-label="Open database">
+    <div class="modal-backdrop" id="db-modal-backdrop"></div>
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>Open database</h2>
+        <button class="modal-close" id="db-modal-close" type="button" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body">
+
+        <!-- 1. Server-side file browser — the only reliable way to pick a
+             .db file.  Native OS file dialogs no longer expose the
+             absolute path in modern browsers (security restriction), so
+             we delegate to the server which can return real paths. -->
+        <div class="picker-zone" id="db-drop-zone">
+          <div class="picker-zone-icon" aria-hidden="true">📂</div>
+          <div class="picker-zone-text">
+            <div class="picker-zone-title">Pick a <code>.db</code> file</div>
+            <div class="picker-zone-hint">Open the filesystem browser and navigate to your database</div>
+          </div>
+          <div class="picker-zone-actions">
+            <button class="btn btn-primary" id="db-browse-server-btn" type="button" title="Open the server-side filesystem browser">Browse…</button>
+          </div>
+        </div>
+
+        <!-- 2. Direct path entry -->
+        <details class="path-details" id="db-path-details">
+          <summary>Or type a path / create a new file</summary>
+          <div class="path-row">
+            <input type="text" id="db-path-input" placeholder="e.g. C:\path\to\mydb.db  (a new file is created if it does not exist)" spellcheck="false">
+            <button class="btn btn-secondary" id="db-scan-btn" type="button" title="Scan this directory for .db files">↻ Scan</button>
+          </div>
+          <p class="hint" id="db-path-feedback">Start typing a path. If the parent directory exists, scanning will list existing <code>.db</code> files there.</p>
+        </details>
+
+        <p class="hint db-error" id="db-error" hidden></p>
+
+        <!-- 3. Recently opened (persistent, across sessions) -->
+        <div class="recent-section" id="db-recent-section" hidden>
+          <div class="recent-section-head">
+            <h3>Recently opened</h3>
+            <button class="link-btn" id="db-clear-recent" type="button" title="Forget all recently opened databases">Clear</button>
+          </div>
+          <ul class="recent-list" id="db-recent-list"></ul>
+        </div>
+
+        <!-- 4. Files in the typed path's directory -->
+        <div class="recent-section" id="db-folder-section" hidden>
+          <div class="recent-section-head">
+            <h3>Files in this folder</h3>
+            <span class="recent-section-meta" id="db-folder-meta"></span>
+          </div>
+          <ul class="recent-list" id="db-folder-list"></ul>
+        </div>
+
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-secondary" id="db-cancel-btn" type="button">Cancel</button>
+        <button class="btn btn-primary" id="db-open-btn" type="button">Open</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Server-side filesystem browser ──────────────────────────────── -->
+  <div id="browse-modal" class="modal hidden" role="dialog" aria-modal="true" aria-label="Browse filesystem">
+    <div class="modal-backdrop" id="browse-modal-backdrop"></div>
+    <div class="modal-card browse-card">
+      <div class="modal-head">
+        <h2>Browse filesystem</h2>
+        <button class="modal-close" id="browse-modal-close" type="button" aria-label="Close">×</button>
+      </div>
+      <div class="browse-toolbar">
+        <div class="browse-crumbs" id="browse-crumbs"></div>
+        <div class="browse-actions">
+          <button class="icon-btn" id="browse-up-btn" type="button" title="Up to parent">↑</button>
+          <button class="icon-btn" id="browse-home-btn" type="button" title="Home">🏠</button>
+          <button class="icon-btn" id="browse-refresh-btn" type="button" title="Refresh">↻</button>
+        </div>
+      </div>
+      <div class="browse-path-row">
+        <input type="text" id="browse-path-input" placeholder="Type a directory path and press Enter" spellcheck="false">
+        <button class="btn btn-secondary" id="browse-go-btn" type="button">Go</button>
+      </div>
+      <div class="browse-body" id="browse-body">
+        <div class="browse-empty">Loading…</div>
+      </div>
+      <div class="browse-selected" id="browse-selected" hidden>
+        <span class="browse-selected-label">Selected:</span>
+        <code class="browse-selected-path mono" id="browse-selected-path"></code>
+        <div class="browse-selected-actions">
+          <button class="btn btn-secondary" id="browse-new-here-btn" type="button" title="Create a new .db file in this directory">New here</button>
+          <button class="btn btn-primary" id="browse-open-btn" type="button">Open</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Main layout ─────────────────────────────────────────────────── -->
+  <main class="layout">
+
+    <!-- Sidebar: tables -->
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <h2>Tables</h2>
+        <button class="icon-btn" id="refresh-tables" type="button" title="Refresh">↻</button>
+      </div>
+      <div class="sidebar-body">
+        <ul class="table-list" id="table-list">
+          <li class="table-empty" id="table-empty">Open a database to see tables.</li>
+        </ul>
+      </div>
+      <div class="sidebar-foot">
+        <button class="btn btn-secondary btn-block" id="new-table-btn" type="button">+ New table</button>
+      </div>
+    </aside>
+
+    <!-- Workspace: tabs + editor + results -->
+    <section class="workspace">
+      <nav class="tabs" role="tablist">
+        <button class="tab is-active" data-tab="query" role="tab">Query</button>
+        <button class="tab" data-tab="schema" role="tab" id="tab-schema">Schema</button>
+        <button class="tab" data-tab="history" role="tab">History <span class="tab-count" id="history-count"></span></button>
+      </nav>
+
+      <!-- ── Query tab ──────────────────────────────────────────────── -->
+      <div class="tab-panel is-active" data-panel="query">
+        <div class="editor-wrap">
+          <textarea
+            id="sql-editor"
+            spellcheck="false"
+            autocomplete="off"
+            autocorrect="off"
+            autocapitalize="off"
+            placeholder="-- Type SQL here. Press Ctrl+Enter to run.&#10;SELECT * FROM users WHERE age &gt; 25;"
+          ></textarea>
+          <div class="editor-actions">
+            <div class="editor-actions-left">
+              <button class="btn btn-secondary" id="format-btn" type="button" title="Pretty-print uppercase keywords">Format</button>
+              <button class="btn btn-secondary" id="clear-btn" type="button" title="Clear editor">Clear</button>
+            </div>
+            <div class="editor-actions-right">
+              <span class="shortcut-hint">Ctrl+Enter to run</span>
+              <button class="btn btn-primary" id="run-btn" type="button">Run ▶</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="query-status" class="status hidden"></div>
+        <div id="query-error" class="panel error-panel hidden">
+          <strong>Query failed</strong>
+          <p id="query-error-text"></p>
+        </div>
+        <div id="query-loading" class="panel loading-panel hidden">
+          <div class="spinner" aria-hidden="true"></div>
+          <p class="loading-title">Executing on C++ engine…</p>
+        </div>
+
+        <div id="results-root" class="results-root"></div>
+      </div>
+
+      <!-- ── Schema tab ─────────────────────────────────────────────── -->
+      <div class="tab-panel" data-panel="schema">
+        <div id="schema-empty" class="panel empty-panel">
+          <p>Select a table from the left sidebar to inspect its schema.</p>
+        </div>
+        <div id="schema-detail" class="hidden">
+          <div class="panel">
+            <div class="panel-head">
+              <h2 id="schema-title">table</h2>
+              <span id="schema-meta" class="cache-tag"></span>
+            </div>
+            <div class="schema-grid">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Column</th>
+                    <th>Type</th>
+                    <th>Null</th>
+                    <th>Key</th>
+                    <th>Default</th>
+                  </tr>
+                </thead>
+                <tbody id="schema-columns-body"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="panel">
+            <h2>CREATE TABLE</h2>
+            <pre class="code-block" id="schema-create-sql"></pre>
+          </div>
+          <div class="panel">
+            <h2>Sample rows (SELECT * LIMIT 100)</h2>
+            <div id="schema-sample-root"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── History tab ────────────────────────────────────────────── -->
+      <div class="tab-panel" data-panel="history">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Query history</h2>
+            <button class="btn btn-secondary" id="clear-history-btn" type="button">Clear</button>
+          </div>
+          <p class="hint">Last 50 statements (kept in browser localStorage). Click an entry to load it into the editor.</p>
+          <ul class="history-list" id="history-list">
+            <li class="history-empty">No history yet.</li>
+          </ul>
+        </div>
+      </div>
+
+    </section>
+  </main>
+
+  <footer class="footer">
+    SQL-Compiler &nbsp;·&nbsp; C++17 / Modern CMake &nbsp;·&nbsp; © local single-user console
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

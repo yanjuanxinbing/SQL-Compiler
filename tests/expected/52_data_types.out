@@ -1,0 +1,88 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | b | c   | txt       | dec    | d    | r    | s    | ti  | ts       | j       | u                                   
+---+---+-----+-----------+--------+------+------+------+-----+----------+---------+-------------------------------------
+1  | 1 | abc | long text | 123.45 | 3.14 | 2.71 | 1000 | 127 | 12:30:45 | {"k":1} | 550e8400-e29b-41d4-a716-446655440000
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> b = TRUE | dec = 123.45 | d > 3.0
+---------+--------------+--------
+1        | 1            | 1      
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> 
+Error: [Semantic] NOT NULL violation: t.b
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | b
+---+--
+3  | 0
+(1 row)
+sqlcompiler> COUNT
+-----
+2    
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> id
+--
+(0 rows)
+sqlcompiler> 
+Error: [Semantic] NOT NULL violation: nn.name
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> 
+Error: [Semantic] UNIQUE constraint violation: uq.email
+sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> 
+Error: [Semantic] UNIQUE constraint violation: uq2.(a, b)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> id
+--
+1 
+4 
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> id
+--
+1 
+4 
+5 
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> id | name
+---+-----
+1  | a   
+2  | b   
+3  | c   
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> dec        
+-----------
+99999999.99
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> dec    
+-------
+10000.5
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> id | amt  
+---+------
+1  | 100.5
+2  | 0    
+(2 rows)
+sqlcompiler> COUNT
+-----
+2    
+(1 row)
+sqlcompiler> amt
+---
+(0 rows)
+sqlcompiler> 
+Error: [Semantic] check constraint violated: money.amt ((amt >= 0))
+sqlcompiler> sqlcompiler> 

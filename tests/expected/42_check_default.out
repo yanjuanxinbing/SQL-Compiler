@@ -1,0 +1,26 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> OK
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | score | status
+---+-------+-------
+1  | 50    | active
+(1 row)
+sqlcompiler> sqlcompiler> sqlcompiler> 
+Error: [Semantic] check constraint violated: t.score (((score >= 0) AND (score <= 100)))
+sqlcompiler> sqlcompiler> sqlcompiler> 
+Error: [Semantic] check constraint violated: t.score (((score >= 0) AND (score <= 100)))
+sqlcompiler> sqlcompiler> sqlcompiler> 
+Error: [Semantic] check constraint violated: t.score (((score >= 0) AND (score <= 100)))
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | score | status
+---+-------+-------
+1  | 50    | active
+4  | 80    | NULL  
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> id | score | status
+---+-------+-------
+5  | NULL  | active
+(1 row)
+sqlcompiler> sqlcompiler> 
