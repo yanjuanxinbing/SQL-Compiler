@@ -1,11 +1,19 @@
 /build
 /.vscode
+/.idea
 /tests/tmp
 
 # Python bytecode (re-generated on first import; never track it)
 __pycache__/
 *.pyc
 *.pyo
+
+# Virtualenv created by webui/run.bat
+webui/.venv/
+
+# Local run logs / scratch dumps
+*.log
+diff_*.txt
 
 # Database files: engine runtime data + local playground, never source
 *.db
@@ -18,3 +26,9 @@ TMP_*.db
 TMP_*.db.wal
 _e2e_test_*.db
 _e2e_test_*.db.wal
+
+# Local scratch / reference artifacts (kept out of the repo)
+/index.html
+/test.sql
+/webui.zip
+/可视化文件.md
