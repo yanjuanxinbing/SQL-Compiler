@@ -23,6 +23,7 @@
 #include "txn/LogManager.h"
 
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 
 #if defined(_WIN32)
@@ -64,25 +65,56 @@ LogManager::LogManager(const std::string& wal_file) : wal_file_(wal_file) {
     if (!OpenForAppend()) {
         throw std::runtime_error("LogManager: cannot open WAL file: " + wal_file_);
     }
-    // 启动期：扫描整个 WAL 文件，按 lsn 顺序重建 last_lsn_per_txn_ 与
-    // next_lsn_。durable_lsn_ 保守设为 0，由第一次 Flush() 推进。
+    // 启动期：扫描整个 WAL 文件，按 lsn 顺序重建 last_lsn_per_txn_ /
+    // next_lsn_ / lsn_to_offset_。durable_lsn_ 保守设为 0，由第一次
+    // Flush() 推进。
+    //
+    // Header-only 扫描：解析固定头 kLogRecordHeaderSize 字节
+    // （lsn / prev_lsn / txn_id / type / page_id / before_len /
+    // after_len / undo_next_lsn / savepoint_name_len），按
+    // before_len + after_len + name_len 跳过 image / name 字节。
+    // 不调 DeserializeLogRecord——避免把整页 PAGE_SIZE 字节拷到
+    // std::vector 里，复杂度从 O(W·P) 降到 O(W)（W = 总记录数，
+    // P = PAGE_SIZE = 4KB）。
     std::vector<char> raw;
     ScanFile(&raw);
     next_lsn_ = 1;
     durable_lsn_ = 0;
     last_lsn_per_txn_.clear();
+    lsn_to_offset_.clear();
     size_t pos = 0;
     while (pos + sizeof(uint32_t) <= raw.size()) {
-        uint32_t len = ReadU32(raw.data() + pos);
-        pos += sizeof(uint32_t);
-        if (pos + len > raw.size()) break;
-        LogRecord rec;
-        if (!DeserializeLogRecord(raw.data() + pos, len, &rec)) break;
-        if (rec.lsn_ >= next_lsn_) next_lsn_ = rec.lsn_ + 1;
-        if (rec.txn_id_ != 0) {
-            last_lsn_per_txn_[rec.txn_id_] = rec.lsn_;
+        const uint32_t len = ReadU32(raw.data() + pos);
+        const size_t record_start = pos + sizeof(uint32_t);
+        if (record_start + len > raw.size()) break;
+        if (len < kLogRecordHeaderSize) break;
+        // 只解析 header 部分：lsn / txn_id / before_len / after_len /
+        // name_len。其余字段（type / page_id / prev_lsn / undo_next_lsn）
+        // 启动期不必关心——last_lsn_per_txn_ / next_lsn_ / lsn_to_offset_
+        // 已经能从「头部几个固定字段」推出。
+        const char* hdr = raw.data() + record_start;
+        uint64_t lsn = 0;
+        std::memcpy(&lsn, hdr + 0, sizeof(uint64_t));
+        int64_t txn_id = 0;
+        std::memcpy(&txn_id, hdr + 16, sizeof(int64_t));
+        uint32_t before_len = 0;
+        std::memcpy(&before_len, hdr + 29, sizeof(uint32_t));
+        uint32_t after_len = 0;
+        std::memcpy(&after_len, hdr + 33, sizeof(uint32_t));
+        uint32_t name_len = 0;
+        std::memcpy(&name_len, hdr + 45, sizeof(uint32_t));
+        // 校验 image / name 总长在 record 范围内；超出视为截断尾部。
+        const size_t tail =
+            static_cast<size_t>(before_len) + after_len + name_len;
+        if (kLogRecordHeaderSize + tail > len) break;
+        if (lsn >= next_lsn_) next_lsn_ = static_cast<lsn_t>(lsn + 1);
+        if (txn_id != 0) {
+            last_lsn_per_txn_[txn_id] = lsn;
         }
-        pos += len;
+        // LSN → WAL 文件内 byte 偏移（指向该 record 的长度前缀起点）。
+        lsn_to_offset_[lsn] = pos;
+        // 跳到下一条 record 起点：长度前缀（4 字节）+ 整条 record 字节数。
+        pos = record_start + len;
     }
     // 已扫描到的最大 lsn 视为已持久化（durable），让后续 FlushPage 不再因
     // LSN 检查无谓刷盘。
@@ -266,25 +298,38 @@ void LogManager::ScanFile(std::vector<char>* out) {
     out->clear();
 #if defined(_WIN32)
     if (posix_fd_ < 0) return;
+    // 取文件大小，一次性 resize + 单次 read。避免 64KB chunked append
+    // 带来的多次 syscalls 与 std::vector 反复扩容拷贝。
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(wal_file_, ec);
+    if (ec) return;
     // 重新打开读取，避免影响写入端的 fd 位置。
     int rd = _open(wal_file_.c_str(), _O_BINARY | _O_RDONLY);
     if (rd < 0) return;
-    std::vector<char> chunk(64 * 1024);
-    while (true) {
-        int n = _read(rd, chunk.data(), static_cast<unsigned int>(chunk.size()));
+    out->resize(static_cast<size_t>(sz));
+    size_t total = 0;
+    while (total < static_cast<size_t>(sz)) {
+        int n = _read(rd, out->data() + total,
+                      static_cast<unsigned int>(sz - total));
         if (n <= 0) break;
-        out->insert(out->end(), chunk.data(), chunk.data() + n);
+        total += static_cast<size_t>(n);
     }
+    out->resize(total);  // 截断到实际读到的大小（防并发写入导致的尾部扩展）
     _close(rd);
 #else
+    std::error_code ec;
+    const auto sz = std::filesystem::file_size(wal_file_, ec);
+    if (ec) return;
     int rd = ::open(wal_file_.c_str(), O_RDONLY);
     if (rd < 0) return;
-    std::vector<char> chunk(64 * 1024);
-    while (true) {
-        ssize_t n = ::read(rd, chunk.data(), chunk.size());
+    out->resize(static_cast<size_t>(sz));
+    size_t total = 0;
+    while (total < static_cast<size_t>(sz)) {
+        ssize_t n = ::read(rd, out->data() + total, sz - total);
         if (n <= 0) break;
-        out->insert(out->end(), chunk.data(), chunk.data() + n);
+        total += static_cast<size_t>(n);
     }
+    out->resize(total);
     ::close(rd);
 #endif
 }
