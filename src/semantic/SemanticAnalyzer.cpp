@@ -4,7 +4,9 @@
 #include "common/EditDistance.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
+#include <unordered_set>
 #include <utility>
 
 namespace sqlcompiler {
@@ -312,6 +314,9 @@ bool SemanticAnalyzer::AnalyzeInternal(const StatementPtr& statement, bool& ok) 
 
 bool SemanticAnalyzer::Analyze(const StatementPtr& statement) {
     ClearErrors();
+    // 跨语句隔离列候选缓存：每次新的 Analyze 入口清空，
+    // 避免上一个语句残留的 (表名 → 列名) 映射污染本次结果。
+    candidates_cache_.clear();
     if (!statement) {
         AddError(SemanticErrorKind::Other, "null statement");
         return false;
@@ -691,19 +696,21 @@ bool SemanticAnalyzer::AnalyzeCreateTable(const CreateTableStatement& stmt) {
         ok = false;
     }
     // Check duplicate column names
+    // 单遍 O(C·L)：对每列 lowercase 一次后插入 unordered_set；
+    // 命中即说明之前已经出现过同名列，直接报错并保留原 message text 与位置。
+    std::unordered_set<std::string> seen_lower;
+    seen_lower.reserve(stmt.columns.size());
     for (size_t i = 0; i < stmt.columns.size(); ++i) {
-        for (size_t j = i + 1; j < stmt.columns.size(); ++j) {
-            const auto& a = stmt.columns[i].column_name;
-            const auto& b = stmt.columns[j].column_name;
-            std::string ua, ub;
-            for (char c : a) ua.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-            for (char c : b) ub.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-            if (ua == ub) {
-                AddError(SemanticErrorKind::DuplicateName,
-                         "duplicate column name: " + a,
-                         stmt.line, stmt.column);
-                ok = false;
-            }
+        const auto& a = stmt.columns[i].column_name;
+        std::string lower;
+        lower.reserve(a.size());
+        for (char c : a)
+            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        if (!seen_lower.insert(std::move(lower)).second) {
+            AddError(SemanticErrorKind::DuplicateName,
+                     "duplicate column name: " + a,
+                     stmt.line, stmt.column);
+            ok = false;
         }
         // Validate type (支持 BIGINT/INTEGER/DOUBLE/DECIMAL/CHAR/TEXT/STRING 等全部归一化类型)
         std::string up;
@@ -962,34 +969,21 @@ bool SemanticAnalyzer::CheckColumnExists(const std::string& table_name,
         return false;
     };
     // 收集候选列名（用于「Did you mean」提示）。多个表时取并集。
-    std::vector<std::string> column_candidates;
-    auto collect_columns = [&](const std::string& t) {
-        const TableInfo* info = symbol_table_.GetTable(t);
-        if (info != nullptr) {
-            for (const auto& c : info->columns) {
-                column_candidates.push_back(c.name);
-            }
-            return;
-        }
-        // MV 也作为候选列名来源 —— 与 check_one 的语义对齐。
-        if (catalog_ != nullptr) {
-            const SystemCatalog::MaterializedViewInfo* mv =
-                catalog_->LookupMaterializedView(t);
-            if (mv != nullptr) {
-                for (const auto& c : mv->columns) {
-                    column_candidates.push_back(c.column_name);
-                }
-            }
-        }
+    // 通过 candidates_cache_ 复用每张表已构造过的列名列表，避免反复线性
+    // 扫描 symbol_table_ / MV columns；表出现多次仍按出现次数累加（与原版一致）。
+    auto append_candidates = [&](std::vector<std::string>& dst, const std::string& t) {
+        const auto& per = GetColumnCandidatesFor(t);
+        dst.insert(dst.end(), per.begin(), per.end());
     };
     if (table_name.find(',') != std::string::npos) {
+        std::vector<std::string> column_candidates;
         size_t start = 0;
         while (start < table_name.size()) {
             size_t end = table_name.find(',', start);
             std::string t = table_name.substr(start,
                 end == std::string::npos ? std::string::npos : end - start);
             if (check_one(t)) return true;
-            collect_columns(t);
+            append_candidates(column_candidates, t);
             if (end == std::string::npos) break;
             start = end + 1;
         }
@@ -1001,7 +995,8 @@ bool SemanticAnalyzer::CheckColumnExists(const std::string& table_name,
         return false;
     }
     if (check_one(table_name)) return true;
-    collect_columns(table_name);
+    std::vector<std::string> column_candidates;
+    append_candidates(column_candidates, table_name);
     std::string base = "column not found: " + table_name + "." + column_name;
     std::string hint = SuggestClosestName(column_name, column_candidates);
     AddError(SemanticErrorKind::ColumnNotFound,
@@ -1061,22 +1056,12 @@ bool SemanticAnalyzer::CheckExpressionMulti(const ExprPtr& expr,
                 }
             }
             // 收集候选列名，提供「Did you mean」提示。
+            // 通过 candidates_cache_ 复用每张表的列名列表，第二次起 O(1) 命中。
             std::vector<std::string> column_candidates;
             for (const auto& t : tables) {
-                const TableInfo* info = symbol_table_.GetTable(t);
-                if (info != nullptr) {
-                    for (const auto& c : info->columns) column_candidates.push_back(c.name);
-                    continue;
-                }
-                if (catalog_ != nullptr) {
-                    const SystemCatalog::MaterializedViewInfo* mv =
-                        catalog_->LookupMaterializedView(t);
-                    if (mv != nullptr) {
-                        for (const auto& c : mv->columns) {
-                            column_candidates.push_back(c.column_name);
-                        }
-                    }
-                }
+                const auto& per = GetColumnCandidatesFor(t);
+                column_candidates.insert(column_candidates.end(),
+                                         per.begin(), per.end());
             }
             std::string base = "column not found: " + cr->column_name;
             std::string hint = SuggestClosestName(cr->column_name, column_candidates);
@@ -1165,24 +1150,14 @@ bool SemanticAnalyzer::CheckExpressionMultiWithAliases(const ExprPtr& expr,
                 }
             }
             // 收集候选列名，提供「Did you mean」提示。
+            // 通过 candidates_cache_ 复用每张表的列名列表，第二次起 O(1) 命中；
+            // SELECT 别名仍然按出现顺序原样前插（与原版一致），候选序列化不变。
             std::vector<std::string> column_candidates;
             for (const auto& a : aliases) column_candidates.push_back(a);
             for (const auto& t : tables) {
-                const TableInfo* info = symbol_table_.GetTable(t);
-                if (info != nullptr) {
-                    for (const auto& c : info->columns) column_candidates.push_back(c.name);
-                    continue;
-                }
-                // MV 也加入候选列名。
-                if (catalog_ != nullptr) {
-                    const SystemCatalog::MaterializedViewInfo* mv =
-                        catalog_->LookupMaterializedView(t);
-                    if (mv != nullptr) {
-                        for (const auto& c : mv->columns) {
-                            column_candidates.push_back(c.column_name);
-                        }
-                    }
-                }
+                const auto& per = GetColumnCandidatesFor(t);
+                column_candidates.insert(column_candidates.end(),
+                                         per.begin(), per.end());
             }
             std::string base = "column not found: " + cr->column_name;
             std::string hint = SuggestClosestName(cr->column_name, column_candidates);
@@ -1275,14 +1250,20 @@ void SemanticAnalyzer::AddError(SemanticErrorKind kind,
 // Distance threshold matches the prompt's spec; SQL identifiers are short
 // so 2 is enough to absorb a single transposition or doubled letter without
 // flooding the message with noise.
+//
+// 长度预过滤：Levenshtein 距离天然满足 |len(a) - len(b)| <= distance，
+// 因此对长度差超过 kMaxDistance 的候选直接跳过，可省掉 O(m·n) 的 DP 表
+// 计算；过滤后的剩余集合及其 (distance, name) 排序结果与原版字面一致。
 std::string SemanticAnalyzer::SuggestClosestName(
     const std::string& bad_name,
     const std::vector<std::string>& candidates) const {
     constexpr int kMaxDistance = 2;
     std::vector<std::pair<int, std::string>> scored;
     scored.reserve(candidates.size());
+    const int bad_len = static_cast<int>(bad_name.size());
     for (const auto& c : candidates) {
         if (c.empty()) continue;
+        if (std::abs(bad_len - static_cast<int>(c.size())) > kMaxDistance) continue;
         int d = LevenshteinDistance(bad_name, c);
         if (d <= kMaxDistance) scored.emplace_back(d, c);
     }
@@ -1302,6 +1283,31 @@ std::string SemanticAnalyzer::SuggestClosestName(
     }
     out += "?";
     return out;
+}
+
+// 取指定表（含物化视图）的列候选名列表，懒填进 candidates_cache_。
+// 返回的引用指向 cache 内部元素，调用方必须在本轮迭代内消费完毕，
+// 不要跨多次插入持有——后续插入可能触发 rehash 使旧引用失效。
+const std::vector<std::string>& SemanticAnalyzer::GetColumnCandidatesFor(
+    const std::string& table_name) {
+    auto it = candidates_cache_.find(table_name);
+    if (it != candidates_cache_.end()) return it->second;
+    std::vector<std::string> candidates;
+    const TableInfo* info = symbol_table_.GetTable(table_name);
+    if (info != nullptr) {
+        candidates.reserve(info->columns.size());
+        for (const auto& c : info->columns) candidates.push_back(c.name);
+    } else if (catalog_ != nullptr) {
+        const SystemCatalog::MaterializedViewInfo* mv =
+            catalog_->LookupMaterializedView(table_name);
+        if (mv != nullptr) {
+            for (const auto& c : mv->columns) {
+                candidates.push_back(c.column_name);
+            }
+        }
+    }
+    auto ins = candidates_cache_.emplace(table_name, std::move(candidates));
+    return ins.first->second;
 }
 
 }  // namespace sqlcompiler
