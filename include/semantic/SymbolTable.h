@@ -54,9 +54,19 @@ struct TableInfo {
         ExprPtr expr;
     };
     std::vector<TableCheck> table_checks;
+    // [perf] catalog-indexes: 列名到列下标的旁路 map，key 是小写化的列名。
+    // HasColumn/GetColumn 在 AddTable 时一次性建好，运行时 O(1) hash 查。
+    // 索引值指向 columns 向量内的位置；TableInfo 被拷贝后索引在新向量上仍有效。
+    // 表加载后只读——SymbolTable::AddTable 在插入前会 RebuildColumnIndex()。
+    std::unordered_map<std::string, size_t> column_index_;
 
     bool HasColumn(const std::string& column_name) const;
     const ColumnInfo* GetColumn(const std::string& column_name) const;
+
+    // [perf] catalog-indexes: 由 columns 重建 column_index_。每次 columns 发生变化后
+    // 调用一次（目前在 SymbolTable::AddTable 末尾统一触发）。
+    // 用 emplace 保证"先出现的列名优先"，与原 HasColumn 的线性扫描语义一致。
+    void RebuildColumnIndex();
 
     // 返回用于唯一性校验的主键组。若 primary_keys 为空（例如从旧格式元数据
     // 读出），退化为「所有被标记 is_primary_key 的列构成一个复合组」。

@@ -128,6 +128,10 @@ void CreateTableExecutor::Init() {
     }
     // 52_data_types: 表级 UNIQUE(col, ...) 约束分组（来自 CREATE TABLE 语句）。
     info.unique_constraints = unique_constraints_;
+    // [perf] catalog-indexes: 走 cat->CreateTable(info) 之前先把列名旁路建好。
+    // ValidateForeignKeys 走 info.GetColumn(...) 做子/父列校验；SymbolTable::AddTable
+    // 也会重建一次，但 FK 校验发生在 catalog 写入之前，必须在此处先建一次。
+    info.RebuildColumnIndex();
     SystemCatalog* cat = context_->GetCatalog();
     // 53_ddl: 校验 schema 限定。
     {
