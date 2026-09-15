@@ -20,17 +20,78 @@ Optimizer::Optimizer(SystemCatalog* catalog) : catalog_(catalog) {
 }
 
 PlanNodePtr Optimizer::Optimize(PlanNodePtr plan) {
-    // 顺序：先 ChooseAccessPaths（把能转 IndexScan 的 Filter -> SeqScan 改写），
-    // 再 FoldConstants（编译期常量折叠，并把恒真 Filter 移除），
-    // 再 PushDownPredicates（下推剩余的 Filter 到 SeqScan.predicate），
-    // 再 FoldConstants 第二遍（下推后的 SeqScan.predicate 也可能有可化简常量），
-    // 最后 PruneColumns（列裁剪）。
-    plan = ChooseAccessPaths(plan);
-    plan = FoldConstants(plan);
-    plan = PushDownPredicates(plan);
-    plan = FoldConstants(plan);
-    plan = PruneColumns(plan);
-    return plan;
+    // 4.1: 把 5 遍 visitor (ChooseAccessPaths → FoldConstants → PushDownPredicates
+    //      → FoldConstants → PruneColumns) 合并成 1 遍 fused DFS。
+    //   - ChooseAccessPaths 单独跑一遍（仅作用于「原始树」节点），保留原行为
+    //     —— 后续 PushDownFilterOverJoin 插入的「新 Filter→SeqScan」不会被改写，
+    //     否则 EXPLAIN 输出会变。
+    //   - 其余 4 阶段（PushDown / FoldConstants / 列裁剪）合并到一次 DFS：
+    //     * 前序（本节点）：PushDownPredicates（可能改写本节点 / 在 Join 子节点上
+    //                       插入新 Filter）；
+    //     * 递归处理 children（post-order 递归：子树完整优化后再返回）；
+    //     * 后序（本节点）：FoldConstants（折叠表达式 / 移除恒真 Filter） +
+    //                       列裁剪的叶子剪枝（基于父节点 required_xxx 上下文
+    //                       与本节点当前 predicate 列）。
+    if (!plan) return plan;
+    plan = ChooseAccessPaths(plan);  // 单独：仅作用于「原始树」
+    PruneColumnsCtx ctx;
+    ctx.catalog = catalog_;
+    return OptimizeFusedImpl(plan, ctx);
+}
+
+// 4.3: 在 JOIN 左右两侧做未限定列的"fan-out"分派。
+//   - 若某列只在左侧表集合中存在 → 只归入左侧。
+//   - 若只在右侧表集合中存在 → 只归入右侧。
+//   - 若两侧都存在（或都不存在，保守策略） → 同时归入两侧。
+// 原版 (lu = all_unqual; ru = all_unqual;) 把每列都下放到两侧，本质等价：
+// 叶子 SeqScan 在 ResolveColumnsForTable 里会按 "本表 schema 是否含该列" 二次过滤，
+// 未含的列自动丢弃。所以 fan-out 优化只是去掉冗余传播，不改变 prune 结果。
+namespace {
+
+void SplitUnqualified(const std::unordered_set<std::string>& left_tables,
+                      const std::unordered_set<std::string>& right_tables,
+                      const std::vector<std::string>& all_unqual,
+                      SystemCatalog* catalog,
+                      std::vector<std::string>* left_unqual,
+                      std::vector<std::string>* right_unqual) {
+    if (!left_unqual || !right_unqual) return;
+    auto table_has_column = [&](const std::unordered_set<std::string>& tables,
+                                const std::string& col) -> bool {
+        if (catalog == nullptr) return false;
+        for (const auto& tname : tables) {
+            const TableInfo* info = catalog->GetTable(tname);
+            if (!info) continue;
+            for (const auto& ci : info->columns) {
+                if (ci.name == col) return true;
+            }
+        }
+        return false;
+    };
+    for (const auto& col : all_unqual) {
+        bool in_left = table_has_column(left_tables, col);
+        bool in_right = table_has_column(right_tables, col);
+        if (in_left && !in_right) {
+            left_unqual->push_back(col);
+        } else if (in_right && !in_left) {
+            right_unqual->push_back(col);
+        } else {
+            // 两侧都有 / 都没有：fan-out（与原行为等价）
+            left_unqual->push_back(col);
+            right_unqual->push_back(col);
+        }
+    }
+}
+
+}  // namespace
+
+// 4.1: Fused DFS 的入口签名与 Optimize 保持一致（PlanNodePtr → PlanNodePtr）。
+//   实际递归实现在 OptimizeFusedImpl：传入 parent prune_ctx 与 catalog。
+PlanNodePtr Optimizer::OptimizeFused(PlanNodePtr plan) {
+    if (!plan) return plan;
+    plan = ChooseAccessPaths(plan);  // 仅作用于「原始树」
+    PruneColumnsCtx ctx;
+    ctx.catalog = catalog_;
+    return OptimizeFusedImpl(plan, ctx);
 }
 
 PlanNodePtr Optimizer::ChooseAccessPaths(PlanNodePtr plan) {
@@ -464,6 +525,8 @@ bool ProjectIsSelectStar(const ProjectNode* proj) {
 // 把 (qual, unqual) 中的列挑出属于指定表 (table_name / table_alias) 的列。
 // 返回值按表 schema 的列序排列，保证下游 Executor 的 column_index_map
 // 与 prune 前一致（前提：catalog 中表的列序未被列裁剪改动）。
+//
+// 4.2: 用 std::unordered_set<std::string> 去重插入，从 O(R^2) 降到 O(R)。
 std::vector<std::string> ResolveColumnsForTable(
     const std::vector<std::pair<std::string, std::string>>& qualified,
     const std::vector<std::string>& unqualified,
@@ -472,15 +535,11 @@ std::vector<std::string> ResolveColumnsForTable(
     const TableInfo* info) {
     std::vector<std::string> result;
     if (!info) return result;
-    auto add_unique = [&](const std::string& col) {
-        for (const auto& x : result) {
-            if (x == col) return;
-        }
-        result.push_back(col);
-    };
+    std::unordered_set<std::string> seen;
+    seen.reserve(qualified.size() + unqualified.size());
     for (const auto& [tbl, col] : qualified) {
         if (tbl == table_name || (!table_alias.empty() && tbl == table_alias)) {
-            add_unique(col);
+            if (seen.insert(col).second) result.push_back(col);
         }
     }
     for (const auto& col : unqualified) {
@@ -488,7 +547,7 @@ std::vector<std::string> ResolveColumnsForTable(
         for (const auto& ci : info->columns) {
             if (ci.name == col) { found = true; break; }
         }
-        if (found) add_unique(col);
+        if (found && seen.insert(col).second) result.push_back(col);
     }
     // 按表 schema 列序重新排列，保留下推谓词与上层 column_index_map 的稳定次序
     std::vector<std::string> ordered;
@@ -675,7 +734,14 @@ void Optimizer::PruneNode(PlanNode* node, const PruneColumnsCtx& ctx) {
             CollectScanTables(j->children[1], &right_tables);
             // 分派
             std::vector<std::pair<std::string, std::string>> lq, rq;
-            std::vector<std::string> lu = all_unqual, ru = all_unqual;  // 未限定列下放到两侧（保守）
+            std::vector<std::string> lu, ru;
+            // 4.3: 用 SplitUnqualified 做未限定列的 fan-out 分派：
+            //   - 能唯一归属一侧的列只下放到该侧（去掉冗余传播）；
+            //   - 两侧都有 / 都没有的列才双侧 fan-out（保守，与原行为等价）。
+            // 最终到叶子的 read_columns 完全一致（叶子 ResolveColumnsForTable
+            // 会按"本表 schema 是否含该列"二次过滤）。
+            SplitUnqualified(left_tables, right_tables, all_unqual,
+                             ctx.catalog, &lu, &ru);
             for (auto& q : all_qual) {
                 const auto& tbl = q.first;
                 if (left_tables.count(tbl)) lq.push_back(q);
@@ -1641,6 +1707,446 @@ ExprPtr Optimizer::FoldConstants(ExprPtr expr) {
 
 bool Optimizer::IsConstantExpr(const ExprPtr& expr) const {
     return FoldExpr(expr) ? IsConstTrueForFilter(expr) || (expr->GetType() == NodeType::LITERAL_EXPR) : false;
+}
+
+// =====================================================================
+// 4.1: 单遍 fused DFS — 前序 PushDown + 后序 FoldConstants + 叶子剪枝
+// =====================================================================
+//
+// 入口 OptimizeFused（公有）已经先在原始树上跑过 ChooseAccessPaths（避免对
+// PushDown 后续插入的新 Filter→SeqScan 误改写），这里只处理剩余阶段：
+//   - 前序（pre-order）：PushDownAtNode(plan)
+//       仅对本节点做下推决策（不递归）；可能改写本节点（Filter→Scan 把谓词
+//       下沉到 scan.predicate）或在 Join 子节点外裹入新 Filter。
+//   - 递归 children：把父节点"需要的列"沿节点类型分派给子节点（与 PruneNode
+//       相同的上下文传播语义）。子树完整优化后返回。
+//   - 后序（post-order）：FoldConstantsAtNode(plan)
+//       仅对本节点的表达式字段折叠；可能把恒真 Filter 替换为子节点。
+//   - 后序（post-order，仅叶节点）：ApplyLeafPrune(plan, parent_ctx)
+//       SeqScan / IndexScan 写入 read_columns = 父节点所需列 ∪ scan.predicate 列。
+//
+// 设计要点：所有递归都集中在本函数，PushDown / FoldConstants / 列裁剪的"单节点"
+// 版本各自不递归。这样原 5 遍 DFS 合并为 1 遍。
+namespace {
+
+// 4.1: 单节点 FoldConstants（不递归 children；与 FoldNode 共用 FoldExpr）。
+//   - 折叠本节点的表达式字段；
+//   - 谓词折叠为 TRUE 的 FilterNode 替换为其唯一子节点；
+//   - 不递归 children（递归由 OptimizeFusedImpl 统一调度）。
+PlanNodePtr FoldConstantsAtNodeImpl(PlanNodePtr plan);  // 前向声明
+
+// 4.1: 单节点 PushDown wrapper（外部通过 Optimizer::PushDownAtNode 调用，
+// 实现见类外）。
+//
+// 4.1: 单节点 FoldConstants
+PlanNodePtr FoldConstantsAtNodeImpl(PlanNodePtr plan) {
+    if (!plan) return plan;
+    auto* raw = plan.get();
+    auto fold_assign = [](std::pair<std::string, ExprPtr>& a) {
+        a.second = FoldExpr(a.second);
+    };
+    auto fold_list = [](std::vector<ExprPtr>& v) {
+        for (auto& x : v) x = FoldExpr(x);
+    };
+    auto fold_item = [](OrderByItem& it) {
+        it.expr = FoldExpr(it.expr);
+    };
+    switch (raw->GetType()) {
+        case PlanNodeType::SEQ_SCAN: {
+            auto* n = static_cast<SeqScanNode*>(raw);
+            if (n->predicate) n->predicate = FoldExpr(n->predicate);
+            return plan;
+        }
+        case PlanNodeType::INDEX_SCAN: {
+            auto* n = static_cast<IndexScanNode*>(raw);
+            if (n->residual_predicate) {
+                n->residual_predicate = FoldExpr(n->residual_predicate);
+            }
+            return plan;
+        }
+        case PlanNodeType::FILTER: {
+            auto* n = static_cast<FilterNode*>(raw);
+            if (n->predicate) n->predicate = FoldExpr(n->predicate);
+            if (IsConstTrueForFilter(n->predicate) && plan->children.size() == 1) {
+                return plan->children[0];
+            }
+            return plan;
+        }
+        case PlanNodeType::PROJECT: {
+            auto* n = static_cast<ProjectNode*>(raw);
+            fold_list(n->columns);
+            return plan;
+        }
+        case PlanNodeType::JOIN: {
+            auto* n = static_cast<JoinNode*>(raw);
+            if (n->condition) n->condition = FoldExpr(n->condition);
+            return plan;
+        }
+        case PlanNodeType::SORT: {
+            auto* n = static_cast<SortNode*>(raw);
+            for (auto& it : n->order_items) fold_item(it);
+            return plan;
+        }
+        case PlanNodeType::AGGREGATE: {
+            auto* n = static_cast<AggregateNode*>(raw);
+            fold_list(n->group_by_exprs);
+            fold_list(n->aggregate_exprs);
+            return plan;
+        }
+        case PlanNodeType::WINDOW: {
+            auto* n = static_cast<WindowNode*>(raw);
+            fold_list(n->select_list);
+            for (auto& [name, spec] : n->named_windows) {
+                (void)name;
+                fold_list(spec.partition_by);
+                for (auto& it : spec.order_by) fold_item(it);
+            }
+            return plan;
+        }
+        case PlanNodeType::INSERT: {
+            auto* n = static_cast<InsertNode*>(raw);
+            for (auto& row : n->values_list) {
+                for (auto& v : row) v = FoldExpr(v);
+            }
+            fold_list(n->returning_exprs);
+            return plan;
+        }
+        case PlanNodeType::UPSERT: {
+            auto* n = static_cast<UpsertNode*>(raw);
+            for (auto& row : n->values_list) {
+                for (auto& v : row) v = FoldExpr(v);
+            }
+            for (auto& a : n->upsert_assignments) fold_assign(a);
+            fold_list(n->returning_exprs);
+            return plan;
+        }
+        case PlanNodeType::UPDATE: {
+            auto* n = static_cast<UpdateNode*>(raw);
+            for (auto& a : n->assignments) fold_assign(a);
+            if (n->predicate) n->predicate = FoldExpr(n->predicate);
+            fold_list(n->returning_exprs);
+            return plan;
+        }
+        case PlanNodeType::UPDATE_FROM: {
+            auto* n = static_cast<UpdateFromNode*>(raw);
+            for (auto& a : n->assignments) fold_assign(a);
+            if (n->where_clause) n->where_clause = FoldExpr(n->where_clause);
+            fold_list(n->returning_exprs);
+            return plan;
+        }
+        case PlanNodeType::DELETE: {
+            auto* n = static_cast<DeleteNode*>(raw);
+            if (n->predicate) n->predicate = FoldExpr(n->predicate);
+            fold_list(n->returning_exprs);
+            return plan;
+        }
+        case PlanNodeType::MERGE: {
+            auto* n = static_cast<MergeNode*>(raw);
+            if (n->on_condition) n->on_condition = FoldExpr(n->on_condition);
+            for (auto& a : n->matched_assignments) fold_assign(a);
+            fold_list(n->not_matched_values);
+            return plan;
+        }
+        case PlanNodeType::VALUES: {
+            auto* n = static_cast<ValuesNode*>(raw);
+            for (auto& row : n->rows) {
+                for (auto& v : row) v = FoldExpr(v);
+            }
+            return plan;
+        }
+        case PlanNodeType::CALL: {
+            auto* n = static_cast<CallNode*>(raw);
+            fold_list(n->arguments);
+            return plan;
+        }
+        default:
+            return plan;
+    }
+}
+
+// 4.1: 把父节点 prune_ctx 与本节点引用到的列合并，得到要传给每个 child 的
+// "本节点向子节点要的列" 上下文。JOIN 节点特殊：左右两侧各自得到不同的 ctx。
+//
+// 这是 PruneNode 的"前序"部分剥离出来的版本——只计算 children 的 ctx，不再
+// 在内部递归（递归由 OptimizeFusedImpl 统一驱动）。
+//
+// 返回值：长度 == children.size() 的 ctx 列表（JOIN 返回左右两个不同 ctx，
+// 其余节点把 parent_ctx 加上本节点表达式列后对所有 child 一致下发）。
+std::vector<PruneColumnsCtx> ComputePerChildPruneCtx(
+    PlanNode* node, const PruneColumnsCtx& parent_ctx) {
+    std::vector<PruneColumnsCtx> result;
+    if (!node) return result;
+    auto type = node->GetType();
+    switch (type) {
+        case PlanNodeType::SEQ_SCAN:
+        case PlanNodeType::INDEX_SCAN: {
+            // 叶子：不递归（叶子剪枝在 OptimizeFusedImpl 末尾处理）
+            return result;
+        }
+        case PlanNodeType::PROJECT: {
+            auto* proj = static_cast<ProjectNode*>(node);
+            if (ProjectIsSelectStar(proj)) {
+                // SELECT *：不裁剪，子树原样保留
+                return result;
+            }
+            for (size_t i = 0; i < node->children.size(); ++i) {
+                PruneColumnsCtx c = parent_ctx;
+                std::vector<std::pair<std::string, std::string>> qual;
+                std::vector<std::string> unqual;
+                MergeExprColumns(proj->columns, & qual, & unqual);
+                for (auto& q : c.required_qualified) qual.push_back(q);
+                for (auto& uq : c.required_unqualified) unqual.push_back(uq);
+                c.required_qualified = std::move(qual);
+                c.required_unqualified = std::move(unqual);
+                result.push_back(std::move(c));
+            }
+            return result;
+        }
+        case PlanNodeType::FILTER: {
+            auto* f = static_cast<FilterNode*>(node);
+            for (size_t i = 0; i < node->children.size(); ++i) {
+                PruneColumnsCtx c = parent_ctx;
+                PruneColumnUsage u;
+                CollectPruneColumns(f->predicate, u);
+                for (auto& q : u.qualified) c.required_qualified.push_back(std::move(q));
+                for (auto& uq : u.unqualified) c.required_unqualified.push_back(uq);
+                result.push_back(std::move(c));
+            }
+            return result;
+        }
+        case PlanNodeType::SORT: {
+            auto* s = static_cast<SortNode*>(node);
+            for (size_t i = 0; i < node->children.size(); ++i) {
+                PruneColumnsCtx c = parent_ctx;
+                for (const auto& it : s->order_items) {
+                    PruneColumnUsage u;
+                    CollectPruneColumns(it.expr, u);
+                    for (auto& q : u.qualified) c.required_qualified.push_back(std::move(q));
+                    for (auto& uq : u.unqualified) c.required_unqualified.push_back(uq);
+                }
+                result.push_back(std::move(c));
+            }
+            return result;
+        }
+        case PlanNodeType::AGGREGATE: {
+            auto* a = static_cast<AggregateNode*>(node);
+            for (size_t i = 0; i < node->children.size(); ++i) {
+                PruneColumnsCtx c = parent_ctx;
+                std::vector<std::pair<std::string, std::string>> qual;
+                std::vector<std::string> unqual;
+                MergeExprColumns(a->group_by_exprs, & qual, & unqual);
+                MergeExprColumns(a->aggregate_exprs, & qual, & unqual);
+                c.required_qualified = std::move(qual);
+                c.required_unqualified = std::move(unqual);
+                result.push_back(std::move(c));
+            }
+            return result;
+        }
+        case PlanNodeType::WINDOW: {
+            auto* w = static_cast<WindowNode*>(node);
+            for (size_t i = 0; i < node->children.size(); ++i) {
+                PruneColumnsCtx c = parent_ctx;
+                std::vector<std::pair<std::string, std::string>> qual;
+                std::vector<std::string> unqual;
+                MergeExprColumns(w->select_list, & qual, & unqual);
+                for (const auto& [name, spec] : w->named_windows) {
+                    (void)name;
+                    MergeExprColumns(spec.partition_by, & qual, & unqual);
+                    for (const auto& it : spec.order_by) {
+                        PruneColumnUsage u;
+                        CollectPruneColumns(it.expr, u);
+                        for (auto& q : u.qualified) qual.push_back(std::move(q));
+                        for (auto& uq : u.unqualified) unqual.push_back(uq);
+                    }
+                }
+                c.required_qualified = std::move(qual);
+                c.required_unqualified = std::move(unqual);
+                result.push_back(std::move(c));
+            }
+            return result;
+        }
+        case PlanNodeType::JOIN: {
+            auto* j = static_cast<JoinNode*>(node);
+            if (node->children.size() < 2) return result;
+            PruneColumnsCtx base = parent_ctx;
+            {
+                PruneColumnUsage u;
+                CollectPruneColumns(j->condition, u);
+                for (auto& q : u.qualified) base.required_qualified.push_back(std::move(q));
+                for (auto& uq : u.unqualified) base.required_unqualified.push_back(uq);
+            }
+            std::unordered_set<std::string> left_tables, right_tables;
+            CollectScanTables(j->children[0], & left_tables);
+            CollectScanTables(j->children[1], & right_tables);
+            // 限定列按 left/right 分派
+            std::vector<std::pair<std::string, std::string>> lq, rq;
+            for (auto& q : base.required_qualified) {
+                const auto& tbl = q.first;
+                if (left_tables.count(tbl)) lq.push_back(q);
+                else if (right_tables.count(tbl)) rq.push_back(q);
+                else { lq.push_back(q); rq.push_back(q); }
+            }
+            // 未限定列：4.3 SplitUnqualified fan-out
+            std::vector<std::string> lu, ru;
+            SplitUnqualified(left_tables, right_tables, base.required_unqualified,
+                             base.catalog, & lu, & ru);
+            PruneColumnsCtx lc = parent_ctx;
+            lc.required_qualified = std::move(lq);
+            lc.required_unqualified = std::move(lu);
+            PruneColumnsCtx rc = parent_ctx;
+            rc.required_qualified = std::move(rq);
+            rc.required_unqualified = std::move(ru);
+            result.push_back(std::move(lc));
+            result.push_back(std::move(rc));
+            return result;
+        }
+        case PlanNodeType::LIMIT:
+        case PlanNodeType::SET_OP: {
+            for (size_t i = 0; i < node->children.size(); ++i) {
+                result.push_back(parent_ctx);
+            }
+            return result;
+        }
+        case PlanNodeType::INSERT: {
+            auto* ins = static_cast<InsertNode*>(node);
+            if (ins->query_plan) {
+                PruneColumnsCtx sub;
+                sub.catalog = parent_ctx.catalog;
+                if (!ins->returning_exprs.empty()) {
+                    std::vector<std::pair<std::string, std::string>> qual;
+                    std::vector<std::string> unqual;
+                    MergeExprColumns(ins->returning_exprs, & qual, & unqual);
+                    sub.required_qualified = std::move(qual);
+                    sub.required_unqualified = std::move(unqual);
+                }
+                result.push_back(std::move(sub));
+            }
+            return result;
+        }
+        case PlanNodeType::UPDATE_FROM: {
+            if (!node->children.empty()) {
+                PruneColumnsCtx sub;
+                sub.catalog = parent_ctx.catalog;
+                result.push_back(std::move(sub));
+            }
+            return result;
+        }
+        case PlanNodeType::MERGE: {
+            auto* m = static_cast<MergeNode*>(node);
+            if (m->source_plan) {
+                PruneColumnsCtx sub;
+                sub.catalog = parent_ctx.catalog;
+                result.push_back(std::move(sub));
+            }
+            return result;
+        }
+        case PlanNodeType::APPLY: {
+            if (node->children.size() >= 2) {
+                result.push_back(parent_ctx);  // outer
+                PruneColumnsCtx inner;
+                inner.catalog = parent_ctx.catalog;
+                result.push_back(std::move(inner));  // inner 独立
+            } else if (node->children.size() >= 1) {
+                result.push_back(parent_ctx);
+            }
+            return result;
+        }
+        default:
+            // 其它节点（含 DDL / 子查询占位 / no-op）：children 透传 parent_ctx
+            for (size_t i = 0; i < node->children.size(); ++i) {
+                result.push_back(parent_ctx);
+            }
+            return result;
+    }
+}
+
+// 4.1: 叶子节点剪枝 —— SeqScan / IndexScan 写入 read_columns。
+//   - parent_ctx.required_qualified / required_unqualified：父节点"要的"列
+//   - 加上 scan->predicate（已被父级 PushDown 写过）引用的列
+//   - 用 ResolveColumnsForTable 按表 schema 列序排列
+void ApplyLeafPrune(PlanNode* node, const PruneColumnsCtx& ctx) {
+    if (!node) return;
+    auto type = node->GetType();
+    if (type == PlanNodeType::SEQ_SCAN) {
+        auto* scan = static_cast<SeqScanNode*>(node);
+        const TableInfo* info = ctx.catalog ? ctx.catalog->GetTable(scan->table_name) : nullptr;
+        std::vector<std::pair<std::string, std::string>> qual = ctx.required_qualified;
+        std::vector<std::string> unqual = ctx.required_unqualified;
+        if (scan->predicate) {
+            PruneColumnUsage u;
+            CollectPruneColumns(scan->predicate, u);
+            for (auto& q : u.qualified) qual.push_back(std::move(q));
+            for (auto& uq : u.unqualified) unqual.push_back(uq);
+        }
+        scan->read_columns = ResolveColumnsForTable(qual, unqual,
+                                                   scan->table_name,
+                                                   scan->table_alias,
+                                                   info);
+        return;
+    }
+    if (type == PlanNodeType::INDEX_SCAN) {
+        auto* scan = static_cast<IndexScanNode*>(node);
+        const TableInfo* info = ctx.catalog ? ctx.catalog->GetTable(scan->table_name) : nullptr;
+        std::vector<std::pair<std::string, std::string>> qual = ctx.required_qualified;
+        std::vector<std::string> unqual = ctx.required_unqualified;
+        if (scan->residual_predicate) {
+            PruneColumnUsage u;
+            CollectPruneColumns(scan->residual_predicate, u);
+            for (auto& q : u.qualified) qual.push_back(std::move(q));
+            for (auto& uq : u.unqualified) unqual.push_back(uq);
+        }
+        scan->read_columns = ResolveColumnsForTable(qual, unqual,
+                                                   scan->table_name,
+                                                   scan->table_alias,
+                                                   info);
+        return;
+    }
+}
+
+}  // namespace
+
+// 4.1: 单节点 PushDown（不递归 children）。
+//   - Filter→SeqScan：调 PushDownFilterOverScan
+//   - Filter→Join ：调 PushDownFilterOverJoin
+//   - 其它节点 ：原样返回
+PlanNodePtr Optimizer::PushDownAtNode(PlanNodePtr plan) {
+    if (!plan) return plan;
+    if (plan->GetType() != PlanNodeType::FILTER) return plan;
+    if (plan->children.size() != 1) return plan;
+    auto& child = plan->children[0];
+    if (child->GetType() == PlanNodeType::SEQ_SCAN) {
+        return PushDownFilterOverScan(plan);
+    }
+    if (child->GetType() == PlanNodeType::JOIN) {
+        return PushDownFilterOverJoin(plan);
+    }
+    return plan;
+}
+
+PlanNodePtr Optimizer::OptimizeFusedImpl(PlanNodePtr plan,
+                                          const PruneColumnsCtx& parent_ctx) {
+    if (!plan) return plan;
+
+    // 前序：PushDown（不递归；可能改写本节点 / 在 Join 子节点外裹入新 Filter）
+    plan = PushDownAtNode(plan);
+
+    // 计算子节点的 prune ctx（不递归下发；递归由本函数统一驱动）
+    auto child_ctxs = ComputePerChildPruneCtx(plan.get(), parent_ctx);
+
+    // 递归处理 children（post-order 递归：子树完整优化后返回）
+    for (size_t i = 0; i < plan->children.size(); ++i) {
+        const PruneColumnsCtx& child_ctx =
+            (i < child_ctxs.size()) ? child_ctxs[i] : parent_ctx;
+        plan->children[i] = OptimizeFusedImpl(plan->children[i], child_ctx);
+    }
+
+    // 后序：FoldConstants（不递归；可能把恒真 Filter 替换为子节点）
+    plan = FoldConstantsAtNodeImpl(plan);
+
+    // 后序：叶子剪枝（仅 SeqScan / IndexScan 实际写入 read_columns）
+    ApplyLeafPrune(plan.get(), parent_ctx);
+
+    return plan;
 }
 
 }  // namespace sqlcompiler

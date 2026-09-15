@@ -31,6 +31,12 @@ public:
     // 优化入口：输入原始逻辑计划，返回优化后的逻辑计划
     PlanNodePtr Optimize(PlanNodePtr plan);
 
+    // 4.1: 单遍 fused DFS 的公开入口（与 Optimize 同语义）。
+    //   保留独立公开方法便于测试与复用：先在原始树上做 ChooseAccessPaths
+    //   （避免改写 PushDown 后续插入的新 Filter→SeqScan），再合并递归跑
+    //   PushDown / FoldConstants / 列裁剪。
+    PlanNodePtr OptimizeFused(PlanNodePtr plan);
+
 private:
     // 谓词下推：将Filter尽可能下推到靠近数据源的位置
     PlanNodePtr PushDownPredicates(PlanNodePtr plan);
@@ -53,6 +59,17 @@ private:
 
     // 列裁剪递归助手：自顶向下传播「上层用到的列」，在叶子节点上写入 read_columns
     void PruneNode(PlanNode* node, const PruneColumnsCtx& ctx);
+
+    // 4.1: Fused DFS 递归主体。前序执行 PushDown，递归处理 children，
+    // 后序执行 FoldConstants + 叶子剪枝。parent_ctx 是父节点对当前节点
+    // "需要输出的列"要求；按节点类型继续向下分派给 children。
+    PlanNodePtr OptimizeFusedImpl(PlanNodePtr plan, const PruneColumnsCtx& parent_ctx);
+
+    // 4.1: 单节点 PushDown（仅作用于 plan，不递归 children）。
+    //   - Filter→SeqScan：调 PushDownFilterOverScan
+    //   - Filter→Join ：调 PushDownFilterOverJoin
+    //   - 其它节点 ：原样返回
+    PlanNodePtr PushDownAtNode(PlanNodePtr plan);
 
     // 常量折叠：在编译期计算表达式中的常量子表达式
     ExprPtr FoldConstants(ExprPtr expr);
