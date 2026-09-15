@@ -2,7 +2,6 @@
 
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "ast/AST.h"
@@ -50,21 +49,6 @@ private:
     SystemCatalog* catalog_ = nullptr;
     SymbolTable& symbol_table_;
     std::vector<SemanticError> errors_;
-
-    // ---- 「Did you mean」候选缓存 ----
-    // 每次 CheckColumnExists / CheckExpressionMulti / CheckExpressionMultiWithAliases
-    // 在「未命中」分支构造 column_candidates 时，原本会对同一张表的 columns 反复
-    // 线性扫描并按值拷贝。这里把「按表名 → 列名列表」的派生结果缓存一次，
-    // 后续调用 O(1) 命中即可。该 cache 在 Analyze 入口处清空，保证跨语句隔
-    // 离；单次 Analyze 内部允许 symbol_table_ 新增表（view/CTE 派生表按需懒填）。
-    mutable std::unordered_map<std::string, std::vector<std::string>>
-        candidates_cache_;
-
-    // 取指定表（含 MV 视图）的列候选名列表。首次访问按 symbol_table_ / catalog
-    // 构造并存入 cache；返回引用指向 cache 内部元素，调用方须在同一迭代内
-    // 用完，避免再发起可能引发 rehash 的插入。
-    const std::vector<std::string>& GetColumnCandidatesFor(
-        const std::string& table_name);
 
     // ---- 各语句类型的语义检查 ----
     bool AnalyzeSelect(const SelectStatement& stmt);

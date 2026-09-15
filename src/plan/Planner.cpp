@@ -14,40 +14,8 @@ namespace sqlcompiler {
 
 namespace {
 
-// 4.5: ASCII case-insensitive 比较，0 堆分配。用 string_view 避免任何拷贝，
-// 大小写折叠就地做（不动原串）。
-bool IEqualName(std::string_view a, std::string_view b) {
-    if (a.size() != b.size()) return false;
-    for (size_t i = 0; i < a.size(); ++i) {
-        unsigned char ca = static_cast<unsigned char>(a[i]);
-        unsigned char cb = static_cast<unsigned char>(b[i]);
-        if (std::tolower(ca) != std::tolower(cb)) return false;
-    }
-    return true;
-}
-
-// 4.5: 大小写不敏感地判断 name 是否在候选列表中。0 分配。
-bool IEqualAny(std::string_view name,
-               std::initializer_list<std::string_view> candidates) {
-    for (auto c : candidates) {
-        if (IEqualName(name, c)) return true;
-    }
-    return false;
-}
-
-// 在本文件中复用：IsAggregateFuncName 定义于下方（第 ~1650 行），这里给出
-// 内部版本以便匿名命名空间中的 helper 可以直接调用而不依赖前向声明。
-//
-// 4.5: 直接接受原始（未大写）的 function_name，内部 IEqualAny 比较。0 分配。
-bool IsAggregateFuncNameLocal(std::string_view fn) {
-    return IEqualAny(fn,
-                     {"COUNT", "SUM", "AVG", "MIN", "MAX",
-                      "STDDEV", "STDDEV_POP", "STDDEV_SAMP",
-                      "VARIANCE", "VAR_POP", "VAR_SAMP",
-                      "MEDIAN",
-                      "STRING_AGG", "GROUP_CONCAT",
-                      "PERCENTILE_CONT", "PERCENTILE_DISC"});
-}
+ExprPtr RewriteAggregateRefs(const ExprPtr& expr,
+                              const std::vector<ExprPtr>& aggregate_exprs);
 
 bool ContainsAggregateExpr(const ExprPtr& e) {
     if (!e) return false;
@@ -65,16 +33,17 @@ bool ContainsAggregateExpr(const ExprPtr& e) {
         }
         case NodeType::FUNCTION_CALL_EXPR: {
             auto f = std::static_pointer_cast<FunctionCallExpr>(e);
-            // 4.5: ASCII case-insensitive 比较，0 分配；不再走 UpperName + 字符串拼接。
+            std::string name;
+            for (char c : f->function_name) name.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
             // 60_funcs: 把新增的统计 / 有序集合聚合纳入聚合识别，否则
             // SELECT STDDEV(v) FROM stats 会被当成投影表达式漏掉聚合路径。
-            if (IEqualAny(f->function_name,
-                          {"COUNT", "SUM", "AVG", "MIN", "MAX",
-                           "STDDEV", "STDDEV_POP", "STDDEV_SAMP",
-                           "VARIANCE", "VAR_POP", "VAR_SAMP",
-                           "MEDIAN",
-                           "STRING_AGG", "GROUP_CONCAT",
-                           "PERCENTILE_CONT", "PERCENTILE_DISC"})) {
+            if (name == "COUNT" || name == "SUM" || name == "AVG" ||
+                name == "MIN" || name == "MAX" ||
+                name == "STDDEV" || name == "STDDEV_POP" || name == "STDDEV_SAMP" ||
+                name == "VARIANCE" || name == "VAR_POP" || name == "VAR_SAMP" ||
+                name == "MEDIAN" ||
+                name == "STRING_AGG" || name == "GROUP_CONCAT" ||
+                name == "PERCENTILE_CONT" || name == "PERCENTILE_DISC") {
                 return true;
             }
             for (auto& a : f->arguments) {
@@ -146,9 +115,26 @@ bool SelectHasWindowFunc(const SelectStatement& stmt) {
 
 // 判定 expr 是否是聚合函数调用。供 CollectAggregatesInExpr 和 RewriteAggregateRefs
 // 共用；与 AggregateExecutor::IsAggregateFunc 保持一致（60_funcs 同款集合）。
-//
-// IEqualName / IEqualAny / IsAggregateFuncNameLocal 已在文件上方第一个匿名
-// 命名空间中定义。
+namespace {
+
+std::string UpperName(const std::string& s) {
+    std::string r;
+    r.reserve(s.size());
+    for (char c : s) r.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    return r;
+}
+
+// 在本文件中复用：IsAggregateFuncName 定义于下方（第 ~1650 行），这里给出
+// 内部版本以便匿名命名空间中的 helper 可以直接调用而不依赖前向声明。
+bool IsAggregateFuncNameLocal(const std::string& fn_upper) {
+    return fn_upper == "COUNT" || fn_upper == "SUM" || fn_upper == "AVG" ||
+           fn_upper == "MIN" || fn_upper == "MAX" ||
+           fn_upper == "STDDEV" || fn_upper == "STDDEV_POP" || fn_upper == "STDDEV_SAMP" ||
+           fn_upper == "VARIANCE" || fn_upper == "VAR_POP" || fn_upper == "VAR_SAMP" ||
+           fn_upper == "MEDIAN" ||
+           fn_upper == "STRING_AGG" || fn_upper == "GROUP_CONCAT" ||
+           fn_upper == "PERCENTILE_CONT" || fn_upper == "PERCENTILE_DISC";
+}
 
 // 把 `expr` 中的聚合函数调用收集到一个 vector。深度优先；若 expr 自身就是聚合
 // 调用，则返回 {expr}。仅收集最浅层的聚合调用（不含已包含的子表达式中聚合，
@@ -158,9 +144,8 @@ std::vector<ExprPtr> CollectTopLevelAggregates(const ExprPtr& expr) {
     if (!expr) return out;
     if (expr->GetType() == NodeType::FUNCTION_CALL_EXPR) {
         auto f = std::static_pointer_cast<FunctionCallExpr>(expr);
-        // 4.5: 直接传原始 function_name，IsAggregateFuncNameLocal 内部做大小写
-        // 不敏感比较（0 分配）。
-        if (IsAggregateFuncNameLocal(f->function_name)) {
+        std::string name = UpperName(f->function_name);
+        if (IsAggregateFuncNameLocal(name)) {
             out.push_back(expr);
             return out;
         }
@@ -212,106 +197,16 @@ std::vector<ExprPtr> CollectTopLevelAggregates(const ExprPtr& expr) {
     return out;
 }
 
-// 4.4: 结构化比较两个表达式是否等价。逐节点比对类型与结构化字段（不调用
-// ToString，避免每次都堆分配字符串）。HAVING/ORDER BY 重写时用来在同一名字
-// 下区分多个聚合调用（如 SUM(a) vs SUM(b)）。
-//
-// 重要：行为必须与旧的 ToString 路径严格一致。原先 AggregateCallsEqual 只
-// 比较 FunctionCallExpr 的 function_name / arity / is_distinct / 每个参数
-// ToString。EqualsExpr 是其严格扩展：参数之间递归走 EqualsExpr，覆盖所有
-// 表达式节点类型（除 WINDOW_FUNC/SUBQUERY/NEXTVAL/UPSERT_VALUES_REF 等含
-// 运行期语义的节点；这些不参与重写，按"不等"处理）。
-bool EqualsExpr(const Expr* lhs, const Expr* rhs) {
-    if (lhs == rhs) return true;          // 同一指针
-    if (!lhs || !rhs) return false;
-    if (lhs->GetType() != rhs->GetType()) return false;
-    switch (lhs->GetType()) {
-        case NodeType::LITERAL_EXPR: {
-            const auto* a = static_cast<const LiteralExpr*>(lhs);
-            const auto* b = static_cast<const LiteralExpr*>(rhs);
-            return a->literal_type == b->literal_type && a->value == b->value;
-        }
-        case NodeType::COLUMN_REF_EXPR: {
-            const auto* a = static_cast<const ColumnRefExpr*>(lhs);
-            const auto* b = static_cast<const ColumnRefExpr*>(rhs);
-            return a->table_name == b->table_name &&
-                   a->column_name == b->column_name;
-        }
-        case NodeType::BINARY_EXPR: {
-            const auto* a = static_cast<const BinaryExpr*>(lhs);
-            const auto* b = static_cast<const BinaryExpr*>(rhs);
-            return a->op == b->op &&
-                   EqualsExpr(a->left.get(), b->left.get()) &&
-                   EqualsExpr(a->right.get(), b->right.get());
-        }
-        case NodeType::UNARY_EXPR: {
-            const auto* a = static_cast<const UnaryExpr*>(lhs);
-            const auto* b = static_cast<const UnaryExpr*>(rhs);
-            return a->op == b->op && EqualsExpr(a->operand.get(), b->operand.get());
-        }
-        case NodeType::FUNCTION_CALL_EXPR: {
-            const auto* a = static_cast<const FunctionCallExpr*>(lhs);
-            const auto* b = static_cast<const FunctionCallExpr*>(rhs);
-            // 4.5: 大小写不敏感比较 function_name（0 分配）。
-            if (!IEqualName(a->function_name, b->function_name)) return false;
-            if (a->arguments.size() != b->arguments.size()) return false;
-            if (a->is_distinct != b->is_distinct) return false;
-            for (size_t i = 0; i < a->arguments.size(); ++i) {
-                if (!EqualsExpr(a->arguments[i].get(), b->arguments[i].get())) return false;
-            }
-            return true;
-        }
-        case NodeType::CASE_EXPR: {
-            const auto* a = static_cast<const CaseExprNode*>(lhs);
-            const auto* b = static_cast<const CaseExprNode*>(rhs);
-            if (!EqualsExpr(a->subject.get(), b->subject.get())) return false;
-            if (a->whens.size() != b->whens.size()) return false;
-            for (size_t i = 0; i < a->whens.size(); ++i) {
-                if (!EqualsExpr(a->whens[i].when_expr.get(), b->whens[i].when_expr.get())) return false;
-                if (!EqualsExpr(a->whens[i].then_expr.get(), b->whens[i].then_expr.get())) return false;
-            }
-            return EqualsExpr(a->else_expr.get(), b->else_expr.get());
-        }
-        case NodeType::CAST_EXPR: {
-            const auto* a = static_cast<const CastExprNode*>(lhs);
-            const auto* b = static_cast<const CastExprNode*>(rhs);
-            return a->target_type == b->target_type &&
-                   a->char_length == b->char_length &&
-                   a->numeric_scale == b->numeric_scale &&
-                   EqualsExpr(a->expr.get(), b->expr.get());
-        }
-        case NodeType::LIKE_EXPR: {
-            const auto* a = static_cast<const LikeExprNode*>(lhs);
-            const auto* b = static_cast<const LikeExprNode*>(rhs);
-            return a->kind == b->kind &&
-                   a->escape_char == b->escape_char &&
-                   a->has_escape == b->has_escape &&
-                   EqualsExpr(a->operand.get(), b->operand.get()) &&
-                   EqualsExpr(a->pattern.get(), b->pattern.get());
-        }
-        case NodeType::EXTRACT_EXPR: {
-            const auto* a = static_cast<const ExtractExprNode*>(lhs);
-            const auto* b = static_cast<const ExtractExprNode*>(rhs);
-            return a->field == b->field &&
-                   EqualsExpr(a->source.get(), b->source.get());
-        }
-        default:
-            // 含运行期语义的节点（WINDOW_FUNC / SUBQUERY / INTERVAL / NEXTVAL /
-            // UPSERT_VALUES_REF / DEFAULT）：保守视为不等。
-            return false;
-    }
-}
-
-// 4.4: 比较两个聚合函数调用是否结构上等价（保持原 AggregateCallsEqual 签名）。
-// 由 FindMatchingAggregate 调用。
-inline bool AggregateCallsEqual(const FunctionCallExpr& a,
-                                const FunctionCallExpr& b) {
-    if (!IEqualName(a.function_name, b.function_name)) return false;
+// 比较两个聚合函数调用是否结构上等价（同名 + 参数个数一致 + 每个参数 ToString 相等）。
+// HAVING/ORDER BY 重写时用来在同一名字下区分多个聚合调用（如 SUM(a) vs SUM(b)）。
+bool AggregateCallsEqual(const FunctionCallExpr& a, const FunctionCallExpr& b) {
+    if (UpperName(a.function_name) != UpperName(b.function_name)) return false;
     if (a.arguments.size() != b.arguments.size()) return false;
     if (a.is_distinct != b.is_distinct) return false;
     for (size_t i = 0; i < a.arguments.size(); ++i) {
-        // 4.4: 用 EqualsExpr 替代 ToString 比较，去掉每次的 std::string 堆分配。
-        if (!EqualsExpr(a.arguments[i].get(), b.arguments[i].get())) return false;
+        std::string sa = a.arguments[i] ? a.arguments[i]->ToString() : "";
+        std::string sb = b.arguments[i] ? b.arguments[i]->ToString() : "";
+        if (sa != sb) return false;
     }
     return true;
 }
@@ -324,8 +219,7 @@ size_t FindMatchingAggregate(const FunctionCallExpr& f,
         const auto& ae = aggregate_exprs[i];
         if (!ae || ae->GetType() != NodeType::FUNCTION_CALL_EXPR) continue;
         auto af = std::static_pointer_cast<FunctionCallExpr>(ae);
-        // 4.5: 直接传原始 function_name，0 分配。
-        if (IsAggregateFuncNameLocal(af->function_name) &&
+        if (IsAggregateFuncNameLocal(UpperName(af->function_name)) &&
             AggregateCallsEqual(f, *af)) {
             return i;
         }
@@ -357,26 +251,16 @@ ExprPtr RewriteAggregateRefs(const ExprPtr& expr,
         }
         case NodeType::FUNCTION_CALL_EXPR: {
             auto f = std::static_pointer_cast<FunctionCallExpr>(expr);
-            // 4.5: 直接传原始 function_name 给 IsAggregateFuncNameLocal，
-            //   内部走 IEqualAny 大小写不敏感比较（0 分配）。这里需要一个
-            //   uppercase 形式用于"未匹配到 aggregate_exprs"时的槽位名
-            //   agg_<NAME>；用 UpperCaseInPlace 现场拷贝一份（小写写通常极短）。
-            if (IsAggregateFuncNameLocal(f->function_name)) {
+            std::string name = UpperName(f->function_name);
+            if (IsAggregateFuncNameLocal(name)) {
                 // 结构化匹配：找同名且参数等价的聚合，避免 SUM(a) vs SUM(b) 冲突。
                 // 重写后的 ColumnRefExpr 用 "agg_<index>" 作为列名（不可与用户
                 // 列名冲突），ExecutionEngine 在 HAVING/ORDER BY 的 cmap 里同时
                 // 注册 function_name 和 "agg_<index>" 两个键，使两种 lookup 都能命中。
                 size_t idx = FindMatchingAggregate(*f, aggregate_exprs);
-                std::string slot;
-                if (idx == static_cast<size_t>(-1)) {
-                    slot = "agg_";
-                    slot.append(f->function_name);
-                    for (auto& c : slot) {
-                        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 32);
-                    }
-                } else {
-                    slot = "agg_" + std::to_string(idx);
-                }
+                std::string slot = (idx == static_cast<size_t>(-1))
+                                       ? std::string("agg_") + name
+                                       : std::string("agg_") + std::to_string(idx);
                 return std::make_shared<ColumnRefExpr>("", slot);
             }
             // 非聚合函数调用：递归子参数（COALESCE/IIF 等可能嵌套聚合）。
@@ -472,6 +356,8 @@ std::vector<OrderByItem> ResolveOrderByOrdinals(std::vector<OrderByItem> items,
     }
     return items;
 }
+
+}  // namespace
 
 Planner::Planner(SystemCatalog* catalog, SymbolTable& symbol_table)
     : catalog_(catalog), symbol_table_(symbol_table) {
@@ -2192,25 +2078,10 @@ std::string InferExprTypeImpl(const Expr* raw,
     }
 }
 
-// 4.6: AST 节点上的 cached_type_（见 Expr 基类）。
-//   - 非 ColumnRefExpr 节点：推断结果只依赖子表达式 / SymbolTable，与调用者
-//     传入的 source_tables 无关。SymbolTable 在一次 Planner 调用内保持稳定，
-//     因此可以安全跨 SELECT 缓存。
-//   - ColumnRefExpr：未限定列名的查找结果依赖 source_tables（不同 SELECT 的
-//     from_table + joins 可能不同），不能跨调用缓存。每次都直接重算。
 std::string InferExprType(const ExprPtr& e,
                           const SymbolTable& st,
                           const std::vector<std::string>& source_tables) {
-    if (!e) return kVarchar;
-    if (e->GetType() != NodeType::COLUMN_REF_EXPR) {
-        const auto& cached = e->GetCachedType();
-        if (cached) return *cached;
-    }
-    std::string result = InferExprTypeImpl(e.get(), st, source_tables);
-    if (e->GetType() != NodeType::COLUMN_REF_EXPR) {
-        e->SetCachedType(result);
-    }
-    return result;
+    return InferExprTypeImpl(e.get(), st, source_tables);
 }
 
 // 展开 SELECT * / t.*：按 from_table + joins 的列顺序产生 ColumnDefinition。

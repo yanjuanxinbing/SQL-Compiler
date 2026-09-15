@@ -131,11 +131,7 @@ void UpsertExecutor::PrepareCandidateRow(std::vector<Value>& row_values) {
     if (row_values.size() < info->columns.size()) {
         row_values.resize(info->columns.size());
     }
-    // AUTO_INCREMENT：第一列为 PRIMARY KEY 且未赋值时按 TableInfo::next_auto_id_
-    // 原子取下一个 id。
-    // [perf] groupby-expr-autoinc: 取代原 SeqScan 计行数。每次 fetch_add(1) O(1)
-    // 返回下一个自增值；表加载时 LoadFromDisk 已把 next_auto_id_ 初始化为 MAX(pk) + 1，
-    // 序列与原「每行 count+1」等价（PK 单调递增时累计行数 == MAX(pk)）。
+    // AUTO_INCREMENT：第一列为 PRIMARY KEY 且未赋值时按当前行数 + 1 自动编号。
     if (!info->columns.empty() && info->columns[0].is_primary_key) {
         size_t idx = 0;
         bool need_autoinc = row_values[idx].IsNull();
@@ -146,11 +142,14 @@ void UpsertExecutor::PrepareCandidateRow(std::vector<Value>& row_values) {
             }
         }
         if (need_autoinc) {
-            // 直接从 TableInfo 缓存取下一个 id；不再 SeqScan。
-            // next_auto_id_ 是 mutable（公共 API 返回的 TableInfo* 为 const），
-            // 即使 info 是 const TableInfo* 也能 ++。
-            int64_t next_id = info->next_auto_id_++;
-            row_values[idx] = Value::MakeInt(static_cast<int32_t>(next_id));
+            TableHeap* heap = context_->GetCatalog()->GetTableHeap(table_name_);
+            auto it = heap->Begin();
+            int count = 0;
+            while (it.HasNext()) {
+                Tuple t = it.Next(column_types_);
+                if (t.ColumnCount() > 0) ++count;
+            }
+            row_values[idx] = Value::MakeInt(count + 1);
         }
     }
     // ApplyDefaults 已在 InsertExecutor::InsertRow 里走过；这里也覆盖同名 DEFAULT 列，
