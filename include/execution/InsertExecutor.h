@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -49,6 +51,10 @@ private:
     // 用于 REPLACE INTO 路径；其他场景下与 INSERT 等价。
     bool InsertRow(const std::vector<Value>& row_values, bool is_replace);
 
+    // Item #11 (perf)：一次性扫堆求每列 AUTO_INCREMENT 列的 max(id)，
+    // 之后每行插入用本地 counter 直接 +1，不重复扫表。从 O(N²) 降到 O(N)。
+    void PrepareAutoIncBaselines();
+
     std::string table_name_;
     std::vector<std::string> columns_;
     // VALUES 路径：预先准备好的字面量表达式集合。
@@ -72,6 +78,13 @@ private:
     std::vector<std::string> returning_aliases_;
     std::vector<Tuple> pending_returning_;
     size_t pending_pos_ = 0;
+
+    // Item #11 (perf)：AUTO_INCREMENT 列本地计数器。
+    // key = 列下标 idx；value = 下一个要分配的值（首次 Init 时是 max+1）。
+    // 每次 InsertRow 实际消费自增值（user_explicit=false / NULL / 0）后
+    // 计数器就地 +1，不再扫堆。
+    std::unordered_map<size_t, int32_t> autoinc_next_;
+    bool autoinc_baseline_ready_ = false;
 };
 
 }  // namespace sqlcompiler

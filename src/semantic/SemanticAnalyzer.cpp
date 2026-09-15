@@ -1,10 +1,12 @@
 #include "semantic/SemanticAnalyzer.h"
 
 #include "catalog/SystemCatalog.h"
+#include "common/CaseInsensitive.h"
 #include "common/EditDistance.h"
 
 #include <algorithm>
 #include <functional>
+#include <unordered_set>
 #include <utility>
 
 namespace sqlcompiler {
@@ -117,22 +119,13 @@ bool SemanticAnalyzer::AnalyzeInternal(const StatementPtr& statement, bool& ok) 
         }
         case NodeType::SET_OP_STMT: {
             auto so = std::static_pointer_cast<SetOperationStatement>(statement);
-            // 列数与类型兼容性：左右两侧 SELECT 列表需有相同数量的列。
-            std::function<int(const StatementPtr&)> count_cols =
-                [&](const StatementPtr& s) -> int {
-                if (!s) return -1;
-                if (s->GetType() == NodeType::SELECT_STMT) {
-                    auto ss = std::static_pointer_cast<SelectStatement>(s);
-                    return static_cast<int>(ss->select_list.size());
-                }
-                if (s->GetType() == NodeType::SET_OP_STMT) {
-                    auto so2 = std::static_pointer_cast<SetOperationStatement>(s);
-                    if (so2->left) return count_cols(so2->left);
-                }
-                return -1;
-            };
-            int left_cols = count_cols(so->left);
-            int right_cols = count_cols(so->right);
+            // item #16: 一次走完「列数 + 别名收集」，替代原 count_cols/collect_aliases
+            // 两个 lambda + 2 次 AnalyzeInternal 的 4× walker。对深度 D 的 SET_OP 树
+            // 总开销从 O(4D) 降到 O(D)。
+            SetOpWalkResult left_walk = WalkSetOpTree(so->left);
+            SetOpWalkResult right_walk = WalkSetOpTree(so->right);
+            int left_cols = left_walk.col_count;
+            int right_cols = right_walk.col_count;
             if (left_cols >= 0 && right_cols >= 0 && left_cols != right_cols) {
                 AddError(SemanticErrorKind::ArityMismatch,
                     "set operation column count mismatch: left has " +
@@ -144,29 +137,11 @@ bool SemanticAnalyzer::AnalyzeInternal(const StatementPtr& statement, bool& ok) 
             // 顶层 ORDER BY 列引用：把当前左右两侧的列别名都视为可见，避免
             // ORDER BY 引用左/右 SELECT 的别名报「column not found」。
             std::vector<std::string> order_aliases;
-            std::function<void(const StatementPtr&)> collect_aliases =
-                [&](const StatementPtr& s) {
-                if (!s) return;
-                if (s->GetType() == NodeType::SELECT_STMT) {
-                    auto ss = std::static_pointer_cast<SelectStatement>(s);
-                    for (const auto& a : ss->select_aliases) {
-                        if (!a.empty()) order_aliases.push_back(a);
-                    }
-                    for (const auto& e : ss->select_list) {
-                        if (e && e->GetType() == NodeType::COLUMN_REF_EXPR) {
-                            auto cr = std::static_pointer_cast<ColumnRefExpr>(e);
-                            if (!cr->table_name.empty()) continue;
-                            order_aliases.push_back(cr->column_name);
-                        }
-                    }
-                } else if (s->GetType() == NodeType::SET_OP_STMT) {
-                    auto so2 = std::static_pointer_cast<SetOperationStatement>(s);
-                    collect_aliases(so2->left);
-                    collect_aliases(so2->right);
-                }
-            };
-            collect_aliases(so->left);
-            collect_aliases(so->right);
+            order_aliases.reserve(left_walk.aliases.size() + right_walk.aliases.size());
+            order_aliases.insert(order_aliases.end(),
+                                 left_walk.aliases.begin(), left_walk.aliases.end());
+            order_aliases.insert(order_aliases.end(),
+                                 right_walk.aliases.begin(), right_walk.aliases.end());
             if (so->left) ok &= AnalyzeInternal(so->left, ok);
             if (so->right) ok &= AnalyzeInternal(so->right, ok);
             for (const auto& ob : so->order_by) {
@@ -194,45 +169,8 @@ bool SemanticAnalyzer::AnalyzeInternal(const StatementPtr& statement, bool& ok) 
                 TableInfo ti;
                 ti.table_name = cte.cte_name;
                 if (cte.cte_query) {
-                    const auto& sl = cte.cte_query->select_list;
-                    const auto& sa = cte.cte_query->select_aliases;
-                    // 如果是 SELECT * FROM <real_table>，复制该表的列作为 CTE 列
-                    // SELECT * 在 parser 中被表达为 FunctionCallExpr("*"), 也兼容 COLUMN_REF_EXPR
-                    if (sl.size() == 1 && sl[0] &&
-                        ((sl[0]->GetType() == NodeType::COLUMN_REF_EXPR &&
-                          std::static_pointer_cast<ColumnRefExpr>(sl[0])->column_name == "*") ||
-                         (sl[0]->GetType() == NodeType::FUNCTION_CALL_EXPR &&
-                          (std::static_pointer_cast<FunctionCallExpr>(sl[0])->function_name == "*" ||
-                           std::static_pointer_cast<FunctionCallExpr>(sl[0])->function_name == "STAR")))) {
-                        const auto& ft = cte.cte_query->from_table;
-                        if (!ft.empty()) {
-                            const TableInfo* src = symbol_table_.GetTable(ft);
-                            if (src) {
-                                for (const auto& c : src->columns) {
-                                    ColumnInfo ci;
-                                    ci.name = c.name;
-                                    ci.data_type = c.data_type;
-                                    ti.columns.push_back(std::move(ci));
-                                }
-                            }
-                        }
-                    }
-                    if (ti.columns.empty()) {
-                        for (size_t i = 0; i < sl.size(); ++i) {
-                            ColumnInfo ci;
-                            if (i < cte.cte_column_aliases.size() && !cte.cte_column_aliases[i].empty()) {
-                                ci.name = cte.cte_column_aliases[i];
-                            } else if (i < sa.size() && !sa[i].empty()) {
-                                ci.name = sa[i];
-                            } else if (sl[i] && sl[i]->GetType() == NodeType::COLUMN_REF_EXPR) {
-                                ci.name = std::static_pointer_cast<ColumnRefExpr>(sl[i])->column_name;
-                            } else {
-                                ci.name = "col" + std::to_string(i);
-                            }
-                            ci.data_type = "VARCHAR";
-                            ti.columns.push_back(std::move(ci));
-                        }
-                    }
+                    // item #17: 列派生收敛到 BuildCteColumns。
+                    BuildCteColumns(ti, *cte.cte_query, cte.cte_column_aliases);
                 } else {
                     // bug3: 非递归 CTE 且 body 是 SetOperationStatement 时
                     // cte_query 为空，从 cte_body 的左侧 SELECT 派生列名——
@@ -244,43 +182,8 @@ bool SemanticAnalyzer::AnalyzeInternal(const StatementPtr& statement, bool& ok) 
                         body_select = sel;
                     }
                     if (body_select) {
-                        const auto& sl = body_select->select_list;
-                        const auto& sa = body_select->select_aliases;
-                        if (sl.size() == 1 && sl[0] &&
-                            ((sl[0]->GetType() == NodeType::COLUMN_REF_EXPR &&
-                              std::static_pointer_cast<ColumnRefExpr>(sl[0])->column_name == "*") ||
-                             (sl[0]->GetType() == NodeType::FUNCTION_CALL_EXPR &&
-                              (std::static_pointer_cast<FunctionCallExpr>(sl[0])->function_name == "*" ||
-                               std::static_pointer_cast<FunctionCallExpr>(sl[0])->function_name == "STAR")))) {
-                            const auto& ft = body_select->from_table;
-                            if (!ft.empty()) {
-                                const TableInfo* src = symbol_table_.GetTable(ft);
-                                if (src) {
-                                    for (const auto& c : src->columns) {
-                                        ColumnInfo ci;
-                                        ci.name = c.name;
-                                        ci.data_type = c.data_type;
-                                        ti.columns.push_back(std::move(ci));
-                                    }
-                                }
-                            }
-                        }
-                        if (ti.columns.empty()) {
-                            for (size_t i = 0; i < sl.size(); ++i) {
-                                ColumnInfo ci;
-                                if (i < cte.cte_column_aliases.size() && !cte.cte_column_aliases[i].empty()) {
-                                    ci.name = cte.cte_column_aliases[i];
-                                } else if (i < sa.size() && !sa[i].empty()) {
-                                    ci.name = sa[i];
-                                } else if (sl[i] && sl[i]->GetType() == NodeType::COLUMN_REF_EXPR) {
-                                    ci.name = std::static_pointer_cast<ColumnRefExpr>(sl[i])->column_name;
-                                } else {
-                                    ci.name = "col" + std::to_string(i);
-                                }
-                                ci.data_type = "VARCHAR";
-                                ti.columns.push_back(std::move(ci));
-                            }
-                        }
+                        // item #17: 同样的列派生逻辑直接复用，避免重复代码漂移。
+                        BuildCteColumns(ti, *body_select, cte.cte_column_aliases);
                     } else if (!cte.cte_column_aliases.empty()) {
                         // 递归 CTE 但 anchor 不可达（理论上 parser 已保证 cte_query
                         // 非空，置此分支仅为防御）。用 cte_column_aliases 兜底占位。
@@ -319,6 +222,101 @@ bool SemanticAnalyzer::Analyze(const StatementPtr& statement) {
     bool ok = true;
     AnalyzeInternal(statement, ok);
     return ok && errors_.empty();
+}
+
+// item #16: 单次递归遍历 SET_OP 子树，把「叶子列数 + 别名收集」一次做完。
+// 原实现是两个 lambda + 2 次 AnalyzeInternal 对同一棵子树各走一遍；新版合并
+// 成一次 walk，递归总次数从 4×O(D) 降到 1×O(D)（D = SET_OP 嵌套深度）。
+//
+// 行为等价性：原 count_cols 在没有 SELECT_STMT 叶子时返回 -1；别名收集要求
+// 「走到 SELECT_STMT 才收集，跳过 SET_OP_STMT 自身」。本函数保持相同语义。
+SemanticAnalyzer::SetOpWalkResult SemanticAnalyzer::WalkSetOpTree(
+    const StatementPtr& statement) const {
+    SetOpWalkResult result;
+    result.col_count = -1;
+    if (!statement) return result;
+    if (statement->GetType() == NodeType::SELECT_STMT) {
+        auto ss = std::static_pointer_cast<SelectStatement>(statement);
+        result.col_count = static_cast<int>(ss->select_list.size());
+        result.aliases.reserve(ss->select_aliases.size() + ss->select_list.size());
+        for (const auto& a : ss->select_aliases) {
+            if (!a.empty()) result.aliases.push_back(a);
+        }
+        for (const auto& e : ss->select_list) {
+            if (e && e->GetType() == NodeType::COLUMN_REF_EXPR) {
+                auto cr = std::static_pointer_cast<ColumnRefExpr>(e);
+                if (!cr->table_name.empty()) continue;
+                result.aliases.push_back(cr->column_name);
+            }
+        }
+        return result;
+    }
+    if (statement->GetType() == NodeType::SET_OP_STMT) {
+        auto so = std::static_pointer_cast<SetOperationStatement>(statement);
+        SetOpWalkResult left = WalkSetOpTree(so->left);
+        SetOpWalkResult right = WalkSetOpTree(so->right);
+        // 行为：原 count_cols 只看 left 分支（遇到 SET_OP_STMT 就递归左支），
+        // 即忽略 right 分支的列数差异。这里保留同语义：col_count 取 left
+        // 的列数（与原实现一致）。
+        result.col_count = left.col_count;
+        // 但别名要把 right 分支的也并入 —— 原 collect_aliases 对 left/right
+        // 都递归，所以别名会双向累积。
+        result.aliases.reserve(left.aliases.size() + right.aliases.size());
+        result.aliases.insert(result.aliases.end(),
+                              left.aliases.begin(), left.aliases.end());
+        result.aliases.insert(result.aliases.end(),
+                              right.aliases.begin(), right.aliases.end());
+        return result;
+    }
+    return result;
+}
+
+// item #17: 把 WITH_STMT 中两个几乎完全相同的列派生块统一到一个函数。
+// 原逻辑在 cte_query 路径和 cte_body 路径上各写了一遍「SELECT * 展开 / 否则
+// 按列派生」 流程。本函数只关心 SELECT_STMT 本身，调用方负责传入正确的
+// SELECT（anchor 或 body 的 left）。所有分支细节（* 展开 / cte_column_aliases /
+// select_aliases / COLUMN_REF / col<i> 占位）都集中在这一处。
+void SemanticAnalyzer::BuildCteColumns(TableInfo& ti,
+                                       const SelectStatement& select,
+                                       const std::vector<std::string>& cte_column_aliases) const {
+    const auto& sl = select.select_list;
+    const auto& sa = select.select_aliases;
+    // SELECT * / SELECT table.* 展开：复制源表列到 ti.columns。
+    if (sl.size() == 1 && sl[0] &&
+        ((sl[0]->GetType() == NodeType::COLUMN_REF_EXPR &&
+          std::static_pointer_cast<ColumnRefExpr>(sl[0])->column_name == "*") ||
+         (sl[0]->GetType() == NodeType::FUNCTION_CALL_EXPR &&
+          (std::static_pointer_cast<FunctionCallExpr>(sl[0])->function_name == "*" ||
+           std::static_pointer_cast<FunctionCallExpr>(sl[0])->function_name == "STAR")))) {
+        const auto& ft = select.from_table;
+        if (!ft.empty()) {
+            const TableInfo* src = symbol_table_.GetTable(ft);
+            if (src) {
+                for (const auto& c : src->columns) {
+                    ColumnInfo ci;
+                    ci.name = c.name;
+                    ci.data_type = c.data_type;
+                    ti.columns.push_back(std::move(ci));
+                }
+            }
+        }
+    }
+    if (!ti.columns.empty()) return;
+    // 逐列派生：cte_column_aliases → select_aliases → COLUMN_REF → col<i>。
+    for (size_t i = 0; i < sl.size(); ++i) {
+        ColumnInfo ci;
+        if (i < cte_column_aliases.size() && !cte_column_aliases[i].empty()) {
+            ci.name = cte_column_aliases[i];
+        } else if (i < sa.size() && !sa[i].empty()) {
+            ci.name = sa[i];
+        } else if (sl[i] && sl[i]->GetType() == NodeType::COLUMN_REF_EXPR) {
+            ci.name = std::static_pointer_cast<ColumnRefExpr>(sl[i])->column_name;
+        } else {
+            ci.name = "col" + std::to_string(i);
+        }
+        ci.data_type = "VARCHAR";
+        ti.columns.push_back(std::move(ci));
+    }
 }
 
 const std::vector<SemanticError>& SemanticAnalyzer::GetErrors() const {
@@ -476,12 +474,12 @@ bool SemanticAnalyzer::AnalyzeSelect(const SelectStatement& stmt) {
     for (auto& j : stmt.joins) {
         if (j.on_condition) ok &= CheckExpressionMulti(j.on_condition, real_tables, table_aliases);
         // USING (col1, col2, ...) — 校验每个 USING 列同时存在于左右两表。
+        // 把 left_info / right_info 上提到循环外，避免对每个 USING 列重复查表。
+        const TableInfo* left_info = symbol_table_.GetTable(stmt.from_table);
+        const TableInfo* right_info = symbol_table_.GetTable(j.table_name);
         for (const auto& cn : j.using_columns) {
-            bool in_left = false, in_right = false;
-            const TableInfo* left_info = symbol_table_.GetTable(stmt.from_table);
-            const TableInfo* right_info = symbol_table_.GetTable(j.table_name);
-            if (left_info && left_info->HasColumn(cn)) in_left = true;
-            if (right_info && right_info->HasColumn(cn)) in_right = true;
+            bool in_left = (left_info != nullptr) && left_info->HasColumnFast(cn);
+            bool in_right = (right_info != nullptr) && right_info->HasColumnFast(cn);
             if (!in_left || !in_right) {
                 AddError(SemanticErrorKind::ColumnNotFound,
                          "USING column '" + cn + "' not found in both tables of JOIN",
@@ -491,8 +489,6 @@ bool SemanticAnalyzer::AnalyzeSelect(const SelectStatement& stmt) {
         }
         // NATURAL JOIN — 左右表至少存在一个公共列；否则按 SQL 标准退化为 CROSS JOIN。
         if (j.is_natural) {
-            const TableInfo* left_info = symbol_table_.GetTable(stmt.from_table);
-            const TableInfo* right_info = symbol_table_.GetTable(j.table_name);
             if (!left_info || !right_info) {
                 AddError(SemanticErrorKind::TableNotFound,
                          "NATURAL JOIN: table not found",
@@ -633,8 +629,13 @@ bool SemanticAnalyzer::AnalyzeMerge(const MergeStatement& stmt) {
         aliases.push_back({stmt.target_alias, stmt.target_table});
     }
     if (stmt.source_query) {
-        // 派生表：递归校验内层 SELECT。
-        ok &= AnalyzeSelect(const_cast<SelectStatement&>(*stmt.source_query));
+        // 派生表：递归校验内层 SELECT。item #18: 用 AnalyzeInternal 代替
+        // AnalyzeSelect —— 前者能正确处理嵌套的 SET_OP / WITH / 子 SELECT，
+        // 后者只走 SELECT_STMT 单路径，遇到 UNION/INTERSECT/EXCEPT 形式的
+        // 派生表会漏掉子节点校验。
+        bool inner_ok = true;
+        AnalyzeInternal(stmt.source_query, inner_ok);
+        ok &= inner_ok;
         // 用派生表的 alias 作为 "表名" —— 但 catalog 找不到该别名。
         // 我们仍把 source_alias 加入 tables_for_check，并允许任意列引用通过
         // （即 CheckExpressionMulti 在该别名上不会校验列存在性）。
@@ -690,20 +691,19 @@ bool SemanticAnalyzer::AnalyzeCreateTable(const CreateTableStatement& stmt) {
                  stmt.line, stmt.column);
         ok = false;
     }
-    // Check duplicate column names
+    // 预先构建大小写不敏感的列名集合：用于 O(1) 重复列检测 + PRIMARY KEY
+    // 列查找 + CHECK 表达式的列存在性校验。一次遍历建立，三个用途共享。
+    std::unordered_set<std::string,
+                       CaseInsensitiveHash, CaseInsensitiveEq> seen_columns;
+    seen_columns.reserve(stmt.columns.size());
+    // Check duplicate column names — O(N) via hash set
     for (size_t i = 0; i < stmt.columns.size(); ++i) {
-        for (size_t j = i + 1; j < stmt.columns.size(); ++j) {
-            const auto& a = stmt.columns[i].column_name;
-            const auto& b = stmt.columns[j].column_name;
-            std::string ua, ub;
-            for (char c : a) ua.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-            for (char c : b) ub.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-            if (ua == ub) {
-                AddError(SemanticErrorKind::DuplicateName,
-                         "duplicate column name: " + a,
-                         stmt.line, stmt.column);
-                ok = false;
-            }
+        const auto& cn = stmt.columns[i].column_name;
+        if (!seen_columns.emplace(cn).second) {
+            AddError(SemanticErrorKind::DuplicateName,
+                     "duplicate column name: " + cn,
+                     stmt.line, stmt.column);
+            ok = false;
         }
         // Validate type (支持 BIGINT/INTEGER/DOUBLE/DECIMAL/CHAR/TEXT/STRING 等全部归一化类型)
         std::string up;
@@ -722,14 +722,10 @@ bool SemanticAnalyzer::AnalyzeCreateTable(const CreateTableStatement& stmt) {
             ok = false;
         }
     }
-    // 表级 PRIMARY KEY(a, b, ...) 引用的列必须存在于列定义中。
+    // 表级 PRIMARY KEY(a, b, ...) 引用的列必须存在于列定义中（O(1) hash 查询）。
     for (const auto& pk : stmt.primary_keys) {
         for (const auto& pk_col : pk) {
-            bool found = false;
-            for (const auto& cd : stmt.columns) {
-                if (cd.column_name == pk_col) { found = true; break; }
-            }
-            if (!found) {
+            if (seen_columns.find(pk_col) == seen_columns.end()) {
                 AddError(SemanticErrorKind::ColumnNotFound,
                          "PRIMARY KEY references unknown column: " + pk_col,
                          stmt.line, stmt.column);
@@ -751,14 +747,7 @@ bool SemanticAnalyzer::AnalyzeCreateTable(const CreateTableStatement& stmt) {
                     return true;
                 case NodeType::COLUMN_REF_EXPR: {
                     auto cr = std::static_pointer_cast<ColumnRefExpr>(e);
-                    bool found = false;
-                    for (const auto& cd : stmt.columns) {
-                        if (cd.column_name == cr->column_name) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
+                    if (seen_columns.find(cr->column_name) == seen_columns.end()) {
                         AddError(SemanticErrorKind::ColumnNotFound,
                                  "CHECK references unknown column: " +
                                  cr->column_name,
@@ -943,55 +932,53 @@ bool SemanticAnalyzer::CheckColumnExists(const std::string& table_name,
                                          const std::string& column_name,
                                          int line, int column) {
     // table_name may be a comma-separated list of table names (for JOIN).
-    auto check_one = [&](const std::string& t) -> bool {
-        const TableInfo* info = symbol_table_.GetTable(t);
-        if (info && info->HasColumn(column_name)) return true;
-        // 60_view_trigger: 物化视图在 SELECT FROM mv / ORDER BY mv.col 场景下
-        // 也应可被识别 —— Planner 会把 from_table 替换为 backing table，但语义
-        // 校验仍按 mv 名走，所以这里放行 MV 的 columns（来源：
-        // catalog.MaterializedViewInfo.columns，由 Planner::InferSelectOutputSchema 静态定型）。
-        if (catalog_ != nullptr) {
-            const SystemCatalog::MaterializedViewInfo* mv =
-                catalog_->LookupMaterializedView(t);
-            if (mv != nullptr) {
-                for (const auto& c : mv->columns) {
-                    if (c.column_name == column_name) return true;
-                }
-            }
-        }
-        return false;
-    };
+    // 在第一次循环里同时做"存在性检查 + 候选列收集"，避免错误路径上再走一遍。
     // 收集候选列名（用于「Did you mean」提示）。多个表时取并集。
     std::vector<std::string> column_candidates;
-    auto collect_columns = [&](const std::string& t) {
-        const TableInfo* info = symbol_table_.GetTable(t);
+    // item #8: 用 string_view span 切片代替 substr，避免每张 JOIN 表分配一次
+    // 临时 std::string。GetTable 需要 std::string&，我们在调用现场再构造一次
+    // —— 但每次只构造一个 slice，而不是为整个逗号分隔字符串反复 substr。
+    auto process_one = [&](std::string_view t) -> bool {
+        std::string t_str(t);  // 仅在需要 GetTable 时构造一次
+        const TableInfo* info = symbol_table_.GetTable(t_str);
         if (info != nullptr) {
+            if (info->HasColumnFast(column_name)) return true;
             for (const auto& c : info->columns) {
                 column_candidates.push_back(c.name);
             }
-            return;
+            return false;
         }
-        // MV 也作为候选列名来源 —— 与 check_one 的语义对齐。
+        // 60_view_trigger: 物化视图在 SELECT FROM mv / ORDER BY mv.col 场景下
+        // 也应可被识别 —— Planner 会把 from_table 替换为 backing table，但语义
+        // 校验仍按 mv 名走，所以这里放行 MV 的 columns。
         if (catalog_ != nullptr) {
             const SystemCatalog::MaterializedViewInfo* mv =
-                catalog_->LookupMaterializedView(t);
+                catalog_->LookupMaterializedView(t_str);
             if (mv != nullptr) {
+                // item #2: MV columns 来自 ColumnDefinition，没有 column_index_，
+                // 暂时保留 O(M*C) 扫描但用 IEquals 替换 byte-equal 比较，确保大小写
+                // 不敏感与 TableInfo 路径一致。MV column 数一般 < 30，开销可忽略；
+                // 真要 O(1) 可在 MaterializedViewInfo 上加个 hash（item #2 后续）。
+                for (const auto& c : mv->columns) {
+                    if (IEquals(c.column_name, column_name)) return true;
+                }
                 for (const auto& c : mv->columns) {
                     column_candidates.push_back(c.column_name);
                 }
             }
         }
+        return false;
     };
     if (table_name.find(',') != std::string::npos) {
-        size_t start = 0;
-        while (start < table_name.size()) {
-            size_t end = table_name.find(',', start);
-            std::string t = table_name.substr(start,
-                end == std::string::npos ? std::string::npos : end - start);
-            if (check_one(t)) return true;
-            collect_columns(t);
-            if (end == std::string::npos) break;
-            start = end + 1;
+        std::string_view remaining(table_name);
+        while (!remaining.empty()) {
+            size_t comma = remaining.find(',');
+            std::string_view t = (comma == std::string_view::npos)
+                ? remaining
+                : remaining.substr(0, comma);
+            if (process_one(t)) return true;
+            if (comma == std::string_view::npos) break;
+            remaining.remove_prefix(comma + 1);
         }
         std::string base = "column not found: " + column_name;
         std::string hint = SuggestClosestName(column_name, column_candidates);
@@ -1000,8 +987,7 @@ bool SemanticAnalyzer::CheckColumnExists(const std::string& table_name,
                  line, column);
         return false;
     }
-    if (check_one(table_name)) return true;
-    collect_columns(table_name);
+    if (process_one(table_name)) return true;
     std::string base = "column not found: " + table_name + "." + column_name;
     std::string hint = SuggestClosestName(column_name, column_candidates);
     AddError(SemanticErrorKind::ColumnNotFound,
@@ -1037,7 +1023,7 @@ bool SemanticAnalyzer::CheckExpressionMulti(const ExprPtr& expr,
                     return false;
                 }
                 const TableInfo* info = symbol_table_.GetTable(resolved);
-                if (!info || !info->HasColumn(cr->column_name)) {
+                if (info == nullptr || !info->HasColumnFast(cr->column_name)) {
                     AddError(SemanticErrorKind::ColumnNotFound,
                              "column not found: " + cr->column_name,
                              cr->line, cr->column);
@@ -1045,33 +1031,27 @@ bool SemanticAnalyzer::CheckExpressionMulti(const ExprPtr& expr,
                 }
                 return true;
             }
-            // 未限定列：在所有真实表中查找（含物化视图）
+            // 未限定列：在所有真实表中查找（含物化视图），同时累加候选列名。
+            // 错误路径上不再走第二次 walk（item #9）。
+            std::vector<std::string> column_candidates;
             for (const auto& t : tables) {
                 const TableInfo* info = symbol_table_.GetTable(t);
-                if (info && info->HasColumn(cr->column_name)) return true;
+                if (info != nullptr) {
+                    if (info->HasColumnFast(cr->column_name)) return true;
+                    for (const auto& c : info->columns) {
+                        column_candidates.push_back(c.name);
+                    }
+                    continue;
+                }
                 // 60_view_trigger: 物化视图列也作为合法引用源。
                 if (catalog_ != nullptr) {
                     const SystemCatalog::MaterializedViewInfo* mv =
                         catalog_->LookupMaterializedView(t);
                     if (mv != nullptr) {
+                        // item #2: 大小写不敏感与 TableInfo 路径对齐（见 CheckColumnExists）。
                         for (const auto& c : mv->columns) {
-                            if (c.column_name == cr->column_name) return true;
+                            if (IEquals(c.column_name, cr->column_name)) return true;
                         }
-                    }
-                }
-            }
-            // 收集候选列名，提供「Did you mean」提示。
-            std::vector<std::string> column_candidates;
-            for (const auto& t : tables) {
-                const TableInfo* info = symbol_table_.GetTable(t);
-                if (info != nullptr) {
-                    for (const auto& c : info->columns) column_candidates.push_back(c.name);
-                    continue;
-                }
-                if (catalog_ != nullptr) {
-                    const SystemCatalog::MaterializedViewInfo* mv =
-                        catalog_->LookupMaterializedView(t);
-                    if (mv != nullptr) {
                         for (const auto& c : mv->columns) {
                             column_candidates.push_back(c.column_name);
                         }
@@ -1137,7 +1117,7 @@ bool SemanticAnalyzer::CheckExpressionMultiWithAliases(const ExprPtr& expr,
                     return false;
                 }
                 const TableInfo* info = symbol_table_.GetTable(resolved);
-                if (!info || !info->HasColumn(cr->column_name)) {
+                if (info == nullptr || !info->HasColumnFast(cr->column_name)) {
                     AddError(SemanticErrorKind::ColumnNotFound,
                              "column not found: " + cr->column_name,
                              cr->line, cr->column);
@@ -1149,41 +1129,34 @@ bool SemanticAnalyzer::CheckExpressionMultiWithAliases(const ExprPtr& expr,
             for (const auto& a : aliases) {
                 if (a == cr->column_name) return true;
             }
-            // 再在真实表中查找（含物化视图：catalog.MaterializedViewInfo.columns）。
+            // 在真实表中查找（含物化视图），同时累加候选列名（错误路径用）。
+            std::vector<std::string> column_candidates;
             for (const auto& t : tables) {
                 const TableInfo* info = symbol_table_.GetTable(t);
-                if (info && info->HasColumn(cr->column_name)) return true;
+                if (info != nullptr) {
+                    if (info->HasColumnFast(cr->column_name)) return true;
+                    for (const auto& c : info->columns) {
+                        column_candidates.push_back(c.name);
+                    }
+                    continue;
+                }
                 // 60_view_trigger: 物化视图列同样可作为合法引用源。
                 if (catalog_ != nullptr) {
                     const SystemCatalog::MaterializedViewInfo* mv =
                         catalog_->LookupMaterializedView(t);
                     if (mv != nullptr) {
+                        // item #2: 大小写不敏感与 TableInfo 路径对齐。
                         for (const auto& c : mv->columns) {
-                            if (c.column_name == cr->column_name) return true;
+                            if (IEquals(c.column_name, cr->column_name)) return true;
                         }
-                    }
-                }
-            }
-            // 收集候选列名，提供「Did you mean」提示。
-            std::vector<std::string> column_candidates;
-            for (const auto& a : aliases) column_candidates.push_back(a);
-            for (const auto& t : tables) {
-                const TableInfo* info = symbol_table_.GetTable(t);
-                if (info != nullptr) {
-                    for (const auto& c : info->columns) column_candidates.push_back(c.name);
-                    continue;
-                }
-                // MV 也加入候选列名。
-                if (catalog_ != nullptr) {
-                    const SystemCatalog::MaterializedViewInfo* mv =
-                        catalog_->LookupMaterializedView(t);
-                    if (mv != nullptr) {
                         for (const auto& c : mv->columns) {
                             column_candidates.push_back(c.column_name);
                         }
                     }
                 }
             }
+            // 别名也加入候选列名集合。
+            for (const auto& a : aliases) column_candidates.push_back(a);
             std::string base = "column not found: " + cr->column_name;
             std::string hint = SuggestClosestName(cr->column_name, column_candidates);
             AddError(SemanticErrorKind::ColumnNotFound,
@@ -1281,8 +1254,12 @@ std::string SemanticAnalyzer::SuggestClosestName(
     constexpr int kMaxDistance = 2;
     std::vector<std::pair<int, std::string>> scored;
     scored.reserve(candidates.size());
+    const int bn_size = static_cast<int>(bad_name.size());
     for (const auto& c : candidates) {
         if (c.empty()) continue;
+        // item #19：长度差距超过 kMaxDistance 时，编辑距离必然 >= kMaxDistance，
+        // 提前 skip 整个 DP 过程，避免对每个候选都跑一次 O(L1*L2) 算法。
+        if (std::abs(bn_size - static_cast<int>(c.size())) > kMaxDistance) continue;
         int d = LevenshteinDistance(bad_name, c);
         if (d <= kMaxDistance) scored.emplace_back(d, c);
     }
@@ -1293,7 +1270,12 @@ std::string SemanticAnalyzer::SuggestClosestName(
                   if (a.first != b.first) return a.first < b.first;
                   return a.second < b.second;
               });
-    std::string out = "Did you mean: ";
+    // item #10：hint 字符串构造时一次性 reserve，避免 += 链式多次触发 realloc。
+    // 每个候选最多 14 字节（逗号 + 2 个引号 + 10 字符以内的典型名字），
+    // 加上前缀 "Did you mean: " 与尾部 "?" 共 15 字节，给出充足余量。
+    std::string out;
+    out.reserve(15 + scored.size() * 14);
+    out += "Did you mean: ";
     for (size_t i = 0; i < scored.size(); ++i) {
         if (i > 0) out += ", ";
         out += "'";

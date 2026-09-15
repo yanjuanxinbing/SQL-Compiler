@@ -2,13 +2,50 @@
 #include <iostream>
 #include "parser/Parser.h"
 
+#include "common/CaseInsensitive.h"
 #include "common/DateTime.h"
 #include "common/Error.h"
 
 #include <cstdlib>
+#include <unordered_map>
 #include <utility>
 
 namespace sqlcompiler {
+
+namespace {
+
+// item #12: TokenType → 列类型归一化串名 的全局映射。原来在两个地方（ALTER
+// ADD/MODIFY COLUMN 与 CREATE TABLE 的列定义）各写一段 14 路 if/else 链；
+// 现在统一到一张表 + 一个 LookupSqlTypeName 助手，避免重复且便于扩充。
+//
+// SERIAL 是个特例：除归一化 data_type = "INT" 外还要把 PK / NOT NULL /
+// AUTO_INCREMENT 三个 flag 一并打开，简单的 char* 映射表达不了。我们让
+// SERIAL 走专用分支（在调用方处理），其它 14 种纯字符串归一化用 map 走。
+const std::unordered_map<TokenType, const char*>& KTokenTypeToSqlTypeName() {
+    static const std::unordered_map<TokenType, const char*> kMap = {
+        {TokenType::KEYWORD_INT,       "INT"},
+        {TokenType::KEYWORD_VARCHAR,   "VARCHAR"},
+        {TokenType::KEYWORD_FLOAT,     "FLOAT"},
+        {TokenType::KEYWORD_DATE,      "DATE"},
+        {TokenType::KEYWORD_TIMESTAMP, "TIMESTAMP"},
+        {TokenType::KEYWORD_BOOLEAN,   "BOOLEAN"},
+        {TokenType::KEYWORD_BOOL,      "BOOLEAN"},
+        {TokenType::KEYWORD_CHAR,      "CHAR"},
+        {TokenType::KEYWORD_TEXT,      "TEXT"},
+        {TokenType::KEYWORD_DECIMAL,   "DECIMAL"},
+        {TokenType::KEYWORD_NUMERIC,   "DECIMAL"},
+        {TokenType::KEYWORD_DOUBLE,    "DOUBLE"},
+        {TokenType::KEYWORD_REAL,      "REAL"},
+        {TokenType::KEYWORD_SMALLINT,  "SMALLINT"},
+        {TokenType::KEYWORD_TINYINT,   "TINYINT"},
+        {TokenType::KEYWORD_TIME,      "TIME"},
+        {TokenType::KEYWORD_JSON,      "JSON"},
+        {TokenType::KEYWORD_UUID,      "UUID"},
+    };
+    return kMap;
+}
+
+}  // namespace
 
 Parser::Parser(std::vector<Token> tokens) : tokens_(std::move(tokens)), current_(0) {
 }
@@ -1244,41 +1281,29 @@ StatementPtr Parser::ParseAlterTableStatement() {
     SetNodePos(stmt, alter_tok);
     stmt->table_name = std::move(table_name);
     auto parse_column_type = [](const Token& ty, ColumnDefinition* cd) {
-        // 与 ParseColumnDefinition 的类型识别集合对齐（bug10）：ALTER ADD COLUMN
-        // 之前只支持 INT/VARCHAR/FLOAT/DATE/TIMESTAMP/IDENTIFIER 六个分支，导致
-        // TEXT/REAL/BOOLEAN/DECIMAL/DOUBLE/SMALLINT 等常见类型在 ADD COLUMN 上
-        // 立即被语法拒绝。补齐后所有 CREATE TABLE 支持的类型在 ALTER ADD/MODIFY
-        // 上同样可用。
-        if (ty.type == TokenType::KEYWORD_INT)            { cd->data_type = "INT";      }
-        else if (ty.type == TokenType::KEYWORD_VARCHAR)   { cd->data_type = "VARCHAR";  }
-        else if (ty.type == TokenType::KEYWORD_FLOAT)     { cd->data_type = "FLOAT";    }
-        else if (ty.type == TokenType::KEYWORD_DATE)      { cd->data_type = "DATE";     }
-        else if (ty.type == TokenType::KEYWORD_TIMESTAMP) { cd->data_type = "TIMESTAMP";}
-        else if (ty.type == TokenType::KEYWORD_BOOLEAN ||
-                 ty.type == TokenType::KEYWORD_BOOL)       { cd->data_type = "BOOLEAN";  }
-        else if (ty.type == TokenType::KEYWORD_CHAR)      { cd->data_type = "CHAR";     }
-        else if (ty.type == TokenType::KEYWORD_TEXT)      { cd->data_type = "TEXT";     }
-        else if (ty.type == TokenType::KEYWORD_DECIMAL ||
-                 ty.type == TokenType::KEYWORD_NUMERIC)    { cd->data_type = "DECIMAL";  }
-        else if (ty.type == TokenType::KEYWORD_DOUBLE)    { cd->data_type = "DOUBLE";   }
-        else if (ty.type == TokenType::KEYWORD_REAL)      { cd->data_type = "REAL";     }
-        else if (ty.type == TokenType::KEYWORD_SMALLINT)  { cd->data_type = "SMALLINT"; }
-        else if (ty.type == TokenType::KEYWORD_TINYINT)   { cd->data_type = "TINYINT";  }
-        else if (ty.type == TokenType::KEYWORD_TIME)      { cd->data_type = "TIME";     }
-        else if (ty.type == TokenType::KEYWORD_JSON)      { cd->data_type = "JSON";     }
-        else if (ty.type == TokenType::KEYWORD_UUID)      { cd->data_type = "UUID";     }
-        else if (ty.type == TokenType::KEYWORD_SERIAL) {
+        // item #12: TokenType → 归一化串名 通过 KTokenTypeToSqlTypeName 表查找，
+        // 把 14 路 if/else 链替换为单次 hash lookup。SERIAL 是特例（额外要打
+        // PK / NOT NULL / AUTO_INCREMENT 三个 flag），保留专用分支。
+        const auto& type_map = KTokenTypeToSqlTypeName();
+        auto it = type_map.find(ty.type);
+        if (it != type_map.end()) {
+            cd->data_type = it->second;
+            return;
+        }
+        if (ty.type == TokenType::KEYWORD_SERIAL) {
             // SERIAL：等价于 INT PRIMARY KEY AUTO_INCREMENT NOT NULL。
             cd->data_type = "INT";
             cd->is_primary_key = true;
             cd->is_not_null = true;
             cd->is_auto_increment = true;
+            return;
         }
-        else if (ty.type == TokenType::IDENTIFIER)       { cd->data_type = ty.lexeme;  }
-        else {
-            throw CompilerException(ErrorStage::SYNTAX,
-                "expected column type", ty.line, ty.column);
+        if (ty.type == TokenType::IDENTIFIER) {
+            cd->data_type = ty.lexeme;
+            return;
         }
+        throw CompilerException(ErrorStage::SYNTAX,
+            "expected column type", ty.line, ty.column);
     };
     if (Match(TokenType::KEYWORD_ADD)) {
         // ADD COLUMN 是关键字 COLUMN 形式；同时也接受裸 ADD col ... 形式以兼容
@@ -1668,10 +1693,14 @@ std::vector<OrderByItem> Parser::ParseOrderByClause() {
             it.ascending = (CurrentToken().type == TokenType::KEYWORD_ASC);
             Advance();
         } else if (CurrentToken().type == TokenType::IDENTIFIER) {
-            std::string up = CurrentToken().lexeme;
-            for (auto& ch : up) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-            if (up == "ASC") { it.ascending = true; Advance(); }
-            else if (up == "DESC") { it.ascending = false; Advance(); }
+            // item #6: IEquals 零分配比较，替换原 up = toupper(...) 链。
+            if (IEquals(CurrentToken().lexeme, "ASC")) {
+                it.ascending = true;
+                Advance();
+            } else if (IEquals(CurrentToken().lexeme, "DESC")) {
+                it.ascending = false;
+                Advance();
+            }
         }
         items.push_back(it);
     } while (Match(TokenType::COMMA));
@@ -1809,67 +1838,12 @@ ColumnDefinition Parser::ParseColumnDefinition() {
     Token name = Expect(TokenType::IDENTIFIER, "expected column name");
     cd.column_name = name.lexeme;
     const Token& ty = CurrentToken();
-    // 52_data_types: 新增的数据类型关键字。统一归一化到标准串名，语义层 /
-    // 执行层只识别归一化后的名称。下表保留与历史 DataTypeId 一致的"内部串名"，
-    // 例如 DECIMAL/NUMERIC 都映射到 "DECIMAL"、DOUBLE → "DOUBLE"、REAL → "REAL"、
-    // SMALLINT/TINYINT → "INT"（运行期沿用 int32 表示）。
-    if (ty.type == TokenType::KEYWORD_INT) {
-        cd.data_type = "INT";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_VARCHAR) {
-        cd.data_type = "VARCHAR";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_FLOAT) {
-        cd.data_type = "FLOAT";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_DATE) {
-        // 45_datetime: DATE 'YYYY-MM-DD'
-        cd.data_type = "DATE";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_TIMESTAMP) {
-        // 45_datetime: TIMESTAMP 'YYYY-MM-DD HH:MM:SS'
-        cd.data_type = "TIMESTAMP";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_BOOLEAN ||
-               ty.type == TokenType::KEYWORD_BOOL) {
-        // BOOLEAN / BOOL — 归一化到 "BOOLEAN"。运行期按 INTEGER (0/1) 流转，
-        // 但保留独立字符串名以便展示和落盘。
-        cd.data_type = "BOOLEAN";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_CHAR) {
-        cd.data_type = "CHAR";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_TEXT) {
-        cd.data_type = "TEXT";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_DECIMAL ||
-               ty.type == TokenType::KEYWORD_NUMERIC) {
-        // DECIMAL / NUMERIC — 归一化到 "DECIMAL"，按精确十进制文本持久化。
-        cd.data_type = "DECIMAL";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_DOUBLE) {
-        cd.data_type = "DOUBLE";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_REAL) {
-        cd.data_type = "REAL";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_SMALLINT) {
-        // 16 位有符号：运行期使用 int32 表示。
-        cd.data_type = "SMALLINT";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_TINYINT) {
-        // 8 位无符号：运行期使用 int32 表示。
-        cd.data_type = "TINYINT";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_TIME) {
-        // TIME 'HH:MM:SS' — 按文本持久化。
-        cd.data_type = "TIME";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_JSON) {
-        cd.data_type = "JSON";
-        Advance();
-    } else if (ty.type == TokenType::KEYWORD_UUID) {
-        cd.data_type = "UUID";
+    // item #12: 14 路 if/else 链替换为单次 hash lookup（见 KTokenTypeToSqlTypeName）。
+    // SERIAL 仍走专用分支（额外打 PK / NOT NULL / AUTO_INCREMENT）。
+    const auto& type_map = KTokenTypeToSqlTypeName();
+    auto type_it = type_map.find(ty.type);
+    if (type_it != type_map.end()) {
+        cd.data_type = type_it->second;
         Advance();
     } else if (ty.type == TokenType::KEYWORD_SERIAL) {
         // SERIAL：PostgreSQL 风格列级 attribute，等价于
@@ -2464,11 +2438,8 @@ ExprPtr Parser::ParsePrimaryExpr() {
         // DEFAULT/CHECK 的「不允许列引用」校验。改造成零参
         // FunctionCallExpr，ExecutionEvaluator 的
         // `name == "CURRENT_TIMESTAMP"` 分支直接返回当前时间。
-        std::string up = cur.lexeme;
-        for (auto& ch : up) {
-            ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-        }
-        if (up == "CURRENT_TIMESTAMP") {
+        // item #6: IEquals 是零分配的大小写不敏感比较，替换原 `up = toupper(ch)` 循环。
+        if (IEquals(cur.lexeme, "CURRENT_TIMESTAMP")) {
             Advance();
             return std::make_shared<FunctionCallExpr>("CURRENT_TIMESTAMP",
                                                       std::vector<ExprPtr>{});

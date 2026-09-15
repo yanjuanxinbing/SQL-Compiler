@@ -50,6 +50,12 @@ private:
     // 外层所有列（含左表的真实列 + 限定别名）→ 下标映射。
     // 由 BuildExecutor 在构造时基于 PlanNode 计算出（左侧各表的列下标）。
     std::unordered_map<std::string, size_t> combined_column_index_map_;
+    // Item #3 (perf)：构造时一次性复制内层表名集合，避免 Init() 里再从
+    // context 重新读 LateralInnerTables。
+    std::unordered_set<std::string> lateral_inner_tables_;
+    // Item #3 (perf)：构造时一次性探测右子计划是否引用了外层列。若为 false
+    // 则 inner 是非相关的，可一次性跑完并复用 right_buffer_。
+    bool is_correlated_ = true;
     // 当前左行：保存供 outer_bind 关联。
     Tuple current_left_;
     bool has_left_ = false;
@@ -60,6 +66,9 @@ private:
     bool left_pulled_ = false;
     // 当前左行的 outer_bind（生命周期内有效）。
     std::unordered_map<std::string, Value> current_bind_;
+    // Item #3 (perf)：非相关 inner 已一次性跑完 → right_exhausted_ 始终为 false，
+    // 不需要每行重跑；left_exhausted_ 防止 Next 越界访问 current_left_。
+    bool right_exhausted_ = false;
 };
 
 }  // namespace sqlcompiler

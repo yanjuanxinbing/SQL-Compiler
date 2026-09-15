@@ -1,16 +1,24 @@
 #include "lexer/Lexer.h"
 
+#include "common/CaseInsensitive.h"
 #include "common/Error.h"
 
 #include <cctype>
+#include <string>
 #include <unordered_map>
 
 namespace sqlcompiler {
 
 namespace {
 
-const std::unordered_map<std::string, TokenType>& KeywordTable() {
-    static const std::unordered_map<std::string, TokenType> kKeywords = {
+// item #5: KeywordTable 的 hash/equal 改为大小写不敏感，LookupKeyword 即可
+// 直接用原始 lexeme 查表，跳过每次 ToUpper 的临时字符串分配。
+// C++17 std::unordered_map 不支持 heterogeneous lookup，所以调用方仍要持有
+// const std::string&（ScanIdentifierOrKeyword 传下来的 text 已经是 std::string）。
+const std::unordered_map<std::string, TokenType,
+                         CaseInsensitiveHash, CaseInsensitiveEq>& KeywordTable() {
+    static const std::unordered_map<std::string, TokenType,
+                                    CaseInsensitiveHash, CaseInsensitiveEq> kKeywords = {
         {"SELECT",   TokenType::KEYWORD_SELECT},
         {"FROM",     TokenType::KEYWORD_FROM},
         {"WHERE",    TokenType::KEYWORD_WHERE},
@@ -264,15 +272,6 @@ const std::unordered_map<std::string, TokenType>& KeywordTable() {
     return kKeywords;
 }
 
-std::string ToUpper(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s) {
-        out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-    }
-    return out;
-}
-
 bool IsIdentStart(char c) {
     // 71_proc_out_params: '@' 视为 session variable 标识符的起始字符，
     // 让后续解析路径（ParsePrimaryExpr -> ColumnRefExpr）能把 '@x' 当成
@@ -364,9 +363,10 @@ void Lexer::SkipWhitespaceAndComments() {
 }
 
 TokenType Lexer::LookupKeyword(const std::string& text) const {
-    std::string upper = ToUpper(text);
-    auto& table = KeywordTable();
-    auto it = table.find(upper);
+    // item #5: KeywordTable 本身已是大小写不敏感（CaseInsensitiveHash/Eq），
+    // 直接用原始 lexeme 查表，跳过 ToUpper 的临时字符串分配。
+    const auto& table = KeywordTable();
+    auto it = table.find(text);
     if (it != table.end()) {
         return it->second;
     }

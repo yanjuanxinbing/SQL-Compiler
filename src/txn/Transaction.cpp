@@ -55,12 +55,36 @@ void Transaction::SetLastUndoLSN(lsn_t lsn) {
     undo_log_.back().lsn = lsn;
 }
 
+// item #8：PopSavepoint / PopSavepointStack / RollbackToSavepoint 在 erase
+// savepoints_ 的同时需要把对应 entry 的 offset 从 name_to_offsets_ 中移除，
+// 保证 map 与栈保持一一对应。
+namespace {
+
+// 把 savepoints_ 中 [fwd, savepoints_.end()) 区间的每个 entry 从 name_to_offsets_
+// 中 pop_back 一份（按 entry.name 在 map 中的最后一个匹配）。这是「栈收尾」
+// 的对偶：栈弹掉多少条目，map 就 pop 掉多少 offset。区间为空时 no-op。
+void EraseOffsetsForRange(
+    const std::vector<Transaction::Savepoint>::iterator& fwd,
+    const std::vector<Transaction::Savepoint>::iterator& end,
+    std::unordered_map<std::string, std::vector<size_t>>& name_to_offsets) {
+    for (auto it = fwd; it != end; ++it) {
+        auto mit = name_to_offsets.find(it->name);
+        if (mit == name_to_offsets.end()) continue;
+        if (!mit->second.empty()) mit->second.pop_back();
+        if (mit->second.empty()) name_to_offsets.erase(mit);
+    }
+}
+
+}  // namespace
+
 void Transaction::PushSavepoint(const std::string& name) {
     if (!active_) return;
     Savepoint sp;
     sp.name = name;
     sp.undo_log_offset = undo_log_.size();
     savepoints_.push_back(std::move(sp));
+    // 同步登记到 name → offsets map，让 HasSavepoint / GetSavepointOffset O(1)。
+    name_to_offsets_[name].push_back(savepoints_.back().undo_log_offset);
 }
 
 bool Transaction::PopSavepoint(const std::string& name) {
@@ -68,6 +92,7 @@ bool Transaction::PopSavepoint(const std::string& name) {
         if (it->name == name) {
             // reverse_iterator 转回正向 iterator 再 erase。
             auto fwd = std::next(it).base();
+            EraseOffsetsForRange(fwd, fwd, name_to_offsets_);
             savepoints_.erase(fwd);
             return true;
         }
@@ -82,6 +107,7 @@ bool Transaction::PopSavepointStack(const std::string& name) {
     for (auto it = savepoints_.rbegin(); it != savepoints_.rend(); ++it) {
         if (it->name != name) continue;
         auto fwd = std::next(it).base();
+        EraseOffsetsForRange(fwd, savepoints_.end(), name_to_offsets_);
         savepoints_.erase(fwd, savepoints_.end());
         return true;
     }
@@ -97,6 +123,7 @@ bool Transaction::RollbackToSavepoint(const std::string& name) {
         // 删除栈顶到（含）该保存点的所有 entry：
         //   反向迭代器 it 转正向 = std::next(it).base()，erase 到 savepoints_.end()。
         auto fwd = std::next(it).base();
+        EraseOffsetsForRange(fwd, savepoints_.end(), name_to_offsets_);
         savepoints_.erase(fwd, savepoints_.end());
         // 截断 undo log。Phase A 直接丢弃 offset 之后的所有记录——
         // Rollback 由调用方（TransactionExecutor）反向应用 offset 之前的记录。
@@ -109,17 +136,16 @@ bool Transaction::RollbackToSavepoint(const std::string& name) {
 }
 
 bool Transaction::HasSavepoint(const std::string& name) const {
-    for (const auto& sp : savepoints_) {
-        if (sp.name == name) return true;
-    }
-    return false;
+    // item #8: O(1) via name_to_offsets_ map.
+    auto it = name_to_offsets_.find(name);
+    return it != name_to_offsets_.end() && !it->second.empty();
 }
 
 size_t Transaction::GetSavepointOffset(const std::string& name) const {
-    for (auto it = savepoints_.rbegin(); it != savepoints_.rend(); ++it) {
-        if (it->name == name) return it->undo_log_offset;
-    }
-    return 0;
+    // item #8: O(1) via name_to_offsets_ map (back = 最近同名保存点).
+    auto it = name_to_offsets_.find(name);
+    if (it == name_to_offsets_.end() || it->second.empty()) return 0;
+    return it->second.back();
 }
 
 void Transaction::TruncateUndoLog(size_t new_size) {

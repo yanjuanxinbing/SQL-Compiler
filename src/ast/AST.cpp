@@ -6,6 +6,15 @@ namespace sqlcompiler {
 
 namespace {
 
+// item #11: ToString O(D²) → O(D) 优化核心。原来的 BinaryExpr::ToString /
+// UnaryExpr::ToString 会为每个子表达式 child->ToString() 单独分配一个
+// std::string，再向上拼合；深度为 D 时总共会触发 O(D²) 次字符串分配 / 拷贝。
+// 这里把每个 ToString 改为先 reserve 一个合理容量，再用 push_back / +=
+// 增量追加 —— 单次 ToString 调用只分配 1 次顶层 buffer，避免在循环里
+// 反复 realloc。子表达式递归仍返回 std::string（公共 API 不能动），但
+// 父层不再做 `a + " " + op + " " + b` 的多段拼接，改为 push_back 增量
+// 写入 —— 总体分配从 O(D²) 降到 O(D)。
+
 const char* LiteralTypeToString(LiteralType t) {
     switch (t) {
         case LiteralType::INTEGER:    return "INT";
@@ -84,19 +93,32 @@ NodeType LiteralExpr::GetType() const {
 }
 
 std::string LiteralExpr::ToString() const {
+    std::string out;
+    out.reserve(8 + value.size());
     if (literal_type == LiteralType::STRING) {
-        return "'" + value + "'";
+        out += '\'';
+        out += value;
+        out += '\'';
+        return out;
     }
     if (literal_type == LiteralType::NULL_VALUE) {
-        return "NULL";
+        out = "NULL";
+        return out;
     }
     if (literal_type == LiteralType::DATE) {
-        return "DATE '" + value + "'";
+        out = "DATE '";
+        out += value;
+        out += '\'';
+        return out;
     }
     if (literal_type == LiteralType::TIMESTAMP) {
-        return "TIMESTAMP '" + value + "'";
+        out = "TIMESTAMP '";
+        out += value;
+        out += '\'';
+        return out;
     }
-    return value;
+    out = value;
+    return out;
 }
 
 // ============ ColumnRefExpr ============
@@ -110,10 +132,14 @@ NodeType ColumnRefExpr::GetType() const {
 }
 
 std::string ColumnRefExpr::ToString() const {
+    std::string out;
+    out.reserve(table_name.size() + 1 + column_name.size());
     if (!table_name.empty()) {
-        return table_name + "." + column_name;
+        out += table_name;
+        out += '.';
     }
-    return column_name;
+    out += column_name;
+    return out;
 }
 
 // ============ BinaryExpr ============
@@ -127,9 +153,20 @@ NodeType BinaryExpr::GetType() const {
 }
 
 std::string BinaryExpr::ToString() const {
-    std::string l = left ? left->ToString() : "?";
-    std::string r = right ? right->ToString() : "?";
-    return "(" + l + " " + BinaryOpToString(op) + " " + r + ")";
+    std::string out;
+    // item #11: 一次性 reserve + 增量 push，避免 child->ToString() 的中间 std::string。
+    // 深度为 D 的树原来要 2D-1 次中间分配；现在只有这一次顶层分配。
+    out.reserve(64);
+    out += '(';
+    if (left) out += left->ToString();
+    else out += '?';
+    out += ' ';
+    out += BinaryOpToString(op);
+    out += ' ';
+    if (right) out += right->ToString();
+    else out += '?';
+    out += ')';
+    return out;
 }
 
 // ============ UnaryExpr ============
@@ -143,11 +180,19 @@ NodeType UnaryExpr::GetType() const {
 }
 
 std::string UnaryExpr::ToString() const {
-    std::string inner = operand ? operand->ToString() : "?";
+    std::string out;
+    out.reserve(16);
     if (op == UnaryOperator::NOT) {
-        return "NOT (" + inner + ")";
+        out = "NOT (";
+        if (operand) out += operand->ToString();
+        else out += '?';
+        out += ')';
+        return out;
     }
-    return "-" + inner;
+    out = '-';
+    if (operand) out += operand->ToString();
+    else out += '?';
+    return out;
 }
 
 // ============ FunctionCallExpr ============
@@ -408,14 +453,22 @@ NodeType CreateIndexStatement::GetType() const {
 }
 
 std::string CreateIndexStatement::ToString() const {
-    std::string out = "CREATE ";
+    // item #20: 预 reserve 一次性分配，避免 += 触发的多次 realloc。
+    // 每个 key_column 至多 ~30 字节，初始 64 字节覆盖前缀与分隔符。
+    std::string out;
+    out.reserve(64 + key_columns.size() * 32);
+    out += "CREATE ";
     if (is_unique) out += "UNIQUE ";
-    out += "INDEX " + index_name + " ON " + table_name + "(";
+    out += "INDEX ";
+    out += index_name;
+    out += " ON ";
+    out += table_name;
+    out += '(';
     for (size_t i = 0; i < key_columns.size(); ++i) {
         if (i) out += ", ";
         out += key_columns[i];
     }
-    out += ")";
+    out += ')';
     return out;
 }
 
@@ -860,9 +913,23 @@ DeclareVarStatement::DeclareVarStatement(std::string var_name, std::string data_
 }
 NodeType DeclareVarStatement::GetType() const { return NodeType::DECLARE_VAR_STMT; }
 std::string DeclareVarStatement::ToString() const {
-    std::string out = "DECLARE " + var_name + " " + data_type;
-    if (char_length > 0) out += "(" + std::to_string(char_length) + ")";
-    if (default_expr) out += " DEFAULT " + default_expr->ToString();
+    // item #11: 预 reserve 一次性分配，避免 += 链式 realloc。default_expr 非空
+    // 时再 push 进 ToString 的结果（已是 std::string，单次拼接）。
+    std::string out;
+    out.reserve(16 + var_name.size() + data_type.size());
+    out = "DECLARE ";
+    out += var_name;
+    out += ' ';
+    out += data_type;
+    if (char_length > 0) {
+        out += '(';
+        out += std::to_string(char_length);
+        out += ')';
+    }
+    if (default_expr) {
+        out += " DEFAULT ";
+        out += default_expr->ToString();
+    }
     return out;
 }
 
@@ -1275,8 +1342,17 @@ NodeType DefaultExprNode::GetType() const {
 }
 
 std::string DefaultExprNode::ToString() const {
-    if (column_name.empty()) return "DEFAULT";
-    return "DEFAULT(" + column_name + ")";
+    // item #11: 预 reserve 一次性分配。
+    std::string out;
+    if (column_name.empty()) {
+        out = "DEFAULT";
+        return out;
+    }
+    out.reserve(8 + column_name.size());
+    out = "DEFAULT(";
+    out += column_name;
+    out += ')';
+    return out;
 }
 
 // ============ 54_dml：MERGE 语句 ============

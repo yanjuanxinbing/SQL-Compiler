@@ -120,7 +120,8 @@ page_id_t TableHeap::GetFirstPageId() const {
 }
 
 bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
-                                 const std::vector<ValueType>& column_types) {
+                                 const std::vector<ValueType>& column_types,
+                                 page_id_t* out_next_pid) {
     Page* page = storage_->GetPage(page_id);
     if (!page) return false;
     char* data = page->GetData();
@@ -132,9 +133,22 @@ bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
     std::vector<char> serialized = tuple.Serialize(column_types);
     int32_t len = static_cast<int32_t>(serialized.size());
 
-    // Need room for: new slot entry (kSlotBytes) + record bytes
-    int32_t slot_dir_end = kHeaderBytes + (slot_count + 1) * kSlotBytes;
+    // Tombstone reuse (item #2): 先扫一遍现有 slot，找第一个墓碑位复用——
+    // 避免每次 DELETE 后都让 slot_count 单调递增、最终把 slot 目录撑爆。
+    // 扫描代价 O(M)（M = 当前 slot_count），远比 O(M*kMaxSlots) 安全。
+    int32_t reuse_slot = -1;
+    for (int32_t s = 0; s < slot_count; ++s) {
+        int32_t o, l;
+        ReadSlot(data, s, o, l);
+        if (IsTombstone(l)) { reuse_slot = s; break; }
+    }
+
+    // 算"插入后"是否还有空间。新 slot 总是占 1 个槽（要么复用、要么追加）；
+    // 复用路径下 slot_count 不变，所以 slot_dir_end 不变；追加路径下 +1。
+    int32_t new_slot_count = (reuse_slot >= 0) ? slot_count : slot_count + 1;
+    int32_t slot_dir_end = kHeaderBytes + new_slot_count * kSlotBytes;
     if (slot_dir_end > free_off || len > free_off - slot_dir_end) {
+        if (out_next_pid) *out_next_pid = next_pid;
         storage_->UnpinPage(page_id, header_fixed);
         return false;
     }
@@ -155,8 +169,9 @@ bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
     if (len > 0) {
         std::memcpy(data + new_off, serialized.data(), len);
     }
-    WriteSlot(data, slot_count, new_off, len);
-    WritePageHeader(data, next_pid, slot_count + 1, new_off);
+    int32_t target_slot = (reuse_slot >= 0) ? reuse_slot : slot_count;
+    WriteSlot(data, target_slot, new_off, len);
+    WritePageHeader(data, next_pid, new_slot_count, new_off);
     page->SetDirty(true);
 
     // Phase B：写 WAL（UPDATE 记录；before/after 都是 PAGE_SIZE 字节）。
@@ -176,32 +191,53 @@ bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
     }
     if (rid) {
         rid->page_id = page_id;
-        rid->slot_num = slot_count;
+        rid->slot_num = target_slot;
     }
+    if (out_next_pid) *out_next_pid = next_pid;
     storage_->UnpinPage(page_id, true);
     return true;
 }
 
 bool TableHeap::InsertTuple(const Tuple& tuple, RID* rid,
                             const std::vector<ValueType>& column_types) {
-    page_id_t pid = first_page_id_;
+    page_id_t pid = first_page_with_space_;
+    if (pid == INVALID_PAGE_ID) {
+        // 游标未初始化（重新打开堆 / 首次写入），从首页起步。
+        pid = first_page_id_;
+    }
     page_id_t prev_pid = INVALID_PAGE_ID;
     // 防止损坏的 next_pid 形成环导致死循环（例如全零页自指 page 0）
     std::unordered_set<page_id_t> visited;
     while (pid != INVALID_PAGE_ID && pid >= 0) {
         if (!visited.insert(pid).second) break;
-        if (InsertIntoPage(pid, tuple, rid, column_types)) {
+        // out_next_pid 让我们一次 page fetch 完成"尝试插入 + 取链表下一节点"，
+        // 避免失败后再 GetPage+UnpinPage 一次。
+        page_id_t next_pid_unused = INVALID_PAGE_ID;
+        if (InsertIntoPage(pid, tuple, rid, column_types, &next_pid_unused)) {
+            // 命中一页：检查"是否变满"。若变满（slot 目录到顶 / 数据满），
+            // 把游标推进到下一页；否则留在本页（O(1) 摊销）。
+            Page* page = storage_->GetPage(pid);
+            if (page) {
+                char* data = page->GetData();
+                int32_t nxt, sc, fo;
+                ReadPageHeader(data, nxt, sc, fo);
+                int32_t slot_dir_end = kHeaderBytes + sc * kSlotBytes;
+                if (slot_dir_end >= fo) {
+                    // 已满：游标前进到下一页（保证下次插入不会再次撞同一页）
+                    first_page_with_space_ = nxt;
+                } else {
+                    first_page_with_space_ = pid;
+                }
+                storage_->UnpinPage(pid, false);
+            }
             return true;
         }
-        // Walk to next page in chain
-        Page* page = storage_->GetPage(pid);
-        if (!page) return false;
-        int32_t next_pid, slot_count, free_off;
-        ReadPageHeader(page->GetData(), next_pid, slot_count, free_off);
-        storage_->UnpinPage(pid, false);
+        // 插入失败（页已满）：游标前进到 next_pid_unused——InsertIntoPage 已
+        // 把 next_pid 写进 out_next_pid，省掉一次额外的 GetPage+UnpinPage。
+        first_page_with_space_ = next_pid_unused;
         prev_pid = pid;
-        if (next_pid == pid) break;
-        pid = next_pid;
+        if (next_pid_unused == pid) break;
+        pid = next_pid_unused;
     }
     // Allocate a new page and link from prev page
     page_id_t new_pid = INVALID_PAGE_ID;
@@ -222,7 +258,12 @@ bool TableHeap::InsertTuple(const Tuple& tuple, RID* rid,
     } else {
         first_page_id_ = new_pid;
     }
-    return InsertIntoPage(new_pid, tuple, rid, column_types);
+    // 新页是空的；插入并把游标设回它（之后若变满会再前进）。
+    if (InsertIntoPage(new_pid, tuple, rid, column_types)) {
+        first_page_with_space_ = new_pid;
+        return true;
+    }
+    return false;
 }
 
 bool TableHeap::GetTuple(const RID& rid, Tuple* tuple,
@@ -299,6 +340,25 @@ bool TableHeap::DeleteTuple(const RID& rid) {
         }
     }
     storage_->UnpinPage(rid.page_id, true);
+    // Item #3 (optional part): 如果本页之前已经"满了"且游标已越过它（指向它
+    // 之后某页），那这条 DELETE 释放出的 slot 让本页重新可写——回退游标。
+    // 判定方式：slot_dir_end 算出来比 free_off 至少小 1 字节即"有空间"。
+    // 只有当 cursor 严格晚于本页时才回退，避免把游标"重置"到一个其实已满的
+    // 页上。
+    if (first_page_with_space_ != INVALID_PAGE_ID &&
+        rid.page_id < first_page_with_space_) {
+        Page* probe = storage_->GetPage(rid.page_id);
+        if (probe) {
+            char* pd = probe->GetData();
+            int32_t n2, s2, f2;
+            ReadPageHeader(pd, n2, s2, f2);
+            int32_t slot_dir_end2 = kHeaderBytes + s2 * kSlotBytes;
+            if (slot_dir_end2 < f2) {
+                first_page_with_space_ = rid.page_id;
+            }
+            storage_->UnpinPage(rid.page_id, false);
+        }
+    }
     return true;
 }
 
@@ -468,25 +528,199 @@ TableHeap::Iterator::Iterator(TableHeap* table_heap, RID start_rid)
     : table_heap_(table_heap), current_rid_(start_rid) {
 }
 
-bool TableHeap::Iterator::HasNext() const {
-    return current_rid_.IsValid();
+TableHeap::Iterator::~Iterator() {
+    // 跨 Next 调用复用的 pinned page 必须在这里释放，否则 frame pin count
+    // 永不归零、永远不能被 Replacer 选为淘汰候选。
+    if (current_page_guard_ != INVALID_PAGE_ID) {
+        table_heap_->storage_->UnpinPage(current_page_guard_, false);
+        current_page_guard_ = INVALID_PAGE_ID;
+        current_page_ptr_ = nullptr;
+    }
+}
+
+TableHeap::Iterator::Iterator(Iterator&& other) noexcept
+    : table_heap_(other.table_heap_),
+      current_rid_(other.current_rid_),
+      current_page_guard_(other.current_page_guard_),
+      current_page_ptr_(other.current_page_ptr_),
+      exhausted_(other.exhausted_) {
+    other.current_rid_ = RID();
+    other.current_page_guard_ = INVALID_PAGE_ID;
+    other.current_page_ptr_ = nullptr;
+    other.exhausted_ = false;
+}
+
+TableHeap::Iterator& TableHeap::Iterator::operator=(Iterator&& other) noexcept {
+    if (this != &other) {
+        // 释放当前持有的 pin
+        if (current_page_guard_ != INVALID_PAGE_ID) {
+            table_heap_->storage_->UnpinPage(current_page_guard_, false);
+        }
+        table_heap_ = other.table_heap_;
+        current_rid_ = other.current_rid_;
+        current_page_guard_ = other.current_page_guard_;
+        current_page_ptr_ = other.current_page_ptr_;
+        exhausted_ = other.exhausted_;
+        other.current_rid_ = RID();
+        other.current_page_guard_ = INVALID_PAGE_ID;
+        other.current_page_ptr_ = nullptr;
+        other.exhausted_ = false;
+    }
+    return *this;
+}
+
+bool TableHeap::Iterator::EnsurePagePinned(page_id_t page_id) {
+    if (current_page_guard_ == page_id && current_page_ptr_ != nullptr) return true;
+    if (current_page_guard_ != INVALID_PAGE_ID) {
+        table_heap_->storage_->UnpinPage(current_page_guard_, false);
+        current_page_guard_ = INVALID_PAGE_ID;
+        current_page_ptr_ = nullptr;
+    }
+    Page* p = table_heap_->storage_->GetPage(page_id);
+    if (p == nullptr) return false;
+    current_page_guard_ = page_id;
+    current_page_ptr_ = p;
+    return true;
+}
+
+bool TableHeap::Iterator::AdvanceToNextValidSlot(int start_slot, RID* next_rid) {
+    // 已完成或从未开始：从首页起步。
+    page_id_t pid = current_page_guard_;
+    int slot = start_slot;
+    if (pid == INVALID_PAGE_ID) {
+        pid = table_heap_->first_page_id_;
+        slot = 0;
+    }
+    // 防止损坏的 next_pid 形成环。
+    std::unordered_set<page_id_t> visited;
+    while (pid != INVALID_PAGE_ID && pid >= 0) {
+        if (!visited.insert(pid).second) {
+            current_rid_ = RID();
+            if (current_page_guard_ != INVALID_PAGE_ID) {
+                table_heap_->storage_->UnpinPage(current_page_guard_, false);
+                current_page_guard_ = INVALID_PAGE_ID;
+                current_page_ptr_ = nullptr;
+            }
+            return false;
+        }
+        if (!EnsurePagePinned(pid)) {
+            current_rid_ = RID();
+            current_page_guard_ = INVALID_PAGE_ID;
+            current_page_ptr_ = nullptr;
+            return false;
+        }
+        // 用 current_page_ptr_ 直接访问 pinned 帧的数据，避免再 GetPage 一次
+        // （每次 GetPage 都 +1 pin count，会造成 pin count 漂移）。
+        Page* page = current_page_ptr_;
+        char* data = page->GetData();
+        int32_t next_pid, slot_count, free_off;
+        ReadPageHeader(data, next_pid, slot_count, free_off);
+        bool header_fixed =
+            NormalizePageHeader(data, next_pid, slot_count, free_off);
+        if (header_fixed) page->SetDirty(true);
+        while (slot < slot_count) {
+            int32_t off, len;
+            ReadSlot(data, slot, off, len);
+            if (!IsTombstone(len)) {
+                next_rid->page_id = pid;
+                next_rid->slot_num = slot;
+                current_rid_ = *next_rid;
+                return true;
+            }
+            ++slot;
+        }
+        // 当前页没找到 → 跳到下一页
+        if (next_pid == pid) {
+            // 自指环：保护
+            current_rid_ = RID();
+            table_heap_->storage_->UnpinPage(pid, header_fixed);
+            current_page_guard_ = INVALID_PAGE_ID;
+            current_page_ptr_ = nullptr;
+            return false;
+        }
+        if (next_pid < 0) {
+            current_rid_ = RID();
+            table_heap_->storage_->UnpinPage(pid, header_fixed);
+            current_page_guard_ = INVALID_PAGE_ID;
+            current_page_ptr_ = nullptr;
+            return false;
+        }
+        table_heap_->storage_->UnpinPage(pid, header_fixed);
+        current_page_guard_ = INVALID_PAGE_ID;
+        current_page_ptr_ = nullptr;
+        pid = next_pid;
+        slot = 0;
+    }
+    current_rid_ = RID();
+    if (current_page_guard_ != INVALID_PAGE_ID) {
+        table_heap_->storage_->UnpinPage(current_page_guard_, false);
+        current_page_guard_ = INVALID_PAGE_ID;
+        current_page_ptr_ = nullptr;
+    }
+    return false;
+}
+
+bool TableHeap::Iterator::HasNext() {
+    if (exhausted_) return false;
+    if (current_rid_.IsValid()) return true;
+    // 第一次调用：从堆首扫到第一个非墓碑 slot。复用 AdvanceToNextValidSlot。
+    RID nxt;
+    if (!AdvanceToNextValidSlot(0, &nxt)) {
+        exhausted_ = true;
+        return false;
+    }
+    return true;
 }
 
 Tuple TableHeap::Iterator::Next(const std::vector<ValueType>& column_types) {
     Tuple t;
-    if (!current_rid_.IsValid()) return t;
+    if (exhausted_) return t;
+    if (!current_rid_.IsValid()) {
+        // 与 HasNext 一致：第一次 Next（未先 HasNext）从堆首起步。
+        RID nxt;
+        if (!AdvanceToNextValidSlot(0, &nxt)) {
+            exhausted_ = true;
+            return t;
+        }
+    }
     RID rid_to_read = current_rid_;
-    RID next;
-    table_heap_->FindNextRid(rid_to_read, &next);
-    current_rid_ = next;
-    table_heap_->GetTuple(rid_to_read, &t, column_types);
+    // current_rid_ 现在对应的页已经被 pin 在 current_page_guard_ 上。
+    if (current_page_guard_ != rid_to_read.page_id || current_page_ptr_ == nullptr) {
+        // 防御性：游标与 pin 不一致，重新 pin。
+        if (!EnsurePagePinned(rid_to_read.page_id)) {
+            current_rid_ = RID();
+            exhausted_ = true;
+            return t;
+        }
+    }
+    // 用 current_page_ptr_ 直接访问 pinned 帧的数据，不再 GetPage（避免
+    // pin count 漂移）。
+    Page* page = current_page_ptr_;
+    char* data = page->GetData();
+    int32_t next_pid, slot_count, free_off;
+    ReadPageHeader(data, next_pid, slot_count, free_off);
+    int32_t off, len;
+    ReadSlot(data, rid_to_read.slot_num, off, len);
+    if (!IsTombstone(len) && len > 0 &&
+        off >= kHeaderBytes &&
+        off <= static_cast<int32_t>(PAGE_SIZE) - len) {
+        t = Tuple::Deserialize(data + off, column_types);
+        t.SetRid(rid_to_read);
+    }
+    // 推进 current_rid_ 到下一个非墓碑 slot；保持 current_page_guard_ pin 着。
+    RID nxt;
+    if (!AdvanceToNextValidSlot(rid_to_read.slot_num + 1, &nxt)) {
+        current_rid_ = RID();
+        exhausted_ = true;
+    }
     return t;
 }
 
 TableHeap::Iterator TableHeap::Begin() {
-    RID first;
-    FindNextRid(RID(), &first);
-    return Iterator(this, first);
+    // 新的"lazy" 策略：Begin 只构造 Iterator，current_rid_ = invalid；第一次
+    // HasNext / Next 才触发 AdvanceToNextValidSlot。这样 Begin 的成本从
+    // O(P)（scan first page）降到 O(1)。
+    return Iterator(this, RID());
 }
 
 }  // namespace sqlcompiler

@@ -67,6 +67,25 @@ private:
     // 累积所有子树产生的错误。
     bool AnalyzeInternal(const StatementPtr& statement, bool& ok);
 
+    // item #16: 单次递归遍历 SET_OP 子树，返回「叶子 SELECT 的列数 + 所有
+    // SELECT 的别名集合」。原实现用 2 个 lambda + 2 次 AnalyzeInternal 递归，
+    // 对深度为 D 的子树会跑 4×O(D) = O(4D)；新版合并成一次 walk，返回值
+    // 同时填充两种用途，walk 次数降到 1×O(D)。
+    struct SetOpWalkResult {
+        int col_count;                 // -1 表示子树无 SELECT_STMT 叶子
+        std::vector<std::string> aliases;  // 累积的 SELECT 别名（用于 ORDER BY 解析）
+    };
+    SetOpWalkResult WalkSetOpTree(const StatementPtr& statement) const;
+
+    // item #17: 根据 SELECT_STMT + cte_column_aliases 派生 CTE 列信息。
+    // 把 WITH_STMT 里两个几乎相同的列派生块（recursive 锚点 vs non-recursive body）
+    // 抽取到这里。返回的 vector 已 push 到 ti.columns（就地修改）。
+    // 函数语义保持与原代码一致：优先使用 cte_column_aliases，否则用 select_aliases，
+    // 否则用 SELECT * 展开的源表列，否则用 col<index> 占位。
+    void BuildCteColumns(TableInfo& ti,
+                         const SelectStatement& select,
+                         const std::vector<std::string>& cte_column_aliases) const;
+
     // ---- 通用检查函数 ----
     // 当 Node 非空时从节点读取 line/column，否则使用默认值 -1。
     // 一些检查函数没有 AST 节点上下文（如纯字符串检查函数），可以显式

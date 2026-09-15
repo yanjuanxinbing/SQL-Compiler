@@ -277,14 +277,27 @@ AggregateExecutor::AggregateExecutor(ExecutionContext* context, ExecutorPtr chil
 void AggregateExecutor::Init() {
     cursor_ = 0;
     groups_.clear();
+    groups_by_key_.clear();
+    // Item #6 (perf): 一次 O(A·expr_size) 预先为每个 aggregate_expr 计算
+    // 是否含聚合、聚合调用是哪个节点；避免 per-row 重走表达式树。
+    contains_agg_.clear();
+    contains_agg_.reserve(aggregate_exprs_.size());
+    agg_call_.clear();
+    agg_call_.reserve(aggregate_exprs_.size());
+    for (const auto& expr : aggregate_exprs_) {
+        contains_agg_.push_back(expr ? ContainsAggregate(expr) : false);
+        agg_call_.push_back(expr ? FindAggregateCall(expr) : nullptr);
+    }
     if (!child_) {
         // 无输入子节点：保证无 GROUP BY 时仍发射一行（聚合初始值：COUNT=0, SUM=0, AVG/MIN/MAX=NULL）。
         if (group_by_exprs_.empty()) {
             Group g;
             g.key_values.clear();
+            g.key_str = "";  // 与 GroupKeyOf({}) 一致
             g.sample_tuple = Tuple();
             g.agg_states.resize(aggregate_exprs_.size());
             groups_.push_back(std::move(g));
+            groups_by_key_[g.key_str] = 0;
         }
         return;
     }
@@ -301,20 +314,20 @@ void AggregateExecutor::Init() {
         }
         std::string key_str = GroupKeyOf(key);
 
-        // Find or create the group
+        // Item #5 (perf): O(1) 哈希查组；若新建则同步登记到 groups_by_key_。
         Group* grp = nullptr;
-        for (auto& g : groups_) {
-            if (GroupKeyOf(g.key_values) == key_str) {
-                grp = &g;
-                break;
-            }
-        }
-        if (!grp) {
+        auto it = groups_by_key_.find(key_str);
+        if (it != groups_by_key_.end()) {
+            grp = &groups_[it->second];
+        } else {
+            size_t new_idx = groups_.size();
             Group g;
             g.key_values = std::move(key);
+            g.key_str = key_str;
             g.sample_tuple = t;
             g.agg_states.resize(aggregate_exprs_.size());
             groups_.push_back(std::move(g));
+            groups_by_key_[key_str] = new_idx;
             grp = &groups_.back();
         }
         // Update sample tuple (in case a column ref evaluates differently for first row)
@@ -324,12 +337,10 @@ void AggregateExecutor::Init() {
 
         // Update aggregates for each aggregate_expr
         for (size_t i = 0; i < aggregate_exprs_.size(); ++i) {
+            // Item #6 (perf): 直接读 cached 标志 / cached 聚合调用节点。
+            if (!contains_agg_[i]) continue;
             const auto& expr = aggregate_exprs_[i];
-            if (!expr) continue;
-            if (!ContainsAggregate(expr)) continue;  // non-aggregate; only computed at output time
-
-            // 找到嵌套的聚合函数调用（处理 COALESCE(SUM(x), 0) 这类外包标量函数的情况）
-            ExprPtr agg_call = FindAggregateCall(expr);
+            ExprPtr agg_call = agg_call_[i];
             if (!agg_call) continue;
             auto f = std::static_pointer_cast<FunctionCallExpr>(agg_call);
             std::string fname = Upper(f->function_name);
@@ -478,9 +489,11 @@ void AggregateExecutor::Init() {
     if (group_by_exprs_.empty() && groups_.empty()) {
         Group g;
         g.key_values.clear();
+        g.key_str = "";
         g.sample_tuple = Tuple();
         g.agg_states.resize(aggregate_exprs_.size());
         groups_.push_back(std::move(g));
+        groups_by_key_[g.key_str] = 0;
     }
 }
 

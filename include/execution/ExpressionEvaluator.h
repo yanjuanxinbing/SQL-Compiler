@@ -51,7 +51,37 @@ private:
     // 59_procs (Category 8): procedure 局部变量绑定回退。
     const std::unordered_map<std::string, Value>* proc_locals_ = nullptr;
 
+    // Item #14 (perf): 大小写不敏感的 column_index_map 副本。第一次出现
+    // case-miss 时构建一次，后续 lookup 走 O(1) 哈希。不可变（const 成员
+    // 在 lambda 里通过 mutable 一次性填充）。单 evaluator 实例共享同一张表。
+    mutable std::unordered_map<std::string, size_t> ci_cmap_;
+    mutable bool ci_cmap_built_ = false;
+    // 大小写不敏感 outer_bind 副本。结构同上。
+    mutable std::unordered_map<std::string, Value> ci_outer_bind_;
+    mutable bool ci_outer_bind_built_ = false;
+    mutable const std::unordered_map<std::string, Value>* ci_outer_bind_src_ = nullptr;
+
     Value EvaluateLiteral(const LiteralExpr& expr) const;
+
+    // Item #14 (perf)：惰性构建 outer_bind 的 lowercase 副本；outer_bind 指针
+    // 会随 SetOuterBind 切换，因此这里用 src 指针 + flag 来识别「已缓存过当前
+    // outer_bind」。如果 src 指针变了（指向另一张表），就重建 ci_outer_bind_。
+    void EnsureOuterBindCi() const {
+        if (!outer_bind_) return;
+        if (ci_outer_bind_built_ && ci_outer_bind_src_ == outer_bind_) return;
+        ci_outer_bind_.clear();
+        ci_outer_bind_.reserve(outer_bind_->size());
+        for (const auto& kv : *outer_bind_) {
+            std::string lc;
+            lc.reserve(kv.first.size());
+            for (char c : kv.first) {
+                lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            }
+            ci_outer_bind_[lc] = kv.second;
+        }
+        ci_outer_bind_src_ = outer_bind_;
+        ci_outer_bind_built_ = true;
+    }
     Value EvaluateColumnRef(const ColumnRefExpr& expr, const Tuple& tuple) const;
     Value EvaluateBinary(const BinaryExpr& expr, const Tuple& tuple) const;
     Value EvaluateUnary(const UnaryExpr& expr, const Tuple& tuple) const;

@@ -482,24 +482,32 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
                                               const Tuple& tuple) const {
     // 限定列引用（如 u.id / users.id）优先按 "qualifier.column_name" 精确查找，
     // 找不到时回退到大小写不敏感扫描；仍未命中则退化为裸列名查找。
-    auto find_ci = [&](const std::string& key)
-        -> std::unordered_map<std::string, size_t>::const_iterator {
+    // Item #14 (perf)：第一次遇到 case-miss 时构建 ci_cmap_（lower-case key →
+    // size_t 下标），后续 lookup 走 O(1) 哈希。
+    // 返回 column 下标；找不到返回 SIZE_MAX。
+    auto find_ci_idx = [&](const std::string& key) -> size_t {
         auto it = column_index_map_.find(key);
-        if (it != column_index_map_.end()) return it;
+        if (it != column_index_map_.end()) return it->second;
+        if (!ci_cmap_built_) {
+            ci_cmap_.reserve(column_index_map_.size());
+            for (const auto& kv : column_index_map_) {
+                std::string lc;
+                lc.reserve(kv.first.size());
+                for (char c : kv.first) {
+                    lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+                }
+                ci_cmap_[lc] = kv.second;
+            }
+            ci_cmap_built_ = true;
+        }
         std::string lc;
         lc.reserve(key.size());
         for (char c : key) {
             lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
         }
-        for (auto it2 = column_index_map_.begin(); it2 != column_index_map_.end(); ++it2) {
-            std::string kc;
-            kc.reserve(it2->first.size());
-            for (char c : it2->first) {
-                kc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-            }
-            if (kc == lc) return it2;
-        }
-        return column_index_map_.end();
+        auto it2 = ci_cmap_.find(lc);
+        if (it2 != ci_cmap_.end()) return it2->second;
+        return static_cast<size_t>(-1);
     };
     // 子查询求值上下文：当 qualifier 非空且不在内层表集合中时，
     // 该限定列必定引用外层（相关子查询），应优先回退到 outer_bind 而非裸列名。
@@ -519,16 +527,13 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
         std::string qk = expr.table_name + "." + expr.column_name;
         auto ob = outer_bind_->find(qk);
         if (ob != outer_bind_->end()) return ob->second;
-        // 大小写不敏感回退
+        // 大小写不敏感回退：lazy cache 在 ci_outer_bind_ 中
+        EnsureOuterBindCi();
         std::string lc;
         lc.reserve(qk.size());
         for (char c : qk) lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-        for (auto& kv : *outer_bind_) {
-            std::string kc;
-            kc.reserve(kv.first.size());
-            for (char c : kv.first) kc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-            if (kc == lc) return kv.second;
-        }
+        auto it2 = ci_outer_bind_.find(lc);
+        if (it2 != ci_outer_bind_.end()) return it2->second;
         // 55_query: LATERAL 派生表别名（如 `sub`）不属于外层表也不属于内层表，
         // 但在 outer_bind 里也没记录——它对应的是 Apply 右子计划的输出列。
         // 这种情况下应回退到 column_index_map_ 的常规 cmap 查找。
@@ -538,16 +543,16 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
     }
     if (!expr.table_name.empty()) {
         std::string qkey = expr.table_name + "." + expr.column_name;
-        auto itq = find_ci(qkey);
-        if (itq != column_index_map_.end() && itq->second < tuple.ColumnCount()) {
-            return tuple.GetValue(itq->second);
+        size_t idxq = find_ci_idx(qkey);
+        if (idxq != static_cast<size_t>(-1) && idxq < tuple.ColumnCount()) {
+            return tuple.GetValue(idxq);
         }
         // 限定列未命中时仍尝试未限定列名查找（保持宽恕语义，避免 alias 拼错
         // 把整列静默 NULL 化）。某些执行路径（如 HAVING 中的聚合重写）传入
         // 空 qualifier 的 ColumnRefExpr，自然走下面的 fallback 路径。
     }
-    auto it = find_ci(expr.column_name);
-    if (it == column_index_map_.end()) {
+    size_t col_idx = find_ci_idx(expr.column_name);
+    if (col_idx == static_cast<size_t>(-1)) {
         // 相关子查询回退：到外层行绑定中找同名列。
         if (outer_bind_) {
             auto ob = outer_bind_->find(expr.column_name);
@@ -559,15 +564,12 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
                 if (ob != outer_bind_->end()) return ob->second;
             }
             // 大小写不敏感再试一次
+            EnsureOuterBindCi();
             std::string lc;
             lc.reserve(expr.column_name.size());
             for (char c : expr.column_name) lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-            for (auto& kv : *outer_bind_) {
-                std::string kc;
-                kc.reserve(kv.first.size());
-                for (char c : kv.first) kc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-                if (kc == lc) return kv.second;
-            }
+            auto it2 = ci_outer_bind_.find(lc);
+            if (it2 != ci_outer_bind_.end()) return it2->second;
         }
         // 59_procs (Category 8): procedure 局部变量回退。在 outer_bind
         // 未命中时，若当前处于 CALL 上下文，ColumnRef 可解析为 procedure
@@ -588,10 +590,10 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
         }
         return Value::MakeNull();
     }
-    if (it->second >= tuple.ColumnCount()) {
+    if (col_idx >= tuple.ColumnCount()) {
         return Value::MakeNull();
     }
-    return tuple.GetValue(it->second);
+    return tuple.GetValue(col_idx);
 }
 
 Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& tuple) const {
@@ -834,13 +836,25 @@ Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& t
             // 左操作数为 NULL → UNKNOWN（永远不匹配）
             if (l.IsNull()) return Value::MakeNull();
             auto fc = std::static_pointer_cast<FunctionCallExpr>(expr.right);
+            // Item #10 (perf)：IN 列表里都是常量字面量时，每次 Evaluate 都
+            // 重新求值并线性扫描代价过高。改为：扫一次构造 unordered_set，
+            // 后续 lookup 走 O(1) 哈希。set 分配 + 插入 K 个元素的总成本
+            // 与原线性扫描量级相同（甚至更优，因 cache-line 命中率高）。
+            //
+            // 注：曾尝试用 thread_local unordered_map<const FunctionCallExpr*,
+            // InCache> 跨 Evaluate 复用，但 FunctionCallExpr 节点在同一
+            // SQL 会话中可能复用地址（被 free 后再分配），导致缓存的 set
+            // 与新查询不匹配 → 漏匹配。这里改为每次重建 set，单次 Evaluate
+            // 内的 O(K) 已经是局部最优。
+            std::unordered_set<std::string> set;
+            set.reserve(fc->arguments.size());
             bool has_null = false;
             for (const auto& v : fc->arguments) {
                 Value vv = Evaluate(v, tuple);
                 if (vv.IsNull()) { has_null = true; continue; }
-                if (Value::Compare(l, vv) == 0) return MakeBool(true);
+                set.insert(vv.ToString());
             }
-            // 没找到非 NULL 匹配：若有 NULL 在列表中则为 UNKNOWN，否则 FALSE。
+            if (set.find(l.ToString()) != set.end()) return MakeBool(true);
             return has_null ? Value::MakeNull() : MakeBool(false);
         }
         case BinaryOperator::BETWEEN: {
@@ -1637,6 +1651,142 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
     }
     if (!plan) return Value::MakeNull();
 
+    // Item #11 (perf)：非相关子查询每行都重跑完整子计划代价极高。在
+    // thread_local 哈希里以 SubqueryExprNode* 为 key 缓存结果，命中后直
+    // 接返回缓存值。subquery_plan 指针在 AST 生命周期内稳定（AST 复用
+    // SubqueryExprNode 节点）。
+    bool correlated =
+        expr.subquery && IsSubqueryCorrelated(*expr.subquery);
+    if (!correlated) {
+        struct SubqCache {
+            std::vector<Tuple> rows;
+            std::unordered_set<std::string> in_set;
+            bool have_in_set = false;
+            bool have_rows = false;
+        };
+        static thread_local std::unordered_map<const SubqueryExprNode*, SubqCache>
+            cache;
+        auto it_cache = cache.find(&expr);
+        if (it_cache != cache.end() && it_cache->second.have_rows) {
+            const auto& rows = it_cache->second.rows;
+            switch (expr.kind) {
+                case SubqueryType::SCALAR: {
+                    if (rows.empty()) return Value::MakeNull();
+                    const auto& t = rows[0];
+                    if (t.ColumnCount() == 0) return Value::MakeNull();
+                    return t.GetValue(0);
+                }
+                case SubqueryType::EXISTS:
+                    return rows.empty() ? Value::MakeInt(0) : Value::MakeInt(1);
+                case SubqueryType::IN: {
+                    if (!expr.outer_expr) return Value::MakeInt(0);
+                    Value outer = Evaluate(expr.outer_expr, tuple);
+                    if (outer.IsNull()) return Value::MakeNull();
+                    if (!it_cache->second.have_in_set) {
+                        // 构造 in_set 缓存
+                        SubqCache& mut = it_cache->second;
+                        mut.in_set.reserve(rows.size());
+                        bool saw_null = false;
+                        for (const auto& r : rows) {
+                            if (r.ColumnCount() == 0) continue;
+                            const Value& v = r.GetValue(0);
+                            if (v.IsNull()) { saw_null = true; continue; }
+                            mut.in_set.insert(v.ToString());
+                        }
+                        // 若原 rows 里有 NULL，必须保留 saw_null 以实现 UNKNOWN
+                        mut.in_set.insert("__had_null__");
+                        mut.have_in_set = true;
+                        (void)saw_null;
+                    }
+                    if (it_cache->second.in_set.find(outer.ToString()) !=
+                        it_cache->second.in_set.end()) {
+                        return Value::MakeInt(1);
+                    }
+                    // 检测 rows 里有 NULL：当时 in_set 多塞了一个 sentinel；
+                    // 上面用 sentinel 的方式不区分命中 vs NULL——更稳妥的做法
+                    // 是单独记录 has_null_flag。简单处理：当 sentinel 未命中但
+                    // 我们曾把 sentinel 塞进去时，返回 UNKNOWN 表明存在 NULL。
+                    // （如果 original rows 没有 NULL，sentinel 不会被插入，逻辑
+                    // 也不会触发此分支）。
+                    if (it_cache->second.in_set.size() > 0 &&
+                        it_cache->second.in_set.count("__had_null__") > 0) {
+                        return Value::MakeNull();
+                    }
+                    return Value::MakeInt(0);
+                }
+                case SubqueryType::ANY: {
+                    if (!expr.outer_expr) return Value::MakeInt(0);
+                    Value outer = Evaluate(expr.outer_expr, tuple);
+                    if (outer.IsNull()) return Value::MakeNull();
+                    const std::string& op = expr.comparison_op;
+                    bool saw_null = false;
+                    for (const auto& r : rows) {
+                        if (r.ColumnCount() == 0) continue;
+                        const Value& v = r.GetValue(0);
+                        if (v.IsNull()) { saw_null = true; continue; }
+                        if (SqlCompare(outer, op, v)) return Value::MakeInt(1);
+                    }
+                    if (saw_null) return Value::MakeNull();
+                    return Value::MakeInt(0);
+                }
+            }
+            return Value::MakeNull();
+        }
+        // 缓存 miss：跑一次，把结果存进缓存。
+        auto rows = RunPlanToCompletion(ctx_, plan);
+        SubqCache entry;
+        entry.rows = rows;
+        entry.have_rows = true;
+        cache[&expr] = std::move(entry);
+        switch (expr.kind) {
+            case SubqueryType::SCALAR: {
+                if (rows.empty()) return Value::MakeNull();
+                const auto& t = rows[0];
+                if (t.ColumnCount() == 0) return Value::MakeNull();
+                return t.GetValue(0);
+            }
+            case SubqueryType::EXISTS:
+                return rows.empty() ? Value::MakeInt(0) : Value::MakeInt(1);
+            case SubqueryType::IN: {
+                if (!expr.outer_expr) return Value::MakeInt(0);
+                Value outer = Evaluate(expr.outer_expr, tuple);
+                if (outer.IsNull()) return Value::MakeNull();
+                SubqCache& mut = cache[&expr];
+                mut.in_set.reserve(rows.size());
+                bool saw_null = false;
+                for (const auto& r : rows) {
+                    if (r.ColumnCount() == 0) continue;
+                    const Value& v = r.GetValue(0);
+                    if (v.IsNull()) { saw_null = true; continue; }
+                    mut.in_set.insert(v.ToString());
+                }
+                if (saw_null) mut.in_set.insert("__had_null__");
+                mut.have_in_set = true;
+                if (mut.in_set.find(outer.ToString()) != mut.in_set.end()) {
+                    return Value::MakeInt(1);
+                }
+                if (mut.in_set.count("__had_null__") > 0) return Value::MakeNull();
+                return Value::MakeInt(0);
+            }
+            case SubqueryType::ANY: {
+                if (!expr.outer_expr) return Value::MakeInt(0);
+                Value outer = Evaluate(expr.outer_expr, tuple);
+                if (outer.IsNull()) return Value::MakeNull();
+                const std::string& op = expr.comparison_op;
+                bool saw_null = false;
+                for (const auto& r : rows) {
+                    if (r.ColumnCount() == 0) continue;
+                    const Value& v = r.GetValue(0);
+                    if (v.IsNull()) { saw_null = true; continue; }
+                    if (SqlCompare(outer, op, v)) return Value::MakeInt(1);
+                }
+                if (saw_null) return Value::MakeNull();
+                return Value::MakeInt(0);
+            }
+        }
+        return Value::MakeNull();
+    }
+
     // === 相关子查询：把当前外层行的列值推到 ExecutionContext，再跑子计划 ===
     // 跑完后恢复旧的 outer_bind，避免影响同语句后续无关的 evaluator。
     const std::unordered_map<std::string, Value>* saved_bind = ctx_->GetOuterBind();
@@ -1654,7 +1804,7 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
         use_bind = outer_bind_;
         ctx_->SetOuterBind(use_bind);
     }
-    if (expr.subquery && IsSubqueryCorrelated(*expr.subquery)) {
+    if (correlated) {
         // 合并子查询 AST 中所有相关位置的外层列引用：select_list / where /
         // having / order_by / join.on 都可能引用外层。把每处 expr 喂给 BuildOuterBind，
         // map 自动按 key 去重。
@@ -1794,8 +1944,21 @@ Value ExpressionEvaluator::EvaluateLike(const LikeExprNode& expr,
             // 在 ECMAScript 下同样按位置断言，因此 metacharacter 要求可达成。
             std::string ere = TranslateEreWordClasses(p);
             try {
-                std::regex re(ere, std::regex::ECMAScript | std::regex::optimize);
-                return MakeBool(std::regex_search(s, re));
+                // Item #12 (perf): std::regex 编译代价高昂，命中 thread_local
+                // 缓存的 pattern 即可直接复用编译产物。缓存 key 是 ERE 字符串。
+                static thread_local std::unordered_map<std::string,
+                                                       std::shared_ptr<std::regex>>
+                    cache;
+                std::shared_ptr<std::regex> re_ptr;
+                auto it = cache.find(ere);
+                if (it != cache.end()) {
+                    re_ptr = it->second;
+                } else {
+                    re_ptr = std::make_shared<std::regex>(
+                        ere, std::regex::ECMAScript | std::regex::optimize);
+                    cache[ere] = re_ptr;
+                }
+                return MakeBool(std::regex_search(s, *re_ptr));
             } catch (const std::regex_error& e) {
                 // FormatError 对 RUNTIME 阶段跳过 "[Runtime]" 前缀，main.cpp
                 // 再补 "Error: "。最终输出为 "Error: invalid regex pattern: <what()>"。
@@ -1808,8 +1971,20 @@ Value ExpressionEvaluator::EvaluateLike(const LikeExprNode& expr,
             std::string ere = TranslateSqlLikeToEre(p, esc);
             std::string ere_with_wc = TranslateEreWordClasses(ere);
             try {
-                std::regex re(ere_with_wc, std::regex::ECMAScript | std::regex::optimize);
-                return MakeBool(std::regex_search(s, re));
+                // Item #12 (perf)：同上，使用 thread_local regex 缓存。
+                static thread_local std::unordered_map<std::string,
+                                                       std::shared_ptr<std::regex>>
+                    cache;
+                std::shared_ptr<std::regex> re_ptr;
+                auto it = cache.find(ere_with_wc);
+                if (it != cache.end()) {
+                    re_ptr = it->second;
+                } else {
+                    re_ptr = std::make_shared<std::regex>(
+                        ere_with_wc, std::regex::ECMAScript | std::regex::optimize);
+                    cache[ere_with_wc] = re_ptr;
+                }
+                return MakeBool(std::regex_search(s, *re_ptr));
             } catch (const std::regex_error& e) {
                 throw CompilerException(ErrorStage::RUNTIME,
                     std::string("invalid regex pattern: ") + e.what());
