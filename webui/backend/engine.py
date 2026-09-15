@@ -279,9 +279,24 @@ def _split_blocks(stdout: str, statements: list[str], stderr: str = "") -> list[
             blk = _parse_one_block(stmt, leftover, stderr)
             blk.statement = stmt
             blocks.append(blk)
-    # pad with empty success blocks if we ended up with fewer blocks than statements
+    # pad with empty blocks if we ended up with fewer blocks than statements.
+    # When stderr carries an "Error:" line, every padded statement is
+    # marked as a failure so the UI surfaces the engine's diagnostic
+    # instead of silently showing "OK" for an unparseable block.
+    has_stderr_error = bool(
+        stderr
+        and any(
+            ln.lstrip().startswith("Error:") or ln.lstrip().startswith("error:")
+            for ln in stderr.splitlines()
+        )
+    )
     while len(blocks) < len(statements):
-        blocks.append(ParsedBlock(success=True, kind="other", statement=statements[len(blocks)]))
+        pad = ParsedBlock(success=not has_stderr_error, kind="other",
+                          statement=statements[len(blocks)])
+        if has_stderr_error:
+            pad.message = stderr.strip().splitlines()[0]
+            pad.kind = "error"
+        blocks.append(pad)
     return blocks
 
 
@@ -386,6 +401,83 @@ class SqlEngine:
         if not s.endswith(";"):
             s = s + ";"
         return await self.run_script(s)
+
+    # ── debug: execute + return JSON visualization data ───────────────────
+    async def execute_debug(self, statement: str) -> tuple[EngineRunResult, dict | None]:
+        """Run a statement with --debug-output and parse the JSON debug block.
+
+        Returns (EngineRunResult, debug_dict).  debug_dict is None if parsing
+        failed or the engine crashed.
+        """
+        s = statement.strip()
+        if not s:
+            return EngineRunResult(success=True, blocks=[]), None
+        if not s.endswith(";"):
+            s = s + ";"
+
+        # build script: statement + newline to flush
+        script_text = s + "\n"
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".sql", delete=False, encoding="utf-8", dir=tempfile.gettempdir()
+        ) as f:
+            f.write(script_text)
+            tmp_path = f.name
+        try:
+            proc = subprocess.run(
+                [str(self.binary), str(self.db_path), "-f", tmp_path, "--debug-output"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            return EngineRunResult(success=False, blocks=[], stderr="engine timeout", returncode=-1), None
+        except FileNotFoundError as e:
+            raise EngineError(f"engine binary not found: {e}") from e
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        # Strip the debug JSON envelope from stdout BEFORE we hand it to
+        # `_split_blocks`, otherwise a `{...}` line and the surrounding
+        # bracket markers get mis-classified as a DML "OK" line for the
+        # previous statement.  The engine writes the envelope *after*
+        # the statement output, so a single non-greedy capture here is
+        # sufficient and leaves the regular block layout untouched.
+        raw = proc.stdout or ""
+        m = re.search(r"\[DEBUG_JSON_START\]\s*(.*?)\s*\[DEBUG_JSON_END\]", raw, re.DOTALL)
+        debug_data = None
+        if m:
+            import json
+            try:
+                debug_data = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                pass
+            # Replace the envelope with a blank placeholder so the
+            # block splitter sees a clean blank line between this
+            # statement and the next one (defensive even when there is
+            # only one statement in the script).
+            raw = raw[: m.start()] + raw[m.end():]
+
+        statements = self._split_statements(statement)
+        blocks = _split_blocks(raw, statements, proc.stderr or "")
+        # The C++ engine returns exit code 0 even for semantic errors
+        # (e.g. table not found).  Detect those via the stderr
+        # "Error:" prefix and propagate them as overall failures so
+        # the API layer can report `success=false` instead of silently
+        # claiming the compile succeeded.
+        stderr_clean = proc.stderr or ""
+        has_engine_error = any(
+            ln.lstrip().startswith("Error:") or ln.lstrip().startswith("error:")
+            for ln in stderr_clean.splitlines()
+        )
+        overall_success = proc.returncode == 0 and not has_engine_error
+        result = EngineRunResult(
+            success=overall_success,
+            blocks=blocks,
+            stderr=stderr_clean,
+            returncode=proc.returncode,
+        )
+        return result, debug_data
 
     # ── helper: split a script into per-statement strings ────────────────
     @staticmethod

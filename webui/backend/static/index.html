@@ -1,247 +1,298 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SQL-Compiler · Database Console</title>
-  <link rel="stylesheet" href="/static/style.css">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MiniDB IDE · SQL-Compiler 调试平台</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%234f8cff'/><text x='50' y='68' font-size='52' font-family='monospace' font-weight='bold' fill='white' text-anchor='middle'>DB</text></svg>">
+<link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <!-- ── Top bar ─────────────────────────────────────────────────────── -->
-  <header class="topbar">
-    <div class="brand">
-      <div class="logo">SQL</div>
-      <div class="title-block">
-        <div class="title">SQL-Compiler Console</div>
-        <div class="subtitle">C++17 &nbsp;·&nbsp; Volcano Executor &nbsp;·&nbsp; B+Tree / WAL / ARIES</div>
+
+<!-- ===== 顶部工具栏 ===== -->
+<header class="toolbar">
+  <div class="toolbar-brand">
+    <div class="logo">DB</div>
+    <div class="title">MiniDB IDE</div>
+    <div class="subtitle">C++17 Volcano · B+Tree / WAL / ARIES</div>
+  </div>
+  <div class="toolbar-divider"></div>
+  <button class="tb-btn primary" id="run-btn" type="button" title="执行（Ctrl+Enter）">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+    执行
+  </button>
+  <button class="tb-btn" id="format-btn" type="button" title="格式化 SQL（关键字大写）">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="21" y1="10" x2="7" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="21" y1="18" x2="7" y2="18"/></svg>
+    格式化
+  </button>
+  <button class="tb-btn" id="clear-btn" type="button" title="清空编辑器">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+  </button>
+  <div class="toolbar-divider"></div>
+  <span class="tb-file mono">query.sql</span>
+
+  <div class="toolbar-spacer"></div>
+
+  <button class="tb-btn" id="db-pill" type="button" title="选择数据库">
+    <span class="tb-status-hint" id="db-pill-label">未连接数据库</span>
+  </button>
+
+  <div class="toolbar-status" id="engine-status">
+    <span class="status-dot"></span>
+    <span id="engine-status-text">引擎</span>
+  </div>
+</header>
+<div class="subbar">
+  <span id="sub-status" class="sub-status">就绪 — 在 SQL 编辑器输入语句后点击「执行」</span>
+</div>
+
+<!-- ===== 主布局 ===== -->
+<div class="main-layout">
+
+  <!-- 左侧侧边栏 -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <span>导航</span>
+      <button id="sidebar-toggle" type="button" title="收起侧边栏" aria-label="收起侧边栏">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
+    </div>
+    <div class="sidebar-body">
+
+      <!-- Catalog 元数据 -->
+      <section class="sb-group is-open" id="group-catalog">
+        <div class="sb-group-title" data-group="group-catalog">
+          <span class="arrow">&#9660;</span>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+          数据库 Catalog
+        </div>
+        <div class="sb-group-content">
+          <div class="cat-meta" id="catalog-meta">未连接数据库</div>
+          <div class="cat-tree" id="catalog-tree">
+            <div class="cat-empty">打开数据库后此处显示表</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 存储系统状态 -->
+      <section class="sb-group is-open" id="group-storage">
+        <div class="sb-group-title" data-group="group-storage">
+          <span class="arrow">&#9660;</span>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+          存储系统状态
+        </div>
+        <div class="sb-group-content">
+          <div class="storage-cards">
+            <div class="storage-card">
+              <div class="label">命中率</div>
+              <div class="value" id="side-hit-rate" style="color:var(--cyan)">—</div>
+            </div>
+            <div class="storage-card">
+              <div class="label">缓存命中</div>
+              <div class="value hit" id="side-hits">0</div>
+            </div>
+            <div class="storage-card">
+              <div class="label">失效 Miss</div>
+              <div class="value" id="side-misses">0</div>
+            </div>
+            <div class="storage-card">
+              <div class="label">替换次数</div>
+              <div class="value" id="side-repl">0</div>
+            </div>
+            <div class="storage-card">
+              <div class="label">总页数</div>
+              <div class="value" id="side-pages">0</div>
+            </div>
+          </div>
+          <div class="side-policy">
+            <button class="btn btn-ghost" id="viz-reset-storage-btn" type="button" title="以当前计数器为基线，之后展示相对增量" hidden>重置基线</button>
+            <span class="side-policy-hint">执行 SQL 后更新</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 测试用例库 -->
+      <section class="sb-group is-open" id="group-tests">
+        <div class="sb-group-title" data-group="group-tests">
+          <span class="arrow">&#9660;</span>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+          测试用例库
+        </div>
+        <div class="sb-group-content">
+          <div class="test-list" id="test-list"><!-- 动态渲染 --></div>
+        </div>
+      </section>
+
+    </div>
+  </aside>
+
+  <!-- 侧边栏折叠按钮 -->
+  <div class="sidebar-toggle" id="sidebar-toggle-bar" title="展开/收起侧边栏">
+    <svg id="toggle-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+  </div>
+
+  <!-- 右侧主内容区 -->
+  <section class="content-area">
+    <!-- SQL 编辑器区 -->
+    <div class="editor-section" id="editor-section">
+      <div class="editor-toolbar">
+        <span class="et-label">SQL 编辑器</span>
+        <span class="et-file mono">query.sql</span>
+        <div class="et-actions">
+          <span class="et-hint">Ctrl+Enter 执行</span>
+        </div>
+      </div>
+      <div class="editor-container">
+        <textarea class="code-textarea" id="sql-editor" spellcheck="false" autocomplete="off"
+          autocorrect="off" autocapitalize="off"
+          placeholder="在此输入 SQL 语句...&#10;&#10;支持: CREATE TABLE / INSERT / SELECT / DELETE / EXPLAIN&#10;快捷键: Ctrl+Enter 执行"></textarea>
       </div>
     </div>
-    <div class="db-pill" id="db-pill" title="Click to switch database">
-      <span class="db-pill-dot" id="db-pill-dot"></span>
-      <span class="db-pill-label" id="db-pill-label">No database open</span>
-      <button class="db-pill-action" id="db-pill-action" type="button" title="Change database">Change</button>
+
+    <!-- 拖拽分割条 -->
+    <div class="vsplit" id="vsplit"></div>
+
+    <!-- 下方面板区 -->
+    <div class="panel-section">
+      <div class="panel-tabs" id="panel-tabs">
+        <button class="panel-tab is-active" data-panel="result" type="button">执行结果</button>
+        <button class="panel-tab" data-panel="token" type="button">Token 流</button>
+        <button class="panel-tab" data-panel="ast" type="button">AST 语法树</button>
+        <button class="panel-tab" data-panel="plan" type="button">执行计划</button>
+        <button class="panel-tab" data-panel="compare" type="button">优化对比</button>
+        <button class="panel-tab" data-panel="storage" type="button">存储监控</button>
+        <button class="panel-tab" data-panel="errors" type="button">错误控制台</button>
+      </div>
+      <div class="panel-body">
+
+        <!-- 执行结果 -->
+        <div class="panel-content is-active" data-panel="result">
+          <div class="panel-scroll" id="results-root">
+            <div class="viz-empty"><p>执行 SQL 后，结果集将在此展示。</p></div>
+          </div>
+        </div>
+
+        <!-- 可视化（Token/AST/Plan/Compare/Storage 共享容器） -->
+        <div class="panel-content" data-panel="viz">
+          <div class="viz-status" id="viz-status" role="status" aria-live="polite" hidden></div>
+          <div class="panel-scroll" id="viz-content">
+            <div class="viz-empty">
+              <p>在上方输入 SQL 并点击「执行」，编译管线（词法 / 语法 / 执行计划 / 存储）将在此可视化。</p>
+              <p class="hint">点击下方的面板标题切换视图。</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- 错误控制台 -->
+        <div class="panel-content" data-panel="errors">
+          <div class="panel-scroll" id="viz-errors">
+            <div class="viz-empty"><p>词法、语法、语义、运行时错误将在此汇总。</p></div>
+          </div>
+        </div>
+
+      </div>
     </div>
-  </header>
+  </section>
+</div>
 
-  <!-- ── Open-database modal ────────────────────────────────────────── -->
-  <div id="db-modal" class="modal hidden" role="dialog" aria-modal="true" aria-label="Open database">
-    <div class="modal-backdrop" id="db-modal-backdrop"></div>
-    <div class="modal-card">
-      <div class="modal-head">
-        <h2>Open database</h2>
-        <button class="modal-close" id="db-modal-close" type="button" aria-label="Close">×</button>
+<!-- ===== 底部状态栏 ===== -->
+<footer class="statusbar">
+  <div class="sb-item" id="sb-status">就绪</div>
+  <div class="sb-item mono" id="sb-db-path">暂无数据库</div>
+  <div class="sb-right">
+    <div class="sb-item" id="sb-elapsed">—</div>
+    <div class="sb-item mono">UTF-8 · SQL</div>
+  </div>
+</footer>
+
+<!-- ===== 打开数据库弹窗 ===== -->
+<div id="db-modal" class="modal hidden" role="dialog" aria-modal="true" aria-label="打开数据库">
+  <div class="modal-backdrop" id="db-modal-backdrop"></div>
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>打开数据库</h2>
+      <button class="modal-close" id="db-modal-close" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="picker-zone" id="db-drop-zone">
+        <div class="picker-zone-icon" aria-hidden="true">📂</div>
+        <div class="picker-zone-text">
+          <div class="picker-zone-title">选择 <code>.db</code> 文件</div>
+          <div class="picker-zone-hint">通过服务器侧文件浏览器导航到你的数据库</div>
+        </div>
+        <div class="picker-zone-actions">
+          <button class="btn btn-primary" id="db-browse-server-btn" type="button" title="打开服务器侧文件浏览器">浏览…</button>
+        </div>
       </div>
-      <div class="modal-body">
 
-        <!-- 1. Server-side file browser — the only reliable way to pick a
-             .db file.  Native OS file dialogs no longer expose the
-             absolute path in modern browsers (security restriction), so
-             we delegate to the server which can return real paths. -->
-        <div class="picker-zone" id="db-drop-zone">
-          <div class="picker-zone-icon" aria-hidden="true">📂</div>
-          <div class="picker-zone-text">
-            <div class="picker-zone-title">Pick a <code>.db</code> file</div>
-            <div class="picker-zone-hint">Open the filesystem browser and navigate to your database</div>
-          </div>
-          <div class="picker-zone-actions">
-            <button class="btn btn-primary" id="db-browse-server-btn" type="button" title="Open the server-side filesystem browser">Browse…</button>
-          </div>
+      <details class="path-details" id="db-path-details">
+        <summary>或者输入路径 / 新建文件</summary>
+        <div class="path-row">
+          <input type="text" id="db-path-input" placeholder="例如 C:\path\to\mydb.db （不存在则会创建）" spellcheck="false">
+          <button class="btn btn-secondary" id="db-scan-btn" type="button" title="扫描该目录下的 .db 文件">↻ 扫描</button>
         </div>
+        <p class="hint" id="db-path-feedback">输入路径。若父目录存在，将列出其中的 <code>.db</code> 文件。</p>
+      </details>
 
-        <!-- 2. Direct path entry -->
-        <details class="path-details" id="db-path-details">
-          <summary>Or type a path / create a new file</summary>
-          <div class="path-row">
-            <input type="text" id="db-path-input" placeholder="e.g. C:\path\to\mydb.db  (a new file is created if it does not exist)" spellcheck="false">
-            <button class="btn btn-secondary" id="db-scan-btn" type="button" title="Scan this directory for .db files">↻ Scan</button>
-          </div>
-          <p class="hint" id="db-path-feedback">Start typing a path. If the parent directory exists, scanning will list existing <code>.db</code> files there.</p>
-        </details>
+      <p class="hint db-error" id="db-error" hidden></p>
 
-        <p class="hint db-error" id="db-error" hidden></p>
-
-        <!-- 3. Recently opened (persistent, across sessions) -->
-        <div class="recent-section" id="db-recent-section" hidden>
-          <div class="recent-section-head">
-            <h3>Recently opened</h3>
-            <button class="link-btn" id="db-clear-recent" type="button" title="Forget all recently opened databases">Clear</button>
-          </div>
-          <ul class="recent-list" id="db-recent-list"></ul>
+      <div class="recent-section" id="db-recent-section" hidden>
+        <div class="recent-section-head">
+          <h3>最近打开</h3>
+          <button class="link-btn" id="db-clear-recent" type="button">清空</button>
         </div>
-
-        <!-- 4. Files in the typed path's directory -->
-        <div class="recent-section" id="db-folder-section" hidden>
-          <div class="recent-section-head">
-            <h3>Files in this folder</h3>
-            <span class="recent-section-meta" id="db-folder-meta"></span>
-          </div>
-          <ul class="recent-list" id="db-folder-list"></ul>
-        </div>
-
+        <ul class="recent-list" id="db-recent-list"></ul>
       </div>
-      <div class="modal-foot">
-        <button class="btn btn-secondary" id="db-cancel-btn" type="button">Cancel</button>
-        <button class="btn btn-primary" id="db-open-btn" type="button">Open</button>
+
+      <div class="recent-section" id="db-folder-section" hidden>
+        <div class="recent-section-head">
+          <h3>该文件夹中的文件</h3>
+          <span class="recent-section-meta" id="db-folder-meta"></span>
+        </div>
+        <ul class="recent-list" id="db-folder-list"></ul>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn btn-secondary" id="db-cancel-btn" type="button">取消</button>
+      <button class="btn btn-primary" id="db-open-btn" type="button">打开</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 服务器侧文件浏览器 ===== -->
+<div id="browse-modal" class="modal hidden" role="dialog" aria-modal="true" aria-label="浏览文件系统">
+  <div class="modal-backdrop" id="browse-modal-backdrop"></div>
+  <div class="modal-card browse-card">
+    <div class="modal-head">
+      <h2>浏览文件系统</h2>
+      <button class="modal-close" id="browse-modal-close" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="browse-toolbar">
+      <div class="browse-crumbs" id="browse-crumbs"></div>
+      <div class="browse-actions">
+        <button class="icon-btn" id="browse-up-btn" type="button" title="上级目录">↑</button>
+        <button class="icon-btn" id="browse-home-btn" type="button" title="主页">🏠</button>
+        <button class="icon-btn" id="browse-refresh-btn" type="button" title="刷新">↻</button>
+      </div>
+    </div>
+    <div class="browse-path-row">
+      <input type="text" id="browse-path-input" placeholder="输入目录路径后回车" spellcheck="false">
+      <button class="btn btn-secondary" id="browse-go-btn" type="button">Go</button>
+    </div>
+    <div class="browse-body" id="browse-body">
+      <div class="browse-empty">加载中…</div>
+    </div>
+    <div class="browse-selected" id="browse-selected" hidden>
+      <span class="browse-selected-label">已选择：</span>
+      <code class="browse-selected-path mono" id="browse-selected-path"></code>
+      <div class="browse-selected-actions">
+        <button class="btn btn-secondary" id="browse-new-here-btn" type="button" title="在该目录新建 .db 文件">新建于此</button>
+        <button class="btn btn-primary" id="browse-open-btn" type="button">打开</button>
       </div>
     </div>
   </div>
+</div>
 
-  <!-- ── Server-side filesystem browser ──────────────────────────────── -->
-  <div id="browse-modal" class="modal hidden" role="dialog" aria-modal="true" aria-label="Browse filesystem">
-    <div class="modal-backdrop" id="browse-modal-backdrop"></div>
-    <div class="modal-card browse-card">
-      <div class="modal-head">
-        <h2>Browse filesystem</h2>
-        <button class="modal-close" id="browse-modal-close" type="button" aria-label="Close">×</button>
-      </div>
-      <div class="browse-toolbar">
-        <div class="browse-crumbs" id="browse-crumbs"></div>
-        <div class="browse-actions">
-          <button class="icon-btn" id="browse-up-btn" type="button" title="Up to parent">↑</button>
-          <button class="icon-btn" id="browse-home-btn" type="button" title="Home">🏠</button>
-          <button class="icon-btn" id="browse-refresh-btn" type="button" title="Refresh">↻</button>
-        </div>
-      </div>
-      <div class="browse-path-row">
-        <input type="text" id="browse-path-input" placeholder="Type a directory path and press Enter" spellcheck="false">
-        <button class="btn btn-secondary" id="browse-go-btn" type="button">Go</button>
-      </div>
-      <div class="browse-body" id="browse-body">
-        <div class="browse-empty">Loading…</div>
-      </div>
-      <div class="browse-selected" id="browse-selected" hidden>
-        <span class="browse-selected-label">Selected:</span>
-        <code class="browse-selected-path mono" id="browse-selected-path"></code>
-        <div class="browse-selected-actions">
-          <button class="btn btn-secondary" id="browse-new-here-btn" type="button" title="Create a new .db file in this directory">New here</button>
-          <button class="btn btn-primary" id="browse-open-btn" type="button">Open</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ── Main layout ─────────────────────────────────────────────────── -->
-  <main class="layout">
-
-    <!-- Sidebar: tables -->
-    <aside class="sidebar">
-      <div class="sidebar-head">
-        <h2>Tables</h2>
-        <button class="icon-btn" id="refresh-tables" type="button" title="Refresh">↻</button>
-      </div>
-      <div class="sidebar-body">
-        <ul class="table-list" id="table-list">
-          <li class="table-empty" id="table-empty">Open a database to see tables.</li>
-        </ul>
-      </div>
-      <div class="sidebar-foot">
-        <button class="btn btn-secondary btn-block" id="new-table-btn" type="button">+ New table</button>
-      </div>
-    </aside>
-
-    <!-- Workspace: tabs + editor + results -->
-    <section class="workspace">
-      <nav class="tabs" role="tablist">
-        <button class="tab is-active" data-tab="query" role="tab">Query</button>
-        <button class="tab" data-tab="schema" role="tab" id="tab-schema">Schema</button>
-        <button class="tab" data-tab="history" role="tab">History <span class="tab-count" id="history-count"></span></button>
-      </nav>
-
-      <!-- ── Query tab ──────────────────────────────────────────────── -->
-      <div class="tab-panel is-active" data-panel="query">
-        <div class="editor-wrap">
-          <textarea
-            id="sql-editor"
-            spellcheck="false"
-            autocomplete="off"
-            autocorrect="off"
-            autocapitalize="off"
-            placeholder="-- Type SQL here. Press Ctrl+Enter to run.&#10;SELECT * FROM users WHERE age &gt; 25;"
-          ></textarea>
-          <div class="editor-actions">
-            <div class="editor-actions-left">
-              <button class="btn btn-secondary" id="format-btn" type="button" title="Pretty-print uppercase keywords">Format</button>
-              <button class="btn btn-secondary" id="clear-btn" type="button" title="Clear editor">Clear</button>
-            </div>
-            <div class="editor-actions-right">
-              <span class="shortcut-hint">Ctrl+Enter to run</span>
-              <button class="btn btn-primary" id="run-btn" type="button">Run ▶</button>
-            </div>
-          </div>
-        </div>
-
-        <div id="query-status" class="status hidden"></div>
-        <div id="query-error" class="panel error-panel hidden">
-          <strong>Query failed</strong>
-          <p id="query-error-text"></p>
-        </div>
-        <div id="query-loading" class="panel loading-panel hidden">
-          <div class="spinner" aria-hidden="true"></div>
-          <p class="loading-title">Executing on C++ engine…</p>
-        </div>
-
-        <div id="results-root" class="results-root"></div>
-      </div>
-
-      <!-- ── Schema tab ─────────────────────────────────────────────── -->
-      <div class="tab-panel" data-panel="schema">
-        <div id="schema-empty" class="panel empty-panel">
-          <p>Select a table from the left sidebar to inspect its schema.</p>
-        </div>
-        <div id="schema-detail" class="hidden">
-          <div class="panel">
-            <div class="panel-head">
-              <h2 id="schema-title">table</h2>
-              <span id="schema-meta" class="cache-tag"></span>
-            </div>
-            <div class="schema-grid">
-              <table class="data-table">
-                <thead>
-                  <tr>
-                    <th>#</th>
-                    <th>Column</th>
-                    <th>Type</th>
-                    <th>Null</th>
-                    <th>Key</th>
-                    <th>Default</th>
-                  </tr>
-                </thead>
-                <tbody id="schema-columns-body"></tbody>
-              </table>
-            </div>
-          </div>
-          <div class="panel">
-            <h2>CREATE TABLE</h2>
-            <pre class="code-block" id="schema-create-sql"></pre>
-          </div>
-          <div class="panel">
-            <h2>Sample rows (SELECT * LIMIT 100)</h2>
-            <div id="schema-sample-root"></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- ── History tab ────────────────────────────────────────────── -->
-      <div class="tab-panel" data-panel="history">
-        <div class="panel">
-          <div class="panel-head">
-            <h2>Query history</h2>
-            <button class="btn btn-secondary" id="clear-history-btn" type="button">Clear</button>
-          </div>
-          <p class="hint">Last 50 statements (kept in browser localStorage). Click an entry to load it into the editor.</p>
-          <ul class="history-list" id="history-list">
-            <li class="history-empty">No history yet.</li>
-          </ul>
-        </div>
-      </div>
-
-    </section>
-  </main>
-
-  <footer class="footer">
-    SQL-Compiler &nbsp;·&nbsp; C++17 / Modern CMake &nbsp;·&nbsp; © local single-user console
-  </footer>
-
-  <script src="/static/app.js"></script>
+<script src="/static/app.js"></script>
 </body>
 </html>

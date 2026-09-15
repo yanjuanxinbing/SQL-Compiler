@@ -1,0 +1,1900 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MiniDB IDE - 数据库系统实习调试平台</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%234f8cff'/><text x='50' y='68' font-size='52' font-family='monospace' font-weight='bold' fill='white' text-anchor='middle'>DB</text></svg>">
+<style>
+/* ===== 全局重置与变量 ===== */
+:root{
+  --bg-primary:#1e1f22;
+  --bg-secondary:#25262b;
+  --bg-tertiary:#2d2e33;
+  --bg-hover:#35363c;
+  --bg-active:#3d3e45;
+  --border:#3a3b40;
+  --border-light:#45464c;
+  --text-primary:#e4e4e7;
+  --text-secondary:#a1a1aa;
+  --text-muted:#71717a;
+  --accent:#4f8cff;
+  --accent-hover:#6ba0ff;
+  --accent-dim:rgba(79,140,255,0.15);
+  --success:#4ade80;
+  --warning:#fbbf24;
+  --error:#f87171;
+  --purple:#c084fc;
+  --cyan:#22d3ee;
+  --orange:#fb923c;
+  --sidebar-width:260px;
+  --toolbar-height:44px;
+  --tab-height:36px;
+  --statusbar-height:24px;
+  --font-mono:'JetBrains Mono','Fira Code','Cascadia Code',Consolas,'Courier New',monospace;
+  --font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden;font-family:var(--font-sans);font-size:13px;color:var(--text-primary);background:var(--bg-primary)}
+button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border-light);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:#55565c}
+
+/* ===== 顶部工具栏 ===== */
+.toolbar{
+  height:var(--toolbar-height);
+  background:var(--bg-secondary);
+  border-bottom:1px solid var(--border);
+  display:flex;align-items:center;
+  padding:0 12px;gap:6px;
+  flex-shrink:0;z-index:100;
+}
+.toolbar-brand{display:flex;align-items:center;gap:8px;margin-right:16px}
+.toolbar-brand .logo{
+  width:26px;height:26px;border-radius:6px;
+  background:linear-gradient(135deg,var(--accent),#7c5cff);
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--font-mono);font-weight:700;font-size:11px;color:#fff;
+}
+.toolbar-brand .title{font-weight:600;font-size:13px;letter-spacing:0.3px}
+.toolbar-brand .subtitle{font-size:10px;color:var(--text-muted);margin-left:2px}
+.toolbar-divider{width:1px;height:22px;background:var(--border);margin:0 6px}
+.tb-btn{
+  display:flex;align-items:center;gap:5px;
+  padding:5px 10px;border-radius:5px;
+  font-size:12px;color:var(--text-secondary);
+  transition:all 0.15s;white-space:nowrap;
+}
+.tb-btn:hover{background:var(--bg-hover);color:var(--text-primary)}
+.tb-btn:active{background:var(--bg-active)}
+.tb-btn.primary{background:var(--accent);color:#fff;font-weight:500}
+.tb-btn.primary:hover{background:var(--accent-hover)}
+.tb-btn svg{width:14px;height:14px;flex-shrink:0}
+.tb-btn .kbd{
+  font-family:var(--font-mono);font-size:10px;
+  background:rgba(255,255,255,0.12);padding:1px 4px;border-radius:3px;
+  margin-left:2px;
+}
+.toolbar-spacer{flex:1}
+.toolbar-status{
+  display:flex;align-items:center;gap:6px;
+  font-size:11px;color:var(--text-muted);
+}
+.status-dot{width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 6px var(--success)}
+
+/* ===== 主布局 ===== */
+.main-layout{display:flex;height:calc(100vh - var(--toolbar-height) - var(--statusbar-height))}
+
+/* ===== 左侧侧边栏 ===== */
+.sidebar{
+  width:var(--sidebar-width);
+  background:var(--bg-secondary);
+  border-right:1px solid var(--border);
+  display:flex;flex-direction:column;
+  flex-shrink:0;transition:width 0.2s;
+  overflow:hidden;
+}
+.sidebar.collapsed{width:0;border-right:none}
+.sidebar-header{
+  height:36px;display:flex;align-items:center;justify-content:space-between;
+  padding:0 10px;border-bottom:1px solid var(--border);
+  flex-shrink:0;
+}
+.sidebar-header span{font-size:11px;font-weight:600;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px}
+.sidebar-header button{color:var(--text-muted);padding:3px;border-radius:3px}
+.sidebar-header button:hover{background:var(--bg-hover);color:var(--text-primary)}
+.sidebar-body{flex:1;overflow-y:auto;padding:6px 0}
+
+/* 侧边栏分组 */
+.sb-group{margin-bottom:4px}
+.sb-group-title{
+  display:flex;align-items:center;gap:6px;
+  padding:6px 12px;font-size:11px;font-weight:600;
+  color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;
+  cursor:pointer;user-select:none;
+}
+.sb-group-title:hover{color:var(--text-secondary)}
+.sb-group-title .arrow{transition:transform 0.15s;font-size:9px}
+.sb-group.collapsed .arrow{transform:rotate(-90deg)}
+.sb-group.collapsed .sb-group-content{display:none}
+.sb-group-content{padding:2px 0}
+
+/* Catalog 树 */
+.cat-tree{padding-left:4px}
+.cat-node{display:flex;align-items:center;gap:5px;padding:3px 12px 3px 8px;cursor:pointer;border-radius:4px;font-size:12px}
+.cat-node:hover{background:var(--bg-hover)}
+.cat-node.active{background:var(--accent-dim);color:var(--accent)}
+.cat-node .icon{width:14px;height:14px;flex-shrink:0;color:var(--text-muted)}
+.cat-node.table .icon{color:var(--cyan)}
+.cat-node .badge{
+  margin-left:auto;font-size:10px;background:var(--bg-tertiary);
+  color:var(--text-muted);padding:1px 5px;border-radius:8px;
+}
+.cat-children{padding-left:16px}
+.cat-col{display:flex;align-items:center;gap:6px;padding:2px 12px 2px 24px;font-size:11px;color:var(--text-secondary);cursor:default}
+.cat-col .col-type{margin-left:auto;font-family:var(--font-mono);font-size:10px;color:var(--text-muted)}
+.cat-col .pk{color:var(--warning);font-size:9px;font-weight:700}
+
+/* 存储状态卡片 */
+.storage-cards{padding:4px 10px;display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.storage-card{
+  background:var(--bg-tertiary);border-radius:6px;padding:8px 10px;
+  border:1px solid var(--border);
+}
+.storage-card .label{font-size:10px;color:var(--text-muted);margin-bottom:3px}
+.storage-card .value{font-family:var(--font-mono);font-size:16px;font-weight:600;color:var(--text-primary)}
+.storage-card .value.hit{color:var(--success)}
+.storage-card .sub{font-size:10px;color:var(--text-muted);margin-top:2px}
+
+/* 测试用例列表 */
+.test-list{padding:2px 8px}
+.test-item{
+  display:flex;align-items:center;gap:6px;
+  padding:5px 8px;border-radius:5px;cursor:pointer;
+  font-size:11px;color:var(--text-secondary);
+  border:1px solid transparent;transition:all 0.15s;
+}
+.test-item:hover{background:var(--bg-hover);border-color:var(--border);color:var(--text-primary)}
+.test-item .tag{
+  font-size:9px;padding:1px 5px;border-radius:3px;font-weight:600;flex-shrink:0;
+}
+.test-item .tag.ok{background:rgba(74,222,128,0.15);color:var(--success)}
+.test-item .tag.err{background:rgba(248,113,113,0.15);color:var(--error)}
+.test-item .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ===== 侧边栏折叠按钮 ===== */
+.sidebar-toggle{
+  width:16px;background:var(--bg-secondary);border-right:1px solid var(--border);
+  display:flex;align-items:center;justify-content:center;cursor:pointer;
+  flex-shrink:0;transition:background 0.15s;
+}
+.sidebar-toggle:hover{background:var(--bg-hover)}
+.sidebar-toggle svg{width:12px;height:12px;color:var(--text-muted)}
+
+/* ===== 右侧主区域 ===== */
+.content-area{flex:1;display:flex;flex-direction:column;min-width:0}
+
+/* SQL 编辑器区 */
+.editor-section{
+  display:flex;flex-direction:column;
+  border-bottom:1px solid var(--border);
+  min-height:180px;
+}
+.editor-toolbar{
+  height:32px;display:flex;align-items:center;gap:8px;
+  padding:0 12px;background:var(--bg-secondary);
+  border-bottom:1px solid var(--border);flex-shrink:0;
+}
+.editor-toolbar .et-label{font-size:11px;color:var(--text-muted);font-weight:600;text-transform:uppercase;letter-spacing:0.5px}
+.editor-toolbar .et-file{
+  display:flex;align-items:center;gap:5px;
+  font-family:var(--font-mono);font-size:11px;color:var(--text-secondary);
+  background:var(--bg-tertiary);padding:2px 8px;border-radius:4px;
+}
+.editor-toolbar .et-actions{margin-left:auto;display:flex;gap:4px}
+.et-btn{
+  display:flex;align-items:center;gap:4px;
+  padding:3px 8px;border-radius:4px;font-size:11px;
+  color:var(--text-secondary);transition:all 0.15s;
+}
+.et-btn:hover{background:var(--bg-hover);color:var(--text-primary)}
+.et-btn svg{width:12px;height:12px}
+
+/* 编辑器主体 */
+.editor-container{
+  flex:1;display:flex;position:relative;overflow:hidden;
+  background:var(--bg-primary);
+}
+.line-numbers{
+  width:48px;background:var(--bg-secondary);
+  border-right:1px solid var(--border);
+  padding:8px 0;text-align:right;
+  font-family:var(--font-mono);font-size:12px;
+  color:var(--text-muted);line-height:1.6;
+  user-select:none;flex-shrink:0;overflow:hidden;
+}
+.line-numbers div{padding:0 10px 0 0}
+.line-numbers div.error-line{color:var(--error);background:rgba(248,113,113,0.1)}
+.code-textarea{
+  flex:1;background:transparent;border:none;outline:none;
+  resize:none;padding:8px 12px;
+  font-family:var(--font-mono);font-size:12px;
+  line-height:1.6;color:var(--text-primary);
+  tab-size:4;caret-color:var(--accent);
+  white-space:pre;overflow:auto;
+}
+.code-textarea::placeholder{color:var(--text-muted)}
+
+/* ===== 下方面板区 ===== */
+.panel-section{
+  flex:1;display:flex;flex-direction:column;
+  min-height:160px;background:var(--bg-primary);
+}
+.panel-tabs{
+  height:var(--tab-height);display:flex;align-items:flex-end;
+  background:var(--bg-secondary);border-bottom:1px solid var(--border);
+  padding:0 8px;gap:1px;flex-shrink:0;overflow-x:auto;
+}
+.panel-tab{
+  display:flex;align-items:center;gap:5px;
+  padding:0 14px;height:calc(var(--tab-height) - 1px);
+  font-size:11.5px;color:var(--text-muted);
+  border-bottom:2px solid transparent;cursor:pointer;
+  transition:all 0.15s;white-space:nowrap;user-select:none;
+}
+.panel-tab:hover{color:var(--text-secondary)}
+.panel-tab.active{color:var(--accent);border-bottom-color:var(--accent);background:var(--bg-primary)}
+.panel-tab .count{
+  font-size:9px;background:var(--bg-tertiary);color:var(--text-muted);
+  padding:1px 5px;border-radius:7px;min-width:16px;text-align:center;
+}
+.panel-tab .count.has-error{background:rgba(248,113,113,0.2);color:var(--error)}
+.panel-tab .count.has-data{background:rgba(74,222,128,0.15);color:var(--success)}
+
+.panel-body{flex:1;overflow:auto;padding:0}
+.panel-content{display:none;height:100%;overflow:auto}
+.panel-content.active{display:block}
+
+/* ===== 通用表格 ===== */
+.data-table{width:100%;border-collapse:collapse;font-size:12px}
+.data-table thead{position:sticky;top:0;z-index:5}
+.data-table th{
+  background:var(--bg-secondary);color:var(--text-secondary);
+  font-weight:600;font-size:11px;text-align:left;
+  padding:7px 12px;border-bottom:1px solid var(--border);
+  text-transform:uppercase;letter-spacing:0.3px;white-space:nowrap;
+}
+.data-table td{
+  padding:6px 12px;border-bottom:1px solid var(--border);
+  color:var(--text-primary);vertical-align:top;
+}
+.data-table tbody tr:hover{background:var(--bg-hover)}
+.data-table .mono{font-family:var(--font-mono);font-size:11.5px}
+.data-table .num{text-align:right;font-family:var(--font-mono)}
+.data-table .token-type{
+  display:inline-block;padding:1px 7px;border-radius:3px;
+  font-size:10px;font-weight:600;font-family:var(--font-mono);
+}
+.tt-keyword{background:rgba(79,140,255,0.15);color:var(--accent)}
+.tt-identifier{background:rgba(192,132,252,0.15);color:var(--purple)}
+.tt-literal{background:rgba(74,222,128,0.15);color:var(--success)}
+.tt-operator{background:rgba(251,191,36,0.15);color:var(--warning)}
+.tt-punctuation{background:var(--bg-tertiary);color:var(--text-muted)}
+
+/* ===== AST 树 ===== */
+.ast-tree{padding:12px 16px;font-family:var(--font-mono);font-size:12px}
+.ast-node{position:relative;padding-left:20px}
+.ast-node::before{
+  content:'';position:absolute;left:6px;top:0;bottom:0;
+  width:1px;background:var(--border);
+}
+.ast-node:last-child::before{height:14px}
+.ast-node::after{
+  content:'';position:absolute;left:6px;top:14px;width:12px;height:1px;
+  background:var(--border);
+}
+.ast-node-label{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:3px 8px;border-radius:4px;cursor:pointer;
+  margin-bottom:2px;
+}
+.ast-node-label:hover{background:var(--bg-hover)}
+.ast-node-label .node-type{
+  font-weight:600;color:var(--accent);
+}
+.ast-node-label .node-val{color:var(--success)}
+.ast-node-label .node-detail{color:var(--text-muted);font-size:11px}
+.ast-children{margin-left:4px}
+.ast-toggle{
+  width:14px;height:14px;display:inline-flex;align-items:center;justify-content:center;
+  color:var(--text-muted);font-size:10px;cursor:pointer;flex-shrink:0;
+}
+.ast-toggle:hover{color:var(--text-primary)}
+
+/* ===== 执行计划树 ===== */
+.plan-tree{padding:12px 16px}
+.plan-node{
+  display:flex;align-items:flex-start;gap:10px;
+  padding:8px 12px;margin:4px 0;border-radius:6px;
+  background:var(--bg-secondary);border:1px solid var(--border);
+  border-left:3px solid var(--accent);
+}
+.plan-node.op-scan{border-left-color:var(--cyan)}
+.plan-node.op-filter{border-left-color:var(--warning)}
+.plan-node.op-project{border-left-color:var(--purple)}
+.plan-node.op-insert{border-left-color:var(--success)}
+.plan-node.op-create{border-left-color:var(--orange)}
+.plan-node .op-icon{
+  width:28px;height:28px;border-radius:6px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:14px;flex-shrink:0;margin-top:1px;
+}
+.plan-node .op-info{flex:1;min-width:0}
+.plan-node .op-name{font-weight:600;font-size:12.5px;margin-bottom:2px}
+.plan-node .op-desc{font-size:11px;color:var(--text-secondary);font-family:var(--font-mono)}
+.plan-node .op-cost{
+  font-family:var(--font-mono);font-size:10px;color:var(--text-muted);
+  background:var(--bg-tertiary);padding:2px 6px;border-radius:3px;flex-shrink:0;
+}
+.plan-children{margin-left:24px;border-left:1px dashed var(--border);padding-left:8px}
+
+/* ===== 执行结果 ===== */
+.result-header{
+  display:flex;align-items:center;gap:12px;
+  padding:8px 16px;background:var(--bg-secondary);
+  border-bottom:1px solid var(--border);font-size:12px;
+}
+.result-header .rh-status{display:flex;align-items:center;gap:6px;font-weight:500}
+.result-header .rh-status.success{color:var(--success)}
+.result-header .rh-status.error{color:var(--error)}
+.result-header .rh-meta{color:var(--text-muted);font-size:11px}
+.result-table-wrap{overflow:auto}
+
+/* ===== 存储日志 ===== */
+.log-list{padding:0}
+.log-entry{
+  display:flex;align-items:center;gap:10px;
+  padding:5px 16px;font-family:var(--font-mono);font-size:11px;
+  border-bottom:1px solid rgba(58,59,64,0.5);
+}
+.log-entry:hover{background:var(--bg-hover)}
+.log-entry .log-time{color:var(--text-muted);flex-shrink:0;width:70px}
+.log-entry .log-op{
+  padding:1px 6px;border-radius:3px;font-weight:600;font-size:10px;
+  flex-shrink:0;min-width:60px;text-align:center;
+}
+.log-op.read{background:rgba(34,211,238,0.15);color:var(--cyan)}
+.log-op.write{background:rgba(251,146,60,0.15);color:var(--orange)}
+.log-op.get{background:rgba(79,140,255,0.15);color:var(--accent)}
+.log-op.flush{background:rgba(192,132,252,0.15);color:var(--purple)}
+.log-op.hit{background:rgba(74,222,128,0.15);color:var(--success)}
+.log-op.evict{background:rgba(248,113,113,0.15);color:var(--error)}
+.log-entry .log-page{color:var(--text-secondary);flex-shrink:0;width:80px}
+.log-entry .log-msg{color:var(--text-primary);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ===== 错误控制台 ===== */
+.error-list{padding:0}
+.error-entry{
+  display:flex;align-items:flex-start;gap:10px;
+  padding:8px 16px;border-bottom:1px solid var(--border);
+}
+.error-entry:hover{background:var(--bg-hover)}
+.error-entry .err-icon{
+  width:20px;height:20px;border-radius:50%;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+  font-size:11px;font-weight:700;margin-top:1px;
+}
+.err-icon.lexical{background:rgba(251,191,36,0.15);color:var(--warning)}
+.err-icon.syntax{background:rgba(251,146,60,0.15);color:var(--orange)}
+.err-icon.semantic{background:rgba(192,132,252,0.15);color:var(--purple)}
+.err-icon.runtime{background:rgba(248,113,113,0.15);color:var(--error)}
+.err-icon.storage{background:rgba(248,113,113,0.2);color:var(--error)}
+.error-entry .err-body{flex:1;min-width:0}
+.error-entry .err-title{font-size:12px;font-weight:500;margin-bottom:2px}
+.error-entry .err-meta{font-size:11px;color:var(--text-muted);font-family:var(--font-mono)}
+.error-entry .err-msg{font-size:11.5px;color:var(--text-secondary);margin-top:2px}
+
+/* ===== 语义面板 ===== */
+.semantic-grid{display:grid;grid-template-columns:1fr 1fr;gap:0;height:100%}
+.semantic-col{display:flex;flex-direction:column;overflow:hidden}
+.semantic-col:first-child{border-right:1px solid var(--border)}
+.semantic-col-title{
+  padding:8px 16px;font-size:11px;font-weight:600;
+  color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;
+  background:var(--bg-secondary);border-bottom:1px solid var(--border);
+}
+.semantic-col-body{flex:1;overflow:auto}
+.check-item{
+  display:flex;align-items:center;gap:8px;
+  padding:6px 16px;font-size:12px;border-bottom:1px solid rgba(58,59,64,0.4);
+}
+.check-item .ci-icon{width:16px;height:16px;flex-shrink:0;display:flex;align-items:center;justify-content:center}
+.check-item.pass .ci-icon{color:var(--success)}
+.check-item.fail .ci-icon{color:var(--error)}
+.check-item .ci-text{flex:1}
+.check-item .ci-detail{font-size:10.5px;color:var(--text-muted);font-family:var(--font-mono)}
+
+/* ===== 空状态 ===== */
+.empty-state{
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  height:100%;color:var(--text-muted);gap:10px;padding:40px;
+}
+.empty-state svg{width:40px;height:40px;opacity:0.3}
+.empty-state .empty-title{font-size:13px;font-weight:500;color:var(--text-secondary)}
+.empty-state .empty-desc{font-size:11px;text-align:center;max-width:300px;line-height:1.6}
+
+/* ===== 底部状态栏 ===== */
+.statusbar{
+  height:var(--statusbar-height);background:var(--accent);
+  display:flex;align-items:center;padding:0 12px;gap:16px;
+  font-size:10.5px;color:rgba(255,255,255,0.85);flex-shrink:0;
+}
+.statusbar .sb-item{display:flex;align-items:center;gap:4px}
+.statusbar .sb-right{margin-left:auto;display:flex;gap:16px}
+
+/* ===== Toast 通知 ===== */
+.toast-container{
+  position:fixed;top:60px;right:20px;z-index:9999;
+  display:flex;flex-direction:column;gap:8px;
+}
+.toast{
+  background:var(--bg-tertiary);border:1px solid var(--border-light);
+  border-radius:8px;padding:10px 16px;min-width:240px;max-width:360px;
+  box-shadow:0 8px 24px rgba(0,0,0,0.4);
+  display:flex;align-items:flex-start;gap:10px;
+  animation:toastIn 0.25s ease-out;
+  font-size:12px;
+}
+.toast.success{border-left:3px solid var(--success)}
+.toast.error{border-left:3px solid var(--error)}
+.toast.info{border-left:3px solid var(--accent)}
+.toast .toast-icon{flex-shrink:0;margin-top:1px}
+.toast .toast-body{flex:1}
+.toast .toast-title{font-weight:600;margin-bottom:2px}
+.toast .toast-msg{color:var(--text-secondary);font-size:11px;line-height:1.5}
+@keyframes toastIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
+
+/* ===== 分割拖拽条 ===== */
+.vsplit{
+  height:5px;background:var(--border);cursor:row-resize;
+  flex-shrink:0;transition:background 0.15s;position:relative;
+}
+.vsplit:hover,.vsplit.dragging{background:var(--accent)}
+.vsplit::after{
+  content:'';position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+  width:40px;height:2px;background:var(--text-muted);border-radius:1px;opacity:0.5;
+}
+
+/* ===== 响应式 ===== */
+@media(max-width:900px){
+  .sidebar{position:absolute;z-index:50;height:100%;box-shadow:4px 0 20px rgba(0,0,0,0.3)}
+  .semantic-grid{grid-template-columns:1fr}
+  .semantic-col:first-child{border-right:none;border-bottom:1px solid var(--border)}
+}
+</style>
+</head>
+<body>
+
+<!-- ===== 顶部工具栏 ===== -->
+<div class="toolbar">
+  <div class="toolbar-brand">
+    <div class="logo">DB</div>
+    <div>
+      <span class="title">MiniDB IDE</span>
+      <span class="subtitle">v1.0 实习调试平台</span>
+    </div>
+  </div>
+  <div class="toolbar-divider"></div>
+  <button class="tb-btn primary" onclick="executeSQL()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+    执行 <span class="kbd">Ctrl+Enter</span>
+  </button>
+  <button class="tb-btn" onclick="compileOnly()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 18l6-6-6-6"/><path d="M8 6l-6 6 6 6"/></svg>
+    仅编译
+  </button>
+  <button class="tb-btn" onclick="clearAll()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+    清空输出
+  </button>
+  <div class="toolbar-divider"></div>
+  <button class="tb-btn" onclick="importSQL()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+    导入 SQL
+  </button>
+  <button class="tb-btn" onclick="exportLogs()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+    导出日志
+  </button>
+  <div class="toolbar-divider"></div>
+  <button class="tb-btn" onclick="simulateRestart()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+    模拟重启
+  </button>
+  <button class="tb-btn" onclick="resetDatabase()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+    重置数据库
+  </button>
+  <div class="toolbar-spacer"></div>
+  <div class="toolbar-status">
+    <span class="status-dot"></span>
+    <span>引擎已连接</span>
+    <span style="color:var(--border)">|</span>
+    <span id="cachePolicyLabel">缓存策略: LRU</span>
+  </div>
+</div>
+
+<!-- ===== 主布局 ===== -->
+<div class="main-layout">
+  <!-- 左侧侧边栏 -->
+  <div class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <span>导航</span>
+      <button onclick="toggleSidebar()" title="收起侧边栏">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
+    </div>
+    <div class="sidebar-body">
+      <!-- Catalog 元数据 -->
+      <div class="sb-group" id="group-catalog">
+        <div class="sb-group-title" onclick="toggleGroup('group-catalog')">
+          <span class="arrow">&#9660;</span>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+          数据库 Catalog
+        </div>
+        <div class="sb-group-content">
+          <div class="cat-tree" id="catalogTree">
+            <!-- 动态渲染 -->
+          </div>
+        </div>
+      </div>
+
+      <!-- 存储系统状态 -->
+      <div class="sb-group" id="group-storage">
+        <div class="sb-group-title" onclick="toggleGroup('group-storage')">
+          <span class="arrow">&#9660;</span>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+          存储系统状态
+        </div>
+        <div class="sb-group-content">
+          <div class="storage-cards">
+            <div class="storage-card">
+              <div class="label">总页数</div>
+              <div class="value" id="statTotalPages">128</div>
+              <div class="sub">页大小 4KB</div>
+            </div>
+            <div class="storage-card">
+              <div class="label">已分配</div>
+              <div class="value" id="statUsedPages">23</div>
+              <div class="sub">空闲 105 页</div>
+            </div>
+            <div class="storage-card">
+              <div class="label">缓存命中</div>
+              <div class="value hit" id="statCacheHits">156</div>
+              <div class="sub">失效 42 次</div>
+            </div>
+            <div class="storage-card">
+              <div class="label">命中率</div>
+              <div class="value" id="statHitRate" style="color:var(--cyan)">78.8%</div>
+              <div class="sub">容量 16 页</div>
+            </div>
+          </div>
+          <div style="padding:8px 10px 4px">
+            <div style="font-size:10px;color:var(--text-muted);margin-bottom:5px;font-weight:600;text-transform:uppercase;letter-spacing:0.3px">缓存替换策略</div>
+            <div style="display:flex;gap:4px">
+              <button class="et-btn" id="policyLRU" style="background:var(--accent-dim);color:var(--accent);flex:1;justify-content:center" onclick="setCachePolicy('LRU')">LRU</button>
+              <button class="et-btn" id="policyFIFO" style="flex:1;justify-content:center" onclick="setCachePolicy('FIFO')">FIFO</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 测试用例库 -->
+      <div class="sb-group" id="group-tests">
+        <div class="sb-group-title" onclick="toggleGroup('group-tests')">
+          <span class="arrow">&#9660;</span>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+          测试用例库
+        </div>
+        <div class="sb-group-content">
+          <div class="test-list" id="testList">
+            <!-- 动态渲染 -->
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 侧边栏折叠按钮 -->
+  <div class="sidebar-toggle" onclick="toggleSidebar()" title="展开/收起侧边栏">
+    <svg id="toggleIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+  </div>
+
+  <!-- 右侧主内容区 -->
+  <div class="content-area">
+    <!-- SQL 编辑器区 -->
+    <div class="editor-section" id="editorSection">
+      <div class="editor-toolbar">
+        <span class="et-label">SQL 编辑器</span>
+        <div class="et-file">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          query.sql
+        </div>
+        <div class="et-actions">
+          <button class="et-btn" onclick="formatSQL()" title="格式化 SQL">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="21" y1="10" x2="7" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="21" y1="18" x2="7" y2="18"/></svg>
+            格式化
+          </button>
+          <button class="et-btn" onclick="clearEditor()" title="清空编辑器">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="editor-container">
+        <div class="line-numbers" id="lineNumbers"></div>
+        <textarea class="code-textarea" id="sqlEditor" spellcheck="false"
+          placeholder="在此输入 SQL 语句...&#10;&#10;支持: CREATE TABLE / INSERT / SELECT / DELETE&#10;快捷键: Ctrl+Enter 执行"></textarea>
+      </div>
+    </div>
+
+    <!-- 拖拽分割条 -->
+    <div class="vsplit" id="vsplit"></div>
+
+    <!-- 下方面板区 -->
+    <div class="panel-section">
+      <div class="panel-tabs" id="panelTabs">
+        <div class="panel-tab active" data-panel="token" onclick="switchPanel('token')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>
+          Token 流
+          <span class="count" id="count-token">0</span>
+        </div>
+        <div class="panel-tab" data-panel="ast" onclick="switchPanel('ast')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="M12 7v4M12 11l-5 6M12 11l5 6"/></svg>
+          AST 语法树
+        </div>
+        <div class="panel-tab" data-panel="semantic" onclick="switchPanel('semantic')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          语义分析
+          <span class="count" id="count-semantic">0</span>
+        </div>
+        <div class="panel-tab" data-panel="plan" onclick="switchPanel('plan')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          执行计划
+        </div>
+        <div class="panel-tab" data-panel="result" onclick="switchPanel('result')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>
+          执行结果
+        </div>
+        <div class="panel-tab" data-panel="storage" onclick="switchPanel('storage')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+          存储日志
+          <span class="count" id="count-storage">0</span>
+        </div>
+        <div class="panel-tab" data-panel="errors" onclick="switchPanel('errors')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          错误控制台
+          <span class="count" id="count-errors">0</span>
+        </div>
+      </div>
+      <div class="panel-body">
+        <!-- Token 面板 -->
+        <div class="panel-content active" id="panel-token">
+          <div class="empty-state" id="token-empty">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>
+            <div class="empty-title">暂无 Token 数据</div>
+            <div class="empty-desc">在上方编辑器输入 SQL 后点击「执行」或「仅编译」，词法分析结果将在此展示</div>
+          </div>
+          <div id="token-table-wrap" style="display:none">
+            <table class="data-table">
+              <colgroup><col style="width:14%"><col style="width:30%"><col style="width:36%"><col style="width:10%"><col style="width:10%"></colgroup>
+              <thead><tr><th>种别码</th><th>Token 类型</th><th>词素值</th><th class="num">行号</th><th class="num">列号</th></tr></thead>
+              <tbody id="token-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- AST 面板 -->
+        <div class="panel-content" id="panel-ast">
+          <div class="empty-state" id="ast-empty">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="M12 7v4M12 11l-5 6M12 11l5 6"/></svg>
+            <div class="empty-title">暂无 AST 数据</div>
+            <div class="empty-desc">编译 SQL 后，语法分析生成的抽象语法树将在此展示，支持折叠展开</div>
+          </div>
+          <div class="ast-tree" id="ast-tree" style="display:none"></div>
+        </div>
+
+        <!-- 语义分析面板 -->
+        <div class="panel-content" id="panel-semantic">
+          <div class="empty-state" id="semantic-empty">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            <div class="empty-title">暂无语义分析结果</div>
+            <div class="empty-desc">语义分析将检查表/字段存在性、类型匹配、列数一致性等，结果在此展示</div>
+          </div>
+          <div class="semantic-grid" id="semantic-grid" style="display:none">
+            <div class="semantic-col">
+              <div class="semantic-col-title">Catalog 模式目录</div>
+              <div class="semantic-col-body" id="semantic-catalog"></div>
+            </div>
+            <div class="semantic-col">
+              <div class="semantic-col-title">语义校验项</div>
+              <div class="semantic-col-body" id="semantic-checks"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 执行计划面板 -->
+        <div class="panel-content" id="panel-plan">
+          <div class="empty-state" id="plan-empty">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            <div class="empty-title">暂无执行计划</div>
+            <div class="empty-desc">编译通过后将生成逻辑执行计划（算子树），包含 SeqScan / Filter / Project 等算子</div>
+          </div>
+          <div class="plan-tree" id="plan-tree" style="display:none"></div>
+        </div>
+
+        <!-- 执行结果面板 -->
+        <div class="panel-content" id="panel-result">
+          <div class="empty-state" id="result-empty">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>
+            <div class="empty-title">暂无执行结果</div>
+            <div class="empty-desc">点击「执行」运行 SQL 后，查询结果集或操作反馈将在此展示</div>
+          </div>
+          <div id="result-content" style="display:none"></div>
+        </div>
+
+        <!-- 存储日志面板 -->
+        <div class="panel-content" id="panel-storage">
+          <div class="empty-state" id="storage-empty">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+            <div class="empty-title">暂无存储日志</div>
+            <div class="empty-desc">执行 SQL 时，页式存储与缓存模块的读写操作日志将在此实时展示</div>
+          </div>
+          <div class="log-list" id="storage-logs" style="display:none"></div>
+        </div>
+
+        <!-- 错误控制台面板 -->
+        <div class="panel-content" id="panel-errors">
+          <div class="empty-state" id="errors-empty">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            <div class="empty-title">暂无错误</div>
+            <div class="empty-desc">词法、语法、语义、运行时、存储 IO 各阶段的错误将统一汇总在此</div>
+          </div>
+          <div class="error-list" id="error-list" style="display:none"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 底部状态栏 ===== -->
+<div class="statusbar">
+  <div class="sb-item">
+    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+    就绪
+  </div>
+  <div class="sb-item" id="sb-currentFile">query.sql</div>
+  <div class="sb-right">
+    <div class="sb-item" id="sb-cursor">行 1, 列 1</div>
+    <div class="sb-item">UTF-8</div>
+    <div class="sb-item">SQL</div>
+    <div class="sb-item" id="sb-pages">页: 23/128</div>
+  </div>
+</div>
+
+<!-- Toast 容器 -->
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- 隐藏文件输入 -->
+<input type="file" id="fileInput" accept=".sql" style="display:none" onchange="handleFileImport(event)">
+
+<script>
+/* ============================================================
+   MiniDB IDE - 前端原型交互逻辑
+   包含：模拟SQL编译器(词法/语法/语义/计划)、执行引擎、存储日志
+   ============================================================ */
+
+// ===== 全局状态 =====
+const state = {
+  currentPanel: 'token',
+  sidebarCollapsed: false,
+  cachePolicy: 'LRU',
+  catalog: {
+    tables: [
+      { name: 'student', columns: [
+        { name: 'id', type: 'INT', pk: true },
+        { name: 'name', type: 'VARCHAR', pk: false },
+        { name: 'age', type: 'INT', pk: false },
+        { name: 'major', type: 'VARCHAR', pk: false }
+      ]},
+      { name: 'course', columns: [
+        { name: 'cid', type: 'INT', pk: true },
+        { name: 'cname', type: 'VARCHAR', pk: false },
+        { name: 'credit', type: 'INT', pk: false }
+      ]},
+      { name: 'sc', columns: [
+        { name: 'sid', type: 'INT', pk: true },
+        { name: 'cid', type: 'INT', pk: true },
+        { name: 'score', type: 'FLOAT', pk: false }
+      ]}
+    ],
+    systemTables: [
+      { name: '__sys_tables__', columns: [{name:'table_id',type:'INT'},{name:'table_name',type:'VARCHAR'},{name:'page_ptr',type:'INT'}] },
+      { name: '__sys_columns__', columns: [{name:'table_id',type:'INT'},{name:'col_name',type:'VARCHAR'},{name:'col_type',type:'INT'},{name:'col_order',type:'INT'}] }
+    ]
+  },
+  storageLogs: [],
+  errors: [],
+  stats: { totalPages:128, usedPages:23, cacheHits:156, cacheMiss:42 }
+};
+
+// ===== 测试用例库 =====
+const testCases = [
+  { name:'创建学生表', tag:'ok', sql:'CREATE TABLE student(\n  id INT PRIMARY KEY,\n  name VARCHAR,\n  age INT,\n  major VARCHAR\n);' },
+  { name:'插入数据', tag:'ok', sql:"INSERT INTO student(id, name, age, major)\nVALUES (1, 'Alice', 20, 'CS'),\n       (2, 'Bob', 21, 'SE'),\n       (3, 'Carol', 19, 'DS');" },
+  { name:'简单查询', tag:'ok', sql:'SELECT id, name, age\nFROM student\nWHERE age > 18\nORDER BY age DESC;' },
+  { name:'删除记录', tag:'ok', sql:'DELETE FROM student\nWHERE id = 2;' },
+  { name:'创建课程表', tag:'ok', sql:'CREATE TABLE course(\n  cid INT PRIMARY KEY,\n  cname VARCHAR,\n  credit INT\n);' },
+  { name:'错误: 缺分号', tag:'err', sql:'SELECT * FROM student' },
+  { name:'错误: 表不存在', tag:'err', sql:'SELECT * FROM nonexistent_table;' },
+  { name:'错误: 字段不存在', tag:'err', sql:'SELECT wrong_col FROM student;' },
+  { name:'错误: 类型不匹配', tag:'err', sql:"INSERT INTO student(id, name, age) VALUES ('abc', 'Test', 20);" },
+  { name:'错误: 值数目不符', tag:'err', sql:"INSERT INTO student(id, name) VALUES (1, 'Test', 'extra');" },
+  { name:'错误: 字符串未闭合', tag:'err', sql:"SELECT * FROM student WHERE name = 'Alice;" },
+  { name:'错误: 非法字符', tag:'err', sql:'SELECT @#$ FROM student;' }
+];
+
+// ===== 初始化 =====
+document.addEventListener('DOMContentLoaded', function(){
+  renderCatalog();
+  renderTestCases();
+  updateLineNumbers();
+  setupEditorEvents();
+  setupDragSplit();
+  // 默认填充示例SQL
+  document.getElementById('sqlEditor').value = testCases[2].sql;
+  updateLineNumbers();
+});
+
+// ===== 侧边栏与分组 =====
+function toggleSidebar(){
+  const sb = document.getElementById('sidebar');
+  const icon = document.getElementById('toggleIcon');
+  state.sidebarCollapsed = !state.sidebarCollapsed;
+  sb.classList.toggle('collapsed', state.sidebarCollapsed);
+  icon.style.transform = state.sidebarCollapsed ? 'rotate(180deg)' : '';
+}
+function toggleGroup(groupId){
+  document.getElementById(groupId).classList.toggle('collapsed');
+}
+
+// ===== 渲染 Catalog 树 =====
+function renderCatalog(){
+  const tree = document.getElementById('catalogTree');
+  let html = '';
+  // 用户表
+  state.catalog.tables.forEach(tbl => {
+    html += `<div class="cat-node table" onclick="toggleTableCols(this)">
+      <span class="arrow" style="font-size:9px;color:var(--text-muted);transition:transform 0.15s">&#9660;</span>
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+      <span>${tbl.name}</span>
+      <span class="badge">${tbl.columns.length} 列</span>
+    </div>
+    <div class="cat-children">`;
+    tbl.columns.forEach(col => {
+      html += `<div class="cat-col">
+        ${col.pk ? '<span class="pk">PK</span>' : '<span style="width:18px"></span>'}
+        <span>${col.name}</span>
+        <span class="col-type">${col.type}</span>
+      </div>`;
+    });
+    html += `</div>`;
+  });
+  // 系统表
+  html += `<div style="padding:6px 12px 2px;font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px;margin-top:6px">系统元数据表</div>`;
+  state.catalog.systemTables.forEach(tbl => {
+    html += `<div class="cat-node" style="opacity:0.7;cursor:default">
+      <span style="width:9px"></span>
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/></svg>
+      <span style="font-family:var(--font-mono);font-size:11px">${tbl.name}</span>
+    </div>`;
+  });
+  tree.innerHTML = html;
+}
+function toggleTableCols(node){
+  const children = node.nextElementSibling;
+  const arrow = node.querySelector('.arrow');
+  if(children.style.display === 'none'){
+    children.style.display = '';
+    arrow.style.transform = '';
+  } else {
+    children.style.display = 'none';
+    arrow.style.transform = 'rotate(-90deg)';
+  }
+}
+
+// ===== 渲染测试用例 =====
+function renderTestCases(){
+  const list = document.getElementById('testList');
+  list.innerHTML = testCases.map((tc,i) =>
+    `<div class="test-item" onclick="loadTestCase(${i})" title="${tc.sql.replace(/"/g,'&quot;')}">
+      <span class="tag ${tc.tag}">${tc.tag==='ok'?'正确':'错误'}</span>
+      <span class="name">${tc.name}</span>
+    </div>`
+  ).join('');
+}
+function loadTestCase(idx){
+  document.getElementById('sqlEditor').value = testCases[idx].sql;
+  updateLineNumbers();
+  showToast('info','已加载测试用例', testCases[idx].name);
+}
+
+// ===== 编辑器行号同步 =====
+function updateLineNumbers(){
+  const ta = document.getElementById('sqlEditor');
+  const ln = document.getElementById('lineNumbers');
+  const lines = ta.value.split('\n').length;
+  let html = '';
+  for(let i=1;i<=lines;i++){
+    html += `<div>${i}</div>`;
+  }
+  ln.innerHTML = html;
+}
+function setupEditorEvents(){
+  const ta = document.getElementById('sqlEditor');
+  ta.addEventListener('input', updateLineNumbers);
+  ta.addEventListener('scroll', function(){
+    document.getElementById('lineNumbers').scrollTop = ta.scrollTop;
+  });
+  ta.addEventListener('keydown', function(e){
+    if(e.ctrlKey && e.key === 'Enter'){
+      e.preventDefault();
+      executeSQL();
+    }
+    if(e.key === 'Tab'){
+      e.preventDefault();
+      const start = ta.selectionStart;
+      const end = ta.selectionEnd;
+      ta.value = ta.value.substring(0,start) + '  ' + ta.value.substring(end);
+      ta.selectionStart = ta.selectionEnd = start + 2;
+      updateLineNumbers();
+    }
+  });
+  ta.addEventListener('click', updateCursorPos);
+  ta.addEventListener('keyup', updateCursorPos);
+}
+function updateCursorPos(){
+  const ta = document.getElementById('sqlEditor');
+  const pos = ta.selectionStart;
+  const before = ta.value.substring(0, pos);
+  const line = before.split('\n').length;
+  const col = pos - before.lastIndexOf('\n');
+  document.getElementById('sb-cursor').textContent = `行 ${line}, 列 ${col}`;
+}
+
+// ===== 面板切换 =====
+function switchPanel(name){
+  state.currentPanel = name;
+  document.querySelectorAll('.panel-tab').forEach(t => t.classList.toggle('active', t.dataset.panel === name));
+  document.querySelectorAll('.panel-content').forEach(c => c.classList.toggle('active', c.id === 'panel-' + name));
+}
+
+// ===== 拖拽分割条 =====
+function setupDragSplit(){
+  const split = document.getElementById('vsplit');
+  const editor = document.getElementById('editorSection');
+  let dragging = false, startY = 0, startH = 0;
+  split.addEventListener('mousedown', function(e){
+    dragging = true;
+    startY = e.clientY;
+    startH = editor.offsetHeight;
+    split.classList.add('dragging');
+    document.body.style.cursor = 'row-resize';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', function(e){
+    if(!dragging) return;
+    const delta = e.clientY - startY;
+    const newH = Math.max(120, Math.min(window.innerHeight - 200, startH + delta));
+    editor.style.height = newH + 'px';
+    editor.style.flex = 'none';
+  });
+  document.addEventListener('mouseup', function(){
+    if(dragging){
+      dragging = false;
+      split.classList.remove('dragging');
+      document.body.style.cursor = '';
+    }
+  });
+}
+
+// ============================================================
+//   模拟 SQL 编译器
+// ============================================================
+
+// 关键字集合
+const KEYWORDS = ['SELECT','FROM','WHERE','INSERT','INTO','VALUES','CREATE','TABLE',
+  'DELETE','UPDATE','SET','AND','OR','NOT','NULL','INT','VARCHAR','FLOAT','PRIMARY',
+  'KEY','ORDER','BY','ASC','DESC','AS','DISTINCT','GROUP','HAVING','LIMIT','JOIN',
+  'ON','IN','LIKE','BETWEEN','IS','DEFAULT','CHECK','UNIQUE','REFERENCES'];
+
+// 简易词法分析
+function lexer(sql){
+  const tokens = [];
+  const errors = [];
+  let i = 0, line = 1, col = 1;
+  const len = sql.length;
+
+  while(i < len){
+    const ch = sql[i];
+    // 空白
+    if(ch === ' ' || ch === '\t'){ i++; col++; continue; }
+    if(ch === '\n'){ i++; line++; col = 1; continue; }
+    if(ch === '\r'){ i++; continue; }
+    // 注释 --
+    if(ch === '-' && sql[i+1] === '-'){
+      while(i < len && sql[i] !== '\n'){ i++; }
+      continue;
+    }
+    // 字符串
+    if(ch === "'"){
+      const startLine = line, startCol = col;
+      let str = '';
+      i++; col++;
+      while(i < len && sql[i] !== "'"){
+        if(sql[i] === '\n'){ line++; col = 1; }
+        str += sql[i];
+        i++; col++;
+      }
+      if(i >= len){
+        errors.push({type:'词法错误', line:startLine, col:startCol, message:'字符串未闭合，缺少结束单引号'});
+        tokens.push({type:'LITERAL', value:str, code:301, line:startLine, col:startCol});
+        break;
+      }
+      i++; col++; // skip closing '
+      tokens.push({type:'LITERAL', value:str, code:301, line:startLine, col:startCol});
+      continue;
+    }
+    // 数字
+    if(/[0-9]/.test(ch)){
+      const startCol = col;
+      let num = '';
+      while(i < len && /[0-9.]/.test(sql[i])){ num += sql[i]; i++; col++; }
+      tokens.push({type:'LITERAL', value:num, code:302, line, col:startCol});
+      continue;
+    }
+    // 标识符 / 关键字
+    if(/[a-zA-Z_]/.test(ch)){
+      const startCol = col;
+      let ident = '';
+      while(i < len && /[a-zA-Z0-9_]/.test(sql[i])){ ident += sql[i]; i++; col++; }
+      const upper = ident.toUpperCase();
+      if(KEYWORDS.includes(upper)){
+        tokens.push({type:'KEYWORD', value:upper, code:101, line, col:startCol});
+      } else {
+        tokens.push({type:'IDENTIFIER', value:ident, code:201, line, col:startCol});
+      }
+      continue;
+    }
+    // 操作符
+    const twoChar = sql.substring(i, i+2);
+    if(['>=','<=','<>','!=','||','&&'].includes(twoChar)){
+      tokens.push({type:'OPERATOR', value:twoChar, code:401, line, col});
+      i += 2; col += 2;
+      continue;
+    }
+    if(['+','-','*','/','=','>','<','%'].includes(ch)){
+      tokens.push({type:'OPERATOR', value:ch, code:401, line, col});
+      i++; col++;
+      continue;
+    }
+    // 标点
+    if(['(',')',',',';','.'].includes(ch)){
+      tokens.push({type:'PUNCTUATION', value:ch, code:501, line, col});
+      i++; col++;
+      continue;
+    }
+    // 非法字符
+    errors.push({type:'词法错误', line, col, message:`非法字符 '${ch}' (ASCII ${ch.charCodeAt(0)})`});
+    i++; col++;
+  }
+  return { tokens, errors };
+}
+
+// 简易语法分析 - 生成AST（基于SQL类型）
+function parser(tokens, sql){
+  const errors = [];
+  const first = tokens.find(t => t.type === 'KEYWORD');
+  if(!first){
+    errors.push({type:'语法错误', line:1, col:1, message:'空 SQL 语句或缺少有效关键字'});
+    return { ast:null, errors };
+  }
+  // 检查分号
+  const hasSemicolon = tokens.some(t => t.type === 'PUNCTUATION' && t.value === ';');
+  if(!hasSemicolon && sql.trim().length > 0){
+    errors.push({type:'语法错误', line:1, col:sql.length+1, message:'语句缺少结束分号 ;，期望在语句末尾添加分号'});
+  }
+
+  const kw = first.value;
+  let ast = null;
+
+  if(kw === 'CREATE'){
+    const tableName = tokens.find(t => t.type === 'IDENTIFIER' && tokens.indexOf(t) > tokens.indexOf(first));
+    ast = {
+      type:'CreateTable',
+      tableName: tableName ? tableName.value : 'unknown',
+      columns: extractColumns(tokens),
+      location:{line:first.line, col:first.col}
+    };
+  } else if(kw === 'INSERT'){
+    const tableName = tokens.find((t,idx) => t.type === 'IDENTIFIER' && idx > tokens.findIndex(x=>x.value==='INTO'));
+    ast = {
+      type:'Insert',
+      tableName: tableName ? tableName.value : 'unknown',
+      columns: extractInsertColumns(tokens),
+      values: extractValues(tokens),
+      location:{line:first.line, col:first.col}
+    };
+  } else if(kw === 'SELECT'){
+    ast = {
+      type:'Select',
+      projections: extractProjections(tokens),
+      fromTable: extractFromTable(tokens),
+      whereClause: extractWhere(tokens),
+      orderBy: extractOrderBy(tokens),
+      location:{line:first.line, col:first.col}
+    };
+  } else if(kw === 'DELETE'){
+    ast = {
+      type:'Delete',
+      tableName: extractFromTable(tokens) || 'unknown',
+      whereClause: extractWhere(tokens),
+      location:{line:first.line, col:first.col}
+    };
+  } else {
+    errors.push({type:'语法错误', line:first.line, col:first.col, message:`不支持的 SQL 语句类型: ${kw}`});
+  }
+  return { ast, errors };
+}
+
+function extractColumns(tokens){
+  const cols = [];
+  const parenStart = tokens.findIndex(t => t.value === '(');
+  const parenEnd = tokens.findIndex((t,idx) => idx > parenStart && t.value === ')');
+  if(parenStart < 0) return cols;
+  let i = parenStart + 1;
+  while(i < parenEnd && i < tokens.length){
+    if(tokens[i].type === 'IDENTIFIER'){
+      const colName = tokens[i].value;
+      let colType = 'UNKNOWN';
+      if(tokens[i+1] && tokens[i+1].type === 'KEYWORD' && ['INT','VARCHAR','FLOAT'].includes(tokens[i+1].value)){
+        colType = tokens[i+1].value;
+      }
+      const isPK = tokens.slice(i, i+5).some(t => t.value === 'PRIMARY') && tokens.slice(i,i+6).some(t=>t.value==='KEY');
+      cols.push({name:colName, type:colType, pk:isPK});
+    }
+    i++;
+  }
+  return cols;
+}
+function extractInsertColumns(tokens){
+  const parenStart = tokens.findIndex(t => t.value === '(');
+  const parenEnd = tokens.findIndex((t,idx) => idx > parenStart && t.value === ')');
+  const cols = [];
+  if(parenStart < 0) return cols;
+  for(let i = parenStart+1; i < parenEnd; i++){
+    if(tokens[i].type === 'IDENTIFIER') cols.push(tokens[i].value);
+  }
+  return cols;
+}
+function extractValues(tokens){
+  const valuesIdx = tokens.findIndex(t => t.value === 'VALUES');
+  if(valuesIdx < 0) return [];
+  const vals = [];
+  for(let i = valuesIdx+1; i < tokens.length; i++){
+    if(tokens[i].type === 'LITERAL') vals.push(tokens[i].value);
+  }
+  return vals;
+}
+function extractProjections(tokens){
+  const selectIdx = tokens.findIndex(t => t.value === 'SELECT');
+  const fromIdx = tokens.findIndex(t => t.value === 'FROM');
+  const projs = [];
+  for(let i = selectIdx+1; i < fromIdx && i < tokens.length; i++){
+    if(tokens[i].type === 'IDENTIFIER' || (tokens[i].type === 'OPERATOR' && tokens[i].value === '*')){
+      projs.push(tokens[i].value);
+    }
+  }
+  return projs.length ? projs : ['*'];
+}
+function extractFromTable(tokens){
+  const fromIdx = tokens.findIndex(t => t.value === 'FROM');
+  if(fromIdx < 0) return null;
+  for(let i = fromIdx+1; i < tokens.length; i++){
+    if(tokens[i].type === 'IDENTIFIER') return tokens[i].value;
+    if(tokens[i].type === 'KEYWORD' && tokens[i].value !== 'FROM') break;
+  }
+  return null;
+}
+function extractWhere(tokens){
+  const whereIdx = tokens.findIndex(t => t.value === 'WHERE');
+  if(whereIdx < 0) return null;
+  let expr = '';
+  for(let i = whereIdx+1; i < tokens.length; i++){
+    if(tokens[i].type === 'KEYWORD' && ['ORDER','GROUP','LIMIT',';'].includes(tokens[i].value)) break;
+    if(tokens[i].value === ';') break;
+    expr += (expr?' ':'') + tokens[i].value;
+  }
+  return expr || null;
+}
+function extractOrderBy(tokens){
+  const orderIdx = tokens.findIndex(t => t.value === 'ORDER');
+  if(orderIdx < 0) return null;
+  let expr = '';
+  for(let i = orderIdx+1; i < tokens.length; i++){
+    if(tokens[i].value === ';') break;
+    if(tokens[i].type === 'KEYWORD' && tokens[i].value !== 'BY' && tokens[i].value !== 'ASC' && tokens[i].value !== 'DESC') break;
+    expr += (expr?' ':'') + tokens[i].value;
+  }
+  return expr || null;
+}
+
+// 语义分析
+function semanticAnalysis(ast, catalog){
+  const errors = [];
+  const checks = [];
+  if(!ast) return { errors, checks };
+
+  // 检查表存在性
+  const tableName = ast.tableName || ast.fromTable;
+  const tableExists = catalog.tables.some(t => t.name === tableName) || catalog.systemTables.some(t => t.name === tableName);
+  if(ast.type !== 'CreateTable'){
+    if(tableName && !tableExists){
+      errors.push({type:'语义错误', line:ast.location.line, col:ast.location.col, message:`表 '${tableName}' 不存在于 Catalog 模式目录中`});
+      checks.push({pass:false, text:`表存在性检查`, detail:`表 '${tableName}' 未找到`});
+    } else {
+      checks.push({pass:true, text:`表存在性检查`, detail:`表 '${tableName}' 存在`});
+    }
+  }
+
+  // 检查字段存在性
+  const tbl = catalog.tables.find(t => t.name === tableName);
+  if(tbl && ast.projections){
+    ast.projections.forEach(col => {
+      if(col !== '*' && !tbl.columns.some(c => c.name === col)){
+        errors.push({type:'语义错误', line:ast.location.line, col:ast.location.col, message:`字段 '${col}' 在表 '${tableName}' 中不存在`});
+        checks.push({pass:false, text:`字段存在性: ${col}`, detail:`表 '${tableName}' 无此字段`});
+      } else {
+        checks.push({pass:true, text:`字段存在性: ${col}`, detail:col==='*'?'通配符':'字段有效'});
+      }
+    });
+  }
+
+  // INSERT 值数目检查
+  if(ast.type === 'Insert' && ast.columns.length > 0 && ast.values.length > 0){
+    if(ast.columns.length !== ast.values.length){
+      errors.push({type:'语义错误', line:ast.location.line, col:ast.location.col,
+        message:`INSERT 值数目不匹配: 列数 ${ast.columns.length}, 值数 ${ast.values.length}`});
+      checks.push({pass:false, text:`值数目匹配`, detail:`列 ${ast.columns.length} ≠ 值 ${ast.values.length}`});
+    } else {
+      checks.push({pass:true, text:`值数目匹配`, detail:`列数与值数一致 (${ast.columns.length})`});
+    }
+  }
+
+  // 类型检查（简化）
+  if(ast.type === 'Insert' && tbl){
+    ast.columns.forEach((col, idx) => {
+      const colDef = tbl.columns.find(c => c.name === col);
+      if(colDef && ast.values[idx]){
+        const val = ast.values[idx];
+        if(colDef.type === 'INT' && isNaN(Number(val))){
+          errors.push({type:'语义错误', line:ast.location.line, col:ast.location.col,
+            message:`类型不匹配: 字段 '${col}' 类型为 INT，但值 '${val}' 不是有效整数`});
+          checks.push({pass:false, text:`类型检查: ${col}`, detail:`INT ≠ '${val}'`});
+        } else {
+          checks.push({pass:true, text:`类型检查: ${col}`, detail:`类型兼容`});
+        }
+      }
+    });
+  }
+
+  if(checks.length === 0){
+    checks.push({pass:true, text:'基础语义校验', detail:'通过'});
+  }
+  return { errors, checks };
+}
+
+// 生成执行计划
+function generatePlan(ast){
+  if(!ast) return null;
+  if(ast.type === 'Select'){
+    return {
+      operator:'Project',
+      desc:`投影字段: ${ast.projections.join(', ')}`,
+      cost:'0.02',
+      child:{
+        operator:'Filter',
+        desc: ast.whereClause ? `过滤条件: ${ast.whereClause}` : '无过滤条件 (全表扫描)',
+        cost:'0.05',
+        child:{
+          operator:'SeqScan',
+          desc:`顺序扫描表: ${ast.fromTable || 'unknown'}`,
+          cost:'0.10',
+          child:null
+        }
+      }
+    };
+  }
+  if(ast.type === 'Insert'){
+    return { operator:'Insert', desc:`向表 ${ast.tableName} 插入 ${ast.values.length} 条记录`, cost:'0.08', child:null };
+  }
+  if(ast.type === 'CreateTable'){
+    return { operator:'CreateTable', desc:`创建表 ${ast.tableName}，共 ${ast.columns.length} 个字段`, cost:'0.03', child:null };
+  }
+  if(ast.type === 'Delete'){
+    return {
+      operator:'Delete',
+      desc:`从表 ${ast.tableName} 删除记录`,
+      cost:'0.06',
+      child:{
+        operator:'Filter',
+        desc: ast.whereClause ? `过滤条件: ${ast.whereClause}` : '无过滤 (删除全部)',
+        cost:'0.05',
+        child:{ operator:'SeqScan', desc:`顺序扫描表: ${ast.tableName}`, cost:'0.10', child:null }
+      }
+    };
+  }
+  return null;
+}
+
+// ============================================================
+//   渲染各面板
+// ============================================================
+
+function renderTokens(tokens){
+  const empty = document.getElementById('token-empty');
+  const wrap = document.getElementById('token-table-wrap');
+  const tbody = document.getElementById('token-tbody');
+  if(!tokens || tokens.length === 0){
+    empty.style.display = 'flex'; wrap.style.display = 'none';
+    document.getElementById('count-token').textContent = '0';
+    return;
+  }
+  empty.style.display = 'none'; wrap.style.display = 'block';
+  tbody.innerHTML = tokens.map(t => {
+    const typeClass = t.type === 'KEYWORD' ? 'tt-keyword' : t.type === 'IDENTIFIER' ? 'tt-identifier' : t.type === 'LITERAL' ? 'tt-literal' : t.type === 'OPERATOR' ? 'tt-operator' : 'tt-punctuation';
+    return `<tr>
+      <td class="mono">${t.code}</td>
+      <td><span class="token-type ${typeClass}">${t.type}</span></td>
+      <td class="mono">${escapeHtml(t.value)}</td>
+      <td class="num">${t.line}</td>
+      <td class="num">${t.col}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('count-token').textContent = tokens.length;
+  document.getElementById('count-token').className = 'count has-data';
+}
+
+function renderAST(ast){
+  const empty = document.getElementById('ast-empty');
+  const tree = document.getElementById('ast-tree');
+  if(!ast){ empty.style.display='flex'; tree.style.display='none'; return; }
+  empty.style.display='none'; tree.style.display='block';
+  tree.innerHTML = buildASTNode(ast, 0);
+}
+function buildASTNode(node, depth){
+  if(!node) return '';
+  let label = `<span class="node-type">${node.type}</span>`;
+  if(node.tableName) label += ` <span class="node-val">"${node.tableName}"</span>`;
+  if(node.fromTable) label += ` <span class="node-val">FROM ${node.fromTable}</span>`;
+  if(node.projections) label += ` <span class="node-detail">[${node.projections.join(', ')}]</span>`;
+  if(node.whereClause) label += ` <span class="node-detail">WHERE ${node.whereClause}</span>`;
+  if(node.columns && node.columns.length) label += ` <span class="node-detail">(${node.columns.map(c=>c.name+' '+c.type).join(', ')})</span>`;
+  if(node.values && node.values.length) label += ` <span class="node-detail">VALUES(${node.values.join(', ')})</span>`;
+
+  let children = '';
+  if(node.columns && node.columns.length){
+    children += node.columns.map(c =>
+      `<div class="ast-node"><div class="ast-node-label"><span class="ast-toggle">&#9654;</span><span class="node-type">ColumnDef</span> <span class="node-val">${c.name}</span> <span class="node-detail">${c.type}${c.pk?' PRIMARY KEY':''}</span></div></div>`
+    ).join('');
+  }
+  if(node.projections){
+    children += node.projections.map(p =>
+      `<div class="ast-node"><div class="ast-node-label"><span class="ast-toggle">&#9654;</span><span class="node-type">Projection</span> <span class="node-val">${p}</span></div></div>`
+    ).join('');
+  }
+  if(node.whereClause){
+    children += `<div class="ast-node"><div class="ast-node-label"><span class="ast-toggle">&#9654;</span><span class="node-type">WhereClause</span> <span class="node-detail">${node.whereClause}</span></div></div>`;
+  }
+
+  const hasChildren = children || (node.child);
+  return `<div class="ast-node">
+    <div class="ast-node-label" onclick="this.nextElementSibling && (this.nextElementSibling.style.display = this.nextElementSibling.style.display==='none'?'':'none')">
+      <span class="ast-toggle">${hasChildren?'&#9660;':'&#8226;'}</span>
+      ${label}
+    </div>
+    ${hasChildren ? `<div class="ast-children">${children}${node.child ? buildASTNode(node.child, depth+1) : ''}</div>` : ''}
+  </div>`;
+}
+
+function renderSemantic(ast, checks, catalog){
+  const empty = document.getElementById('semantic-empty');
+  const grid = document.getElementById('semantic-grid');
+  if(!ast){ empty.style.display='flex'; grid.style.display='none'; return; }
+  empty.style.display='none'; grid.style.display='flex';
+
+  // Catalog 侧
+  const catBody = document.getElementById('semantic-catalog');
+  let catHtml = '';
+  catalog.tables.forEach(tbl => {
+    catHtml += `<div style="padding:8px 16px;border-bottom:1px solid var(--border)">
+      <div style="font-weight:600;font-size:12px;color:var(--cyan);margin-bottom:4px;font-family:var(--font-mono)">${tbl.name}</div>
+      <table style="width:100%;font-size:11px">
+        ${tbl.columns.map(c => `<tr><td style="padding:2px 0;color:var(--text-secondary)">${c.pk?'<span style="color:var(--warning)">PK </span>':''}${c.name}</td><td style="text-align:right;font-family:var(--font-mono);color:var(--text-muted)">${c.type}</td></tr>`).join('')}
+      </table>
+    </div>`;
+  });
+  catBody.innerHTML = catHtml;
+
+  // 校验项侧
+  const checkBody = document.getElementById('semantic-checks');
+  checkBody.innerHTML = checks.map(c =>
+    `<div class="check-item ${c.pass?'pass':'fail'}">
+      <span class="ci-icon">
+        ${c.pass
+          ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>'
+          : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'}
+      </span>
+      <span class="ci-text">${c.text}</span>
+      <span class="ci-detail">${c.detail}</span>
+    </div>`
+  ).join('');
+
+  const failCount = checks.filter(c => !c.pass).length;
+  const countEl = document.getElementById('count-semantic');
+  countEl.textContent = checks.length;
+  countEl.className = failCount > 0 ? 'count has-error' : 'count has-data';
+}
+
+function renderPlan(plan){
+  const empty = document.getElementById('plan-empty');
+  const tree = document.getElementById('plan-tree');
+  if(!plan){ empty.style.display='flex'; tree.style.display='none'; return; }
+  empty.style.display='none'; tree.style.display='block';
+  tree.innerHTML = buildPlanNode(plan);
+}
+function buildPlanNode(node){
+  if(!node) return '';
+  const opClass = 'op-' + node.operator.toLowerCase().replace(/[^a-z]/g,'');
+  const iconMap = {
+    'SeqScan':'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>',
+    'Filter':'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>',
+    'Project':'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/></svg>',
+    'Insert':'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+    'CreateTable':'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
+    'Delete':'<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>'
+  };
+  const colorMap = {'SeqScan':'var(--cyan)','Filter':'var(--warning)','Project':'var(--purple)','Insert':'var(--success)','CreateTable':'var(--orange)','Delete':'var(--error)'};
+  const color = colorMap[node.operator] || 'var(--accent)';
+
+  return `<div class="plan-node ${opClass}">
+    <div class="op-icon" style="background:${color}22;color:${color}">${iconMap[node.operator] || iconMap['Project']}</div>
+    <div class="op-info">
+      <div class="op-name" style="color:${color}">${node.operator}</div>
+      <div class="op-desc">${node.desc}</div>
+    </div>
+    <div class="op-cost">cost=${node.cost}</div>
+  </div>
+  ${node.child ? `<div class="plan-children">${buildPlanNode(node.child)}</div>` : ''}`;
+}
+
+function renderResult(ast, isExecute){
+  const empty = document.getElementById('result-empty');
+  const content = document.getElementById('result-content');
+  if(!ast || !isExecute){
+    empty.style.display = isExecute ? 'flex' : 'flex';
+    content.style.display = 'none';
+    if(!isExecute && ast){
+      empty.style.display = 'none';
+      content.style.display = 'block';
+      content.innerHTML = `<div class="result-header">
+        <div class="rh-status" style="color:var(--warning)">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          仅编译模式
+        </div>
+        <div class="rh-meta">编译成功，未执行存储操作。点击「执行」运行 SQL。</div>
+      </div>`;
+    }
+    return;
+  }
+  empty.style.display = 'none';
+  content.style.display = 'block';
+
+  let html = '';
+  if(ast.type === 'Select'){
+    const cols = ast.projections.includes('*') ? ['id','name','age','major'] : ast.projections;
+    const mockData = [
+      {id:1, name:'Alice', age:20, major:'CS'},
+      {id:2, name:'Bob', age:21, major:'SE'},
+      {id:3, name:'Carol', age:19, major:'DS'}
+    ];
+    html = `<div class="result-header">
+      <div class="rh-status success">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+        查询成功
+      </div>
+      <div class="rh-meta">返回 ${mockData.length} 行，耗时 0.003s</div>
+    </div>
+    <div class="result-table-wrap">
+      <table class="data-table">
+        <colgroup>${cols.map(()=>'<col style="width:'+Math.floor(100/cols.length)+'%">').join('')}</colgroup>
+        <thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead>
+        <tbody>${mockData.map(row => `<tr>${cols.map(c => `<td class="mono">${row[c] !== undefined ? row[c] : 'NULL'}</td>`).join('')}</tr>`).join('')}</tbody>
+      </table>
+    </div>`;
+  } else if(ast.type === 'Insert'){
+    html = `<div class="result-header">
+      <div class="rh-status success">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+        插入成功
+      </div>
+      <div class="rh-meta">向表 '${ast.tableName}' 成功插入 ${ast.values.length} 条记录，耗时 0.002s</div>
+    </div>`;
+  } else if(ast.type === 'CreateTable'){
+    html = `<div class="result-header">
+      <div class="rh-status success">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+        建表成功
+      </div>
+      <div class="rh-meta">表 '${ast.tableName}' 创建成功，共 ${ast.columns.length} 个字段，已分配 1 个数据页</div>
+    </div>`;
+  } else if(ast.type === 'Delete'){
+    html = `<div class="result-header">
+      <div class="rh-status success">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+        删除成功
+      </div>
+      <div class="rh-meta">从表 '${ast.tableName}' 删除满足条件的记录，耗时 0.001s</div>
+    </div>`;
+  }
+  content.innerHTML = html;
+}
+
+function renderStorageLogs(){
+  const empty = document.getElementById('storage-empty');
+  const list = document.getElementById('storage-logs');
+  if(state.storageLogs.length === 0){
+    empty.style.display='flex'; list.style.display='none';
+    document.getElementById('count-storage').textContent = '0';
+    return;
+  }
+  empty.style.display='none'; list.style.display='block';
+  list.innerHTML = state.storageLogs.map(log =>
+    `<div class="log-entry">
+      <span class="log-time">${log.time}</span>
+      <span class="log-op ${log.opClass}">${log.op}</span>
+      <span class="log-page">page ${log.page}</span>
+      <span class="log-msg">${log.msg}</span>
+    </div>`
+  ).join('');
+  const countEl = document.getElementById('count-storage');
+  countEl.textContent = state.storageLogs.length;
+  countEl.className = 'count has-data';
+}
+
+function renderErrors(){
+  const empty = document.getElementById('errors-empty');
+  const list = document.getElementById('error-list');
+  if(state.errors.length === 0){
+    empty.style.display='flex'; list.style.display='none';
+    document.getElementById('count-errors').textContent = '0';
+    return;
+  }
+  empty.style.display='none'; list.style.display='block';
+  const iconMap = {
+    '词法错误':{cls:'lexical', label:'词'},
+    '语法错误':{cls:'syntax', label:'语'},
+    '语义错误':{cls:'semantic', label:'义'},
+    '运行时错误':{cls:'runtime', label:'运'},
+    '存储IO错误':{cls:'storage', label:'存'}
+  };
+  list.innerHTML = state.errors.map(err => {
+    const info = iconMap[err.type] || {cls:'runtime', label:'?'};
+    return `<div class="error-entry">
+      <div class="err-icon ${info.cls}">${info.label}</div>
+      <div class="err-body">
+        <div class="err-title">${err.type}</div>
+        <div class="err-meta">位置: 行 ${err.line}, 列 ${err.col}</div>
+        <div class="err-msg">${err.message}</div>
+      </div>
+    </div>`;
+  }).join('');
+  const countEl = document.getElementById('count-errors');
+  countEl.textContent = state.errors.length;
+  countEl.className = 'count has-error';
+}
+
+// ============================================================
+//   核心操作：编译 / 执行
+// ============================================================
+
+function compileOnly(){
+  const sql = document.getElementById('sqlEditor').value.trim();
+  if(!sql){ showToast('error','无法编译','SQL 编辑器为空，请输入 SQL 语句'); return; }
+  state.errors = [];
+  state.storageLogs = [];
+
+  // 词法
+  const lexResult = lexer(sql);
+  state.errors.push(...lexResult.errors);
+  renderTokens(lexResult.tokens);
+
+  // 语法
+  const parseResult = parser(lexResult.tokens, sql);
+  state.errors.push(...parseResult.errors);
+  renderAST(parseResult.ast);
+
+  // 语义
+  const semResult = semanticAnalysis(parseResult.ast, state.catalog);
+  state.errors.push(...semResult.errors);
+  renderSemantic(parseResult.ast, semResult.checks, state.catalog);
+
+  // 执行计划
+  const plan = generatePlan(parseResult.ast);
+  renderPlan(plan);
+
+  // 结果（仅编译）
+  renderResult(parseResult.ast, false);
+  renderStorageLogs();
+  renderErrors();
+
+  if(state.errors.length > 0){
+    switchPanel('errors');
+    showToast('error','编译完成', `发现 ${state.errors.length} 个错误，已切换到错误控制台`);
+  } else {
+    switchPanel('token');
+    showToast('success','编译成功','词法、语法、语义分析全部通过，执行计划已生成');
+  }
+}
+
+function executeSQL(){
+  const sql = document.getElementById('sqlEditor').value.trim();
+  if(!sql){ showToast('error','无法执行','SQL 编辑器为空，请输入 SQL 语句'); return; }
+  state.errors = [];
+
+  // 先编译
+  const lexResult = lexer(sql);
+  state.errors.push(...lexResult.errors);
+  renderTokens(lexResult.tokens);
+
+  const parseResult = parser(lexResult.tokens, sql);
+  state.errors.push(...parseResult.errors);
+  renderAST(parseResult.ast);
+
+  const semResult = semanticAnalysis(parseResult.ast, state.catalog);
+  state.errors.push(...semResult.errors);
+  renderSemantic(parseResult.ast, semResult.checks, state.catalog);
+
+  const plan = generatePlan(parseResult.ast);
+  renderPlan(plan);
+
+  if(state.errors.length > 0){
+    renderResult(null, true);
+    renderStorageLogs();
+    renderErrors();
+    switchPanel('errors');
+    showToast('error','执行失败', `编译阶段发现 ${state.errors.length} 个错误，已中止执行`);
+    return;
+  }
+
+  // 模拟存储日志
+  generateStorageLogs(parseResult.ast);
+  renderStorageLogs();
+  renderResult(parseResult.ast, true);
+  renderErrors();
+  switchPanel('result');
+
+  // 更新统计
+  state.stats.usedPages = Math.min(state.stats.totalPages, state.stats.usedPages + 1);
+  state.stats.cacheHits += Math.floor(Math.random()*5)+2;
+  updateStats();
+  showToast('success','执行成功','SQL 已执行，存储日志已记录到底层页式存储系统');
+}
+
+function generateStorageLogs(ast){
+  const now = new Date();
+  const time = () => {
+    const d = new Date(now.getTime() + state.storageLogs.length * 3);
+    return d.toTimeString().substring(0,8) + '.' + String(d.getMilliseconds()).padStart(3,'0');
+  };
+  const page = () => Math.floor(Math.random()*23)+1;
+
+  if(ast.type === 'Select'){
+    state.storageLogs.push(
+      {time:time(), op:'get_page', opClass:'get', page:page(), msg:`BufferPool: 请求页，表 ${ast.fromTable}`},
+      {time:time(), op:'hit', opClass:'hit', page:page(), msg:'缓存命中，直接返回页帧'},
+      {time:time(), op:'read_page', opClass:'read', page:page(), msg:'从磁盘读取页数据到缓存'},
+      {time:time(), op:'get_page', opClass:'get', page:page(), msg:'BufferPool: 请求下一页'},
+      {time:time(), op:'hit', opClass:'hit', page:page(), msg:'缓存命中'},
+      {time:time(), op:'read_page', opClass:'read', page:page(), msg:'磁盘读页，顺序扫描完成'}
+    );
+  } else if(ast.type === 'Insert'){
+    state.storageLogs.push(
+      {time:time(), op:'get_page', opClass:'get', page:page(), msg:`定位表 ${ast.tableName} 数据页`},
+      {time:time(), op:'read_page', opClass:'read', page:page(), msg:'读取页头，查找空闲槽位'},
+      {time:time(), op:'write_page', opClass:'write', page:page(), msg:`写入 ${ast.values.length} 条记录到页内槽位`},
+      {time:time(), op:'flush_page', opClass:'flush', page:page(), msg:'脏页刷新到磁盘，持久化完成'}
+    );
+  } else if(ast.type === 'CreateTable'){
+    state.storageLogs.push(
+      {time:time(), op:'get_page', opClass:'get', page:0, msg:'读取系统表 __sys_tables__ 页'},
+      {time:time(), op:'write_page', opClass:'write', page:0, msg:'写入表元数据到系统表'},
+      {time:time(), op:'get_page', opClass:'get', page:1, msg:'读取系统表 __sys_columns__ 页'},
+      {time:time(), op:'write_page', opClass:'write', page:1, msg:`写入 ${ast.columns.length} 个字段元数据`},
+      {time:time(), op:'write_page', opClass:'write', page:page(), msg:'分配新数据页，初始化页头'}
+    );
+  } else if(ast.type === 'Delete'){
+    state.storageLogs.push(
+      {time:time(), op:'get_page', opClass:'get', page:page(), msg:`定位表 ${ast.tableName} 数据页`},
+      {time:time(), op:'read_page', opClass:'read', page:page(), msg:'读取页内记录，逐条匹配过滤条件'},
+      {time:time(), op:'write_page', opClass:'write', page:page(), msg:'标记删除满足条件的记录槽位'},
+      {time:time(), op:'flush_page', opClass:'flush', page:page(), msg:'刷新修改后的页到磁盘'}
+    );
+  }
+  // LRU 淘汰模拟
+  if(Math.random() > 0.5){
+    state.storageLogs.push({time:time(), op:'evict', opClass:'evict', page:page(), msg:`缓存已满，${state.cachePolicy} 策略淘汰该页`});
+    state.stats.cacheMiss++;
+  }
+}
+
+function updateStats(){
+  document.getElementById('statTotalPages').textContent = state.stats.totalPages;
+  document.getElementById('statUsedPages').textContent = state.stats.usedPages;
+  document.getElementById('statCacheHits').textContent = state.stats.cacheHits;
+  document.getElementById('statHitRate').textContent = (state.stats.cacheHits / (state.stats.cacheHits + state.stats.cacheMiss) * 100).toFixed(1) + '%';
+  document.getElementById('sb-pages').textContent = `页: ${state.stats.usedPages}/${state.stats.totalPages}`;
+}
+
+// ============================================================
+//   工具栏操作
+// ============================================================
+
+function clearAll(){
+  state.errors = [];
+  state.storageLogs = [];
+  renderTokens([]);
+  renderAST(null);
+  renderSemantic(null, [], state.catalog);
+  renderPlan(null);
+  renderResult(null, false);
+  renderStorageLogs();
+  renderErrors();
+  showToast('info','已清空','所有输出面板已清空');
+}
+
+function clearEditor(){
+  document.getElementById('sqlEditor').value = '';
+  updateLineNumbers();
+}
+
+function formatSQL(){
+  const ta = document.getElementById('sqlEditor');
+  let sql = ta.value;
+  // 简易格式化：关键字大写 + 换行
+  const kwRegex = /\b(SELECT|FROM|WHERE|INSERT|INTO|VALUES|CREATE|TABLE|DELETE|UPDATE|SET|AND|OR|NOT|ORDER|BY|GROUP|HAVING|LIMIT|JOIN|ON|PRIMARY|KEY|INT|VARCHAR|FLOAT)\b/gi;
+  sql = sql.replace(kwRegex, m => m.toUpperCase());
+  sql = sql.replace(/\s+/g, ' ').trim();
+  // 在主要关键字前换行
+  ['FROM','WHERE','ORDER BY','GROUP BY','HAVING','LIMIT','VALUES'].forEach(kw => {
+    sql = sql.replace(new RegExp('\\b' + kw + '\\b', 'g'), '\n  ' + kw);
+  });
+  ta.value = sql;
+  updateLineNumbers();
+  showToast('info','已格式化','SQL 语句已自动格式化');
+}
+
+function importSQL(){
+  document.getElementById('fileInput').click();
+}
+function handleFileImport(event){
+  const file = event.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e){
+    document.getElementById('sqlEditor').value = e.target.result;
+    updateLineNumbers();
+    showToast('success','导入成功', `已加载文件: ${file.name}`);
+  };
+  reader.readAsText(file);
+  event.target.value = '';
+}
+
+function exportLogs(){
+  let text = '===== MiniDB IDE 导出日志 =====\n';
+  text += `导出时间: ${new Date().toLocaleString()}\n\n`;
+  text += `--- 存储日志 (${state.storageLogs.length} 条) ---\n`;
+  state.storageLogs.forEach(l => { text += `[${l.time}] ${l.op} page=${l.page} ${l.msg}\n`; });
+  text += `\n--- 错误信息 (${state.errors.length} 条) ---\n`;
+  state.errors.forEach(e => { text += `[${e.type}] 行${e.line}列${e.col}: ${e.message}\n`; });
+  const blob = new Blob([text], {type:'text/plain'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'minidb_logs.txt';
+  a.click();
+  showToast('success','导出成功','日志已导出为 minidb_logs.txt');
+}
+
+function simulateRestart(){
+  showToast('info','模拟重启中...','正在关闭引擎并从磁盘重新加载数据...');
+  setTimeout(() => {
+    state.storageLogs = [];
+    const now = new Date().toTimeString().substring(0,8);
+    state.storageLogs.push(
+      {time:now+'.000', op:'read_page', opClass:'read', page:0, msg:'系统重启: 加载系统表 __sys_tables__'},
+      {time:now+'.003', op:'read_page', opClass:'read', page:1, msg:'系统重启: 加载系统表 __sys_columns__'},
+      {time:now+'.006', op:'get_page', opClass:'get', page:2, msg:'恢复用户表数据页，缓存初始化'},
+      {time:now+'.009', op:'hit', opClass:'hit', page:2, msg:'数据持久化验证通过，所有表已恢复'}
+    );
+    renderStorageLogs();
+    switchPanel('storage');
+    showToast('success','重启完成','数据已从磁盘成功恢复，持久化验证通过');
+  }, 1200);
+}
+
+function resetDatabase(){
+  if(!confirm('确定要重置整个数据库吗？所有表、数据和页文件将被清空。')) return;
+  state.catalog.tables = [];
+  state.storageLogs = [];
+  state.errors = [];
+  state.stats = { totalPages:128, usedPages:0, cacheHits:0, cacheMiss:0 };
+  renderCatalog();
+  updateStats();
+  clearAll();
+  showToast('success','重置完成','数据库已重置，所有数据和页文件已清空');
+}
+
+function setCachePolicy(policy){
+  state.cachePolicy = policy;
+  document.getElementById('policyLRU').style.background = policy === 'LRU' ? 'var(--accent-dim)' : '';
+  document.getElementById('policyLRU').style.color = policy === 'LRU' ? 'var(--accent)' : '';
+  document.getElementById('policyFIFO').style.background = policy === 'FIFO' ? 'var(--accent-dim)' : '';
+  document.getElementById('policyFIFO').style.color = policy === 'FIFO' ? 'var(--accent)' : '';
+  document.getElementById('cachePolicyLabel').textContent = `缓存策略: ${policy}`;
+  showToast('info','策略已切换', `缓存替换策略已切换为 ${policy}`);
+}
+
+// ============================================================
+//   工具函数
+// ============================================================
+
+function escapeHtml(str){
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function showToast(type, title, msg){
+  const container = document.getElementById('toastContainer');
+  const icons = {
+    success:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>',
+    error:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--error)" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>',
+    info:'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>'
+  };
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  toast.innerHTML = `<div class="toast-icon">${icons[type] || icons.info}</div>
+    <div class="toast-body"><div class="toast-title">${title}</div><div class="toast-msg">${msg}</div></div>`;
+  container.appendChild(toast);
+  setTimeout(() => {
+    toast.style.opacity = '0';
+    toast.style.transform = 'translateX(20px)';
+    toast.style.transition = 'all 0.3s';
+    setTimeout(() => toast.remove(), 300);
+  }, 3000);
+}
+</script>
+</body>
+</html>
+<!-- （注：内容由AI生成） -->
