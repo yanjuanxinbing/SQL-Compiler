@@ -11,11 +11,6 @@
 #include "lexer/Token.h"
 #include "plan/Plan.h"
 
-#ifdef _WIN32
-#include <fcntl.h>
-#include <io.h>
-#endif
-
 namespace {
 
 // ============ 调试输出模式（Phase 1.5）============
@@ -96,93 +91,6 @@ void PrintAst(const sqlcompiler::Statement* ast) {
 // 打印一行带缩进的文本：用于 plan 树的格式化输出。空文本走 "(empty ...)"
 // 兜底提示。label 在头部方括号里用作分类标签，方便用户区分 \.plan vs
 // \.optimized；body 是已经预先渲染好的 ToString() 输出。
-// ---- Phase 2: 可视化调试输出 ----
-// PrintDebugJson：以 JSON 格式输出完整的编译+存储调试信息，
-// 供 webui 后端 /api/query/debug 端点解析。
-void PrintDebugJson(const sqlcompiler::Database* database) {
-    std::cout << "\n[DEBUG_JSON_START]" << std::endl;
-
-    // Tokens
-    std::cout << "{\"tokens\":[";
-    const auto& tokens = database->LastTokens();
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        if (i > 0) std::cout << ",";
-        std::cout << "{\"type\":\"" << sqlcompiler::TokenTypeToString(tokens[i].type)
-                  << "\",\"lexeme\":\"" << EscapeForDisplay(tokens[i].lexeme)
-                  << "\",\"line\":" << tokens[i].line
-                  << ",\"col\":" << tokens[i].column << "}";
-    }
-    std::cout << "]," << std::endl;
-
-    // AST text
-    std::cout << "\"ast_text\":\"";
-    const auto* ast = database->LastAst();
-    if (ast) {
-        std::string s = ast->ToString();
-        for (char c : s) {
-            if (c == '\\') std::cout << "\\\\";
-            else if (c == '"') std::cout << "\\\"";
-            else if (c == '\n') std::cout << "\\n";
-            else if (c == '\r') std::cout << "\\r";
-            else if (c == '\t') std::cout << "\\t";
-            else std::cout << c;
-        }
-    }
-    std::cout << "\"," << std::endl;
-
-    // Plan JSON
-    std::cout << "\"plan_json\":\"";
-    const auto* plan = database->LastPlan();
-    if (plan) {
-        std::string j = plan->ToJson();
-        for (char c : j) {
-            if (c == '\\') std::cout << "\\\\";
-            else if (c == '"') std::cout << "\\\"";
-            else if (c == '\n') std::cout << "\\n";
-            else if (c == '\r') std::cout << "\\r";
-            else if (c == '\t') std::cout << "\\t";
-            else std::cout << c;
-        }
-    }
-    std::cout << "\"," << std::endl;
-
-    // Plan before optimization (text)
-    std::cout << "\"plan_before_opt\":\"";
-    const std::string& before = database->LastPlanBeforeOptText();
-    for (char c : before) {
-        if (c == '\\') std::cout << "\\\\";
-        else if (c == '"') std::cout << "\\\"";
-        else if (c == '\n') std::cout << "\\n";
-        else if (c == '\r') std::cout << "\\r";
-        else if (c == '\t') std::cout << "\\t";
-        else std::cout << c;
-    }
-    std::cout << "\"," << std::endl;
-
-    // Storage stats
-    const auto& stats = database->Storage().GetStats();
-    std::cout << "\"storage_stats\":{"
-              << "\"hit_count\":" << stats.hit_count
-              << ",\"miss_count\":" << stats.miss_count
-              << ",\"replacement_count\":" << stats.replacement_count
-              << ",\"hit_rate\":" << stats.HitRate()
-              << ",\"total_pages\":" << database->GetDiskManager()->GetNumPages()
-              << "}," << std::endl;
-
-    // Replacement log (last 50 entries)
-    std::cout << "\"replacement_log\":[";
-    const auto& log = database->Storage().GetReplacementLog();
-    size_t log_start = (log.size() > 50) ? log.size() - 50 : 0;
-    for (size_t i = log_start; i < log.size(); ++i) {
-        if (i > log_start) std::cout << ",";
-        std::cout << "{\"evicted\":" << log[i].evicted_page_id
-                  << ",\"loaded\":" << log[i].loaded_page_id
-                  << ",\"dirty\":" << (log[i].evicted_was_dirty ? "true" : "false") << "}";
-    }
-    std::cout << "]}" << std::endl;
-    std::cout << "[DEBUG_JSON_END]" << std::endl;
-}
-
 void PrintIndentedBlock(const std::string& label, const std::string& body,
                         const std::string& empty_msg) {
     if (body.empty()) {
@@ -432,7 +340,7 @@ void PrintResult(const sqlcompiler::ExecutionResult& result) {
 //
 // 复杂度：HasCompleteStatement 自身是 O(|buffer|)，整体 O(N²)。对教学用的
 // 脚本（KB 级）足够快；工业级可换成单趟扫描的 statement splitter。
-bool RunScriptFile(sqlcompiler::Database* database, const std::string& path, bool debug_output) {
+bool RunScriptFile(sqlcompiler::Database* database, const std::string& path) {
     std::ifstream in(path);
     if (!in) {
         std::cerr << "Error: cannot open script file '" << path << "'" << std::endl;
@@ -450,7 +358,6 @@ bool RunScriptFile(sqlcompiler::Database* database, const std::string& path, boo
         if (trimmed.empty() || IsOnlyCommentsOrWhitespace(trimmed)) return false;
         auto result = database->ExecuteSQL(trimmed);
         PrintResult(result);
-        if (debug_output) PrintDebugJson(database);
         return true;
     };
 
@@ -515,8 +422,6 @@ int main(int argc, char** argv) {
     //   3) 都没有就用默认 "sqlcompiler.db"。
     std::string db_file = "sqlcompiler.db";
     std::vector<std::string> script_files;  // 多个 -f 依次执行
-    bool debug_output = false;              // --debug-output: 脚本模式输出 JSON 调试包
-    bool debug_repl = false;                // --debug: REPL 模式每条 SQL 后输出 JSON
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto take_next = [&](const std::string& flag) -> std::string {
@@ -531,19 +436,13 @@ int main(int argc, char** argv) {
             script_files.push_back(take_next(a));
         } else if (a.rfind("-f=", 0) == 0) {
             script_files.push_back(a.substr(3));
-        } else if (a == "--debug-output") {
-            debug_output = true;
-        } else if (a == "--debug") {
-            debug_repl = true;
         } else if (a == "-h" || a == "--help") {
-            std::cout << "Usage: sqlcompiler [db_file] [-f script.sql ...] [options]\n"
+            std::cout << "Usage: sqlcompiler [db_file] [-f script.sql ...]\n"
                       << "  db_file         Path to the database file "
                       << "(default: sqlcompiler.db)\n"
                       << "  -f <file>       Run <file> as a SQL script, then "
                       << "exit (repeatable)\n"
                       << "  --file, --source   Aliases for -f\n"
-                      << "  --debug-output  Output JSON debug info after each statement (script mode)\n"
-                      << "  --debug         Output JSON debug info after each REPL statement\n"
                       << "Inside the REPL you can also run: .source <file> "
                       << "(or .read <file>)\n";
             return 0;
@@ -572,7 +471,7 @@ int main(int argc, char** argv) {
     if (!script_files.empty()) {
         int rc = 0;
         for (const auto& f : script_files) {
-            if (!RunScriptFile(database, f, debug_output)) rc = 1;
+            if (!RunScriptFile(database, f)) rc = 1;
         }
         database->Shutdown();
         delete database;
@@ -658,7 +557,7 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 std::string path = rest.substr(ra, rb - ra + 1);
-                RunScriptFile(database, path, debug_repl);
+                RunScriptFile(database, path);
                 std::cout << "sqlcompiler> " << std::flush;
                 return true;
             };
@@ -717,7 +616,6 @@ int main(int argc, char** argv) {
         }
         auto result = database->ExecuteSQL(trimmed);
         PrintResult(result);
-        if (debug_repl) PrintDebugJson(database);
         sql.clear();
         std::cout << "sqlcompiler> " << std::flush;
     }

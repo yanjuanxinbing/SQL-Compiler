@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -81,10 +80,6 @@ private:
     // 每个事务最近一次 AppendRecord 的 LSN；AppendRecord 时用此值填 prev_lsn_。
     // 重启后由 RecoveryManager::AnalysisPass 从持久化日志重建。
     std::unordered_map<txn_id_t, lsn_t> last_lsn_per_txn_;
-    // LSN → WAL 文件内 byte 偏移。启动期 header-only 扫描时填充，
-    // 让后续按 LSN 定位记录 O(1)。读路径（ReadAll）走按 lsn 顺序的全
-    // 扫描，不需要这个索引；它主要服务于未来的「按 LSN 跳读」扩展。
-    std::unordered_map<lsn_t, size_t> lsn_to_offset_;
 
     // 平台抽象：open / close / write / sync
     bool OpenForAppend();
