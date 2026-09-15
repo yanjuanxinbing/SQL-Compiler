@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -45,9 +44,6 @@ from backend.schemas import (
     CloseDatabaseResponse,
     ColumnInfo,
     DatabaseFileInfo,
-    DebugData,
-    DebugRequest,
-    DebugResponse,
     ExecuteRequest,
     ExecuteResponse,
     HealthResponse,
@@ -55,13 +51,7 @@ from backend.schemas import (
     ListTablesResponse,
     OpenDatabaseRequest,
     OpenDatabaseResponse,
-    PageInfo,
-    ReplacementEntry,
-    ResetStorageResponse,
     StatementResult,
-    StoragePagesResponse,
-    StorageStats,
-    StorageStatsResponse,
     TableSchemaResponse,
     TableSummary,
     TokenInfo,
@@ -90,13 +80,6 @@ class AppSession:
     engine: Optional[SqlEngine] = None
     binary: Optional[Path] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    # Latest storage_stats / replacement_log observed during an
-    # `execute_debug` run.  The C++ engine keeps cumulative counters;
-    # we deliberately do *not* run a probe `SELECT 1` to fetch them
-    # because that would inflate the counters every time the user
-    # opens the storage tab, defeating the "Reset View" feature.
-    last_stats_raw: Optional[dict] = None
-    last_repl_log_raw: Optional[list] = None
 
 
 SESSION = AppSession()
@@ -109,31 +92,6 @@ def _engine_or_404() -> SqlEngine:
     if SESSION.engine is None or SESSION.db_path is None:
         raise HTTPException(status_code=409, detail="No database is currently open. Use /api/db/open first.")
     return SESSION.engine
-
-
-@asynccontextmanager
-async def _engine_call():
-    """Acquire the engine lock and yield the live SqlEngine.
-
-    The C++ engine is a single-process, single-threaded executable
-    that opens the same `.db` file.  Two concurrent requests against
-    it (e.g. a slow visualize run + a list_tables refresh) would each
-    spawn a subprocess pointing at the same database, and the second
-    one would race with the first one's writes — corrupting the
-    buffer-pool stats and potentially the WAL.  Wrapping every engine
-    call in this context manager serialises them and surfaces a clean
-    503 when the queue is overloaded.
-    """
-    if SESSION.lock.locked():
-        # If a previous request is still in flight, surface that
-        # immediately rather than letting the user stare at a spinner
-        # for the entire duration of the long-running query.
-        raise HTTPException(
-            status_code=503,
-            detail="Engine is busy with another request. Please retry shortly.",
-        )
-    async with SESSION.lock:
-        yield _engine_or_404()
 
 
 def _to_statement_result(block, elapsed_ms: int) -> StatementResult:
@@ -215,13 +173,6 @@ async def open_database(req: OpenDatabaseRequest) -> OpenDatabaseResponse:
 
     SESSION.engine = engine
     SESSION.db_path = str(p)
-    # Reset the storage stats cache.  The cumulative counters in the
-    # C++ engine are global across DB files (the engine process is
-    # reused), so showing the previous DB's numbers on a freshly
-    # opened file would be misleading.  The user must run a query on
-    # the new DB to refresh them.
-    SESSION.last_stats_raw = None
-    SESSION.last_repl_log_raw = None
     return OpenDatabaseResponse(
         success=True,
         db_path=str(p),
@@ -563,11 +514,11 @@ async def browse_directory(req: BrowseRequest) -> BrowseResponse:
 
 @router.post("/api/schema/tables", response_model=ListTablesResponse)
 async def schema_tables() -> ListTablesResponse:
-    async with _engine_call() as engine:
-        try:
-            ok, tables, msg = await list_tables(engine)
-        except EngineError as e:
-            raise HTTPException(status_code=500, detail=str(e)) from e
+    engine = _engine_or_404()
+    try:
+        ok, tables, msg = await list_tables(engine)
+    except EngineError as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
     if not ok:
         return ListTablesResponse(success=False, tables=[], message=msg or "SHOW TABLES failed")
     return ListTablesResponse(
@@ -621,6 +572,7 @@ async def schema_table(req: _TableBody) -> TableSchemaResponse:
 
 @router.post("/api/query/execute", response_model=ExecuteResponse)
 async def execute_query(req: ExecuteRequest) -> ExecuteResponse:
+    engine = _engine_or_404()
     statement = req.statement
     if not statement.strip():
         raise HTTPException(status_code=400, detail="Empty statement")
@@ -649,161 +601,4 @@ async def execute_query(req: ExecuteRequest) -> ExecuteResponse:
         total_elapsed_ms=total_ms,
         statement_count=len(results),
         aborted=aborted,
-    )
-
-
-# ── Visualization / Debug ────────────────────────────────────────────────────
-
-
-@router.post("/api/query/debug", response_model=DebugResponse)
-async def query_debug(req: DebugRequest) -> DebugResponse:
-    """Execute a SQL statement and return full visualization data.
-
-    Runs with --debug-output to capture: token stream, AST text,
-    plan JSON (before/after optimization), and storage stats.
-    """
-    statement = req.statement
-    if not statement.strip():
-        raise HTTPException(status_code=400, detail="Empty statement")
-    t0 = time.monotonic()
-    async with _engine_call() as engine:
-        try:
-            run, debug_raw = await engine.execute_debug(statement)
-        except EngineError as e:
-            raise HTTPException(status_code=500, detail=str(e)) from e
-    total_ms = int((time.monotonic() - t0) * 1000)
-    per_stmt_ms = (total_ms // max(1, len(run.blocks))) if run.blocks else total_ms
-    results = [_to_statement_result(blk, per_stmt_ms) for blk in run.blocks]
-
-    # Build DebugData from raw JSON
-    debug_data = None
-    malformed = 0
-    if debug_raw:
-        # Defensive parsing: the C++ engine emits well-formed tokens,
-        # but a future schema drift could land us here with a missing
-        # `type` or `lexeme`.  Pydantic's ValidationError would
-        # otherwise propagate as an uncaught 500.  Skip malformed
-        # entries and surface a flag in the message so the user can
-        # tell the visualisation is incomplete.
-        tokens_raw = debug_raw.get("tokens", []) or []
-        parsed_tokens: list[TokenInfo] = []
-        for t in tokens_raw:
-            try:
-                parsed_tokens.append(TokenInfo(**t))
-            except Exception:
-                malformed += 1
-        stats_raw = debug_raw.get("storage_stats") or {}
-        # Stash the raw counters on the session so /api/storage/stats
-        # can return them without triggering a fresh probe SELECT that
-        # would itself inflate the counters.
-        SESSION.last_stats_raw = stats_raw
-        SESSION.last_repl_log_raw = debug_raw.get("replacement_log") or []
-        storage_stats = StorageStats(
-            hit_count=stats_raw.get("hit_count", 0),
-            miss_count=stats_raw.get("miss_count", 0),
-            replacement_count=stats_raw.get("replacement_count", 0),
-            hit_rate=stats_raw.get("hit_rate", 0.0),
-            total_pages=stats_raw.get("total_pages", 0),
-        )
-        repl_log = [ReplacementEntry(**e) for e in SESSION.last_repl_log_raw]
-        debug_data = DebugData(
-            tokens=parsed_tokens,
-            ast_text=debug_raw.get("ast_text") or "",
-            plan_json=debug_raw.get("plan_json") or "",
-            plan_before_opt=debug_raw.get("plan_before_opt") or "",
-            storage_stats=storage_stats,
-            replacement_log=repl_log,
-        )
-
-    overall_success = all(r.success for r in results) and run.success
-    msg = "" if overall_success else run.stderr
-    if malformed:
-        # Surface the dropped-token count so the user knows the
-        # visualisation may be incomplete.  Don't clobber the engine's
-        # error message (it's more informative); append if both apply.
-        suffix = f"({malformed} malformed token(s) skipped)"
-        msg = f"{msg} {suffix}" if msg else suffix
-    return DebugResponse(
-        success=overall_success,
-        results=results,
-        debug=debug_data,
-        db_path=SESSION.db_path or "",
-        total_elapsed_ms=total_ms,
-        message=msg,
-    )
-
-
-@router.get("/api/storage/stats", response_model=StorageStatsResponse)
-async def storage_stats() -> StorageStatsResponse:
-    """Return the latest buffer-pool counters from the last execute_debug run.
-
-    We deliberately do *not* run a probe query here because every
-    `SELECT 1;` would itself increment the hit/miss counters, which
-    would silently inflate the numbers shown on the storage tab
-    and break the user's "Reset View" baseline.  Instead, the
-    counters come from the last `query_debug` invocation the user
-    already triggered.  When no debug run has happened yet (the
-    page was just opened) the response reports an empty snapshot
-    so the UI can render the "run a statement first" empty state.
-    """
-    if SESSION.db_path is None:
-        raise HTTPException(
-            status_code=409,
-            detail="No database is currently open. Use /api/db/open first.",
-        )
-    stats_raw = SESSION.last_stats_raw or {}
-    repl_log_raw = SESSION.last_repl_log_raw or []
-    stats = StorageStats(
-        hit_count=stats_raw.get("hit_count", 0),
-        miss_count=stats_raw.get("miss_count", 0),
-        replacement_count=stats_raw.get("replacement_count", 0),
-        hit_rate=stats_raw.get("hit_rate", 0.0),
-        total_pages=stats_raw.get("total_pages", 0),
-    )
-    repl_log = [ReplacementEntry(**e) for e in repl_log_raw]
-    return StorageStatsResponse(
-        success=True,
-        stats=stats,
-        replacement_log=repl_log,
-        message=(
-            "Run a statement in the Visualize tab to refresh counters."
-            if not stats_raw
-            else ""
-        ),
-    )
-
-
-@router.post("/api/storage/reset", response_model=ResetStorageResponse)
-async def reset_storage_view() -> ResetStorageResponse:
-    """Capture the *current* buffer-pool counters as a "baseline".
-
-    The C++ engine keeps cumulative counters internally; we can't
-    reset them without rebuilding the buffer pool.  Instead we
-    expose this endpoint so the frontend can ask the backend for
-    the canonical "before" snapshot of stats at reset time, then
-    render deltas against it locally.  This keeps the wire format
-    symmetric with `/api/storage/stats` while still giving the
-    user a clean "fresh session" view of the counters.
-
-    Internally no probe query runs — we just hand the current
-    cached snapshot back as the baseline.  When no debug run has
-    happened yet the baseline is all-zeros.
-    """
-    if SESSION.db_path is None:
-        raise HTTPException(
-            status_code=409,
-            detail="No database is currently open. Use /api/db/open first.",
-        )
-    stats_raw = SESSION.last_stats_raw or {}
-    baseline = StorageStats(
-        hit_count=stats_raw.get("hit_count", 0),
-        miss_count=stats_raw.get("miss_count", 0),
-        replacement_count=stats_raw.get("replacement_count", 0),
-        hit_rate=stats_raw.get("hit_rate", 0.0),
-        total_pages=stats_raw.get("total_pages", 0),
-    )
-    return ResetStorageResponse(
-        success=True,
-        baseline=baseline,
-        message="Baseline captured. Display now shows deltas against this snapshot.",
     )

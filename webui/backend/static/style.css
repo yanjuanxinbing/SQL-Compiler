@@ -1,7 +1,7 @@
 /* ─────────────────────────────────────────────────────────────────────────
-   MiniDB IDE — style
-   Dark IDE layout (toolbar / sidebar / editor / bottom panels) plus the
-   visualization renderer styles (token / AST / plan / compare / storage).
+   SQL-Compiler Web UI — design system
+   Single navy palette, shared spacing scale, shared motion curve.
+   Mirrors the EFRI web app aesthetic so multi-app environments look uniform.
    ───────────────────────────────────────────────────────────────────────── */
 
 /* ===== 设计系统变量 ===== */

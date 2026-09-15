@@ -120,6 +120,15 @@ void RecoveryManager::RedoPass(const std::vector<LogRecord>& records) {
         if (page == nullptr) continue;
         const uint64_t page_lsn = page->GetPageLsn();
         // 仅当 page 还没记录到这条日志之后才重放，保证幂等。
+        // modified 必须按「page_lsn < rec.lsn_」准确求值：
+        //   * 当 page_lsn >= rec.lsn_ 时，page 已经被推进到该 LSN 之后
+        //     （例如 redo 在上一轮已经写过、或磁盘上次残留了更新的 page），
+        //     重放是 no-op，frame 不应被标脏——否则会触发「不必要写盘」，
+        //     把 BufferPool 的脏帧推到磁盘，掩盖 redo 幂等性的真正语义。
+        //   * 只有当 page_lsn < rec.lsn_ 时才 memcpy + SetPageLsn +
+        //     SetDirty(true)；之后 UnpinPage(..., true)。
+        //   * 否则 UnpinPage(..., false)。
+        bool modified = false;
         if (page_lsn < rec.lsn_) {
             // UPDATE 的「最新状态」是 after_image；CLR 的「最新状态」是
             // before_image（即 undo 后状态）。
@@ -131,8 +140,9 @@ void RecoveryManager::RedoPass(const std::vector<LogRecord>& records) {
             }
             page->SetPageLsn(rec.lsn_);
             page->SetDirty(true);
+            modified = true;
         }
-        buffer_pool_manager_->UnpinPage(rec.page_id_, true);
+        buffer_pool_manager_->UnpinPage(rec.page_id_, modified);
     }
 }
 
@@ -152,6 +162,11 @@ void RecoveryManager::UndoPass(const std::vector<LogRecord>& records) {
     //     指向 undo 链上下一个待撤销 LSN（即当前 rec.prev_lsn_）。
     //   * 遇到 CLR：page 已处于 undo 后状态（由 redo 阶段保证），直接跳到
     //     clr.undo_next_lsn_ 继续撤销。
+    //
+    // 单 pin per step：每条 UPDATE 撤销 = 一次 GetPage + before-image memcpy
+    // + CLR.append（从同一 page 取 post_undo bytes）+ page.page_lsn 推进 +
+    // UnpinPage。整个流程只一次 pin，避免「写 CLR 时重取 page」带来的 page
+    // 抖动与重复 latch 开销。
     std::unordered_set<txn_id_t> aborted;
     for (const auto& kv : txn_table_) {
         const txn_id_t tid = kv.first;
@@ -162,34 +177,47 @@ void RecoveryManager::UndoPass(const std::vector<LogRecord>& records) {
             if (it == by_lsn.end()) break;
             const LogRecord& rec = *it->second;
             if (rec.type_ == LogRecordType::UPDATE) {
-                // 应用 before-image。
-                if (rec.before_image_.size() == PAGE_SIZE) {
-                    RestorePageImage(rec.page_id_, rec.before_image_.data());
-                }
-                // Phase C：写 CLR，让 txn 的 WAL 自描述「这部分已 undo」。
-                // undo_next_lsn = 当前 rec.prev_lsn_（undo 链上下一步）。
-                if (log_manager_ != nullptr) {
-                    std::vector<char> post_undo(PAGE_SIZE, 0);
-                    Page* page = buffer_pool_manager_->GetPage(rec.page_id_);
+                // 单 pin undo：抓页 → 写 before-image → 从同一页取 post_undo
+                // → 写 CLR → 推 page_lsn → UnpinPage。语义与原 3× pin 路径
+                // 完全等价（page 在 pin 内不会被换出，从同一 page 取
+                // post_undo 与「Unpin 后重取 page」拿到的内容一致）。
+                if (buffer_pool_manager_ != nullptr) {
+                    Page* page =
+                        buffer_pool_manager_->GetPage(rec.page_id_);
                     if (page != nullptr) {
-                        std::memcpy(post_undo.data(), page->GetData(),
-                                    PAGE_SIZE);
-                        buffer_pool_manager_->UnpinPage(rec.page_id_, false);
-                    } else if (rec.before_image_.size() == PAGE_SIZE) {
-                        std::memcpy(post_undo.data(),
-                                    rec.before_image_.data(), PAGE_SIZE);
-                    }
-                    lsn_t clr_lsn = log_manager_->AppendCLR(
-                        tid, rec.page_id_, post_undo.data(),
-                        /*undo_next_lsn=*/rec.prev_lsn_);
-                    if (page != nullptr) {
-                        // 重取 page 设 page_lsn（page 已 UnpinPage 上面）。
-                        Page* p2 =
-                            buffer_pool_manager_->GetPage(rec.page_id_);
-                        if (p2 != nullptr) {
-                            p2->SetPageLsn(clr_lsn);
-                            buffer_pool_manager_->UnpinPage(rec.page_id_, true);
+                        // 1) before-image 写回。
+                        bool modified = false;
+                        if (rec.before_image_.size() == PAGE_SIZE) {
+                            std::memcpy(page->GetData(),
+                                        rec.before_image_.data(),
+                                        PAGE_SIZE);
+                            page->SetDirty(true);
+                            modified = true;
                         }
+                        // 2) 写 CLR：从同一 page 取「undo 后状态」承载到
+                        //    CLR.before_image_。
+                        if (log_manager_ != nullptr) {
+                            char post_undo[PAGE_SIZE];
+                            std::memcpy(post_undo, page->GetData(),
+                                        PAGE_SIZE);
+                            lsn_t clr_lsn = log_manager_->AppendCLR(
+                                tid, rec.page_id_, post_undo,
+                                /*undo_next_lsn=*/rec.prev_lsn_);
+                            page->SetPageLsn(clr_lsn);
+                            modified = true;
+                        }
+                        // 3) 单 pin 收尾。
+                        buffer_pool_manager_->UnpinPage(rec.page_id_,
+                                                       modified);
+                    } else if (rec.before_image_.size() == PAGE_SIZE &&
+                               log_manager_ != nullptr) {
+                        // page 不可用：退化路径——CLR 仍写，page_bytes 用
+                        // before-image（与原行为一致）。
+                        std::vector<char> post_undo(rec.before_image_.begin(),
+                                                    rec.before_image_.end());
+                        log_manager_->AppendCLR(
+                            tid, rec.page_id_, post_undo.data(),
+                            /*undo_next_lsn=*/rec.prev_lsn_);
                     }
                 }
                 next_undo_lsn = rec.prev_lsn_;
