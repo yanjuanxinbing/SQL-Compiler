@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "storage/DiskManager.h"
@@ -89,6 +90,11 @@ private:
     std::vector<Page> pages_;                        // 帧数组（frame slots），下标即frame_id
     std::unordered_map<page_id_t, int> page_table_;   // page_id -> frame_id
     std::vector<int> free_list_;                      // 尚未使用的空闲帧id列表
+
+    // 脏页 frame_id 旁路集合：每帧的 Page::SetDirty(bool) 通过回调自动维护。
+    // FlushAllDirtyPages / CollectDirtyPages 只遍历此集合（O(K)，K=脏页数），
+    // 不再需要扫遍全部 N 个 frame 才能找出脏页。
+    std::unordered_set<int> dirty_frames_;
 
     BufferPoolStats stats_;
     std::vector<ReplacementLogEntry> replacement_log_;

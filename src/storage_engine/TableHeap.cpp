@@ -98,7 +98,9 @@ bool IsTombstone(int32_t len) {
 }  // namespace
 
 TableHeap::TableHeap(StorageAccess* storage, page_id_t first_page_id)
-    : storage_(storage), first_page_id_(first_page_id) {
+    : storage_(storage),
+      first_page_id_(first_page_id),
+      last_insert_hint_(first_page_id) {
 }
 
 TableHeap* TableHeap::Create(StorageAccess* storage) {
@@ -108,6 +110,7 @@ TableHeap* TableHeap::Create(StorageAccess* storage) {
     InitEmptyPageHeader(page->GetData());
     page->SetDirty(true);
     storage->UnpinPage(pid, true);
+    // 新建表：hint 直接指向新建的首页，下一次 InsertTuple 起步 O(1)。
     return new TableHeap(storage, pid);
 }
 
@@ -184,13 +187,19 @@ bool TableHeap::InsertIntoPage(page_id_t page_id, const Tuple& tuple, RID* rid,
 
 bool TableHeap::InsertTuple(const Tuple& tuple, RID* rid,
                             const std::vector<ValueType>& column_types) {
-    page_id_t pid = first_page_id_;
+    // 起步走 last_insert_hint_：上一次成功插入的页大概率仍有空槽，把沿链
+    // 找空页的 O(P) 摊成 O(1) 起步。hint 失效（INVALID_PAGE_ID 或被
+    // TRUNCATE 回收）时回退到 first_page_id_，语义与原实现一致。
+    page_id_t pid = (last_insert_hint_ != INVALID_PAGE_ID) ? last_insert_hint_
+                                                          : first_page_id_;
     page_id_t prev_pid = INVALID_PAGE_ID;
     // 防止损坏的 next_pid 形成环导致死循环（例如全零页自指 page 0）
     std::unordered_set<page_id_t> visited;
     while (pid != INVALID_PAGE_ID && pid >= 0) {
         if (!visited.insert(pid).second) break;
         if (InsertIntoPage(pid, tuple, rid, column_types)) {
+            // 命中：把 hint 更新为本次接受写入的页，后续 InsertTuple 直接从这里起步。
+            last_insert_hint_ = pid;
             return true;
         }
         // Walk to next page in chain
@@ -221,8 +230,15 @@ bool TableHeap::InsertTuple(const Tuple& tuple, RID* rid,
         }
     } else {
         first_page_id_ = new_pid;
+        // hint 也跟着回退到新首页，下次 InsertTuple 起步就是它。
+        last_insert_hint_ = new_pid;
     }
-    return InsertIntoPage(new_pid, tuple, rid, column_types);
+    // 新分配的页就是本次写穿链的最终接受者，更新 hint。
+    if (InsertIntoPage(new_pid, tuple, rid, column_types)) {
+        last_insert_hint_ = new_pid;
+        return true;
+    }
+    return false;
 }
 
 bool TableHeap::GetTuple(const RID& rid, Tuple* tuple,
@@ -420,6 +436,10 @@ void TableHeap::ClearAll() {
     InitEmptyPageHeader(head->GetData());
     head->SetDirty(true);
     storage_->UnpinPage(first_page_id_, true);
+    // TRUNCATE 之后 hint 必须复位：原来的 hint 可能指向一张已 DeletePage 的
+    // 溢出页，下次 InsertTuple 走 hint 会拿到一个不再属于本堆的 page_id。
+    // 复位到首页 = 退化为「从首页起步」，行为兼容原版的"first_page_id_ 起步"。
+    last_insert_hint_ = first_page_id_;
 }
 
 bool TableHeap::FindNextRid(RID current, RID* next) {

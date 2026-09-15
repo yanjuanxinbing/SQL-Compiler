@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 namespace sqlcompiler {
 
@@ -39,6 +40,14 @@ public:
     // 重置页内容与元信息为初始状态，供缓冲池复用该帧时调用
     void ResetMemory();
 
+    // 脏状态变更回调：BufferPoolManager 通过该回调把每帧的 dirty 翻转同步
+    // 进 dirty_frames_ 旁路集合，避免 FlushAllDirtyPages / CollectDirtyPages
+    // 每次都遍历所有 frame 才能挑出脏页。
+    // 回调签名：(new_dirty_value)。
+    // 默认空实现：不设置回调时 Page 行为完全等同于原版（仅修改 is_dirty_）。
+    using DirtyCallback = std::function<void(bool)>;
+    void SetDirtyCallback(DirtyCallback cb) { dirty_cb_ = std::move(cb); }
+
 private:
     page_id_t page_id_;
     char data_[PAGE_SIZE];
@@ -47,6 +56,7 @@ private:
     // Phase B：当前帧对应 page 上一次被任何 log record 写入时的 LSN。
     // ResetMemory 中归零表示「这是全新页，未参与过 redo」。
     uint64_t page_lsn_ = 0;
+    DirtyCallback dirty_cb_;  // 可选：脏状态变更通知
 };
 
 }  // namespace sqlcompiler
