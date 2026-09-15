@@ -1451,27 +1451,104 @@
     // or `clause` are promoted; ordinary column / table names are
     // left as leaves so they don't collapse the projection list.
     function promoteHeadKeyword(items) {
-      for (let i = 0; i + 1 < items.length; i++) {
-        const a = items[i], b = items[i + 1];
-        if (a.kind === 'leaf' && b.kind === 'group' &&
-            classifyIdent(a.value) !== 'word') {
-          items.splice(i, 2, {
-            kind: 'group',
-            label: a.value,
-            children: [b],
-          });
-          // Don't re-promote children: bail out so the inner group
-          // keeps its own structure (it'll be promoted again
-          // recursively on a subsequent top-level wrap if needed).
-          return items;
+      let progressed = true;
+      while (progressed) {
+        progressed = false;
+        for (let i = 0; i + 1 < items.length; i++) {
+          const a = items[i], b = items[i + 1];
+          if (a.kind === 'leaf' && (b.kind === 'group' || b.kind === 'leaf') &&
+              classifyIdent(a.value) !== 'word') {
+            items.splice(i, 2, {
+              kind: 'group',
+              label: a.value,
+              children: [b],
+            });
+            progressed = true;
+            // Restart the scan so a newly-promoted head isn't missed
+            // by another IDENT sitting before it.
+            break;
+          }
         }
       }
       return items;
     }
 
-    // Parse items until closing paren / end-of-input.  Each item is
-    // either a leaf or a sub-group.
-    function parseItems(allowBinopSplit) {
+    // Parse one operand (an atom): a parenthesised group, a single
+    // ident, or a literal.  When `allowBinop` is true, the parser
+    // also recognises the leading keyword of a `KW (group)` pair (so
+    // `WHERE (...)` becomes a labeled group with the inner as child).
+    function parseAtom(allowBinop) {
+      const a = peek();
+      if (!a) return null;
+      if (a.kind === 'paren' && a.value === '(') return parseGroup();
+      if (a.kind === 'paren' && a.value === ')') return null;
+      if (a.kind === 'comma') return null;
+      if (a.kind === 'string' || a.kind === 'number') {
+        eat();
+        return { kind: 'leaf', value: a.value };
+      }
+      // ident
+      eat();
+      // If next atom is a `(`, the ident is a clause head (WHERE /
+      // AND / OR / NOT / …); consume the paren group and return a
+      // labeled group containing it.  This is what makes
+      // `WHERE (age > 18)` show up as a WHERE node with the predicate
+      // underneath, instead of two siblings.
+      const next = peek();
+      if (allowBinop && next && next.kind === 'paren' && next.value === '(' &&
+          classifyIdent(a.value) !== 'word') {
+        const grp = parseGroup();
+        return { kind: 'group', label: a.value, children: [grp] };
+      }
+      return { kind: 'leaf', value: a.value };
+    }
+
+    // Parse a binary-expression chain: left-associative.  Reads an
+    // initial atom, then loops while the next atom is a binary
+    // operator keyword and folds it in as `op(left, right)`.  Returns
+    // a single tree (group or leaf).
+    //
+    // A paren group counts as an atom too, so `(a = 1) OR (b = 2)`
+    // becomes OR[=[a,1], =[b,2]] with no anonymous wrappers.
+    function parseExpr() {
+      let left = parseAtom(true);
+      if (!left) return null;
+      // Loop: peek for binop keyword at the head of remaining atoms.
+      while (p < atoms.length) {
+        const a = peek();
+        if (!a) break;
+        if (a.kind === 'paren') break;          // ) or ( ends the chain
+        if (a.kind === 'comma') break;
+        if (a.kind !== 'ident') break;
+        if (classifyIdent(a.value) !== 'binop') break;
+        const opTok = eat();
+        // Parse right operand as a full expression: if it starts with
+        // a paren, consume a complete group (with its own binop chain
+        // inside); otherwise recurse into parseExpr so a chain like
+        // `b = 2 AND c = 3` is read as `b = 2` AND `c = 3`, not `b`
+        // AND `c` with the `= 2` and `= 3` operators dangling.
+        let right;
+        const nxt = peek();
+        if (nxt && nxt.kind === 'paren' && nxt.value === '(') {
+          right = parseGroup();
+        } else {
+          right = parseExpr();
+        }
+        if (!right) break;
+        left = { kind: 'group', label: opTok.value, children: [left, right] };
+      }
+      return left;
+    }
+
+    // Parse a comma-separated list of items until a closing paren /
+    // end-of-input.  Each item is either a leaf or a sub-group.
+    // `allowBinop` switches between two modes:
+    //   - true  (inside a parenthesised group): parse each item as a
+    //            full binary expression so `a > 1 AND b = 2` becomes
+    //            AND[>[a,1], =[b,2]].
+    //   - false (top level): each item is a bare atom; the
+    //            top-level clause grouping happens later in astParse.
+    function parseItems(allowBinop) {
       const items = [];
       while (p < atoms.length) {
         const a = peek();
@@ -1479,42 +1556,24 @@
         if (a.kind === 'paren' && a.value === ')') return items;
         if (a.kind === 'comma') { eat(); continue; }
         if (a.kind === 'paren' && a.value === '(') {
-          items.push(parseGroup());
-          continue;
-        }
-        if (a.kind === 'ident') {
-          // Look at the sequence ahead: a binary-op-keyword between
-          // two items turns the whole `( ... OP ... )` shape into a
-          // labeled group so the tree shows precedence visually.
-          if (allowBinopSplit && classifyIdent(a.value) === 'binop') {
-            const opTok = eat();
-            const left = items;
-            const right = [];
-            // Read right operand(s) until closing paren / comma / end.
-            while (p < atoms.length) {
-              const cur = peek();
-              if (!cur) break;
-              if (cur.kind === 'paren' && cur.value === ')') break;
-              if (cur.kind === 'comma') { eat(); break; }
-              if (cur.kind === 'paren' && cur.value === '(') {
-                right.push(parseGroup());
-                continue;
-              }
-              right.push({ kind: 'leaf', value: eat().value });
-            }
-            // Promote: the operator becomes the group label and
-            // left/right operands become its children.
-            return [{
-              kind: 'group',
-              label: opTok.value,
-              children: left.concat(right),
-            }];
+          if (allowBinop) {
+            const expr = parseExpr();
+            if (expr) items.push(expr);
+          } else {
+            items.push(parseGroup());
           }
-          items.push({ kind: 'leaf', value: eat().value });
           continue;
         }
-        // Bare atom (number / string).
-        items.push({ kind: 'leaf', value: eat().value });
+        if (allowBinop) {
+          const expr = parseExpr();
+          if (expr) items.push(expr);
+        } else {
+          if (a.kind === 'string' || a.kind === 'number') {
+            items.push({ kind: 'leaf', value: eat().value });
+          } else {
+            items.push({ kind: 'leaf', value: eat().value });
+          }
+        }
       }
       return items;
     }
@@ -1540,17 +1599,63 @@
     promoteHeadKeyword(top);
     promoteHeadKeyword(top);
     promoteHeadKeyword(top);
+
+    // Post-process: flatten redundant anonymous wrappers that the
+    // raw recursive-descent parser leaves around `((a) AND (b))`-
+    // shaped subtrees.  We do this BEFORE promoting any remaining
+    // `IDENT (group)` pairs because flattening may expose new ones.
+    function flatten(node) {
+      if (!node || node.kind !== 'group') return node;
+      // Recurse first so children are flattened before the parent
+      // makes decisions about them.
+      node.children = (node.children || []).map(flatten).filter((c) => c != null);
+      // Collapse a null-labeled group whose only child is another
+      // group: this strips the cosmetic outer parens around
+      // `((age > 18) AND (1 = 1))` so the AND node sits directly
+      // under WHERE.
+      if (node.label == null && node.children.length === 1 &&
+          node.children[0].kind === 'group' &&
+          node.children[0].label != null) {
+        return node.children[0];
+      }
+      // Same idea but for a single null-labeled child — also collapse,
+      // pulling its label up if any.
+      if (node.label == null && node.children.length === 1 &&
+          node.children[0].kind === 'group') {
+        return node.children[0];
+      }
+      // Promote any `IDENT group` pair that the parser missed (e.g.
+      // when the IDENT sits in front of a flattened wrapper that
+      // arrived here without being promoted yet).
+      promoteHeadKeyword(node.children);
+      return node;
+    }
+    const flat = (top.length === 1 && top[0].kind === 'group') ? flatten(top[0]) : { kind: 'group', label: null, children: top.map(flatten) };
+    if (flat && flat.kind === 'group') flat.children = (flat.children || []).map(flatten);
+
     // Promote a leading bare clause keyword (e.g. `SELECT` before a
     // projection list with no parens) into a single group so the
     // root isn't a flat list of leaves.
-    if (top.length >= 2 && top[0].kind === 'leaf' &&
-        classifyIdent(top[0].value) !== 'word') {
-      return { kind: 'group', label: top[0].value, children: top.slice(1) };
+    const root = flat;
+    if (root.children && root.children.length >= 2 && root.children[0].kind === 'leaf' &&
+        classifyIdent(root.children[0].value) !== 'word') {
+      return { kind: 'group', label: root.children[0].value, children: root.children.slice(1) };
     }
-    // If the whole top level is a single group, render that group as
-    // the root (so we don't wrap a SELECT in an anonymous outer node).
-    if (top.length === 1 && top[0].kind === 'group') return top[0];
-    return { kind: 'group', label: null, children: top };
+    // If the root is still an anonymous group and its first child is a
+    // labeled clause-keyword group (SELECT / INSERT / UPDATE / DELETE
+    // / CREATE …), absorb the sibling clause groups (FROM / WHERE /
+    // GROUP / ORDER …) into that head group so the user sees one
+    // labelled root instead of an empty wrapper.
+    if (root.label == null && root.children && root.children.length > 1 &&
+        root.children[0].kind === 'group' &&
+        root.children[0].label &&
+        classifyIdent(root.children[0].label) === 'clause') {
+      const head = root.children[0];
+      head.children = head.children.concat(root.children.slice(1));
+      return head;
+    }
+    if (root.children && root.children.length === 1 && root.children[0].kind === 'group') return root.children[0];
+    return root;
   }
 
   // Classify a node label so we can color it.  Keywords (uppercase SQL
@@ -1579,38 +1684,262 @@
     return 'ast-ident';
   }
 
-  // Render an AST node tree recursively.  The returned string starts
-  // with the toolbar markup (zoom reset + expand/collapse all) so the
-  // caller can drop it straight into #viz-content.
-  function astRenderNode(node, depth, idCounter) {
-    const id = `n${idCounter[0]++}`;
-    const isGroup = node.kind === 'group';
-    const children = isGroup ? node.children : [];
-    if (!isGroup) {
-      // Leaf — render a chip styled by classification.
-      const cls = /^-?\d+(\.\d+)?$/.test(node.value) ? 'ast-literal' : astNodeClass(node.value);
-      return `<div class="ast-leaf ${cls}" data-id="${id}" data-leaf="${escapeHtml(node.value)}" title="${escapeHtml(node.value)}">${escapeHtml(node.value)}</div>`;
+  // ── SVG tree layout ───────────────────────────────────────────────────
+  // Convert the parsed AST tree into a list of laid-out nodes that can be
+  // drawn as SVG.  The algorithm is a simple two-pass "tidy tree" style
+  // layout:
+  //   1. Bottom-up: compute the width of every subtree (in pixels).
+  //   2. Top-down: assign each node an x-coordinate such that its
+  //      children are evenly distributed under it, and a y-coordinate
+  //      determined by its depth.
+  // Returns {nodes:[{id, label, kind, cls, x, y, w, h, depth, hidden,
+  // parentId, childIds:[…]}], edges:[{from,to}], width, height}.
+  //
+  // `kind` is one of:
+  //   'op'     — binary/unary operator (AND / OR / NOT / + / = / …)
+  //   'kw'     — SQL keyword clause head (WHERE / SELECT / …)
+  //   'ident'  — column / table identifier
+  //   'literal'— numeric / string literal
+  const AST_LAYOUT = {
+    nodeW: 110,        // baseline node width (will grow if label is longer)
+    nodeH: 38,         // baseline node height
+    hGap: 28,          // horizontal gap between sibling subtrees
+    vGap: 64,          // vertical gap between depth levels
+    padX: 18,          // inner padding around the whole tree
+    padY: 26,
+  };
+
+  function astMeasureLabel(label) {
+    // Cheap text-width heuristic: ~7px per monospace char + 28px padding.
+    return Math.max(AST_LAYOUT.nodeW, (String(label || '').length * 7) + 28);
+  }
+
+  function astBuildSvgModel(tree) {
+    const counter = { v: 0 };
+    const nodes = [];
+    const edges = [];
+
+    // Walk: produce a flat list with id, label, kind, cls, parentId.
+    function walk(n, depth, parentId) {
+      const id = `an${counter.v++}`;
+      const isGroup = n.kind === 'group';
+      const label = isGroup ? (n.label || '') : String(n.value || '');
+      let kind, cls;
+      if (isGroup) {
+        cls = astNodeClass(label);
+        kind = cls === 'ast-op' ? 'op'
+             : cls === 'ast-keyword' ? 'kw'
+             : (cls === 'ast-literal' ? 'literal' : 'ident');
+      } else {
+        cls = /^-?\d+(\.\d+)?$/.test(label) ? 'ast-literal' : astNodeClass(label);
+        kind = cls === 'ast-literal' ? 'literal'
+             : cls === 'ast-op' ? 'op'
+             : cls === 'ast-keyword' ? 'kw'
+             : 'ident';
+      }
+      const node = { id, label, kind, cls, depth, parentId, childIds: [], w: astMeasureLabel(label), h: AST_LAYOUT.nodeH };
+      nodes.push(node);
+      if (isGroup) {
+        for (const c of (n.children || [])) {
+          const cid = walk(c, depth + 1, id);
+          node.childIds.push(cid);
+        }
+      }
+      return id;
     }
-    const label = node.label ? `<span class="ast-group-label">${escapeHtml(node.label)}</span>` : '';
-    const kids = children.map((c) => astRenderNode(c, depth + 1, idCounter)).join('');
-    return `<div class="ast-group" data-id="${id}" data-depth="${depth}">
-      <div class="ast-group-head" data-toggle="${id}">
-        <span class="ast-toggle">▾</span>${label}<span class="ast-group-meta">${children.length} 个子节点</span>
-      </div>
-      <div class="ast-children" id="${id}">${kids}</div>
-    </div>`;
+    walk(tree, 0, null);
+
+    // Build a quick id→node lookup + adjacency for collapsed branches.
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    function subtreeIds(rootId) {
+      const out = [];
+      const stack = [rootId];
+      while (stack.length) {
+        const x = stack.pop();
+        const n = byId.get(x);
+        if (!n) continue;
+        out.push(x);
+        for (const c of n.childIds) stack.push(c);
+      }
+      return out;
+    }
+
+    // Width of a subtree = sum of children widths + gaps (or own width if leaf).
+    function widthOf(id) {
+      const n = byId.get(id);
+      if (!n || n._collapsed || !n.childIds.length) return n.w;
+      const kids = n.childIds.filter((c) => !byId.get(c)._collapsed);
+      let total = 0;
+      for (let i = 0; i < kids.length; i++) {
+        total += widthOf(kids[i]);
+        if (i < kids.length - 1) total += AST_LAYOUT.hGap;
+      }
+      // A group must be at least as wide as the spread of its children.
+      return Math.max(n.w, total);
+    }
+
+    // Assign x positions.  Each subtree's children are packed left-to-right
+    // and the parent sits centred over them.
+    function place(id, leftEdge) {
+      const n = byId.get(id);
+      const subW = widthOf(id);
+      if (!n.childIds.length || n._collapsed) {
+        n.x = leftEdge + subW / 2;
+      } else {
+        const kids = n.childIds.filter((c) => !byId.get(c)._collapsed);
+        let cursor = leftEdge;
+        const childCenters = [];
+        for (const cid of kids) {
+          const cw = widthOf(cid);
+          place(cid, cursor);
+          childCenters.push(byId.get(cid).x);
+          cursor += cw + AST_LAYOUT.hGap;
+        }
+        n.x = (childCenters[0] + childCenters[childCenters.length - 1]) / 2;
+      }
+      n.y = n.depth * (AST_LAYOUT.nodeH + AST_LAYOUT.vGap) + AST_LAYOUT.padY;
+      n._subtreeW = subW;
+    }
+
+    // Mark every node hidden whose ancestor is collapsed (so edges skip them).
+    function applyCollapsed() {
+      const stack = [null];
+      let collapsedAbove = false;
+      // Walk in depth-first order, tracking whether any ancestor is collapsed.
+      function dfs(id, ancestorCollapsed) {
+        const n = byId.get(id);
+        if (!n) return;
+        n.hidden = ancestorCollapsed;
+        for (const cid of n.childIds) {
+          dfs(cid, ancestorCollapsed || !!n._collapsed);
+        }
+      }
+      // The root has id nodes[0].id.
+      dfs(nodes[0].id, false);
+    }
+    applyCollapsed();
+
+    place(nodes[0].id, AST_LAYOUT.padX);
+
+    // Build edges only between visible (non-hidden) nodes.
+    for (const n of nodes) {
+      if (n.hidden) continue;
+      for (const cid of n.childIds) {
+        const child = byId.get(cid);
+        if (!child || child.hidden) continue;
+        edges.push({ from: n.id, to: child.id });
+      }
+    }
+
+    // Canvas size.
+    let maxRight = 0;
+    for (const n of nodes) {
+      if (n.hidden) continue;
+      maxRight = Math.max(maxRight, n.x + n.w / 2);
+    }
+    const width = Math.max(maxRight + AST_LAYOUT.padX, 320);
+    const height = (() => {
+      let maxDepth = 0;
+      for (const n of nodes) if (!n.hidden) maxDepth = Math.max(maxDepth, n.depth);
+      return (maxDepth + 1) * (AST_LAYOUT.nodeH + AST_LAYOUT.vGap) + AST_LAYOUT.padY;
+    })();
+
+    // Expose subtreeIds for the collapse/expand logic.
+    const model = { nodes, edges, width, height, byId, subtreeIds };
+    // Stash the model on the panel element so event handlers can read it.
+    return model;
+  }
+
+  // Render an SVG tree from a layout model.
+  function astSvgFromModel(model) {
+    const { nodes, edges, width, height } = model;
+    // Node rect attrs.
+    const rx = 8;
+    const stroke = 'var(--border-light, #45464c)';
+    const nodeClass = (n) => `ast-node-box ast-node-${n.kind} ${n.cls || ''}`;
+    // Edge path: a smooth cubic curve from the parent's bottom-centre to
+    // the child's top-centre.  This produces the "diagonal connection
+    // lines" feel shown in the design reference.
+    function edgePath(e) {
+      const a = model.byId.get(e.from);
+      const b = model.byId.get(e.to);
+      if (!a || !b) return '';
+      const x1 = a.x;
+      const y1 = a.y + a.h / 2;
+      const x2 = b.x;
+      const y2 = b.y - b.h / 2;
+      const mid = (y1 + y2) / 2;
+      return `M ${x1} ${y1} C ${x1} ${mid}, ${x2} ${mid}, ${x2} ${y2}`;
+    }
+
+    const nodeSvg = nodes
+      .filter((n) => !n.hidden)
+      .map((n) => {
+        const x = n.x - n.w / 2;
+        const y = n.y - n.h / 2;
+        const isOp = n.kind === 'op';
+        const isKw = n.kind === 'kw';
+        return `<g class="ast-svg-node" data-id="${n.id}" data-kind="${n.kind}"
+                   data-label="${escapeHtml(n.label)}" data-depth="${n.depth}"
+                   data-has-children="${n.childIds.length ? '1' : '0'}">
+          <rect class="${nodeClass(n)}"
+                x="${x}" y="${y}" width="${n.w}" height="${n.h}"
+                rx="${rx}" ry="${rx}"
+                stroke="${stroke}" stroke-width="1.4"></rect>
+          <text class="ast-node-label ${n.cls || ''}" x="${n.x}" y="${n.y}"
+                text-anchor="middle" dominant-baseline="middle">${escapeHtml(n.label)}</text>
+        </g>`;
+      })
+      .join('');
+
+    const edgeSvg = edges
+      .map((e) => `<path class="ast-edge" d="${edgePath(e)}" fill="none"
+                          stroke="var(--border-light, #5a5b61)" stroke-width="1.4"
+                          stroke-linecap="round"></path>`)
+      .join('');
+
+    // Collapse / expand handles: drawn as a small circle at the bottom of
+    // every group node that has children.
+    const handleSvg = nodes
+      .filter((n) => !n.hidden && n.childIds.length)
+      .map((n) => {
+        const cx = n.x;
+        const cy = n.y + n.h / 2 + 0;
+        return `<g class="ast-collapse-toggle" data-id="${n.id}"
+                   data-action="${n._collapsed ? 'expand' : 'collapse'}">
+          <circle cx="${cx}" cy="${cy + 10}" r="7"
+                  fill="var(--bg-tertiary, #2d2e33)" stroke="var(--border-light)" stroke-width="1.2"></circle>
+          <text x="${cx}" y="${cy + 10}" text-anchor="middle" dominant-baseline="middle"
+                class="ast-collapse-glyph">${n._collapsed ? '+' : '−'}</text>
+        </g>`;
+      })
+      .join('');
+
+    return `<svg class="ast-svg" xmlns="http://www.w3.org/2000/svg"
+                 viewBox="0 0 ${width} ${height}" width="${width}" height="${height}"
+                 preserveAspectRatio="xMidYMin meet">
+      <g class="ast-edges">${edgeSvg}</g>
+      <g class="ast-handles">${handleSvg}</g>
+      <g class="ast-nodes">${nodeSvg}</g>
+    </svg>`;
   }
 
   // The exported entry point.  Kept the same name as the old indented
   // parser so existing tests / callers continue to work.  Returns the
-  // full panel markup (toolbar + tree container).
+  // full panel markup (toolbar + SVG tree container).
   function parseIndentedTree(text) {
     if (!text) return '<p class="hint">No AST available.</p>';
     const tree = astParse(text);
     if (!tree) return '<p class="hint">AST 文本为空或无法解析。</p>';
-    const idCounter = [0];
-    const body = astRenderNode(tree, 0, idCounter);
-    return `<div class="ast-panel">
+    const model = astBuildSvgModel(tree);
+    const svg = astSvgFromModel(model);
+    // Persist the model on the returned markup so attachAstInteractions
+    // can rebuild the SVG after collapse/expand without re-parsing.
+    const modelJson = JSON.stringify(model.nodes.map((n) => ({
+      id: n.id, parentId: n.parentId, label: n.label, kind: n.kind,
+      cls: n.cls, depth: n.depth, childIds: n.childIds,
+    })));
+    return `<div class="ast-panel" id="ast-panel" data-model='${escapeHtml(modelJson)}'>
       <div class="ast-toolbar">
         <button class="btn btn-ghost ast-act" data-action="expand" type="button">全部展开</button>
         <button class="btn btn-ghost ast-act" data-action="collapse" type="button">全部折叠</button>
@@ -1618,11 +1947,18 @@
         <button class="btn btn-ghost ast-act" data-action="zoom-out" type="button" title="缩小 (Ctrl+滚轮)">−</button>
         <button class="btn btn-ghost ast-act" data-action="zoom-reset" type="button" title="重置视图">⌂</button>
         <button class="btn btn-ghost ast-act" data-action="zoom-in" type="button" title="放大 (Ctrl+滚轮)">+</button>
+        <span class="ast-meta" id="ast-meta">${model.nodes.length} 节点 · ${countGroups(model.nodes)} 分组</span>
       </div>
       <div class="ast-stage" id="ast-stage">
-        <div class="ast-canvas" id="ast-canvas">${body}</div>
+        <div class="ast-canvas" id="ast-canvas">${svg}</div>
       </div>
     </div>`;
+  }
+
+  function countGroups(nodes) {
+    let n = 0;
+    for (const x of nodes) if (x.childIds && x.childIds.length) n++;
+    return n;
   }
 
   // Wire up pan / zoom / expand-collapse / hover-link once the AST
@@ -1631,7 +1967,108 @@
   function attachAstInteractions() {
     const stage = document.getElementById('ast-stage');
     const canvas = document.getElementById('ast-canvas');
-    if (!stage || !canvas) return;
+    const panel = document.getElementById('ast-panel');
+    if (!stage || !canvas || !panel) return;
+
+    // Re-hydrate the layout model from the panel's data-model attribute.
+    // The collapsed flags start empty (everything expanded) and are
+    // mutated in place as the user clicks collapse handles.
+    let model = null;
+    try {
+      const raw = panel.getAttribute('data-model');
+      if (raw) {
+        const flat = JSON.parse(raw);
+        const byId = new Map();
+        for (const n of flat) {
+          n.x = 0; n.y = 0; n.w = astMeasureLabel(n.label); n.h = AST_LAYOUT.nodeH;
+          n._collapsed = false;
+          byId.set(n.id, n);
+        }
+        model = { nodes: flat, edges: [], byId };
+      }
+    } catch (_) { /* malformed data-model — bail out gracefully */ }
+    if (!model) return;
+
+    function rebuildLayout() {
+      // Re-run layout using the current _collapsed flags.
+      const root = model.nodes[0];
+      if (!root) return;
+      // Hide nodes under a collapsed ancestor.
+      function dfs(id, ancestorCollapsed) {
+        const n = model.byId.get(id);
+        if (!n) return;
+        n.hidden = ancestorCollapsed;
+        for (const cid of n.childIds) dfs(cid, ancestorCollapsed || !!n._collapsed);
+      }
+      dfs(root.id, false);
+      // Width / place.
+      function widthOf(id) {
+        const n = model.byId.get(id);
+        if (!n || n._collapsed || !n.childIds.length) return n.w;
+        const kids = n.childIds.filter((c) => !model.byId.get(c)._collapsed);
+        let total = 0;
+        for (let i = 0; i < kids.length; i++) {
+          total += widthOf(kids[i]);
+          if (i < kids.length - 1) total += AST_LAYOUT.hGap;
+        }
+        return Math.max(n.w, total);
+      }
+      function place(id, leftEdge) {
+        const n = model.byId.get(id);
+        const subW = widthOf(id);
+        if (!n.childIds.length || n._collapsed) {
+          n.x = leftEdge + subW / 2;
+        } else {
+          const kids = n.childIds.filter((c) => !model.byId.get(c)._collapsed);
+          let cursor = leftEdge;
+          const centers = [];
+          for (const cid of kids) {
+            const cw = widthOf(cid);
+            place(cid, cursor);
+            centers.push(model.byId.get(cid).x);
+            cursor += cw + AST_LAYOUT.hGap;
+          }
+          n.x = (centers[0] + centers[centers.length - 1]) / 2;
+        }
+        n.y = n.depth * (AST_LAYOUT.nodeH + AST_LAYOUT.vGap) + AST_LAYOUT.padY;
+      }
+      place(root.id, AST_LAYOUT.padX);
+      // Build edges.
+      model.edges = [];
+      for (const n of model.nodes) {
+        if (n.hidden) continue;
+        for (const cid of n.childIds) {
+          const ch = model.byId.get(cid);
+          if (!ch || ch.hidden) continue;
+          model.edges.push({ from: n.id, to: ch.id });
+        }
+      }
+      // Rebuild DOM.
+      canvas.innerHTML = astSvgFromModel(model);
+      rebindNodeHandlers();
+    }
+
+    function rebindNodeHandlers() {
+      // Collapse / expand handles.
+      canvas.querySelectorAll('.ast-collapse-toggle').forEach((g) => {
+        g.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          const id = g.getAttribute('data-id');
+          const n = model.byId.get(id);
+          if (!n) return;
+          n._collapsed = !n._collapsed;
+          rebuildLayout();
+        });
+      });
+      // Hover link on every node.
+      canvas.querySelectorAll('.ast-svg-node').forEach((g) => {
+        g.addEventListener('mouseenter', () => {
+          const lab = g.getAttribute('data-label');
+          linkAstLeafToEditor(lab, g);
+        });
+        g.addEventListener('mouseleave', () => clearEditorLink());
+      });
+    }
 
     // Pan with drag.
     let panX = 0, panY = 0, scale = 1;
@@ -1642,7 +2079,9 @@
       if (info) info.textContent = `${Math.round(scale * 100)}%`;
     };
     stage.addEventListener('mousedown', (e) => {
-      if (e.target.closest('.ast-group-head')) return; // let toggle work
+      // Don't grab pan when clicking an interactive SVG element.
+      if (e.target.closest('.ast-collapse-toggle')) return;
+      if (e.target.closest('.ast-svg-node')) return;
       dragging = true; lastX = e.clientX; lastY = e.clientY;
       stage.style.cursor = 'grabbing';
       e.preventDefault();
@@ -1662,7 +2101,6 @@
       e.preventDefault();
       const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
       const newScale = Math.max(0.3, Math.min(3, scale * factor));
-      // Zoom around cursor.
       const rect = stage.getBoundingClientRect();
       const cx = e.clientX - rect.left;
       const cy = e.clientY - rect.top;
@@ -1680,19 +2118,14 @@
       btn.addEventListener('click', () => {
         const act = btn.dataset.action;
         if (act === 'expand') {
-          canvas.querySelectorAll('.ast-children').forEach((el) => el.classList.remove('is-collapsed'));
-          canvas.querySelectorAll('.ast-toggle').forEach((el) => el.classList.remove('is-collapsed'));
+          for (const n of model.nodes) n._collapsed = false;
+          rebuildLayout();
         } else if (act === 'collapse') {
-          // Keep the root open but collapse every deeper group.
-          canvas.querySelectorAll('.ast-children').forEach((el, i, all) => {
-            if (i === 0) return;
-            el.classList.add('is-collapsed');
-          });
-          canvas.querySelectorAll('.ast-group').forEach((g, i, all) => {
-            if (i === 0) return;
-            const t = g.querySelector(':scope > .ast-group-head > .ast-toggle');
-            if (t) t.classList.add('is-collapsed');
-          });
+          // Collapse every non-root node.
+          for (let i = 1; i < model.nodes.length; i++) {
+            if (model.nodes[i].childIds.length) model.nodes[i]._collapsed = true;
+          }
+          rebuildLayout();
         } else if (act === 'zoom-in') {
           scale = Math.min(3, scale * 1.2); apply();
         } else if (act === 'zoom-out') {
@@ -1703,30 +2136,7 @@
       });
     });
 
-    // Toggle single group on click of its head.
-    canvas.querySelectorAll('.ast-group-head').forEach((head) => {
-      head.addEventListener('click', () => {
-        const id = head.dataset.toggle;
-        const kids = document.getElementById(id);
-        const tog = head.querySelector('.ast-toggle');
-        if (!kids) return;
-        const collapsed = kids.classList.toggle('is-collapsed');
-        if (tog) tog.classList.toggle('is-collapsed', collapsed);
-      });
-    });
-
-    // Hover-link: highlight the editor line for the matching token.
-    canvas.querySelectorAll('[data-leaf]').forEach((leaf) => {
-      leaf.addEventListener('mouseenter', () => {
-        const lex = leaf.getAttribute('data-leaf');
-        linkAstLeafToEditor(lex, leaf);
-      });
-      leaf.addEventListener('mouseleave', () => clearEditorLink());
-    });
-    canvas.querySelectorAll('.ast-group-label').forEach((lab) => {
-      lab.addEventListener('mouseenter', () => linkAstLeafToEditor(lab.textContent, lab));
-      lab.addEventListener('mouseleave', () => clearEditorLink());
-    });
+    rebindNodeHandlers();
   }
 
   // Find the token whose lexeme matches `lex` (preferring one that

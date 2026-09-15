@@ -297,43 +297,103 @@ kbd{font-family:var(--font-mono);font-size:10px;background:var(--bg-active);padd
 .tt-literal{color:var(--green)}
 .tt-operator{color:var(--orange)}
 
-/* ===== AST 树 ===== */
-.ast-tree{display:flex;flex-direction:column;gap:2px;padding:4px 0}
-.ast-node{padding:3px 8px;margin-right:6px;border-radius:4px;font-family:var(--font-mono);font-size:12px;white-space:pre}
-.ast-node:hover{background:var(--bg-hover)}
-.ast-node-name{color:var(--cyan);font-weight:500}
-.ast-node-val{color:var(--text-muted);margin-left:6px}
-
-/* AST 面板：树形 + 缩放/平移 + 折叠/展开 */
+/* ===== AST 树（SVG 图形化版本） ===== */
+/* The AST panel renders a true tree graph: each node is a rounded
+   rectangle with a coloured fill (purple = logical operator, white/blue
+   = predicate / leaf, green = literal, purple-pink = keyword clause head)
+   and edges between parent and child are smooth Bezier curves. */
 .ast-panel{display:flex;flex-direction:column;height:100%;min-height:0}
 .ast-toolbar{display:flex;align-items:center;gap:6px;padding:6px 10px;border-bottom:1px solid var(--border);background:var(--bg-secondary);flex-shrink:0;font-size:11px}
 .ast-toolbar .btn{padding:3px 8px;font-size:11px}
 .ast-zoom-info{margin:0 6px;color:var(--text-muted);font-family:var(--font-mono);min-width:36px;text-align:right}
-.ast-stage{flex:1;min-height:0;overflow:hidden;background:var(--bg-primary);position:relative;cursor:grab;user-select:none}
-.ast-canvas{position:absolute;top:0;left:0;transform-origin:0 0;padding:18px;min-width:max-content}
-.ast-group{margin:2px 0}
-.ast-group-head{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:5px;background:var(--bg-tertiary);border:1px solid var(--border);cursor:pointer;font-family:var(--font-mono);font-size:12px;color:var(--text-primary);user-select:none}
-.ast-group-head:hover{background:var(--bg-hover);border-color:var(--accent)}
-.ast-toggle{font-size:10px;color:var(--text-muted);transition:transform 0.15s;display:inline-block;width:10px}
-.ast-toggle.is-collapsed{transform:rotate(-90deg)}
-.ast-group-label{font-weight:600;color:var(--cyan)}
-.ast-group-meta{color:var(--text-faint);font-size:10px;margin-left:6px;font-weight:400}
-.ast-children{margin-left:18px;padding-left:10px;border-left:1px dashed var(--border-light);margin-top:2px}
-.ast-children.is-collapsed{display:none}
-.ast-leaf{display:inline-block;padding:2px 7px;margin:2px 4px 2px 0;border-radius:4px;font-family:var(--font-mono);font-size:11px;background:var(--bg-secondary);border:1px solid var(--border);cursor:default}
-.ast-leaf.ast-keyword{background:rgba(196,132,252,0.16);color:var(--purple);border-color:rgba(196,132,252,0.3)}
-.ast-leaf.ast-ident{color:var(--text-primary)}
-.ast-leaf.ast-op{background:rgba(251,146,60,0.16);color:var(--orange);border-color:rgba(251,146,60,0.3)}
-.ast-leaf.ast-literal{background:rgba(74,222,128,0.16);color:var(--green);border-color:rgba(74,222,128,0.3)}
-.ast-leaf:hover{background:var(--bg-hover);border-color:var(--accent)}
-.ast-leaf.is-linked{animation:ast-pulse 1.2s ease-out}
-@keyframes ast-pulse{
-  0%{box-shadow:0 0 0 0 var(--accent)}
-  60%{box-shadow:0 0 0 6px rgba(79,140,255,0.5)}
-  100%{box-shadow:0 0 0 0 rgba(79,140,255,0)}
+.ast-meta{margin-left:auto;color:var(--text-faint);font-size:11px;font-family:var(--font-mono)}
+.ast-stage{flex:1;min-height:0;overflow:auto;background:var(--bg-primary);position:relative;cursor:grab;user-select:none;background-image:radial-gradient(circle at 1px 1px, var(--border) 1px, transparent 0);background-size:24px 24px;background-position:0 0}
+.ast-canvas{position:absolute;top:0;left:0;transform-origin:0 0;padding:18px}
+
+/* SVG container — never shrink when the canvas is panned past the
+   visible viewport.  The viewBox keeps the graph aligned with the
+   native SVG coordinate system so pan / zoom transforms map 1:1. */
+.ast-svg{display:block}
+
+/* Generic node box: white/blue-tinted rounded rectangle, dark text.
+   Specific kinds (.ast-node-op / -kw / -ident / -literal) override
+   the fill colour below. */
+.ast-node-box{
+  fill:var(--bg-secondary);
+  stroke:var(--accent);
+  stroke-width:1.4;
+  transition:fill 0.15s, stroke 0.15s, filter 0.15s;
+  cursor:pointer;
 }
-.ast-leaf.ast-keyword:hover,
-.ast-leaf.ast-keyword:focus{outline:none}
+.ast-node-box:hover{
+  stroke:var(--accent-hover);
+  filter:drop-shadow(0 0 6px rgba(79,140,255,0.45));
+}
+
+/* Operators (AND / OR / NOT / + - * / etc.) — purple/lavender fill,
+   matching the "OR / AND" pill boxes in the design reference. */
+.ast-node-box.ast-node-op{
+  fill:#e8e2ff;
+  stroke:#7c5cff;
+  stroke-width:1.6;
+}
+.ast-node-box.ast-node-op + text,
+text.ast-node-label.ast-op{fill:#3a1f8a;font-weight:600}
+
+/* SQL clause keywords (WHERE / SELECT / FROM / …) — softer purple. */
+.ast-node-box.ast-node-kw{
+  fill:rgba(196,132,252,0.18);
+  stroke:rgba(196,132,252,0.55);
+}
+text.ast-node-label.ast-keyword{fill:var(--purple);font-weight:600}
+
+/* Identifiers (column / table names) — neutral white. */
+.ast-node-box.ast-node-ident{
+  fill:var(--bg-primary);
+  stroke:var(--accent);
+  stroke-width:1.4;
+}
+text.ast-node-label.ast-ident{fill:var(--text-primary);font-weight:500}
+
+/* Literals (numbers / strings) — green accent. */
+.ast-node-box.ast-node-literal{
+  fill:rgba(74,222,128,0.18);
+  stroke:rgba(74,222,128,0.55);
+}
+text.ast-node-label.ast-literal{fill:var(--green);font-weight:600}
+
+text.ast-node-label{
+  font-family:var(--font-mono);
+  font-size:13px;
+  pointer-events:none;
+  user-select:none;
+}
+
+/* Connection lines between parent and child nodes: smooth cubic Bezier
+   so the curve flows down from the parent's bottom-centre and reaches
+   the child's top-centre without any sharp angles. */
+.ast-edge{
+  fill:none;
+  stroke:var(--text-mute, #909198);
+  stroke-width:1.4;
+  opacity:0.85;
+}
+
+/* The collapse / expand handle drawn at the bottom of group nodes. */
+.ast-collapse-toggle{cursor:pointer}
+.ast-collapse-toggle circle{transition:fill 0.15s, stroke 0.15s}
+.ast-collapse-toggle:hover circle{fill:var(--accent-dim);stroke:var(--accent)}
+text.ast-collapse-glyph{
+  font-family:var(--font-mono);
+  font-size:12px;
+  font-weight:700;
+  fill:var(--text-secondary);
+  pointer-events:none;
+  user-select:none;
+}
+
+/* Highlight pulse on hover-link (driven by linkAstLeafToEditor). */
+.ast-svg-node.is-linked .ast-node-box{filter:drop-shadow(0 0 8px var(--accent))}
 
 /* ===== 执行计划树 ===== */
 .plan-tree{display:flex;flex-direction:column;gap:2px;padding:4px 0;font-family:var(--font-mono)}
