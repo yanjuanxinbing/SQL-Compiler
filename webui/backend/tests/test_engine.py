@@ -382,6 +382,60 @@ class TestSplitStatements(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertIn("nothing here", out[0])
 
+    # ── CREATE PROCEDURE/FUNCTION BEGIN…END awareness ──────────────────
+    # The C++ engine's RunScriptFile keeps `;` inside a routine body as
+    # part of the statement (HasCompleteStatement counts BEGIN/END only
+    # after CREATE FUNCTION/PROCEDURE).  Our splitter must match that,
+    # otherwise per-statement `-f` dispatch chops procedures into
+    # fragments and 68_proc_handlers.sql explodes from 2 real errors to
+    # ~58 bogus ones.
+
+    def test_procedure_body_semicolons_not_split(self):
+        out = SqlEngine._split_statements(
+            "CREATE PROCEDURE p() BEGIN "
+            "DECLARE x INT; SET x = 1; SELECT x; END; "
+            "CALL p();"
+        )
+        self.assertEqual(len(out), 2)
+        self.assertIn("CREATE PROCEDURE", out[0])
+        self.assertIn("DECLARE x INT", out[0])
+        self.assertIn("END", out[0])
+        self.assertEqual(out[1], "CALL p()")
+
+    def test_transaction_begin_is_not_routine_body(self):
+        # A bare BEGIN (transaction control) must NOT start depth
+        # counting — the engine only arms it after CREATE FUNCTION/
+        # PROCEDURE.  Every statement keeps its own `;` boundary.
+        out = SqlEngine._split_statements(
+            "BEGIN; INSERT INTO t VALUES (1); COMMIT;"
+        )
+        self.assertEqual(out, ["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"])
+
+    def test_end_if_does_not_close_routine_body(self):
+        out = SqlEngine._split_statements(
+            "CREATE FUNCTION f() BEGIN "
+            "IF x > 0 THEN RETURN 1; END IF; "
+            "RETURN 0; END; "
+            "SELECT 1;"
+        )
+        self.assertEqual(len(out), 2)
+        self.assertIn("END IF", out[0])
+        self.assertIn("RETURN 0", out[0])
+        self.assertEqual(out[1], "SELECT 1")
+
+    def test_routine_state_resets_between_statements(self):
+        # After one procedure ends, a following standalone BEGIN must
+        # not inherit the routine-body mode.
+        out = SqlEngine._split_statements(
+            "CREATE PROCEDURE a() BEGIN SELECT 1; END; "
+            "BEGIN; SELECT 2; COMMIT;"
+        )
+        self.assertEqual(len(out), 4)
+        self.assertIn("CREATE PROCEDURE a()", out[0])
+        self.assertEqual(out[1], "BEGIN")
+        self.assertEqual(out[2], "SELECT 2")
+        self.assertEqual(out[3], "COMMIT")
+
 
 # ── Debug JSON extraction ──────────────────────────────────────────────────
 
@@ -1051,6 +1105,63 @@ class TestNativeMultiStatement(unittest.TestCase):
         finally:
             db.unlink(missing_ok=True)
 
+    def test_implicit_transaction_surfaces_mid_batch_failure(self):
+        # Regression: a failing statement inside the implicit BEGIN…COMMIT
+        # wrapper printed no stdout, so positional parsing shifted COMMIT's
+        # "OK" onto the failed statement — the UI showed every block green
+        # and the error was silently swallowed.  With one `-f` per
+        # statement the failing block's empty segment is pinpointed and the
+        # stderr error attributed to it.
+        import asyncio
+        eng, db = self._fresh_engine()
+        try:
+            sql = ("CREATE TABLE tx (id INT);"
+                   "INSERT INTO tx VALUES (1);"
+                   "SELECT * FROM nope;"
+                   "INSERT INTO tx VALUES (2);")
+            run = asyncio.run(eng.execute(sql, transaction=True))
+            self.assertFalse(run.success)
+            # BEGIN/COMMIT scaffolding must not leak into the results.
+            self.assertEqual(len(run.blocks), 4)
+            self.assertTrue(run.blocks[0].success)   # CREATE
+            self.assertTrue(run.blocks[1].success)   # INSERT 1
+            self.assertFalse(run.blocks[2].success)  # the failing SELECT
+            self.assertEqual(run.blocks[2].kind, "error")
+            self.assertIn("nope", run.blocks[2].message)
+            self.assertTrue(run.blocks[3].success)   # INSERT 2 (engine kept going)
+        finally:
+            db.unlink(missing_ok=True)
+
+    def test_explicit_transaction_surfaces_mid_batch_failure(self):
+        # Same mis-attribution bug for user-authored BEGIN…COMMIT batches:
+        # the failing statement must be marked as an error, and the
+        # statements around it must keep their own correct output.
+        import asyncio
+        eng, db = self._fresh_engine()
+        try:
+            boot = asyncio.run(eng.execute("CREATE TABLE xt (id INT);"))
+            self.assertTrue(boot.success)
+            sql = ("BEGIN;"
+                   "INSERT INTO xt VALUES (1);"
+                   "SELECT * FROM missing_tbl;"
+                   "INSERT INTO xt VALUES (2);"
+                   "COMMIT;")
+            run = asyncio.run(eng.execute(sql))
+            self.assertFalse(run.success)
+            self.assertEqual(len(run.blocks), 5)
+            self.assertTrue(run.blocks[0].success)   # BEGIN
+            self.assertTrue(run.blocks[1].success)   # INSERT 1
+            self.assertFalse(run.blocks[2].success)  # failing SELECT
+            self.assertEqual(run.blocks[2].kind, "error")
+            self.assertIn("missing_tbl", run.blocks[2].message)
+            self.assertTrue(run.blocks[3].success)   # INSERT 2
+            self.assertTrue(run.blocks[4].success)   # COMMIT
+            # Both inserts survived the batch (engine has no abort-on-error).
+            check = asyncio.run(eng.execute("SELECT COUNT(*) AS n FROM xt;"))
+            self.assertEqual(check.blocks[0].rows, [["2"]])
+        finally:
+            db.unlink(missing_ok=True)
+
     def test_concurrent_batches_on_isolated_databases(self):
         # Each batch uses its own DB file and its own subprocess, so
         # concurrent execution must not cross-contaminate.
@@ -1175,6 +1286,42 @@ class TestNativeMultiStatement(unittest.TestCase):
             for i, b in enumerate(run.blocks):
                 with self.subTest(block=i):
                     self.assertTrue(b.success, msg=f"block {i} failed: {b.message}")
+        finally:
+            db.unlink(missing_ok=True)
+
+    def test_debug_explicit_transaction_surfaces_mid_batch_failure(self):
+        """Regression: execute_debug used to route any script containing
+        BEGIN/COMMIT through the merged-script `_execute_debug_single`,
+        where a failing statement prints no stdout and the positional
+        parser shifted the next statement's output onto it — the Visualize
+        tab showed all-green blocks and swallowed the error.  Explicit
+        user transactions now go through the per-`-f` multi-statement
+        debug path, which pinpoints the failing segment."""
+        import asyncio
+        eng, db = self._fresh_engine()
+        try:
+            boot, _ = asyncio.run(eng.execute_debug("CREATE TABLE dt (id INT);"))
+            self.assertTrue(boot.success)
+            sql = ("BEGIN;"
+                   "INSERT INTO dt VALUES (1);"
+                   "SELECT * FROM ghost_tbl;"
+                   "INSERT INTO dt VALUES (2);"
+                   "COMMIT;")
+            run, debug = asyncio.run(eng.execute_debug(sql))
+            self.assertEqual(len(run.blocks), 5)
+            self.assertFalse(run.success)
+            self.assertTrue(run.blocks[0].success)   # BEGIN
+            self.assertTrue(run.blocks[1].success)   # INSERT 1
+            self.assertFalse(run.blocks[2].success)  # failing SELECT
+            self.assertEqual(run.blocks[2].kind, "error")
+            self.assertIn("ghost_tbl", run.blocks[2].message)
+            self.assertTrue(run.blocks[3].success)   # INSERT 2
+            self.assertTrue(run.blocks[4].success)   # COMMIT
+            # per-statement envelopes stay aligned: the engine emits one
+            # envelope per `-f` file (verified by probe), so every block —
+            # including the post-failure ones — carries its own debug dict
+            self.assertIsNotNone(run.blocks[4].debug)
+            self.assertIsNotNone(debug)
         finally:
             db.unlink(missing_ok=True)
 

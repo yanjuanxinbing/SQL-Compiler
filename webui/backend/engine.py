@@ -343,6 +343,25 @@ def _split_blocks(stdout: str, statements: list[str], stderr: str = "") -> list[
 # ── Engine executor ────────────────────────────────────────────────────────
 
 
+def _align_file_segments(stdout: str, count: int) -> list[str]:
+    """Split combined stdout into exactly `count` per-file segments.
+
+    When the engine runs with N `-f` files it appends a
+    `[script] <path>: ran N statement(s)` trailer after each file, so the
+    output splits into N trailer-terminated segments — including for a
+    file whose statement failed and printed nothing (its segment is simply
+    empty).  Anything after the last trailer is a post-script artifact and
+    gets dropped.  Missing segments are padded with "", surplus trimmed,
+    so the result always has exactly `count` entries aligned 1:1 with the
+    input statements.
+    """
+    parts = re.split(r"^\[script\][^\n]*\n?", stdout, flags=re.MULTILINE)
+    segs = parts[:count]
+    while len(segs) < count:
+        segs.append("")
+    return segs
+
+
 @dataclass
 class EngineRunResult:
     success: bool
@@ -502,10 +521,15 @@ class SqlEngine:
         if transaction and not user_txn:
             # implicit all-or-nothing wrapper
             return await asyncio.to_thread(self._run_transaction_batch_sync, stmts)
-        if len(stmts) == 1 or user_txn:
-            # single statement, or an explicit user-led transaction that
-            # must stay in one engine process
+        if len(stmts) == 1:
             return await self.run_script(s)
+        if user_txn:
+            # An explicit user-led transaction must stay in ONE engine
+            # process (the engine only tracks txn state in-process).  We
+            # still give each statement its own `-f` file so a failing
+            # statement — which prints no stdout — cannot shift the next
+            # statement's output onto it the way a merged script does.
+            return await asyncio.to_thread(self._run_multi_f_sync, stmts)
 
         # multi-statement autocommit → precise per-statement isolation
         return await self._run_each_statement(stmts, on_error)
@@ -557,24 +581,108 @@ class SqlEngine:
         )
 
     # ── implicit (automatic) transaction wrapper ──────────────────────────
-    def _run_transaction_batch_sync(self, stmts: list[str]) -> EngineRunResult:
-        """Run `BEGIN; …; COMMIT;` in a single process for atomic commit."""
-        script_text = (
-            "BEGIN;\n" + "".join(_norm_statement(s) + "\n" for s in stmts) + "COMMIT;\n"
-        )
-        # Align output against BEGIN + user stmts + COMMIT, then drop the
-        # two synthetic boundary blocks so `blocks` mirrors the user's
-        # statements only.
-        full = ["BEGIN"] + list(stmts) + ["COMMIT"]
-        run = self._invoke_engine(script_text, full)
-        blocks = run.blocks[1:-1] if len(run.blocks) >= 2 else []
+    def _run_multi_f_sync(self, full: list[str]) -> EngineRunResult:
+        """Run each statement as its own `-f` file in ONE engine subprocess.
+
+        The engine keeps a single session across all `-f` files of one
+        invocation (verified experimentally: a BEGIN in file 1 is still
+        open when file 4 runs COMMIT, and an uncommitted txn auto-rolls
+        back when the process exits).  The per-file layout is what makes
+        result attribution exact: every statement — including a failing
+        one that prints nothing — owns a `[script] …`-terminated stdout
+        segment, so an empty segment pinpoints the failure instead of
+        shifting the next statement's output onto it (which is what a
+        merged script does and silently swallowed errors).
+
+        Returns one block per entry in `full`, with stderr "Error:" lines
+        attributed in order to the empty segments.
+        """
+        tmp_paths: list[str] = []
+        t0 = time.monotonic()
+        try:
+            for stmt in full:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".sql", delete=False,
+                    encoding="utf-8", dir=tempfile.gettempdir(),
+                ) as f:
+                    f.write(_norm_statement(stmt) + "\n")
+                    tmp_paths.append(f.name)
+            cmd = [str(self.binary), str(self.db_path)]
+            for p in tmp_paths:
+                cmd.extend(["-f", p])
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=120,
+                )
+            except subprocess.TimeoutExpired as e:
+                return EngineRunResult(
+                    success=False, blocks=[],
+                    stderr=f"engine timeout after {e.timeout}s",
+                    elapsed_ms=int((time.monotonic() - t0) * 1000),
+                    returncode=-1,
+                )
+            except FileNotFoundError as e:
+                raise EngineError(f"engine binary not found: {e}") from e
+        finally:
+            for p in tmp_paths:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+        stderr_clean = proc.stderr or ""
+        segs = _align_file_segments(proc.stdout or "", len(full))
+        blocks: list[ParsedBlock] = []
+        err_lines = [
+            ln.strip()
+            for ln in stderr_clean.splitlines()
+            if ln.lstrip().startswith("Error:") or ln.lstrip().startswith("error:")
+        ]
+        err_idx = 0
+        for idx, stmt in enumerate(full):
+            seg = segs[idx]
+            blk = _parse_one_block(stmt, seg, "" if seg.strip() == "" else stderr_clean)
+            blk.statement = stmt
+            # An empty segment in the presence of a pending stderr error
+            # means THIS statement failed and printed nothing.
+            if (
+                blk.success
+                and seg.strip() == ""
+                and err_idx < len(err_lines)
+            ):
+                blk.success = False
+                blk.message = err_lines[err_idx]
+                blk.kind = "error"
+                err_idx += 1
+            blocks.append(blk)
         return EngineRunResult(
-            success=run.success and all(b.success for b in blocks),
+            success=(proc.returncode == 0) and err_idx == 0,
             blocks=blocks,
-            stderr=run.stderr,
-            elapsed_ms=run.elapsed_ms,
-            returncode=run.returncode,
+            stderr=stderr_clean,
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+            returncode=proc.returncode,
         )
+
+    def _run_transaction_batch_sync(self, stmts: list[str]) -> EngineRunResult:
+        """Run `BEGIN; …; COMMIT;` as one engine process for atomic commit.
+
+        The engine has no abort-on-error: after a failing statement it
+        still executes COMMIT, which then commits the *preceding
+        successful* statements.  We therefore surface the failure honestly
+        (block marked error + `run.success == False`) — full
+        all-or-nothing rollback for mid-batch failures is an engine-side
+        limitation, not something this wrapper can fix.
+
+        BEGIN/COMMIT are execution scaffolding, not user statements, so
+        their blocks are dropped from the returned list; `blocks` mirrors
+        `stmts` one-to-one.
+        """
+        full = ["BEGIN"] + list(stmts) + ["COMMIT"]
+        run = self._run_multi_f_sync(full)
+        # Drop the synthetic BEGIN/COMMIT boundary blocks.
+        run.blocks = run.blocks[1:-1] if len(run.blocks) >= 2 else []
+        return run
 
     # ── debug: execute + return JSON visualization data ───────────────────
     async def execute_debug(self, statement: str) -> tuple[EngineRunResult, dict | None]:
@@ -624,10 +732,16 @@ class SqlEngine:
         ]
         if not stmts:
             return EngineRunResult(success=True, blocks=[]), None
-        if len(stmts) == 1 or any(self._is_txn_control(x) for x in stmts):
+        if len(stmts) == 1:
             return await self._execute_debug_single(s)
 
-        # multi-statement autocommit → one -f per statement, single subprocess
+        # multi-statement (autocommit OR an explicit user BEGIN…COMMIT) →
+        # one -f per statement, single subprocess.  The engine keeps the
+        # transaction open across the `-f` files of one invocation, so an
+        # explicit user txn still runs atomically in-process; per-file
+        # layout is what stops a failing statement (which prints no stdout)
+        # from shifting the next statement's output onto it and swallowing
+        # the error the way a merged script does.
         return await asyncio.to_thread(self._execute_debug_multistatement_sync, stmts)
 
     def _execute_debug_multistatement_sync(
@@ -974,7 +1088,7 @@ class SqlEngine:
 
     @staticmethod
     def _is_repl_meta(s: str) -> bool:
-        """True if `s` is a C++ REPL meta-command, not SQL.
+        r"""True if `s` is a C++ REPL meta-command, not SQL.
 
         The CLI accepts a handful of dot/back-slash commands at the
         prompt (the engine banner says: `\.tokens`, `\.ast`, `\.plan`,
@@ -1045,6 +1159,13 @@ class SqlEngine:
         - `--` line comments;
         - `/* … */` block comments (a `;` inside any of these is NOT a
           statement terminator).
+        - `CREATE FUNCTION/PROCEDURE … BEGIN … END` bodies: a `;` inside
+          the body does NOT terminate the statement.  This mirrors the
+          engine's own `HasCompleteStatement` (src/main.cpp) — without it
+          our per-statement `-f` dispatch chops procedure bodies into
+          fragments (`CREATE PROC … BEGIN DECLARE…`, `END`, `CALL …`)
+          that each fail to parse, turning one valid procedure into a
+          dozen bogus errors.
 
         Only a top-level `;` terminates a statement.  Comments are
         preserved verbatim into the following statement (the C++ engine
@@ -1055,8 +1176,24 @@ class SqlEngine:
         in_string = False
         in_line_comment = False
         in_block_comment = False
+        # Per-statement CREATE FUNCTION/PROCEDURE BEGIN…END tracking,
+        # reset whenever a statement is emitted — matching the engine,
+        # which re-runs HasCompleteStatement on a freshly emptied buffer
+        # for every statement.
+        create_fn_seen = False
+        begin_depth = 0
         i = 0
         n = len(sql)
+
+        def word_at(pos: int) -> tuple[str, int]:
+            """Upper-cased identifier word at `pos`; returns (word, end)."""
+            while pos < n and sql[pos].isspace():
+                pos += 1
+            j = pos
+            while j < n and (sql[j].isalpha() or sql[j] == "_"):
+                j += 1
+            return sql[pos:j].upper(), j
+
         while i < n:
             c = sql[i]
             nxt = sql[i + 1] if i + 1 < n else ""
@@ -1100,11 +1237,44 @@ class SqlEngine:
                 buf.append(c)
                 i += 1
                 continue
+            if c.isalpha() or c == "_":
+                # Identifier: mirror the engine's CREATE FUNCTION/PROCEDURE
+                # + BEGIN/END depth scan so routine bodies stay intact.
+                j = i
+                while j < n and (sql[j].isalpha() or sql[j] == "_"):
+                    j += 1
+                w = sql[i:j].upper()
+                if w == "CREATE" and not create_fn_seen:
+                    nxt_w, _ = word_at(j)
+                    if nxt_w in ("FUNCTION", "PROCEDURE"):
+                        create_fn_seen = True
+                elif create_fn_seen and w == "BEGIN":
+                    begin_depth += 1
+                elif create_fn_seen and w == "END":
+                    # END IF / WHILE / LOOP / REPEAT / CASE close a
+                    # sub-block, not the routine body — skip the pair
+                    # (same rule as HasCompleteStatement).
+                    nxt_w, nxt_end = word_at(j)
+                    if nxt_w in ("IF", "WHILE", "LOOP", "REPEAT", "CASE"):
+                        buf.append(sql[i:nxt_end])
+                        i = nxt_end
+                        continue
+                    if begin_depth > 0:
+                        begin_depth -= 1
+                buf.append(sql[i:j])
+                i = j
+                continue
             if c == ";":
-                stmt = "".join(buf).strip()
-                if stmt:
-                    out.append(stmt)
-                buf = []
+                if begin_depth == 0:
+                    stmt = "".join(buf).strip()
+                    if stmt:
+                        out.append(stmt)
+                    buf = []
+                    create_fn_seen = False
+                    begin_depth = 0
+                else:
+                    # semicolon inside a routine body: keep it verbatim
+                    buf.append(c)
                 i += 1
                 continue
             buf.append(c)
