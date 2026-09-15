@@ -511,15 +511,25 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
     };
     // 子查询求值上下文：当 qualifier 非空且不在内层表集合中时，
     // 该限定列必定引用外层（相关子查询），应优先回退到 outer_bind 而非裸列名。
+    // 60_query：再区分「内层别名（from_table_alias）」与「from_table 原名」
+    // —— 内层给了 alias 的情况下，from_table 原名已被屏蔽；用户写
+    // `t.col`（FROM t t2）通常是希望引用外层（alias 才是真正的内层引用）。
+    // qualifier_is_inner_alias = true 时跳过 outer_bind 回退，按内层解析。
     bool qualifier_is_outer = false;
+    bool qualifier_is_inner_alias = false;
     if (!expr.table_name.empty() && ctx_) {
         const std::unordered_set<std::string>* inner_tables = ctx_->GetInnerTables();
+        const std::unordered_set<std::string>* inner_aliases = ctx_->GetInnerAliases();
         if (!inner_tables) {
             // 55_query: LATERAL 路径下 ApplyExecutor 会注册「lateral inner tables」，
             // 即使 EvaluateSubquery 没被调用，evaluator 也能识别哪些表名属于右子计划。
             inner_tables = ctx_->GetLateralInnerTables();
         }
-        if (inner_tables && inner_tables->find(expr.table_name) == inner_tables->end()) {
+        if (inner_aliases &&
+            inner_aliases->find(expr.table_name) != inner_aliases->end()) {
+            qualifier_is_inner_alias = true;
+        } else if (inner_tables &&
+                   inner_tables->find(expr.table_name) == inner_tables->end()) {
             qualifier_is_outer = true;
         }
     }
@@ -541,6 +551,22 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
         // outer_bind 中（极少见的"用户引用了 outer 的列但 subquery 不引用"情形），
         // 同样需要回退。
     }
+    // 60_query：限定符在 inner_tables 但 NOT in inner_aliases ——
+    // 表示它是内层 from_table 的原名（被 alias 屏蔽），按用户意图优先解析为外层
+    // （参考 PostgreSQL 之外多数教学型引擎的实用语义）。仅当 outer_bind 也有该
+    // 限定列条目时回退，避免「外层没记录却被误判为外层引用」导致 silent NULL。
+    if (!qualifier_is_outer && !qualifier_is_inner_alias &&
+        !expr.table_name.empty() && outer_bind_) {
+        std::string qk = expr.table_name + "." + expr.column_name;
+        auto ob = outer_bind_->find(qk);
+        if (ob != outer_bind_->end()) return ob->second;
+        EnsureOuterBindCi();
+        std::string lc;
+        lc.reserve(qk.size());
+        for (char c : qk) lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        auto it2 = ci_outer_bind_.find(lc);
+        if (it2 != ci_outer_bind_.end()) return it2->second;
+    }
     if (!expr.table_name.empty()) {
         std::string qkey = expr.table_name + "." + expr.column_name;
         size_t idxq = find_ci_idx(qkey);
@@ -552,6 +578,25 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
         // 空 qualifier 的 ColumnRefExpr，自然走下面的 fallback 路径。
     }
     size_t col_idx = find_ci_idx(expr.column_name);
+    // 60_query：仅当「unqualified 引用所在的比较表达式的另一侧使用了内层
+    // alias」时，才把该 unqualified 优先解析为外层。
+    //   WHERE t2.cat = cat   —— 左侧用 alias t2（明确指内层），右侧 cat 应指外层；
+    //   WHERE category = t.category —— 左侧 category 是裸名、右侧用 from_table 原名 t
+    //     （非 alias），不满足「另一侧用 alias」条件，category 默认指内层。
+    // 该标志由 EvaluateBinary 在进入比较表达式的对应分支时按需设置。
+    if (col_idx != static_cast<size_t>(-1) && expr.table_name.empty() &&
+        peer_uses_inner_alias_ && outer_bind_ && ctx_) {
+        auto ob_n = outer_bind_->find(expr.column_name);
+        if (ob_n != outer_bind_->end()) return ob_n->second;
+        EnsureOuterBindCi();
+        std::string lc_n;
+        lc_n.reserve(expr.column_name.size());
+        for (char c : expr.column_name) {
+            lc_n.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        }
+        auto it2_n = ci_outer_bind_.find(lc_n);
+        if (it2_n != ci_outer_bind_.end()) return it2_n->second;
+    }
     if (col_idx == static_cast<size_t>(-1)) {
         // 相关子查询回退：到外层行绑定中找同名列。
         if (outer_bind_) {
@@ -597,17 +642,48 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
 }
 
 Value ExpressionEvaluator::EvaluateBinary(const BinaryExpr& expr, const Tuple& tuple) const {
-    // 45_datetime: INTERVAL_ADD / INTERVAL_SUB 的右操作数是 IntervalExprNode，
-    // 不需要对它求值（数据在 AST 节点上），而是直接用节点本身。
+    // 60_query：仅当「比较表达式的另一侧使用了内层 alias」时，才让对侧的
+    // unqualified ColumnRef 优先解析为外层。例：
+    //   `t2.cat = cat`：右 cat 评估时 peer_uses_inner_alias_ = true（左 t2 是 alias）。
+    //   `category = t.category`：左 category 评估时 peer_uses_inner_alias_ = false
+    //     （右 t.category 用的是 from_table 原名而非 alias）。
+    // 这避免「比较里另一侧用 from_table 名而非 alias」时仍误把裸列名当外层。
+    auto peer_uses_alias = [&](const ExprPtr& peer) -> bool {
+        if (!peer || peer->GetType() != NodeType::COLUMN_REF_EXPR) return false;
+        const auto& cr = static_cast<const ColumnRefExpr*>(peer.get())->table_name;
+        if (cr.empty()) return false;
+        if (!ctx_) return false;
+        const auto* aliases = ctx_->GetInnerAliases();
+        return aliases && aliases->find(cr) != aliases->end();
+    };
+    bool is_comparison =
+        expr.op == BinaryOperator::EQUAL || expr.op == BinaryOperator::NOT_EQUAL ||
+        expr.op == BinaryOperator::LESS || expr.op == BinaryOperator::LESS_EQUAL ||
+        expr.op == BinaryOperator::GREATER ||
+        expr.op == BinaryOperator::GREATER_EQUAL;
+    bool prev_peer = peer_uses_inner_alias_;
+    if (is_comparison) {
+        // 评估 expr.left 时把 expr.right 是否为 alias 写入 flag。
+        peer_uses_inner_alias_ = peer_uses_alias(expr.right);
+    }
     Value l = Evaluate(expr.left, tuple);
-    Value r = Value::MakeNull();
     bool right_is_interval = (expr.op == BinaryOperator::INTERVAL_ADD ||
                               expr.op == BinaryOperator::INTERVAL_SUB) &&
                               expr.right &&
                               expr.right->GetType() == NodeType::INTERVAL_EXPR;
+    if (is_comparison) {
+        // 评估 expr.right 时把 expr.left 是否为 alias 写入 flag。
+        peer_uses_inner_alias_ = peer_uses_alias(expr.left);
+    }
+    Value r = Value::MakeNull();
     if (!right_is_interval) {
         r = Evaluate(expr.right, tuple);
+    } else {
+        r = Evaluate(expr.right, tuple);
     }
+    peer_uses_inner_alias_ = prev_peer;
+    // 45_datetime: INTERVAL_ADD / INTERVAL_SUB 的右操作数是 IntervalExprNode，
+    // 不需要对它求值（数据在 AST 节点上），而是直接用节点本身。
     // 混合运算时把INTEGER操作数提升为double：
     // AsFloat()对INTEGER值返回的是内部float_val_（恒为0），直接使用会得到错误结果
     auto ToDouble = [](const Value& v) -> double {
@@ -1483,53 +1559,134 @@ void CollectInnerTableNames(const SelectStatement& sub,
     }
 }
 
+// 60_query 相关子查询：仅收集内层别名（from_table_alias / join.alias），
+// 不包含 from_table 原名。EvaluateColumnRef 据此区分：
+//   - 限定符在 inner_aliases_ 中 → 是内层别名，引用必为内层元组（不可回退到 outer_bind）。
+//   - 限定符不在 inner_aliases_ 但在 inner_tables_ 中 → 是 from_table 原名，
+//     内层用 alias 屏蔽了它，按用户意图优先解析为外层（参考 PostgreSQL 之外
+//     多数教学型 SQL 引擎的实用语义）。
+void CollectInnerAliasNames(const SelectStatement& sub,
+                            std::unordered_set<std::string>& out) {
+    if (!sub.is_lateral && !sub.from_table_alias.empty()) {
+        out.insert(sub.from_table_alias);
+    } else if (sub.is_lateral && !sub.from_table_alias.empty()) {
+        out.insert(sub.from_table_alias);
+    }
+    for (const auto& j : sub.joins) {
+        if (!j.table_alias.empty()) out.insert(j.table_alias);
+    }
+    if (sub.derived_table && !sub.derived_alias.empty()) {
+        out.insert(sub.derived_alias);
+    }
+}
+
 // 在表达式树里查找任何 ColumnRefExpr，其 table_name 非空且不在 inner 表集合中
 // —— 这表示它引用了外层 SELECT 的某列，是相关子查询标志。
+// 60_query：除「限定符不在 inner 集合」外，再考虑「限定符是内层 from_table
+// 原名（被 alias 屏蔽）」也是潜在的外层引用 —— `WHERE t.col = t2.col`（内层
+// `FROM t t2`）中 `t.col` 用户多半意图引用外层同表，否则 `t.col = t2.col` 退化为
+// 恒真导致相关列失效。`inner_aliases`（仅含 from_table_alias / join alias）让
+// 我们区分这两种情形。
 bool WalkExprForOuterRefs(const ExprPtr& e,
-                          const std::unordered_set<std::string>& inner_tables) {
+                          const std::unordered_set<std::string>& inner_tables,
+                          const std::unordered_set<std::string>& inner_aliases);
+
+// 60_query：在外层引用检测中递归遍历嵌套子查询的内层 SELECT，避免「IN-list
+// 体里的相关子查询」把外层 IN 子查询错误识别为非相关并缓存。沿用与
+// WalkExprForOuterRefs 相同的判定规则；inner_tables / inner_aliases 仍按内
+// 层 SELECT 自身的 FROM / JOIN 计算。
+bool WalkExprForOuterRefsInSelect(
+    const SelectStatement& sub,
+    const std::unordered_set<std::string>& inner_tables,
+    const std::unordered_set<std::string>& inner_aliases) {
+    for (const auto& e : sub.select_list) {
+        if (WalkExprForOuterRefs(e, inner_tables, inner_aliases)) return true;
+    }
+    if (WalkExprForOuterRefs(sub.where_clause, inner_tables, inner_aliases)) return true;
+    if (WalkExprForOuterRefs(sub.having_clause, inner_tables, inner_aliases)) return true;
+    for (const auto& e : sub.group_by) {
+        if (WalkExprForOuterRefs(e, inner_tables, inner_aliases)) return true;
+    }
+    for (const auto& ob : sub.order_by) {
+        if (WalkExprForOuterRefs(ob.expr, inner_tables, inner_aliases)) return true;
+    }
+    for (const auto& j : sub.joins) {
+        if (WalkExprForOuterRefs(j.on_condition, inner_tables, inner_aliases)) return true;
+    }
+    return false;
+}
+
+bool WalkExprForOuterRefs(const ExprPtr& e,
+                          const std::unordered_set<std::string>& inner_tables,
+                          const std::unordered_set<std::string>& inner_aliases) {
     if (!e) return false;
     switch (e->GetType()) {
         case NodeType::COLUMN_REF_EXPR: {
             auto cr = static_cast<const ColumnRefExpr*>(e.get());
-            // 限定列：table_name 不在 inner 集合 → 外层引用
-            if (!cr->table_name.empty() &&
-                inner_tables.find(cr->table_name) == inner_tables.end()) {
-                return true;
+            if (!cr->table_name.empty()) {
+                // 限定列：table_name 不在 inner 集合 → 外层引用
+                if (inner_tables.find(cr->table_name) == inner_tables.end()) {
+                    return true;
+                }
+                // 限定列在 inner 集合但不在 inner_aliases 集合 —— 是 from_table
+                // 原名（被 alias 屏蔽），视为潜在外层引用。
+                if (inner_aliases.find(cr->table_name) == inner_aliases.end()) {
+                    return true;
+                }
+                // 限定列是 inner alias（from_table_alias / join alias）→ 必内层。
+                return false;
             }
             // 未限定列：保守地视为可能的外层引用（无法在当前点做完整 schema 解析）。
             // 代价是少量非相关子查询被当成相关，每行重跑——可接受。
-            if (cr->table_name.empty()) return true;
-            return false;
+            return true;
         }
         case NodeType::BINARY_EXPR: {
             auto b = std::static_pointer_cast<BinaryExpr>(e);
-            return WalkExprForOuterRefs(b->left, inner_tables) ||
-                   WalkExprForOuterRefs(b->right, inner_tables);
+            return WalkExprForOuterRefs(b->left, inner_tables, inner_aliases) ||
+                   WalkExprForOuterRefs(b->right, inner_tables, inner_aliases);
         }
         case NodeType::UNARY_EXPR: {
             auto u = std::static_pointer_cast<UnaryExpr>(e);
-            return WalkExprForOuterRefs(u->operand, inner_tables);
+            return WalkExprForOuterRefs(u->operand, inner_tables, inner_aliases);
         }
         case NodeType::FUNCTION_CALL_EXPR: {
             auto f = std::static_pointer_cast<FunctionCallExpr>(e);
             for (auto& a : f->arguments) {
-                if (WalkExprForOuterRefs(a, inner_tables)) return true;
+                if (WalkExprForOuterRefs(a, inner_tables, inner_aliases)) return true;
             }
             return false;
         }
         case NodeType::CASE_EXPR: {
             auto c = std::static_pointer_cast<CaseExprNode>(e);
-            if (WalkExprForOuterRefs(c->subject, inner_tables)) return true;
+            if (WalkExprForOuterRefs(c->subject, inner_tables, inner_aliases)) return true;
             for (auto& w : c->whens) {
-                if (WalkExprForOuterRefs(w.when_expr, inner_tables)) return true;
-                if (WalkExprForOuterRefs(w.then_expr, inner_tables)) return true;
+                if (WalkExprForOuterRefs(w.when_expr, inner_tables, inner_aliases)) return true;
+                if (WalkExprForOuterRefs(w.then_expr, inner_tables, inner_aliases)) return true;
             }
-            if (WalkExprForOuterRefs(c->else_expr, inner_tables)) return true;
+            if (WalkExprForOuterRefs(c->else_expr, inner_tables, inner_aliases)) return true;
             return false;
         }
         case NodeType::CAST_EXPR: {
             auto c = std::static_pointer_cast<CastExprNode>(e);
-            return WalkExprForOuterRefs(c->expr, inner_tables);
+            return WalkExprForOuterRefs(c->expr, inner_tables, inner_aliases);
+        }
+        case NodeType::SUBQUERY_EXPR: {
+            // 60_query：嵌套子查询相关 —— 外层引用出现在 SubqueryExpr 的内层
+            // SELECT 时（如 `... WHERE o.id IN (SELECT id FROM t WHERE cat = cat)`），
+            // 中间层 IN-list 子查询自身不被 IsSubqueryCorrelated 直接识别，但
+            // 仍依赖外层列。需要递归遍历内层 SELECT 的表达式。
+            auto sq = std::static_pointer_cast<SubqueryExprNode>(e);
+            if (sq->subquery) {
+                if (WalkExprForOuterRefsInSelect(*sq->subquery,
+                                                 inner_tables, inner_aliases)) {
+                    return true;
+                }
+            }
+            if (sq->outer_expr &&
+                WalkExprForOuterRefs(sq->outer_expr, inner_tables, inner_aliases)) {
+                return true;
+            }
+            return false;
         }
         default:
             return false;
@@ -1538,11 +1695,15 @@ bool WalkExprForOuterRefs(const ExprPtr& e,
 
 // 判断一个子查询是否为相关子查询：扫描其 SELECT 列表 / WHERE / HAVING /
 // ORDER BY / JOIN ON 中是否有引用外层列的 ColumnRefExpr。
+// 60_query：把「from_table 原名（非 alias）」也视为潜在外层引用，让内层给了 alias
+// 的同名表 `WHERE t.col = t2.col` 不会被漏判为非相关。
 bool IsSubqueryCorrelated(const SelectStatement& sub) {
     std::unordered_set<std::string> inner_tables;
+    std::unordered_set<std::string> inner_aliases;
     CollectInnerTableNames(sub, inner_tables);
+    CollectInnerAliasNames(sub, inner_aliases);
     auto walk = [&](const ExprPtr& e) {
-        return WalkExprForOuterRefs(e, inner_tables);
+        return WalkExprForOuterRefs(e, inner_tables, inner_aliases);
     };
     for (const auto& e : sub.select_list) {
         if (walk(e)) return true;
@@ -1657,6 +1818,62 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
     // SubqueryExprNode 节点）。
     bool correlated =
         expr.subquery && IsSubqueryCorrelated(*expr.subquery);
+
+    // 60_query：嵌套子查询链传递所需的 bind / inner 表集合在「要跑计划」
+    // 之前统一挂到 ctx。两类路径（cache miss / correlated）都共享同一份
+    // 预挂逻辑，仅在「叠加 BuildOuterBind 精确匹配」上有所区别。父 bind
+    // 优先级最低（被后续覆盖），当前行 bind 居中，子查询精确匹配最高。
+    // 71_proc_out_params：同时合并调用方 evaluator 的 outer_bind_ —— procedure
+    // 体内部 SET x = (subquery) 时，UdfExecutor 把 frame.locals 作为 outer_bind_
+    // 传入，本 evaluator 必须把它带下去，否则子查询看不到 threshold 等参数。
+    const std::unordered_map<std::string, Value>* saved_bind_for_nest = ctx_->GetOuterBind();
+    std::unordered_map<std::string, Value> nested_bind;
+    const std::unordered_map<std::string, Value>* use_bind_for_nest = nullptr;
+    if (saved_bind_for_nest) {
+        for (const auto& kv : *saved_bind_for_nest) {
+            nested_bind[kv.first] = kv.second;
+        }
+    }
+    if (outer_bind_) {
+        for (const auto& kv : *outer_bind_) {
+            if (nested_bind.find(kv.first) == nested_bind.end()) {
+                nested_bind[kv.first] = kv.second;
+            }
+        }
+    }
+    for (const auto& kv : column_index_map_) {
+        if (kv.second < tuple.ColumnCount()) {
+            nested_bind[kv.first] = tuple.GetValue(kv.second);
+        }
+    }
+    if (!nested_bind.empty()) {
+        use_bind_for_nest = &nested_bind;
+        ctx_->SetOuterBind(use_bind_for_nest);
+    }
+    const std::unordered_set<std::string>* saved_inner_for_nest = ctx_->GetInnerTables();
+    std::unique_ptr<std::unordered_set<std::string>> owned_inner_tables_for_nest;
+    const std::unordered_set<std::string>* use_inner_for_nest = nullptr;
+    if (expr.subquery) {
+        owned_inner_tables_for_nest = std::make_unique<std::unordered_set<std::string>>();
+        CollectInnerTableNames(*expr.subquery, *owned_inner_tables_for_nest);
+        use_inner_for_nest = owned_inner_tables_for_nest.get();
+        ctx_->SetInnerTables(use_inner_for_nest);
+    }
+    const std::unordered_set<std::string>* saved_inner_aliases_for_nest = ctx_->GetInnerAliases();
+    std::unique_ptr<std::unordered_set<std::string>> owned_inner_aliases_for_nest;
+    const std::unordered_set<std::string>* use_inner_aliases_for_nest = nullptr;
+    if (expr.subquery) {
+        owned_inner_aliases_for_nest = std::make_unique<std::unordered_set<std::string>>();
+        CollectInnerAliasNames(*expr.subquery, *owned_inner_aliases_for_nest);
+        use_inner_aliases_for_nest = owned_inner_aliases_for_nest.get();
+        ctx_->SetInnerAliases(use_inner_aliases_for_nest);
+    }
+    auto restore_nest = [&]() {
+        if (use_bind_for_nest) ctx_->SetOuterBind(saved_bind_for_nest);
+        if (use_inner_for_nest) ctx_->SetInnerTables(saved_inner_for_nest);
+        if (use_inner_aliases_for_nest) ctx_->SetInnerAliases(saved_inner_aliases_for_nest);
+    };
+
     if (!correlated) {
         struct SubqCache {
             std::vector<Tuple> rows;
@@ -1714,7 +1931,12 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
                     }
                     return Value::MakeInt(0);
                 }
-                case SubqueryType::ANY: {
+                case SubqueryType::ANY:
+                case SubqueryType::SOME: {
+                    // SOME 与 ANY 完全等价（SQL 标准同义关键字）。
+                    // 存在性量化：expr op SOME/ANY (SELECT ...)。
+                    // 行值至少有一个匹配比较 → TRUE；空集/全不匹配 → FALSE；
+                    // 含 NULL 且未命中 → UNKNOWN（NULL）。
                     if (!expr.outer_expr) return Value::MakeInt(0);
                     Value outer = Evaluate(expr.outer_expr, tuple);
                     if (outer.IsNull()) return Value::MakeNull();
@@ -1729,15 +1951,40 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
                     if (saw_null) return Value::MakeNull();
                     return Value::MakeInt(0);
                 }
+                case SubqueryType::ALL: {
+                    // 全称量化：expr op ALL (SELECT ...)。
+                    //   - 空集合 → TRUE（vacuous truth，SQL 标准规定）。
+                    //   - outer 为 NULL → NULL（三值逻辑）。
+                    //   - 任一行不满足 op → FALSE。
+                    //   - 所有非 NULL 行都满足且出现过 NULL → NULL（UNKNOWN）。
+                    //   - 所有非 NULL 行都满足且无 NULL → TRUE。
+                    if (!expr.outer_expr) return Value::MakeInt(0);
+                    Value outer = Evaluate(expr.outer_expr, tuple);
+                    if (outer.IsNull()) return Value::MakeNull();
+                    if (rows.empty()) return Value::MakeInt(1);  // vacuous TRUE
+                    const std::string& op = expr.comparison_op;
+                    bool saw_null = false;
+                    for (const auto& r : rows) {
+                        if (r.ColumnCount() == 0) continue;
+                        const Value& v = r.GetValue(0);
+                        if (v.IsNull()) { saw_null = true; continue; }
+                        if (!SqlCompare(outer, op, v)) return Value::MakeInt(0);
+                    }
+                    // 全部满足（无 FALSE）；若含 NULL → UNKNOWN，否则 TRUE。
+                    if (saw_null) return Value::MakeNull();
+                    return Value::MakeInt(1);
+                }
             }
             return Value::MakeNull();
         }
         // 缓存 miss：跑一次，把结果存进缓存。
+        // bind / inner 表集合已在函数顶部统一挂上，直接跑计划即可。
         auto rows = RunPlanToCompletion(ctx_, plan);
         SubqCache entry;
         entry.rows = rows;
         entry.have_rows = true;
         cache[&expr] = std::move(entry);
+        restore_nest();
         switch (expr.kind) {
             case SubqueryType::SCALAR: {
                 if (rows.empty()) return Value::MakeNull();
@@ -1768,7 +2015,9 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
                 if (mut.in_set.count("__had_null__") > 0) return Value::MakeNull();
                 return Value::MakeInt(0);
             }
-            case SubqueryType::ANY: {
+            case SubqueryType::ANY:
+            case SubqueryType::SOME: {
+                // SOME 与 ANY 等价；见上方 cache hit 路径的注释。
                 if (!expr.outer_expr) return Value::MakeInt(0);
                 Value outer = Evaluate(expr.outer_expr, tuple);
                 if (outer.IsNull()) return Value::MakeNull();
@@ -1783,31 +2032,35 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
                 if (saw_null) return Value::MakeNull();
                 return Value::MakeInt(0);
             }
+            case SubqueryType::ALL: {
+                // 全称量化；详见 cache hit 路径。
+                if (!expr.outer_expr) return Value::MakeInt(0);
+                Value outer = Evaluate(expr.outer_expr, tuple);
+                if (outer.IsNull()) return Value::MakeNull();
+                if (rows.empty()) return Value::MakeInt(1);
+                const std::string& op = expr.comparison_op;
+                bool saw_null = false;
+                for (const auto& r : rows) {
+                    if (r.ColumnCount() == 0) continue;
+                    const Value& v = r.GetValue(0);
+                    if (v.IsNull()) { saw_null = true; continue; }
+                    if (!SqlCompare(outer, op, v)) return Value::MakeInt(0);
+                }
+                if (saw_null) return Value::MakeNull();
+                return Value::MakeInt(1);
+            }
         }
         return Value::MakeNull();
     }
 
     // === 相关子查询：把当前外层行的列值推到 ExecutionContext，再跑子计划 ===
     // 跑完后恢复旧的 outer_bind，避免影响同语句后续无关的 evaluator。
-    const std::unordered_map<std::string, Value>* saved_bind = ctx_->GetOuterBind();
-    std::unordered_map<std::string, Value> owned_bind;
-    const std::unordered_map<std::string, Value>* use_bind = nullptr;
-    const std::unordered_set<std::string>* saved_inner = ctx_->GetInnerTables();
-    std::unique_ptr<std::unordered_set<std::string>> owned_inner_tables;
-    const std::unordered_set<std::string>* use_inner = nullptr;
-    // 71_proc_out_params：procedure 体内部的子查询需要看到 frame.locals（如
-    // `WHERE val > threshold`），外层元组通常是空、列下标 cmap 也是空，
-    // BuildOuterBind 提不出任何键。本分支把父 evaluator 的 outer_bind（通常
-    // 是 UdfExecutor::frame.locals）整体塞到 ctx_->outer_bind，使子查询内部
-    // 的 evaluator 通过 EvaluateColumnRef 的 outer_bind 回退路径找到这些键。
-    if (outer_bind_ != nullptr) {
-        use_bind = outer_bind_;
-        ctx_->SetOuterBind(use_bind);
-    }
+    // 60_query：嵌套子查询相关时已经在上方 nested_bind 中预挂了「父 bind + 当前行」，
+    // 本分支只在它之上叠加「子查询 AST 中相关列引用精确匹配的额外条目」——
+    // 这些条目优先级最高（用户写了 `o.col = t.col` 时希望绑到外层 t.col，即使
+    // nested_bind 里同名键已有当前行 / 父 bind 的兜底值）。其余 bind / inner
+    // 表集合已由上方统一设置，无需重做。
     if (correlated) {
-        // 合并子查询 AST 中所有相关位置的外层列引用：select_list / where /
-        // having / order_by / join.on 都可能引用外层。把每处 expr 喂给 BuildOuterBind，
-        // map 自动按 key 去重。
         std::vector<ExprPtr> rels;
         for (auto& e : expr.subquery->select_list) rels.push_back(e);
         if (expr.subquery->where_clause) rels.push_back(expr.subquery->where_clause);
@@ -1815,29 +2068,16 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
         for (auto& e : expr.subquery->group_by) rels.push_back(e);
         for (auto& ob : expr.subquery->order_by) rels.push_back(ob.expr);
         for (auto& j : expr.subquery->joins) rels.push_back(j.on_condition);
-        // 关键步骤：把本 evaluator 的 column_index_map_ 当作「外层」列下标映射，
-        // 因为调用方传进来的 tuple 就是外层元组，列下标语义一致。
         for (auto& r : rels) {
             auto sub_bind = BuildOuterBind(r, tuple, column_index_map_);
-            for (auto& kv : sub_bind) owned_bind[kv.first] = kv.second;
+            for (auto& kv : sub_bind) {
+                nested_bind[kv.first] = kv.second;
+            }
         }
-        if (!owned_bind.empty()) {
-            // 真实相关子查询：用 owned_bind（外层元组列）覆盖父 outer_bind
-            // （procedure locals），否则相关列被 procedure locals 误命中。
-            use_bind = &owned_bind;
-            ctx_->SetOuterBind(use_bind);
-        }
-        // 通知下游 evaluator：本上下文是子查询求值，给出内层表集合，
-        // 让 EvaluateColumnRef 能在限定列引用外层时正确回退。
-        owned_inner_tables = std::make_unique<std::unordered_set<std::string>>();
-        CollectInnerTableNames(*expr.subquery, *owned_inner_tables);
-        use_inner = owned_inner_tables.get();
-        ctx_->SetInnerTables(use_inner);
     }
 
     auto rows = RunPlanToCompletion(ctx_, plan);
-    if (use_bind) ctx_->SetOuterBind(saved_bind);
-    if (use_inner) ctx_->SetInnerTables(saved_inner);
+    restore_nest();
 
     switch (expr.kind) {
         case SubqueryType::SCALAR: {
@@ -1866,10 +2106,11 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
             }
             return saw_null ? Value::MakeNull() : Value::MakeInt(0);
         }
-        case SubqueryType::ANY: {
-            // expr op ANY (SELECT ...)：行值匹配至少一个元素即 TRUE。
-            // 子查询结果含 NULL 时按 NULL 语义：若全部为 NULL 或都不匹配，
-            // 返回 UNKNOWN（NULL）。
+        case SubqueryType::ANY:
+        case SubqueryType::SOME: {
+            // expr op ANY/SOME (SELECT ...)：行值匹配至少一个元素即 TRUE。
+            // SOME 与 ANY 完全等价。子查询结果含 NULL 时按 NULL 语义：
+            // 若全部为 NULL 或都不匹配，返回 UNKNOWN（NULL）。
             if (!expr.outer_expr) return Value::MakeInt(0);
             Value outer = Evaluate(expr.outer_expr, tuple);
             if (outer.IsNull()) return Value::MakeNull();
@@ -1884,6 +2125,24 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
             // 全是 NULL 或全不匹配：含 NULL → UNKNOWN，否则 FALSE
             if (saw_null) return Value::MakeNull();
             return Value::MakeInt(0);
+        }
+        case SubqueryType::ALL: {
+            // 全称量化：expr op ALL (SELECT ...)。空集 → TRUE（vacuous）；
+            // outer 为 NULL → NULL；任一行不满足 → FALSE；否则看是否含 NULL。
+            if (!expr.outer_expr) return Value::MakeInt(0);
+            Value outer = Evaluate(expr.outer_expr, tuple);
+            if (outer.IsNull()) return Value::MakeNull();
+            if (rows.empty()) return Value::MakeInt(1);
+            const std::string& op = expr.comparison_op;
+            bool saw_null = false;
+            for (const auto& r : rows) {
+                if (r.ColumnCount() == 0) continue;
+                const Value& v = r.GetValue(0);
+                if (v.IsNull()) { saw_null = true; continue; }
+                if (!SqlCompare(outer, op, v)) return Value::MakeInt(0);
+            }
+            if (saw_null) return Value::MakeNull();
+            return Value::MakeInt(1);
         }
     }
     return Value::MakeNull();

@@ -674,6 +674,19 @@ std::string SubqueryExprNode::ToString() const {
             << " " << comparison_op << " ANY (";
         if (subquery) oss << subquery->ToString();
         oss << "))";
+    } else if (kind == SubqueryType::SOME) {
+        // SOME 与 ANY 完全等价（SQL 标准同义关键字），仅展示形式不同。
+        oss << "(" << (outer_expr ? outer_expr->ToString() : "?")
+            << " " << comparison_op << " SOME (";
+        if (subquery) oss << subquery->ToString();
+        oss << "))";
+    } else if (kind == SubqueryType::ALL) {
+        // ALL：全称量化；空集时 vacuously TRUE。AST 层只记录结构，语义在
+        // ExpressionEvaluator::EvaluateSubquery 中实现。
+        oss << "(" << (outer_expr ? outer_expr->ToString() : "?")
+            << " " << comparison_op << " ALL (";
+        if (subquery) oss << subquery->ToString();
+        oss << "))";
     } else {
         oss << "(";
         if (subquery) oss << subquery->ToString();

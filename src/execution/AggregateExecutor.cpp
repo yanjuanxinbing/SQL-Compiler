@@ -304,6 +304,10 @@ void AggregateExecutor::Init() {
     child_->Init();
 
     ExpressionEvaluator eval(column_index_map_, context_, nullptr);
+    // 60_query：聚合函数实参 SUM(val) / MAX(price) 中的裸列名引用「val」/
+    // 「price」必须是内层 row 的值（否则会按外层 row 重复累加，结果错）。
+    // 与 FilterExecutor 不同，这里关闭"内层有 alias 时优先解析为外层"的启发式。
+    eval.SetPreferOuterForUnqualified(false);
 
     Tuple t;
     while (child_->Next(&t)) {
@@ -501,6 +505,9 @@ Value AggregateExecutor::EvalAggregateExpr(const ExprPtr& expr, const Tuple& sam
                                             const std::vector<AggregateState>& states,
                                             size_t idx) const {
     ExpressionEvaluator eval(column_index_map_, context_, nullptr);
+    // 60_query：见 Init 注释。EvalAggregateExpr 也用于 HAVING / 窗口函数等
+    // 输出阶段求值，关闭外层优先避免错误求值。
+    eval.SetPreferOuterForUnqualified(false);
     if (!expr) return Value::MakeNull();
     const auto& st = states[idx];
     // 窗口函数包装聚合（MAX(MAX(salary)) OVER (PARTITION BY dept) ... GROUP BY dept）：

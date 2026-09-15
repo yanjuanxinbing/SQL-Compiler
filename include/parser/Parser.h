@@ -188,6 +188,14 @@ private:
     void ParseFromTableRef(SelectStatement& stmt);
     // 解析 SELECT 语句并自动连接尾部 set-op 链
     StatementPtr ParseSelectStatementWithSetOps();
+    // 解析派生表 JOIN 右操作数 (SELECT ...) [AS] alias：
+    // 调用前已经看到 '('，本函数消耗 '('、解析 SELECT/WITH（含 UNION/INTERSECT/
+    // EXCEPT 链）、消耗 ')'、可选 AS、最后消耗别名标识符。
+    // out_select / out_set_op / out_alias 与 SelectStatement::derived_table /
+    // derived_set_op / derived_alias 一一对应；至少有一个指针被填充。
+    void ParseDerivedTableJoinOperand(SelectStatementPtr& out_select,
+                                      SetOperationStatementPtr& out_set_op,
+                                      std::string& out_alias);
 };
 
 }  // namespace sqlcompiler

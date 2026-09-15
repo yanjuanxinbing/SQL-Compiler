@@ -387,6 +387,48 @@ bool SemanticAnalyzer::AnalyzeSelect(const SelectStatement& stmt) {
         }
     }
     for (auto& j : stmt.joins) {
+        // 派生表 JOIN 右操作数：JOIN (SELECT ...) [AS] alias —— 不查 catalog，
+        // 改为注册其 alias 作为「虚拟表」。列来自内层 select_list 与 select_aliases。
+        // （与 LATERAL 子查询走相同的「虚拟表」模式，但语义层不维护 outer_bind。）
+        if (j.derived_subquery || j.derived_set_op) {
+            std::string derived_alias = !j.table_alias.empty() ? j.table_alias : j.table_name;
+            // 把内层 SELECT / 集合运算的 SELECT 节点收齐，统一抽取列名。
+            // 集合运算（UNION/INTERSECT/EXCEPT）取 left 的 select list 作代表：
+            // 两个分支同构、列数对齐，方言层足够覆盖常见用法。
+            SelectStatement* inner_select = nullptr;
+            if (j.derived_subquery) {
+                inner_select = j.derived_subquery.get();
+            } else if (j.derived_set_op && j.derived_set_op->left) {
+                inner_select = dynamic_cast<SelectStatement*>(j.derived_set_op->left.get());
+            }
+            TableInfo ti;
+            ti.table_name = derived_alias;
+            if (inner_select) {
+                const auto& sl = inner_select->select_list;
+                const auto& sa = inner_select->select_aliases;
+                for (size_t i = 0; i < sl.size(); ++i) {
+                    ColumnInfo ci;
+                    if (i < sa.size() && !sa[i].empty()) {
+                        ci.name = sa[i];
+                    } else if (sl[i] && sl[i]->GetType() == NodeType::COLUMN_REF_EXPR) {
+                        ci.name = std::static_pointer_cast<ColumnRefExpr>(sl[i])->column_name;
+                    } else {
+                        ci.name = "col" + std::to_string(i);
+                    }
+                    ci.data_type = "VARCHAR";
+                    ti.columns.push_back(std::move(ci));
+                }
+            }
+            // Catalog 的 SymbolTable 在跨语句间持久化；同名派生别名再次出现
+            // （典型如：前一条 SELECT 已把 `c` 注册为虚拟表，下一条 SELECT 复用
+            // 同名派生别名）时 RemoveTable 把旧条目清掉，让 AddTable 重新生效。
+            // 否则旧的列集合会覆盖新 SELECT 的列，导致外层列引用解析失败。
+            symbol_table_.RemoveTable(derived_alias);
+            symbol_table_.AddTable(ti);
+            real_tables.push_back(derived_alias);
+            table_aliases.emplace_back(derived_alias, derived_alias);
+            continue;
+        }
         // 55_query: LATERAL 派生表 join —— 不在 catalog 中查表存在性；
         // 改为注册其 alias 作为「虚拟表」，并把内部子查询的 select list / 别名
         // 收集为该虚拟表的列，让外层 `sub.col` 与 `m` 等引用通过。
@@ -460,13 +502,20 @@ bool SemanticAnalyzer::AnalyzeSelect(const SelectStatement& stmt) {
             visible_aliases.push_back(stmt.select_aliases[i]);
         }
     }
-    if (stmt.where_clause) ok &= CheckExpressionMulti(stmt.where_clause, real_tables, table_aliases);
-    for (auto& e : stmt.group_by) ok &= CheckExpressionMulti(e, real_tables, table_aliases);
-    // HAVING / ORDER BY 中允许引用 SELECT 列表中的别名。
+    // GROUP BY / HAVING / ORDER BY 中允许引用 SELECT 列表中的别名
+    // （SQL 标准：别名在同 SELECT 块内可见，GROUP BY/HAVING/ORDER BY 均可引用；
+    // 与 PostgreSQL / MySQL / SQL Server 等主流实现一致）。
+    // 实际语义正确性由 Planner 在生成 AggregateNode 时把裸别名
+    // ColumnRefExpr 改写为对应 SELECT-list 表达式的克隆 —— 否则 AggregateExecutor
+    // 会在 column_index_map 中查不到别名，GROUP BY 整列退化为 NULL，所有行
+    // 坍缩到同一组。
     std::vector<std::string> all_aliases;
     for (const auto& a : stmt.select_aliases) {
         if (!a.empty()) all_aliases.push_back(a);
     }
+    if (stmt.where_clause) ok &= CheckExpressionMulti(stmt.where_clause, real_tables, table_aliases);
+    for (auto& e : stmt.group_by) ok &= CheckExpressionMultiWithAliases(e, real_tables,
+                                                                       all_aliases, table_aliases);
     if (stmt.having_clause) ok &= CheckExpressionMultiWithAliases(stmt.having_clause, real_tables,
                                                                   all_aliases, table_aliases);
     for (auto& it : stmt.order_by) ok &= CheckExpressionMultiWithAliases(it.expr, real_tables,

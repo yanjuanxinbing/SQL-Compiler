@@ -36,6 +36,24 @@ public:
         outer_bind_ = bind;
     }
 
+    // 60_query：当内层有 alias（FROM t t2）时，裸列名引用按用户意图优先解析
+    // 为外层。FilterExecutor 默认 true；AggregateExecutor 求聚合函数实参时
+    // 设为 false（避免 SUM(val) 中的 val 被错误解析为外层，导致按外层 row
+    // 重复 SUM 而不是按内层 row 求和）。
+    void SetPreferOuterForUnqualified(bool v) const {
+        prefer_outer_for_unqualified_ = v;
+    }
+
+    // 60_query：仅在「unqualified 引用所在的比较表达式的另一侧使用了内层
+    // alias」时为 true。EvaluateBinary 进入 EQUAL / NOT_EQUAL 等比较的某
+    // 一侧时会按需设置。例如 `WHERE t2.cat = cat`：评估右侧 `cat` 时为 true，
+    // 评估 `t2.cat = t.category` 的 `category` 时为 false（右侧 `t.category`
+    // 用的是 from_table 原名而非 alias）。这样只对「明显在对内层表进行别名
+    // 限定」的场景才走外层优先启发式，避免误把内层 row 值错解析为外层。
+    void SetPeerUsesInnerAlias(bool v) const {
+        peer_uses_inner_alias_ = v;
+    }
+
     // 59_procs (Category 8): 设置 procedure 当前局部变量绑定。当 NULL 时
     // 关闭回退（默认）。该绑定在 ColumnRef 解析时与 outer_bind 并列使用：
     // outer_bind 优先；若 outer_bind 未命中且 proc_locals 非空，再回退到
@@ -60,6 +78,12 @@ private:
     mutable std::unordered_map<std::string, Value> ci_outer_bind_;
     mutable bool ci_outer_bind_built_ = false;
     mutable const std::unordered_map<std::string, Value>* ci_outer_bind_src_ = nullptr;
+    // 60_query：参见 SetPreferOuterForUnqualified。mutable 是 const 方法
+    // EvaluateColumnRef 写它的需要；默认 true 保留 FilterExecutor 的预期行为。
+    mutable bool prefer_outer_for_unqualified_ = true;
+    // 60_query：参见 SetPeerUsesInnerAlias。默认 false（普通子查询比较的
+    // 两侧不一定涉及 alias）；EvaluateBinary 进入比较的某一侧时按需置位。
+    mutable bool peer_uses_inner_alias_ = false;
 
     Value EvaluateLiteral(const LiteralExpr& expr) const;
 

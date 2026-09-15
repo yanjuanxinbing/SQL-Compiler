@@ -1405,6 +1405,52 @@ std::vector<ExprPtr> Parser::ParseSelectList() {
     return list;
 }
 
+// 解析派生表 JOIN 右操作数 (SELECT ...) [AS] alias：
+// 调用前已看到 '('。本函数消耗 '('、解析 SELECT / WITH（含 UNION/INTERSECT/
+// EXCEPT 链）、消耗 ')'、可选 AS、最后消耗别名标识符。
+// 与 ParseFromClause 中的派生表分支对齐：sub 是 SelectStatement 时落到
+// out_select，是 SetOperationStatement 时落到 out_set_op。SQL 标准要求
+// 派生表必须有别名，因此 alias 必填。
+void Parser::ParseDerivedTableJoinOperand(SelectStatementPtr& out_select,
+                                          SetOperationStatementPtr& out_set_op,
+                                          std::string& out_alias) {
+    Expect(TokenType::LEFT_PAREN, "expected '(' to start derived table");
+    StatementPtr sub;
+    if (Check(TokenType::KEYWORD_SELECT)) {
+        sub = ParseSelectStatement();
+    } else if (Check(TokenType::KEYWORD_WITH)) {
+        sub = ParseWithClause();
+    } else {
+        throw CompilerException(ErrorStage::SYNTAX,
+            "expected SELECT inside JOIN derived table",
+            CurrentToken().line, CurrentToken().column);
+    }
+    if (Check(TokenType::KEYWORD_UNION) ||
+        Check(TokenType::KEYWORD_INTERSECT) ||
+        Check(TokenType::KEYWORD_EXCEPT)) {
+        sub = ParseSetOperationTail(sub);
+    }
+    Expect(TokenType::RIGHT_PAREN,
+           "expected ')' after JOIN derived table subquery");
+    // SQL 标准：AS 关键字可选。
+    Match(TokenType::KEYWORD_AS);
+    Token alias = Expect(TokenType::IDENTIFIER,
+        "JOIN derived table requires an alias");
+    out_alias = alias.lexeme;
+    // Bug 6 修复（与 ParseFromClause 同源）：sub 在经过 ParseSetOperationTail
+    // 之后可能是 SetOperationStatement，与 SelectStatement 之间没有继承
+    // 关系；用 dynamic_pointer_cast 分流到对应字段。
+    if (auto ss = std::dynamic_pointer_cast<SelectStatement>(sub)) {
+        out_select = std::move(ss);
+    } else if (auto so = std::dynamic_pointer_cast<SetOperationStatement>(sub)) {
+        out_set_op = std::move(so);
+    } else {
+        throw CompilerException(ErrorStage::SYNTAX,
+            "JOIN derived table body must be a SELECT or set operation",
+            CurrentToken().line, CurrentToken().column);
+    }
+}
+
 std::vector<JoinClause> Parser::ParseJoinClauses() {
     std::vector<JoinClause> joins;
     while (Check(TokenType::KEYWORD_INNER) ||
@@ -1422,25 +1468,28 @@ std::vector<JoinClause> Parser::ParseJoinClauses() {
 JoinClause Parser::ParseJoinClause() {
     JoinClause jc;
     jc.join_type = JoinType::INNER;
-    // NATURAL 出现在类型前缀位置：NATURAL [INNER|LEFT|RIGHT] JOIN
-    // 但 SQL 标准里 NATURAL JOIN 不允许再写 INNER/LEFT/RIGHT/FULL，我们
-    // 直接把它标记为 NATURAL INNER JOIN，由 Planner 推导 USING 列。
-    if (Match(TokenType::KEYWORD_NATURAL)) {
-        jc.is_natural = true;
-        // 可选 NATURAL INNER / LEFT / RIGHT；FULL OUTER 也允许
-        if (Match(TokenType::KEYWORD_INNER)) {
-            jc.join_type = JoinType::INNER;
-        } else if (Match(TokenType::KEYWORD_LEFT)) {
-            jc.join_type = JoinType::LEFT;
-        } else if (Match(TokenType::KEYWORD_RIGHT)) {
-            jc.join_type = JoinType::RIGHT;
-        } else if (Match(TokenType::KEYWORD_FULL)) {
-            Match(TokenType::KEYWORD_OUTER);
-            jc.join_type = JoinType::FULL_OUTER;
-        } else {
-            jc.join_type = JoinType::INNER;
+    // 解析 JOIN 右操作数（普通表名 / 派生表）的共享辅助：
+    //   - 若当前 token 是 '('，调用 ParseDerivedTableJoinOperand 解析
+    //     (SELECT ...) [AS] alias，写入 jc.derived_subquery / derived_set_op，
+    //     table_name 与 table_alias 都被设为派生表别名（与 LATERAL 子查询
+    //     占位的语义一致），列引用走 alias.col 形式。
+    //   - 否则按原逻辑读取表名 + 可选别名。
+    // alias_keywords 列出了紧随表名/别名之后可能出现的关键字 —— 它们让别名
+    // 解析在遇到 SQL 关键字时正确终止（避免把 ON/USING/WHERE 当成隐式别名吞掉）。
+    auto parse_right_operand = [&](JoinClause& jc) {
+        if (Check(TokenType::LEFT_PAREN)) {
+            // 派生表 JOIN 右操作数：见 ParseDerivedTableJoinOperand 注释。
+            // alias 必填（SQL 标准），由辅助函数消耗。
+            ParseDerivedTableJoinOperand(jc.derived_subquery,
+                                        jc.derived_set_op,
+                                        jc.table_alias);
+            // 把派生表别名同步到 table_name —— ExecutionEngine 在 SEQ_SCAN
+            // 分支判定「table_name == table_alias && children[0] 非空」时直接
+            // 递归执行 children[0]（派生表子计划）；cmap 也以 table_alias 为
+            // key 在 column_index_map 里注册派生列。
+            jc.table_name = jc.table_alias;
+            return;
         }
-        Expect(TokenType::KEYWORD_JOIN, "expected JOIN after NATURAL");
         Token t = Expect(TokenType::IDENTIFIER, "expected joined table name");
         jc.table_name = t.lexeme;
         if (CurrentToken().type == TokenType::IDENTIFIER &&
@@ -1467,6 +1516,27 @@ JoinClause Parser::ParseJoinClause() {
             jc.table_alias = CurrentToken().lexeme;
             Advance();
         }
+    };
+    // NATURAL 出现在类型前缀位置：NATURAL [INNER|LEFT|RIGHT] JOIN
+    // 但 SQL 标准里 NATURAL JOIN 不允许再写 INNER/LEFT/RIGHT/FULL，我们
+    // 直接把它标记为 NATURAL INNER JOIN，由 Planner 推导 USING 列。
+    if (Match(TokenType::KEYWORD_NATURAL)) {
+        jc.is_natural = true;
+        // 可选 NATURAL INNER / LEFT / RIGHT；FULL OUTER 也允许
+        if (Match(TokenType::KEYWORD_INNER)) {
+            jc.join_type = JoinType::INNER;
+        } else if (Match(TokenType::KEYWORD_LEFT)) {
+            jc.join_type = JoinType::LEFT;
+        } else if (Match(TokenType::KEYWORD_RIGHT)) {
+            jc.join_type = JoinType::RIGHT;
+        } else if (Match(TokenType::KEYWORD_FULL)) {
+            Match(TokenType::KEYWORD_OUTER);
+            jc.join_type = JoinType::FULL_OUTER;
+        } else {
+            jc.join_type = JoinType::INNER;
+        }
+        Expect(TokenType::KEYWORD_JOIN, "expected JOIN after NATURAL");
+        parse_right_operand(jc);
         // NATURAL JOIN 不允许 ON / USING —— 列条件由 Planner 自动推导。
         return jc;
     }
@@ -1474,31 +1544,7 @@ JoinClause Parser::ParseJoinClause() {
     if (Match(TokenType::KEYWORD_CROSS)) {
         jc.join_type = JoinType::CROSS;
         Expect(TokenType::KEYWORD_JOIN, "expected JOIN after CROSS");
-        Token t = Expect(TokenType::IDENTIFIER, "expected joined table name");
-        jc.table_name = t.lexeme;
-        if (CurrentToken().type == TokenType::IDENTIFIER &&
-            !Check(TokenType::KEYWORD_ON) &&
-            !Check(TokenType::KEYWORD_WHERE) &&
-            !Check(TokenType::KEYWORD_GROUP) &&
-            !Check(TokenType::KEYWORD_HAVING) &&
-            !Check(TokenType::KEYWORD_ORDER) &&
-            !Check(TokenType::KEYWORD_LIMIT) &&
-            !Check(TokenType::KEYWORD_INNER) &&
-            !Check(TokenType::KEYWORD_LEFT) &&
-            !Check(TokenType::KEYWORD_RIGHT) &&
-            !Check(TokenType::KEYWORD_FULL) &&
-            !Check(TokenType::KEYWORD_CROSS) &&
-            !Check(TokenType::KEYWORD_NATURAL) &&
-            !Check(TokenType::KEYWORD_JOIN) &&
-            !Check(TokenType::KEYWORD_UNION) &&
-            !Check(TokenType::KEYWORD_INTERSECT) &&
-            !Check(TokenType::KEYWORD_EXCEPT) &&
-            !Check(TokenType::KEYWORD_WINDOW) &&
-            !Check(TokenType::SEMICOLON) &&
-            !IsAtEnd()) {
-            jc.table_alias = CurrentToken().lexeme;
-            Advance();
-        }
+        parse_right_operand(jc);
         // CROSS JOIN 不需要 ON / USING；on_condition 留空，由 Executor 处理。
         return jc;
     }
@@ -1514,33 +1560,7 @@ JoinClause Parser::ParseJoinClause() {
         jc.join_type = JoinType::FULL_OUTER;
     }
     Expect(TokenType::KEYWORD_JOIN, "expected JOIN");
-    Token t = Expect(TokenType::IDENTIFIER, "expected joined table name");
-    jc.table_name = t.lexeme;
-    // 表别名
-    if (CurrentToken().type == TokenType::IDENTIFIER &&
-        !Check(TokenType::KEYWORD_ON) &&
-        !Check(TokenType::KEYWORD_USING) &&
-        !Check(TokenType::KEYWORD_WHERE) &&
-        !Check(TokenType::KEYWORD_GROUP) &&
-        !Check(TokenType::KEYWORD_HAVING) &&
-        !Check(TokenType::KEYWORD_ORDER) &&
-        !Check(TokenType::KEYWORD_LIMIT) &&
-        !Check(TokenType::KEYWORD_INNER) &&
-        !Check(TokenType::KEYWORD_LEFT) &&
-        !Check(TokenType::KEYWORD_RIGHT) &&
-        !Check(TokenType::KEYWORD_FULL) &&
-        !Check(TokenType::KEYWORD_CROSS) &&
-        !Check(TokenType::KEYWORD_NATURAL) &&
-        !Check(TokenType::KEYWORD_JOIN) &&
-        !Check(TokenType::KEYWORD_UNION) &&
-        !Check(TokenType::KEYWORD_INTERSECT) &&
-        !Check(TokenType::KEYWORD_EXCEPT) &&
-        !Check(TokenType::KEYWORD_WINDOW) &&
-        !Check(TokenType::SEMICOLON) &&
-        !IsAtEnd()) {
-        jc.table_alias = CurrentToken().lexeme;
-        Advance();
-    }
+    parse_right_operand(jc);
     // USING (col1, col2, ...)
     if (Match(TokenType::KEYWORD_USING)) {
         Expect(TokenType::LEFT_PAREN, "expected '(' after USING");
@@ -2251,10 +2271,22 @@ ExprPtr Parser::ParseComparisonExpr() {
     }
     if (!matched) return left;
     Advance();
-    // expr op ANY (SELECT ...) —— 比较运算符后跟 ANY 子查询
+    // expr op ANY (SELECT ...) / expr op SOME (SELECT ...) / expr op ALL (SELECT ...)
+    // —— 比较运算符后跟量化比较子查询。SOME 与 ANY 完全等价；ALL 是全称量化。
+    // 解析期无法区分三者的语义差异，仅在 AST.kind 上标注，由 ExpressionEvaluator
+    // 按 kind 决定如何遍历子查询结果（ANY/SOME: 存在一行即 TRUE；ALL: 空集 TRUE、
+    // 否则所有行都满足比较才 TRUE）。
+    SubqueryType quant_kind = SubqueryType::SCALAR;  // SCALAR = 非量化比较
     if (Check(TokenType::KEYWORD_ANY)) {
+        quant_kind = SubqueryType::ANY;
+    } else if (Check(TokenType::KEYWORD_SOME)) {
+        quant_kind = SubqueryType::SOME;
+    } else if (Check(TokenType::KEYWORD_ALL)) {
+        quant_kind = SubqueryType::ALL;
+    }
+    if (quant_kind != SubqueryType::SCALAR) {
         Advance();
-        Expect(TokenType::LEFT_PAREN, "expected '(' after ANY");
+        Expect(TokenType::LEFT_PAREN, "expected '(' after ANY/SOME/ALL");
         std::string op_str;
         switch (op) {
             case BinaryOperator::EQUAL:          op_str = "="; break;
@@ -2265,7 +2297,7 @@ ExprPtr Parser::ParseComparisonExpr() {
             case BinaryOperator::GREATER_EQUAL:  op_str = ">="; break;
             default: op_str = "="; break;
         }
-        auto sub = ParseSubqueryExpression(left, op_str);
+        auto sub = ParseSubqueryExpression(left, op_str, quant_kind);
         left = sub;
         return try_is_postfix();
     }
@@ -2905,13 +2937,21 @@ ExprPtr Parser::ParseSubqueryExpression(ExprPtr left_operand,
         auto expr = std::make_shared<SubqueryExprNode>(SubqueryType::SCALAR, sptr);
         return expr;
     }
-    // 形如 expr op ANY (SELECT ...) 或 expr IN (SELECT ...)
+    // 形如 expr op ANY (SELECT ...) / expr op SOME (SELECT ...) /
+    //       expr op ALL (SELECT ...) / expr IN (SELECT ...)
     if (comparison_op == "IN") {
         auto expr = std::make_shared<SubqueryExprNode>(SubqueryType::IN, sptr,
                                                         "=", left_operand);
         return expr;
     }
-    auto expr = std::make_shared<SubqueryExprNode>(SubqueryType::ANY, sptr,
+    // 调用方 ParseComparisonExpr 在遇到 ANY/SOME/ALL 量化时会把 forced_kind
+    // 显式传过来；未显式传时（其它路径）默认 ANY，保持历史行为。
+    SubqueryType quant_kind = (forced_kind == SubqueryType::ANY ||
+                               forced_kind == SubqueryType::SOME ||
+                               forced_kind == SubqueryType::ALL)
+                                  ? forced_kind
+                                  : SubqueryType::ANY;
+    auto expr = std::make_shared<SubqueryExprNode>(quant_kind, sptr,
                                                     comparison_op, left_operand);
     return expr;
 }
