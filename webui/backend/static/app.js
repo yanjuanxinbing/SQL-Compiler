@@ -1,12 +1,46 @@
 /* ─────────────────────────────────────────────────────────────────────────
-   SQL-Compiler Web UI — frontend logic
+   MiniDB IDE — frontend logic
    ─────────────────────────────────────────────────────────────────────────
    Single-file vanilla-JS controller.  No build step, no framework; the
    only "magic" is `fetch` against the local FastAPI backend.
+   Layout: toolbar / collapsible sidebar (Catalog · Storage · Tests) /
+   SQL editor / bottom panels (Result · Token · AST · Plan · Compare ·
+   Storage · Errors).  All visualization panels are fed by one
+   `/api/query/debug` call.
    ───────────────────────────────────────────────────────────────────────── */
 
 (() => {
   "use strict";
+
+  // ── Global error capture ─────────────────────────────────────────────
+  // Forward uncaught exceptions and unhandled promise rejections to the
+  // server's /api/client/log endpoint so they show up in the same log
+  // stream as backend issues.  Failures here are swallowed silently to
+  // avoid masking the original error.
+  function reportClient(level, message, extra) {
+    try {
+      const payload = JSON.stringify({
+        level,
+        message: String(message || "").slice(0, 2000),
+        url: location.pathname,
+        ua: navigator.userAgent.slice(0, 200),
+        stack: extra && extra.stack ? String(extra.stack).slice(0, 4000) : null,
+        time: new Date().toISOString(),
+      });
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon("/api/client/log", payload);
+      } else {
+        fetch("/api/client/log", { method: "POST", body: payload, headers: { "Content-Type": "application/json" }, keepalive: true }).catch(() => {});
+      }
+    } catch (_) { /* never throw from the reporter */ }
+  }
+  window.addEventListener("error", (e) => {
+    reportClient("error", e.message, { stack: e.error && e.error.stack });
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    const reason = e.reason;
+    reportClient("error", reason && reason.message ? reason.message : String(reason), { stack: reason && reason.stack });
+  });
 
   // ── DOM shortcuts ──────────────────────────────────────────────────────
   const $ = (sel) => document.querySelector(sel);
@@ -37,7 +71,6 @@
   const dbModal         = $("#db-modal");
   const dbModalBack     = $("#db-modal-backdrop");
   const dbModalClose    = $("#db-modal-close");
-  const dbDropZone      = $("#db-drop-zone");
   const dbBrowseServerBtn = $("#db-browse-server-btn");
   const dbPathDetails   = $("#db-path-details");
   const dbPathInput     = $("#db-path-input");
@@ -69,52 +102,13 @@
   const browseOpenBtn     = $("#browse-open-btn");
   const browseNewHereBtn  = $("#browse-new-here-btn");
 
-  // Sidebar
-  const tableList    = $("#table-list");
-  const tableEmpty   = $("#table-empty");
-  const refreshBtn   = $("#refresh-tables");
-  const newTableBtn  = $("#new-table-btn");
-
-  // Tabs
-  const tabs         = $$(".tab");
-  const tabPanels    = $$(".tab-panel");
-
-  // Editor / results
-  const editor       = $("#sql-editor");
-  const runBtn       = $("#run-btn");
-  const formatBtn    = $("#format-btn");
-  const clearBtn     = $("#clear-btn");
-  const queryStatus  = $("#query-status");
-  const queryError   = $("#query-error");
-  const queryErrorTx = $("#query-error-text");
-  const queryLoading = $("#query-loading");
-  const resultsRoot  = $("#results-root");
-
-  // Schema tab
-  const tabSchema       = $("#tab-schema");
-  const schemaEmpty     = $("#schema-empty");
-  const schemaDetail    = $("#schema-detail");
-  const schemaTitle     = $("#schema-title");
-  const schemaMeta      = $("#schema-meta");
-  const schemaColsBody  = $("#schema-columns-body");
-  const schemaCreateSql = $("#schema-create-sql");
-  const schemaSampleRoot= $("#schema-sample-root");
-
-  // History
-  const historyList    = $("#history-list");
-  const historyCount   = $("#history-count");
-  const clearHistoryBtn= $("#clear-history-btn");
-
   // ── App state ──────────────────────────────────────────────────────────
-  const state = {
-    dbPath: null,         // currently open database path
-    tables: [],           // [{name, column_count}]
-    activeTable: null,    // currently selected table (in sidebar)
-    busy: false,          // a query is in flight
-    history: loadHistory(),   // [{ts, sql, ok, kind}]
-    recents: loadRecents(),   // [path, …]  most recent first
-    schemaVersion: 0,     // bumped after every successful DDL/DML; schema tab
-                          // watches this counter and re-fetches when it changes
+  const app = {
+    dbPath: null,
+    tables: [],          // [{name, column_count}]
+    activeTable: null,
+    busy: false,
+    recents: loadRecents(), // [path, …]  most recent first
   };
 
   // ── Utilities ──────────────────────────────────────────────────────────
@@ -134,19 +128,23 @@
 
   const formatTime = (ms) => ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(2)} s`;
 
-  const formatTimestamp = (ts) => {
-    const d = new Date(ts);
-    const pad = (n) => String(n).padStart(2, "0");
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-  };
-
   // ── API client ─────────────────────────────────────────────────────────
   async function api(path, opts = {}) {
-    const res = await fetch(path, {
-      method: opts.method || (opts.body ? "POST" : "GET"),
-      headers: { "Content-Type": "application/json" },
-      body: opts.body ? JSON.stringify(opts.body) : undefined,
-    });
+    const timeoutMs = opts.timeoutMs || 30_000;
+    let res;
+    try {
+      res = await fetch(path, {
+        method: opts.method || (opts.body ? "POST" : "GET"),
+        headers: { "Content-Type": "application/json" },
+        body: opts.body ? JSON.stringify(opts.body) : undefined,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (err) {
+      if (err && (err.name === "TimeoutError" || err.name === "AbortError")) {
+        throw new Error(`Request timed out after ${timeoutMs} ms`);
+      }
+      throw err;
+    }
     let data = null;
     try { data = await res.json(); } catch (_) { /* may have no body */ }
     if (!res.ok) {
@@ -195,9 +193,10 @@
     }
   }
 
+  // ── DB modal (recently opened) ─────────────────────────────────────────
   const RECENTS_KEY = "sqlui.recents.v1";
   const RECENTS_MAX = 8;
-  let folderScanToken = 0;  // increments on each scan; ignores stale responses
+  let folderScanToken = 0;
 
   function loadRecents() {
     try {
@@ -208,51 +207,45 @@
     } catch (_) { return []; }
   }
   function saveRecents() {
-    try { localStorage.setItem(RECENTS_KEY, JSON.stringify(state.recents)); } catch (_) {}
+    try { localStorage.setItem(RECENTS_KEY, JSON.stringify(app.recents)); } catch (_) {}
   }
   function pushRecent(path) {
-    state.recents = [path, ...state.recents.filter((p) => p !== path)].slice(0, RECENTS_MAX);
+    app.recents = [path, ...app.recents.filter((p) => p !== path)].slice(0, RECENTS_MAX);
     saveRecents();
   }
   function removeRecent(path) {
-    state.recents = state.recents.filter((p) => p !== path);
+    app.recents = app.recents.filter((p) => p !== path);
     saveRecents();
   }
   function clearRecents() {
-    state.recents = [];
+    app.recents = [];
     saveRecents();
   }
 
   function defaultDbPath() {
-    return "C:\\Users\\23080\\Desktop\\fun\\SQL-Compiler\\playground.db";
+    return "playground.db";
   }
 
   function openDbModal() {
     dbError.hidden = true;
     dbModal.classList.remove("hidden");
-    // Pre-fill path: current db > last successful scan > sensible default
-    if (state.dbPath) {
-      dbPathInput.value = state.dbPath;
-    } else if (state.recents.length) {
-      dbPathInput.value = state.recents[0];
-    } else {
-      dbPathInput.value = defaultDbPath();
-    }
+    if (app.dbPath) dbPathInput.value = app.dbPath;
+    else if (app.recents.length) dbPathInput.value = app.recents[0];
+    else dbPathInput.value = defaultDbPath();
     renderRecents();
     scanCurrentPath();
     setTimeout(() => dbBrowseServerBtn.focus(), 50);
   }
   function closeDbModal() { dbModal.classList.add("hidden"); }
 
-  // ── Recently opened list (persistent) ───────────────────────────────
   function renderRecents() {
-    if (!state.recents.length) {
+    if (!app.recents.length) {
       dbRecentSection.hidden = true;
       dbRecentList.innerHTML = "";
       return;
     }
     dbRecentSection.hidden = false;
-    dbRecentList.innerHTML = state.recents.map((p) => {
+    dbRecentList.innerHTML = app.recents.map((p) => {
       const name = pathBasename(p);
       const dir  = pathDirname(p);
       return `
@@ -262,7 +255,7 @@
             <span class="recent-item-name">${escapeHtml(name)}</span>
             <span class="recent-item-path">${escapeHtml(dir)}</span>
           </span>
-          <button class="recent-item-remove" type="button" data-action="remove" title="Forget this path" aria-label="Forget">×</button>
+          <button class="recent-item-remove" type="button" data-action="remove" title="忘记此路径" aria-label="忘记">×</button>
         </li>`;
     }).join("");
     $$("[data-action='open']", dbRecentList).forEach((el) => {
@@ -278,23 +271,18 @@
     });
   }
 
-  // ── Files in this folder (current scan) ─────────────────────────────
   async function scanCurrentPath() {
     const value = (dbPathInput.value || "").trim();
     dbFolderSection.hidden = true;
     dbFolderList.innerHTML = "";
     dbFolderMeta.textContent = "";
     if (!value) {
-      dbPathFeedback.innerHTML = `Start typing a path, or use <strong>Choose file…</strong> above.`;
+      dbPathFeedback.innerHTML = `开始输入路径，或使用上方的「浏览…」按钮。`;
       dbPathInput.classList.remove("is-valid", "is-invalid");
       return;
     }
-
-    // 1) Probe the path first — the backend classifies it into one of
-    //    5 states so we know whether to scan a directory, expect a
-    //    new file, or surface a hard error.
     const myToken = ++folderScanToken;
-    dbPathFeedback.textContent = `Checking ${value} …`;
+    dbPathFeedback.textContent = `正在检查 ${value} …`;
     let probe;
     try {
       probe = await api("/api/db/validate", { method: "POST", body: { path: value } });
@@ -302,12 +290,10 @@
       if (myToken !== folderScanToken) return;
       dbPathInput.classList.add("is-invalid");
       dbPathInput.classList.remove("is-valid");
-      dbPathFeedback.innerHTML = `<span style="color: var(--red)">${escapeHtml(e.message || String(e))}</span>`;
+      dbPathFeedback.innerHTML = `<span style="color: var(--error)">${escapeHtml(e.message || String(e))}</span>`;
       return;
     }
     if (myToken !== folderScanToken) return;
-
-    // 2) Dispatch on the probe status.
     dbPathInput.classList.remove("is-invalid");
     dbPathInput.classList.add("is-valid");
     let dirToScan = null;
@@ -316,7 +302,7 @@
       case "parent_missing":
         dbPathInput.classList.remove("is-valid");
         dbPathInput.classList.add("is-invalid");
-        dbPathFeedback.innerHTML = `<span style="color: var(--red)">Parent directory does not exist:</span> <code>${escapeHtml(probe.parent)}</code>`;
+        dbPathFeedback.innerHTML = `<span style="color: var(--error)">父目录不存在：</span> <code>${escapeHtml(probe.parent)}</code>`;
         return;
       case "wrong_type":
         dbPathInput.classList.remove("is-valid");
@@ -325,19 +311,17 @@
         return;
       case "directory":
         dirToScan = value;
-        extraFeedback = `This is a directory. Pick a <code>.db</code> file below, or change the path to a new file name.`;
+        extraFeedback = `这是一个目录。请在下面选择一个 <code>.db</code> 文件，或改为新文件名。`;
         break;
       case "existing_file":
         dirToScan = probe.parent;
-        extraFeedback = `<span style="color: var(--green)">${escapeHtml(probe.message)}</span> Click <strong>Open</strong> to bind this database.`;
+        extraFeedback = `<span style="color: var(--success)">${escapeHtml(probe.message)}</span> 点「打开」绑定该数据库。`;
         break;
       case "new_file":
         dirToScan = probe.parent;
-        extraFeedback = `<span style="color: var(--blue)">${escapeHtml(probe.message)}</span>`;
+        extraFeedback = `<span style="color: var(--accent)">${escapeHtml(probe.message)}</span>`;
         break;
     }
-
-    // 3) Scan the resolved directory (only for the three cases that have one).
     if (!dirToScan) {
       dbPathFeedback.innerHTML = extraFeedback;
       return;
@@ -347,11 +331,11 @@
       if (myToken !== folderScanToken) return;
       const items = data.items || [];
       if (items.length === 0) {
-        dbPathFeedback.innerHTML = `${extraFeedback} <span class="muted">No existing <code>.db</code> files in <code>${escapeHtml(dirToScan)}</code>.</span>`;
+        dbPathFeedback.innerHTML = `${extraFeedback} <span class="muted">目录中暂无 <code>.db</code> 文件。</span>`;
         return;
       }
       dbFolderSection.hidden = false;
-      dbFolderMeta.textContent = `${items.length} in ${dirToScan}`;
+      dbFolderMeta.textContent = `${items.length} 个文件 · ${dirToScan}`;
       dbFolderList.innerHTML = items.map((it) => {
         const name = pathBasename(it.path);
         const isCurrent = it.path === value;
@@ -359,7 +343,7 @@
           <li class="recent-item ${isCurrent ? "is-active" : ""}" data-path="${escapeHtml(it.path)}">
             <span class="recent-item-icon">${escapeHtml((name[0] || "?").toUpperCase())}</span>
             <span class="recent-item-body">
-              <span class="recent-item-name">${escapeHtml(name)}${isCurrent ? " <span class=\"muted\">(this path)</span>" : ""}</span>
+              <span class="recent-item-name">${escapeHtml(name)}${isCurrent ? ' <span class="muted">(当前)</span>' : ""}</span>
               <span class="recent-item-path">${escapeHtml(it.path)}</span>
             </span>
             <span class="recent-item-meta">${formatBytes(it.size_bytes)}</span>
@@ -368,31 +352,24 @@
       $$(".recent-item", dbFolderList).forEach((el) => {
         el.addEventListener("click", () => openPathAndClose(el.dataset.path));
       });
-      const head = `${items.length} .db file(s) in this folder.`;
-      const tail = probe.status === "new_file" || probe.status === "directory"
-        ? `Or type a new file name to create one.`
-        : `Click one to open.`;
-      dbPathFeedback.innerHTML = `${extraFeedback} <span class="muted">${head} ${tail}</span>`;
+      dbPathFeedback.innerHTML = `${extraFeedback} <span class="muted">共 ${items.length} 个 .db 文件。</span>`;
     } catch (e) {
       if (myToken !== folderScanToken) return;
-      dbPathFeedback.innerHTML = `<span style="color: var(--red)">${escapeHtml(e.message || String(e))}</span>`;
+      dbPathFeedback.innerHTML = `<span style="color: var(--error)">${escapeHtml(e.message || String(e))}</span>`;
     }
   }
 
-  // ── Open a path (from any source) and close the modal ───────────────
   async function openPathAndClose(p) {
     if (!p) return;
     dbError.hidden = true;
     dbOpenBtn.disabled = true;
-    dbOpenBtn.textContent = "Opening…";
+    dbOpenBtn.textContent = "打开中…";
     try {
       const res = await api("/api/db/open", { body: { db_path: p } });
-      state.dbPath = res.db_path;
-      // Switching databases invalidates any cached schema / sample rows.
-      state.activeTable = null;
-      state.schemaVersion += 1;
+      app.dbPath = res.db_path;
+      app.activeTable = null;
       pushRecent(res.db_path);
-      updateDbPill();
+      setDbPillText();
       closeDbModal();
       // The cache, debug snapshot and storage baseline all belong to the
       // previous database — reset them so we don't leak stale deltas or
@@ -422,14 +399,14 @@
       dbError.hidden = false;
     } finally {
       dbOpenBtn.disabled = false;
-      dbOpenBtn.textContent = "Open";
+      dbOpenBtn.textContent = "打开";
     }
   }
 
   async function openDatabaseFromInput() {
     const p = (dbPathInput.value || "").trim();
     if (!p) {
-      dbError.textContent = 'Please enter a database file path, or use the "Choose file…" button above.';
+      dbError.textContent = '请输入数据库文件路径，或使用「浏览…」按钮。';
       dbError.hidden = false;
       return;
     }
@@ -494,47 +471,22 @@
     return i <= 0 ? "" : p.substring(0, i);
   }
 
-  function updateDbPill() {
-    if (state.dbPath) {
-      dbPill.classList.add("is-open");
-      dbPillLabel.textContent = state.dbPath;
-    } else {
-      dbPill.classList.remove("is-open");
-      dbPillLabel.textContent = "No database open — click to open";
-    }
-  }
-
-  // ── Server-side filesystem browser ─────────────────────────────────
-  //
-  // The native file picker (window.showOpenFilePicker / <input
-  // type="file">) doesn't expose the absolute path in modern browsers
-  // — the user gets a security-walled File object with no path string.
-  // We work around this by running the browse on the server: the
-  // user navigates directories in the modal, and the server returns
-  // the *actual* absolute path of the chosen file.
-  //
-  // The browser is a flat list (no tree recursion) — at each level
-  // the user sees: subdirectories (click to enter), and `.db` files
-  // (click to select).  A breadcrumb at the top lets them jump back
-  // up to any ancestor.
-
+  // ── Server-side filesystem browser ─────────────────────────────────────
   const browseState = {
-    currentPath: null,   // currently listed directory
-    parent: null,        // parent directory
-    entries: [],         // current listing
-    roots: [],           // filesystem roots (drives on Windows)
-    selected: null,      // path of currently selected .db file
-    lastFetchToken: 0,   // invalidates stale responses
+    currentPath: null,
+    parent: null,
+    entries: [],
+    roots: [],
+    selected: null,
+    lastFetchToken: 0,
   };
 
   function openBrowseModal(seedPath) {
     browseModal.classList.remove("hidden");
-    // Default: jump to the directory of the current DB, or the first
-    // recent, or the user's home (server decides for empty seed).
     let seed = (seedPath || "").trim();
     if (!seed) {
-      if (state.dbPath) seed = pathDirname(state.dbPath);
-      else if (state.recents.length) seed = pathDirname(state.recents[0]);
+      if (app.dbPath) seed = pathDirname(app.dbPath);
+      else if (app.recents.length) seed = pathDirname(app.recents[0]);
     }
     browseNavigate(seed);
   }
@@ -542,7 +494,7 @@
 
   async function browseNavigate(targetPath) {
     const myToken = ++browseState.lastFetchToken;
-    browseBody.innerHTML = `<div class="browse-empty">Loading…</div>`;
+    browseBody.innerHTML = `<div class="browse-empty">加载中…</div>`;
     browseSelected.hidden = true;
     browseState.selected = null;
     try {
@@ -554,7 +506,6 @@
       }
       browseState.currentPath = data.path;
       browseState.parent = data.parent || "";
-      browseState.entries = data.entries || [];
       browseState.roots = data.roots || [];
       browsePathInput.value = data.path;
       renderBrowseCrumbs();
@@ -568,14 +519,11 @@
   function renderBrowseCrumbs() {
     const p = browseState.currentPath || "";
     if (!p) { browseCrumbs.innerHTML = ""; return; }
-    // On Windows, the path looks like "C:\Users\Foo\bar" — split on
-    // the separator and walk.  Drive letter is the first crumb.
     const sep = p.includes("\\") ? "\\" : "/";
     const parts = p.split(/[\\/]+/).filter(Boolean);
     const crumbs = [];
     let acc = "";
     if (p.match(/^[A-Za-z]:[\\/]/)) {
-      // Windows: include the drive letter as the first crumb
       acc = parts[0] + sep;
       crumbs.push({ label: parts[0], path: acc, isCurrent: parts.length === 1 });
     } else {
@@ -600,40 +548,35 @@
     const dirs = browseState.entries.filter((e) => e.kind === "dir");
     const dbs  = browseState.entries.filter((e) => e.kind === "db");
     if (dirs.length === 0 && dbs.length === 0) {
-      browseBody.innerHTML = `<div class="browse-empty">This folder is empty. Use <strong>New here</strong> to create a new <code>.db</code> file.</div>`;
+      browseBody.innerHTML = `<div class="browse-empty">该文件夹为空。可用「新建于此」创建一个 .db 文件。</div>`;
       return;
     }
     let html = "";
     if (dirs.length) {
-      html += `<div class="browse-section-head">Folders (${dirs.length})</div>`;
+      html += `<div class="browse-section-head">文件夹 (${dirs.length})</div>`;
       html += dirs.map((d) => `
         <div class="browse-item kind-dir" data-path="${escapeHtml(d.path)}" data-kind="dir">
           <span class="browse-item-icon">📁</span>
           <span class="browse-item-name" title="${escapeHtml(d.path)}">${escapeHtml(d.name)}</span>
-          <span class="browse-item-action">Open</span>
+          <span class="browse-item-action">打开</span>
         </div>`).join("");
     }
     if (dbs.length) {
-      html += `<div class="browse-section-head">Database files (${dbs.length})</div>`;
+      html += `<div class="browse-section-head">数据库文件 (${dbs.length})</div>`;
       html += dbs.map((d) => `
         <div class="browse-item kind-db ${browseState.selected === d.path ? "is-selected" : ""}" data-path="${escapeHtml(d.path)}" data-kind="db">
           <span class="browse-item-icon">🗄</span>
           <span class="browse-item-name" title="${escapeHtml(d.path)}">${escapeHtml(d.name)}</span>
-          <span class="browse-item-action">Select</span>
+          <span class="browse-item-action">选择</span>
         </div>`).join("");
     }
     browseBody.innerHTML = html;
-    // Wire up clicks
     $$(".browse-item", browseBody).forEach((el) => {
       el.addEventListener("click", () => {
         const p = el.dataset.path;
         const kind = el.dataset.kind;
-        if (kind === "dir") {
-          browseNavigate(p);
-        } else {
-          // single-click selects; double-click opens
-          selectBrowseItem(p);
-        }
+        if (kind === "dir") browseNavigate(p);
+        else selectBrowseItem(p);
       });
       el.addEventListener("dblclick", () => {
         if (el.dataset.kind === "db") openBrowseSelection();
@@ -643,7 +586,6 @@
 
   function selectBrowseItem(p) {
     browseState.selected = p;
-    // highlight
     $$(".browse-item", browseBody).forEach((el) => {
       el.classList.toggle("is-selected", el.dataset.path === p && el.dataset.kind === "db");
     });
@@ -659,10 +601,9 @@
   }
 
   function openBrowseNewHere() {
-    // Build a default new file name in the current directory.
     const dir = browseState.currentPath || "";
     if (!dir) {
-      browseBody.innerHTML = `<div class="browse-error">No directory selected.</div>`;
+      browseBody.innerHTML = `<div class="browse-error">未选择目录。</div>`;
       return;
     }
     const sep = dir.includes("\\") ? "\\" : "/";
@@ -673,246 +614,179 @@
     browsePathInput.select();
   }
 
-  // ── Tables ─────────────────────────────────────────────────────────────
-  async function refreshTables() {
-    if (!state.dbPath) {
-      tableList.innerHTML = `<li class="table-empty">Open a database to see tables.</li>`;
+  // ── Catalog (sidebar) ──────────────────────────────────────────────────
+  async function refreshCatalog() {
+    if (!app.dbPath) {
+      catalogMeta.textContent = "未连接数据库";
+      catalogTree.innerHTML = `<div class="cat-empty">打开数据库后此处显示表</div>`;
       return;
     }
-    const previousActive = state.activeTable;
     try {
       const data = await api("/api/schema/tables", { method: "POST" });
-      state.tables = data.tables || [];
-      renderTables();
-      // If the active table disappeared (DROP / RENAME), or if the
-      // schema tab is currently open, refresh it.
-      const activeStillExists = state.tables.some((t) => t.name === previousActive);
-      if (previousActive && !activeStillExists) {
-        // Drop the stale reference; schema tab will show a clear message.
-        state.activeTable = null;
-        state.schemaVersion += 1;
-        if (isSchemaTabActive()) {
-          schemaEmpty.classList.remove("hidden");
-          schemaDetail.classList.add("hidden");
-          schemaEmpty.innerHTML = `<p style="color: var(--red)">The table you were viewing (<code>${escapeHtml(previousActive)}</code>) was dropped or renamed. Pick another table from the sidebar.</p>`;
-        }
-      } else if (previousActive && isSchemaTabActive()) {
-        // Active table still exists and we're on the schema tab — the
-        // bump from runQuery already triggered a re-fetch via the
-        // schema-watcher; nothing else to do here.
+      app.tables = data.tables || [];
+      catalogMeta.textContent = `${app.tables.length} 张表`;
+      if (!app.tables.length) {
+        catalogTree.innerHTML = `<div class="cat-empty">暂无表 — 用 <code>CREATE TABLE</code> 建表</div>`;
+        return;
+      }
+      catalogTree.innerHTML = app.tables.map((t) => `
+        <div class="cat-db ${app.activeTable === t.name ? "is-active" : ""}" data-name="${escapeHtml(t.name)}" title="${escapeHtml(t.name)}">
+          <span class="cat-icon">${escapeHtml((t.name[0] || "?").toUpperCase())}</span>
+          <span class="cat-name">${escapeHtml(t.name)}</span>
+          <span class="cat-meta">${t.column_count} 列</span>
+        </div>`).join("");
+      $$(".cat-db", catalogTree).forEach((el) => {
+        el.addEventListener("click", () => selectTable(el.dataset.name));
+      });
+    } catch (e) {
+      catalogTree.innerHTML = `<div class="cat-empty" style="color: var(--error)">${escapeHtml(e.message)}</div>`;
+    }
+  }
+
+  function renderSchemaHTML(schema) {
+    const cols = schema.columns || [];
+    const rows = cols.map((c, i) => `
+      <tr>
+        <td class="muted">${i + 1}</td>
+        <td><strong>${escapeHtml(c.name)}</strong></td>
+        <td class="mono">${escapeHtml(c.type)}</td>
+        <td>${c.nullable ? "YES" : "NO"}</td>
+        <td>${c.pk ? "PK" : ""}</td>
+        <td class="muted">${c.default ? escapeHtml(c.default) : "—"}</td>
+      </tr>`).join("");
+    return `<div class="result-table-wrap"><table class="data-table">
+      <thead><tr><th>#</th><th>列名</th><th>类型</th><th>Null</th><th>Key</th><th>默认值</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+    <h3 style="font-size:12px;text-transform:uppercase;color:var(--text-secondary);margin:14px 0 6px">CREATE TABLE</h3>
+    <pre class="json-raw">${escapeHtml(schema.create_sql || "(empty)")}</pre>`;
+  }
+
+  async function selectTable(name) {
+    app.activeTable = name;
+    renderCatalog();
+    const parts = [];
+    parts.push(`<div class="result-block"><div class="result-head"><span class="result-kind kind-ddl">表结构</span><span class="result-msg">${escapeHtml(name)}</span></div></div>`);
+    try {
+      const schema = await api("/api/schema/table", { method: "POST", body: { table: name } });
+      if (schema.success) {
+        parts.push(`<div class="panel error-panel" style="display:none"></div>`);
+        document.getElementById("results-root").innerHTML = parts.join("") + renderSchemaHTML(schema);
+      } else {
+        document.getElementById("results-root").innerHTML = parts.join("")
+          + `<div class="panel error-panel"><p>${escapeHtml(schema.message || "查询失败")}</p></div>`;
       }
     } catch (e) {
-      tableList.innerHTML = `<li class="table-empty" style="color: var(--red)">${escapeHtml(e.message)}</li>`;
+      document.getElementById("results-root").innerHTML = parts.join("")
+        + `<div class="panel error-panel"><p>${escapeHtml(e.message)}</p></div>`;
     }
+    try {
+      const sample = await api("/api/query/execute", { method: "POST", body: { statement: `SELECT * FROM ${name} LIMIT 100` } });
+      if (sample.success && sample.results[0] && sample.results[0].column_names && sample.results[0].column_names.length) {
+        document.getElementById("results-root").innerHTML +=
+          `<h3 style="font-size:12px;text-transform:uppercase;color:var(--text-secondary);margin:14px 0 6px">示例数据 (前 100 行)</h3>`
+          + renderResultTableHTML(sample.results[0]);
+      }
+    } catch (_) { /* ignore */ }
+    switchPanel("result");
   }
 
-  function isSchemaTabActive() {
-    const t = tabs.find((x) => x.dataset.tab === "schema");
-    return t && t.classList.contains("is-active");
-  }
-
-  // ── Schema-tab auto-refresh watcher ────────────────────────────────────
-  // Polls state.schemaVersion.  When it bumps (e.g. after a DDL/DML on
-  // the Query tab) AND the schema tab is the visible one with a
-  // selected table, re-fetch the schema so the user never sees stale
-  // data.  Polling is cheap (one integer compare every 700 ms) and
-  // robust against race conditions with the in-flight loadSchema().
-  let lastObservedVersion = state.schemaVersion;
-  setInterval(() => {
-    if (state.schemaVersion === lastObservedVersion) return;
-    lastObservedVersion = state.schemaVersion;
-    if (isSchemaTabActive() && state.activeTable) {
-      // Bump a *second* time so the loadSchema() we trigger here is
-      // not immediately re-triggered by the same version change.
-      state.schemaVersion += 1;
-      lastObservedVersion = state.schemaVersion;
-      loadSchema(state.activeTable);
-    }
-  }, 700);
-
-  function renderTables() {
-    if (!state.tables.length) {
-      tableList.innerHTML = `<li class="table-empty">No tables yet. Create one with <code class="mono">CREATE TABLE …</code>.</li>`;
+  function renderCatalog() {
+    if (!app.tables.length) {
+      catalogTree.innerHTML = `<div class="cat-empty">暂无表</div>`;
       return;
     }
-    tableList.innerHTML = state.tables.map((t) => {
-      const isActive = t.name === state.activeTable;
-      const initial = (t.name[0] || "?").toUpperCase();
-      return `
-        <li class="table-item ${isActive ? "is-active" : ""}" data-name="${escapeHtml(t.name)}" title="${escapeHtml(t.name)}">
-          <span class="table-item-icon">${escapeHtml(initial)}</span>
-          <span class="table-item-name">${escapeHtml(t.name)}</span>
-          <span class="table-item-meta">${t.column_count} col</span>
-        </li>`;
-    }).join("");
-    $$(".table-item", tableList).forEach((el) => {
+    catalogTree.querySelectorAll(".cat-db").forEach((n) => {
+      n.classList.toggle("is-active", n.dataset.name === app.activeTable);
+    });
+  }
+
+  // ── Sidebar storage status ─────────────────────────────────────────────
+  function resetSidebarStorage() {
+    $("#side-hit-rate").textContent = "—";
+    $("#side-hits").textContent = "0";
+    $("#side-misses").textContent = "0";
+    $("#side-repl").textContent = "0";
+    $("#side-pages").textContent = "0";
+  }
+
+  async function refreshSidebarStorage() {
+    if (!app.dbPath) { resetSidebarStorage(); return; }
+    try {
+      const res = await api("/api/storage/stats");
+      if (res && res.stats) {
+        const s = res.stats;
+        const total = (s.hit_count || 0) + (s.miss_count || 0);
+        const rate = total > 0 ? (s.hit_rate != null ? s.hit_rate : s.hit_count / total) : 0;
+        $("#side-hit-rate").textContent = `${(rate * 100).toFixed(1)}%`;
+        $("#side-hits").textContent = s.hit_count ?? 0;
+        $("#side-misses").textContent = s.miss_count ?? 0;
+        $("#side-repl").textContent = s.replacement_count ?? 0;
+        $("#side-pages").textContent = s.total_pages ?? 0;
+      }
+    } catch (_) { /* DB closed or server hiccup — leave last values */ }
+  }
+
+  // ── Test cases (presets) ───────────────────────────────────────────────
+  const TEST_CASES = [
+    {
+      title: "建表 + 插入",
+      sql: "CREATE TABLE student(id INT, name VARCHAR, age INT);\nINSERT INTO student(id,name,age) VALUES (1,'Alice',20),(2,'Bob',22),(3,'Cara',18),(4,'Dan',30);",
+    },
+    {
+      title: "查询执行计划",
+      sql: "SELECT id,name FROM student WHERE age > 18;",
+    },
+    {
+      title: "计划优化对比",
+      sql: "SELECT name FROM student WHERE 1=1 AND age>10+8;",
+    },
+    {
+      title: "语义错误示例",
+      sql: "SELECT not_exist_col FROM student;",
+    },
+  ];
+
+  function renderTestList() {
+    testList.innerHTML = TEST_CASES.map((t, i) => `
+      <button class="test-item" type="button" data-i="${i}">
+        <span class="ti-title">${escapeHtml(t.title)}</span>
+        <span class="ti-sql">${escapeHtml(t.sql)}</span>
+      </button>`).join("");
+    $$(".test-item", testList).forEach((el) => {
       el.addEventListener("click", () => {
-        const name = el.dataset.name;
-        selectTable(name);
+        const t = TEST_CASES[Number(el.dataset.i)];
+        if (!t) return;
+        editor.value = t.sql;
+        editor.focus();
+        setSub(`已载入测试用例：${t.title}，点击「执行」或 Ctrl+Enter`, "info");
       });
     });
   }
 
-  async function selectTable(name) {
-    state.activeTable = name;
-    // Bump the version so any in-flight loadSchema() for the OLD table
-    // bails out instead of overwriting the new selection.  This also
-    // forces the schema tab to refetch fresh.
-    state.schemaVersion += 1;
-    renderTables();
-    activateTab("schema");
-    await loadSchema(name);
-  }
+  // ── Bottom panels (switching) ──────────────────────────────────────────
+  const VIZ_MODES = ["token", "ast", "plan", "compare", "storage"];
+  let storageRefreshTimer = null;
 
-  async function loadSchema(name) {
-    // The schema tab is the "live" view of a single table.  Two things
-    // can invalidate it without the user re-clicking the sidebar:
-    //   1) The table was dropped / renamed from the Query tab.
-    //   2) The table's columns were altered (ALTER TABLE).
-    // Both bump state.schemaVersion in runQuery().  We capture the
-    // version at fetch time and re-fetch if it changes before we
-    // render, so the user never sees stale data.
-    schemaEmpty.classList.add("hidden");
-    schemaDetail.classList.add("hidden");
-    schemaSampleRoot.innerHTML = `<p class="hint">Loading…</p>`;
-    const myVersion = state.schemaVersion;
-    const myActiveTable = state.activeTable;
-    // Sanity: if the table is no longer in state.tables, show a clear
-    // message instead of an "Unknown table" error from the engine.
-    if (!state.tables.some((t) => t.name === name)) {
-      schemaEmpty.classList.remove("hidden");
-      schemaEmpty.innerHTML = `<p style="color: var(--red)">Table <code>${escapeHtml(name)}</code> no longer exists. It may have been dropped, renamed, or the database was re-opened.</p>`;
-      return;
-    }
-    try {
-      const [schema, sample] = await Promise.all([
-        api("/api/schema/table", { method: "POST", body: { table: name } }),
-        api("/api/query/execute", { method: "POST", body: { statement: `SELECT * FROM ${name} LIMIT 100` } }),
-      ]);
-      // Another DDL landed while we were waiting; bail and let the
-      // newer loadSchema() call (triggered by the version bump) paint.
-      if (myVersion !== state.schemaVersion) return;
-      if (myActiveTable !== state.activeTable) return;
-      if (!schema.success) {
-        schemaEmpty.classList.remove("hidden");
-        schemaEmpty.innerHTML = `<p style="color: var(--red)">${escapeHtml(schema.message || "Failed to describe table")}</p>`;
-        return;
+  function switchPanel(name) {
+    $$(".panel-tab").forEach((t) => t.classList.toggle("is-active", t.dataset.panel === name));
+    if (VIZ_MODES.includes(name)) {
+      // The four/five viz panels share one content container, each driven
+      // by vizState.mode → renderViz().
+      $$(".panel-content").forEach((p) => p.classList.toggle("is-active", p.dataset.panel === "viz"));
+      vizState.mode = name;
+      renderViz();
+      if (name === "storage") {
+        if (storageRefreshTimer) clearTimeout(storageRefreshTimer);
+        storageRefreshTimer = setTimeout(() => { storageRefreshTimer = null; refreshStorageStats(); }, 80);
       }
-      schemaDetail.classList.remove("hidden");
-      schemaTitle.textContent = schema.table;
-      schemaMeta.textContent = `${schema.columns.length} column(s)`;
-      schemaColsBody.innerHTML = schema.columns.map((c, i) => `
-        <tr>
-          <td class="muted">${i + 1}</td>
-          <td><strong>${escapeHtml(c.name)}</strong></td>
-          <td><code class="mono">${escapeHtml(c.type)}</code></td>
-          <td>${c.nullable ? "YES" : "NO"}</td>
-          <td class="pk-flag">${c.pk ? "PK" : ""}</td>
-          <td class="muted">${c.default ? escapeHtml(c.default) : "—"}</td>
-        </tr>
-      `).join("");
-      schemaCreateSql.textContent = schema.create_sql || "(empty)";
-      // sample rows
-      if (sample.success && sample.results.length > 0) {
-        const r = sample.results[0];
-        if (r.column_names && r.column_names.length) {
-          schemaSampleRoot.innerHTML = renderResultTableHTML(r);
-        } else {
-          schemaSampleRoot.innerHTML = `<p class="hint">No data or query returned no columns.</p>`;
-        }
-      } else {
-        schemaSampleRoot.innerHTML = `<p class="hint">${escapeHtml(sample.results[0]?.message || "Empty table")}</p>`;
-      }
-    } catch (e) {
-      if (myVersion !== state.schemaVersion) return;
-      schemaEmpty.classList.remove("hidden");
-      schemaEmpty.innerHTML = `<p style="color: var(--red)">${escapeHtml(e.message)}</p>`;
+    } else {
+      $$(".panel-content").forEach((p) => p.classList.toggle("is-active", p.dataset.panel === name));
     }
   }
-
-  // ── Tabs ───────────────────────────────────────────────────────────────
-  function activateTab(name) {
-    tabs.forEach((t) => t.classList.toggle("is-active", t.dataset.tab === name));
-    tabPanels.forEach((p) => p.classList.toggle("is-active", p.dataset.panel === name));
-  }
-  tabs.forEach((t) => t.addEventListener("click", () => activateTab(t.dataset.tab)));
-
-  // ── Query execution ────────────────────────────────────────────────────
-  async function runQuery() {
-    if (state.busy) return;
-    const sql = editor.value.trim();
-    if (!sql) {
-      setStatus("Type a SQL statement to run.", "info");
-      return;
-    }
-    if (!state.dbPath) {
-      setStatus("Open a database first (click the pill in the top-right).", "error");
-      return;
-    }
-    state.busy = true;
-    runBtn.disabled = true;
-    queryLoading.classList.remove("hidden");
-    queryError.classList.add("hidden");
-    setStatus("Running…", "info");
-
-    const t0 = performance.now();
-    let data = null;
-    try {
-      data = await api("/api/query/execute", { method: "POST", body: { statement: sql } });
-      const elapsed = Math.round(performance.now() - t0);
-      renderResults(data);
-      pushHistory({ ts: Date.now(), sql, ok: data.success, kind: data.results[0]?.kind || "other" });
-      setStatus(
-        data.success
-          ? `Done in ${formatTime(elapsed)} — ${summarizeResults(data)}`
-          : `Failed in ${formatTime(elapsed)}`,
-        data.success ? "success" : "error"
-      );
-    } catch (e) {
-      queryError.classList.remove("hidden");
-      queryErrorTx.textContent = e.message || String(e);
-      setStatus("Failed.", "error");
-      pushHistory({ ts: Date.now(), sql, ok: false, kind: "error" });
-    } finally {
-      queryLoading.classList.add("hidden");
-      runBtn.disabled = false;
-      state.busy = false;
-      // After any query that may have changed the schema, refresh the
-      // sidebar and bump the schema-version counter.  The schema tab
-      // watches the counter and re-fetches when it changes.
-      //
-      // Source of truth: the API response's per-statement `kind` field.
-      // The engine classifies each statement as `select` / `ddl` / `dml` /
-      // `txn` / `other` / `error`.  We refresh for anything that could
-      // affect catalog state (ddl, plus dml when a BEFORE/AFTER trigger
-      // could have created/dropped a table).
-      const kinds = (data && data.results) ? data.results.map((r) => r.kind) : [];
-      const mayAffectSchema = kinds.some((k) => k === "ddl" || k === "dml" || k === "txn");
-      if (mayAffectSchema) {
-        await refreshTables();      // await so state.tables is current
-        state.schemaVersion += 1;   // signal the schema tab
-      }
-    }
-  }
-
-  function summarizeResults(data) {
-    if (!data.results.length) return "no output";
-    const counts = { select: 0, ddl: 0, dml: 0, txn: 0, other: 0, error: 0 };
-    data.results.forEach((r) => { counts[r.kind] = (counts[r.kind] || 0) + 1; });
-    const parts = [];
-    if (counts.select) parts.push(`${counts.select} SELECT`);
-    if (counts.dml)    parts.push(`${counts.dml} DML`);
-    if (counts.ddl)    parts.push(`${counts.ddl} DDL`);
-    if (counts.txn)    parts.push(`${counts.txn} TXN`);
-    if (counts.error)  parts.push(`${counts.error} error(s)`);
-    return parts.join(" · ") || "done";
-  }
-
-  function setStatus(msg, kind = "info") {
-    queryStatus.classList.remove("hidden", "is-success", "is-error", "is-info");
-    queryStatus.classList.add(`is-${kind}`);
-    queryStatus.textContent = msg;
-  }
+  $$(".panel-tab").forEach((btn) => {
+    btn.addEventListener("click", () => switchPanel(btn.dataset.panel));
+  });
 
   // ── Result rendering ───────────────────────────────────────────────────
   // `vizState.perStatementDebug[i]` mirrors `res.results[i].debug` so
@@ -933,7 +807,7 @@
       root.innerHTML = `<div class="panel empty-panel"><p>语句执行成功，无输出。</p></div>`;
       return;
     }
-    data.results.forEach((r, idx) => {
+    results.forEach((r, idx) => {
       const block = document.createElement("div");
       block.className = "result-block";
       block.dataset.idx = String(idx);
@@ -959,7 +833,7 @@
           <span class="result-kind kind-${escapeHtml(r.kind)}">${escapeHtml(r.kind)}</span>
           <span class="result-msg ${r.success ? "" : "is-error"}">${escapeHtml(r.message || (r.success ? "OK" : ""))}</span>
           <span class="result-time">${formatTime(r.elapsed_ms)}</span>
-          <button class="result-toggle" type="button" title="Show/hide the SQL">SQL</button>
+          <button class="result-toggle" type="button" title="显示/隐藏 SQL">SQL</button>
         </div>
         <pre class="result-statement mono">${escapeHtml(stmt)}</pre>
       `;
@@ -969,7 +843,7 @@
       } else if (!r.success) {
         body = `<div class="result-statement" style="display:block;color:var(--error);background:var(--red-soft);">${escapeHtml(r.error || r.message)}</div>`;
       } else {
-        body = `<div class="result-statement" style="display:block; color: var(--text-mute);">${escapeHtml(r.message || "(no rows)")}</div>`;
+        body = `<div class="result-statement" style="display:block;color:var(--text-mute);">${escapeHtml(r.message || "(no rows)")}</div>`;
       }
       block.innerHTML = head + body;
       // Click anywhere on the block (except the SQL toggle button) to
@@ -1062,7 +936,6 @@
     const body = r.rows.map((row) => {
       const tds = row.map((cell) => {
         if (isNull(cell)) return `<td class="null">NULL</td>`;
-        // try to detect numeric for right-alignment
         if (/^-?\d+(\.\d+)?$/.test(cell)) return `<td class="num">${escapeHtml(cell)}</td>`;
         return `<td>${escapeHtml(cell)}</td>`;
       }).join("");
@@ -1071,19 +944,41 @@
     return `<table class="data-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
   }
 
-  // ── History (localStorage) ─────────────────────────────────────────────
-  const HISTORY_KEY = "sqlui.history.v1";
-  const HISTORY_MAX = 50;
-  function loadHistory() {
-    try {
-      const raw = localStorage.getItem(HISTORY_KEY);
-      if (!raw) return [];
-      const arr = JSON.parse(raw);
-      return Array.isArray(arr) ? arr : [];
-    } catch (_) { return []; }
+  function summarizeResults(data) {
+    if (!data || !data.results || !data.results.length) return "no output";
+    const counts = { select: 0, ddl: 0, dml: 0, txn: 0, other: 0, error: 0 };
+    data.results.forEach((r) => { counts[r.kind] = (counts[r.kind] || 0) + 1; });
+    const parts = [];
+    if (counts.select) parts.push(`${counts.select} SELECT`);
+    if (counts.dml)    parts.push(`${counts.dml} DML`);
+    if (counts.ddl)    parts.push(`${counts.ddl} DDL`);
+    if (counts.txn)    parts.push(`${counts.txn} TXN`);
+    if (counts.error)  parts.push(`${counts.error} error(s)`);
+    return parts.join(" · ") || "done";
   }
-  function saveHistory() {
-    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(state.history)); } catch (_) {}
+
+  function renderErrors(data) {
+    const root = $("viz-errors") || document.getElementById("viz-errors");
+    const list = [];
+    if (data && data.results) {
+      data.results.forEach((r) => {
+        if (!r.success) list.push({ stage: r.kind || "执行", msg: r.statement || "", err: r.message || "unknown" });
+      });
+    } else if (data && data.message) {
+      list.push({ stage: "执行", msg: "", err: data.message });
+    }
+    if (!list.length) {
+      root.innerHTML = `<div class="viz-empty"><p>无错误。执行通过。</p></div>`;
+      return;
+    }
+    root.innerHTML = list.map((x) => `
+      <div class="result-block is-error">
+        <div class="result-head">
+          <span class="result-kind kind-error">${escapeHtml(x.stage)}</span>
+          <span class="result-msg is-error">${escapeHtml(x.err)}</span>
+        </div>
+        ${x.msg ? `<pre class="result-statement mono">${escapeHtml(x.msg)}</pre>` : ""}
+      </div>`).join("");
   }
 
   // ── Main execution ─────────────────────────────────────────────────────
@@ -1183,23 +1078,6 @@
       app.busy = false;
       runBtn.disabled = false;
     }
-    historyList.innerHTML = state.history.map((h, i) => `
-      <li class="history-item" data-i="${i}">
-        <span class="history-item-status ${h.ok ? "ok" : "fail"}">${h.ok ? "OK" : "ERR"}</span>
-        <span class="history-item-text mono" title="${escapeHtml(h.sql)}">${escapeHtml(collapseSql(h.sql))}</span>
-        <span class="history-item-meta">${formatTimestamp(h.ts)}</span>
-      </li>
-    `).join("");
-    $$(".history-item", historyList).forEach((el) => {
-      el.addEventListener("click", () => {
-        const i = Number(el.dataset.i);
-        const entry = state.history[i];
-        if (!entry) return;
-        editor.value = entry.sql;
-        activateTab("query");
-        editor.focus();
-      });
-    });
   }
 
   // When a run finished but no debug envelope survived (typically
@@ -1268,13 +1146,69 @@
 
   // ── Editor helpers ─────────────────────────────────────────────────────
   function formatSql() {
-    // Cheap pretty-printer: uppercase keywords on a per-line basis, leaving
-    // identifiers/strings alone via a simple state machine.
-    const kw = /\b(SELECT|FROM|WHERE|GROUP BY|ORDER BY|LIMIT|OFFSET|HAVING|JOIN|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|ON|AS|AND|OR|NOT|IN|IS|NULL|TRUE|FALSE|LIKE|BETWEEN|EXISTS|ANY|ALL|CASE|WHEN|THEN|ELSE|END|INSERT|INTO|VALUES|UPDATE|SET|DELETE|FROM|CREATE|TABLE|INDEX|VIEW|REPLACE|PRIMARY|KEY|FOREIGN|REFERENCES|UNIQUE|CHECK|DEFAULT|ALTER|DROP|TRUNCATE|RENAME|MERGE|WITH|RETURNING|UNION|INTERSECT|EXCEPT|DISTINCT|CAST|TEXT|INT|INTEGER|BIGINT|SMALLINT|FLOAT|DOUBLE|REAL|DECIMAL|NUMERIC|BOOLEAN|DATE|DATETIME|TIMESTAMP|VARCHAR|CHAR|BLOB|TRANSACTION|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/g;
+    const kw = /\b(SELECT|FROM|WHERE|GROUP BY|ORDER BY|LIMIT|OFFSET|HAVING|JOIN|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|ON|AS|AND|OR|NOT|IN|IS|NULL|TRUE|FALSE|LIKE|BETWEEN|EXISTS|ANY|ALL|CASE|WHEN|THEN|ELSE|END|INSERT|INTO|VALUES|UPDATE|SET|DELETE|FROM|CREATE|TABLE|INDEX|VIEW|REPLACE|PRIMARY|KEY|FOREIGN|REFERENCES|UNIQUE|CHECK|DEFAULT|ALTER|DROP|TRUNCATE|RENAME|MERGE|WITH|RETURNING|UNION|INTERSECT|EXCEPT|DISTINCT|CAST|TEXT|INT|INTEGER|BIGINT|SMALLINT|FLOAT|DOUBLE|REAL|DECIMAL|NUMERIC|BOOLEAN|DATE|DATETIME|TIMESTAMP|VARCHAR|CHAR|BLOB|TRANSACTION|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/gi;
     editor.value = editor.value.replace(kw, (m) => m.toUpperCase());
   }
 
+  // ── Sidebar collapse / groups / vsplit ────────────────────────────────
+  function toggleSidebar() {
+    const sb = $("#sidebar");
+    const collapsed = sb.classList.toggle("collapsed");
+    document.body.classList.toggle("sidebar-collapsed", collapsed);
+  }
+  $("#sidebar-toggle").addEventListener("click", toggleSidebar);
+  $("#sidebar-toggle-bar").addEventListener("click", toggleSidebar);
+  $$(".sb-group-title").forEach((t) => {
+    t.addEventListener("click", () => {
+      const gid = t.dataset.group;
+      const g = document.getElementById(gid);
+      if (g) g.classList.toggle("collapsed");
+    });
+  });
+
+  // Vertical split drag (resize editor vs panel)
+  const vsplit = $("#vsplit");
+  const editorSection = $("#editor-section");
+  (function initSplit() {
+    let dragging = false;
+    vsplit.addEventListener("mousedown", (e) => {
+      dragging = true;
+      e.preventDefault();
+      document.body.classList.add("resizing");
+    });
+    document.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      const rect = editorSection.getBoundingClientRect();
+      const containerHeight = editorSection.parentElement.clientHeight;
+      const desired = (e.clientY - rect.top) + rect.top - editorSection.offsetTop;
+      let pct = (desired / containerHeight) * 100;
+      pct = Math.max(10, Math.min(50, pct));
+      editorSection.style.maxHeight = `${pct}%`;
+      editorSection.style.minHeight = `${pct}%`;
+    });
+    document.addEventListener("mouseup", () => {
+      if (dragging) { dragging = false; document.body.classList.remove("resizing"); }
+    });
+  })();
+
   // ── Event wiring ───────────────────────────────────────────────────────
+  runBtn.addEventListener("click", runAll);
+  formatBtn.addEventListener("click", formatSql);
+  clearBtn.addEventListener("click", () => { editor.value = ""; editor.focus(); });
+
+  editor.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      runAll();
+    }
+    if (e.key === "Tab") {
+      e.preventDefault();
+      const start = editor.selectionStart, end = editor.selectionEnd;
+      editor.value = editor.value.slice(0, start) + "  " + editor.value.slice(end);
+      editor.selectionStart = editor.selectionEnd = start + 2;
+    }
+  });
+
   dbPill.addEventListener("click", openDbModal);
   if (dbResetBtn) {
     dbResetBtn.addEventListener("click", async () => {
@@ -1296,7 +1230,6 @@
   dbCancelBtn.addEventListener("click", closeDbModal);
   dbOpenBtn.addEventListener("click", openDatabaseFromInput);
 
-  // Browse modal events
   dbBrowseServerBtn.addEventListener("click", () => openBrowseModal());
   browseModalClose.addEventListener("click", closeBrowseModal);
   browseModalBack.addEventListener("click", closeBrowseModal);
@@ -1317,7 +1250,6 @@
   browseOpenBtn.addEventListener("click", openBrowseSelection);
   browseNewHereBtn.addEventListener("click", openBrowseNewHere);
 
-  // Path input: live re-scan
   let pathDebounce = null;
   dbPathInput.addEventListener("input", () => {
     clearTimeout(pathDebounce);
@@ -1328,28 +1260,19 @@
     if (e.key === "Escape") { e.preventDefault(); closeDbModal(); }
   });
   dbScanBtn.addEventListener("click", () => { dbPathDetails.open = true; scanCurrentPath(); });
-  // Auto-open the path details when the user starts typing
   dbPathInput.addEventListener("focus", () => { dbPathDetails.open = true; });
 
   dbClearRecent.addEventListener("click", () => {
-    if (!state.recents.length) return;
-    if (!confirm("Forget all recently opened databases?")) return;
+    if (!app.recents.length) return;
+    if (!confirm("忘记所有最近打开的数据库？")) return;
     clearRecents();
     renderRecents();
   });
 
-  // (Browse modal event listeners are wired up earlier in the file.)
-
-  refreshBtn.addEventListener("click", refreshTables);
-  newTableBtn.addEventListener("click", () => {
-    const tpl = `CREATE TABLE new_table (
-  id INT PRIMARY KEY,
-  name TEXT NOT NULL,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);`;
-    editor.value = tpl;
-    activateTab("query");
-    editor.focus();
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !dbModal.classList.contains("hidden")) {
+      closeDbModal();
+    }
   });
 
   // ── Visualization ───────────────────────────────────────────────────────
@@ -2428,55 +2351,131 @@
       </div>`;
       return;
     }
-    // Tab inserts two spaces (don't move focus)
-    if (e.key === "Tab") {
-      e.preventDefault();
-      const start = editor.selectionStart, end = editor.selectionEnd;
-      editor.value = editor.value.slice(0, start) + "  " + editor.value.slice(end);
-      editor.selectionStart = editor.selectionEnd = start + 2;
+    switch (vizState.mode) {
+      case 'token':
+      case 'tokens':
+        content.innerHTML = renderTokens(d.tokens);
+        break;
+      case 'ast':
+        content.innerHTML = parseIndentedTree(d.ast_text);
+        // Interactions (pan / zoom / toggle / hover→editor) only make
+        // sense once the markup is in the DOM.
+        attachAstPanel();
+        break;
+      case 'plan':
+        content.innerHTML = renderPlan(d.plan_json);
+        break;
+      case 'compare':
+        content.innerHTML = renderCompare(d);
+        break;
+      case 'storage':
+        content.innerHTML = renderStorage(d.storage_stats, d.replacement_log, vizState.storageBaseline);
+        break;
+      default:
+        content.innerHTML = renderTokens(d.tokens);
     }
-  });
+  }
 
-  clearHistoryBtn.addEventListener("click", () => {
-    if (!confirm("Clear all query history?")) return;
-    state.history = [];
-    saveHistory();
-    renderHistory();
-  });
+  // Live-fetch the buffer-pool snapshot from /api/storage/stats and
+  // re-render the storage panel with the freshest numbers.
+  async function refreshStorageStats() {
+    try {
+      const res = await api('/api/storage/stats');
+      if (res && res.success && res.stats && vizState.debug) {
+        vizState.debug.storage_stats = res.stats;
+        if (Array.isArray(res.replacement_log)) {
+          vizState.debug.replacement_log = res.replacement_log;
+        }
+        if (vizState.mode === 'storage') {
+          const content = document.getElementById('viz-content');
+          if (content) {
+            content.innerHTML = renderStorage(
+              res.stats,
+              res.replacement_log || [],
+              vizState.storageBaseline
+            );
+          }
+        }
+      }
+    } catch (_) {}
+  }
 
-  // ESC closes modal
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !dbModal.classList.contains("hidden")) {
-      closeDbModal();
+  async function runViz() {
+    // Kept for API parity with the engine compile pipeline; the IDE's
+    // primary entry point is runAll() above.
+    await runAll();
+  }
+
+  // Attach visualization toolbar handlers
+  document.getElementById('viz-reset-storage-btn')?.addEventListener('click', async () => {
+    const btn = document.getElementById('viz-reset-storage-btn');
+    if (!btn || btn.disabled) return;
+    btn.disabled = true;
+    const originalLabel = btn.textContent;
+    btn.textContent = '重置中…';
+    try {
+      const res = await api('/api/storage/reset', { method: 'POST', body: {} });
+      if (res && res.success && res.baseline) {
+        vizState.storageBaseline = {
+          ...res.baseline,
+          captured_at: new Date().toISOString(),
+        };
+        if (vizState.mode === 'storage' && vizState.debug) {
+          renderViz();
+        }
+        setSub('存储计数器已重置为基线。', 'success');
+        setVizStatus(
+          `基线已捕获 (${vizState.storageBaseline.hit_count} hits / ${vizState.storageBaseline.miss_count} misses)。`,
+          'success'
+        );
+        refreshSidebarStorage();
+      } else {
+        setSub(res?.message || '重置存储计数器失败。', 'error');
+        setVizStatus(res?.message || '重置存储计数器失败。', 'error', true);
+      }
+    } catch (e) {
+      setSub(e?.message || String(e), 'error');
+      setVizStatus(e?.message || String(e), 'error', true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = originalLabel;
     }
   });
 
   // ── Boot ───────────────────────────────────────────────────────────────
   async function boot() {
-    updateDbPill();
-    renderHistory();
+    setDbPillText();
+    renderTestList();
     // Try to auto-reopen the most recently used DB so a refresh keeps
-    // the user in context.  This only fires if we have at least one
-    // entry in the recents list; otherwise the user sees the open modal.
-    if (state.recents.length > 0) {
-      const last = state.recents[0];
+    // the user in context.
+    if (app.recents.length > 0) {
+      const last = app.recents[0];
       try {
         const res = await api("/api/db/open", { body: { db_path: last } });
         if (res.success) {
-          state.dbPath = res.db_path;
-          pushRecent(res.db_path);  // bubble to top
-          updateDbPill();
-          await refreshTables();
+          app.dbPath = res.db_path;
+          pushRecent(res.db_path);
+          setDbPillText();
+          await refreshCatalog();
+          refreshSidebarStorage();
         }
-      } catch (_) { /* ignore — user will see the open modal */ }
+      } catch (_) { /* user will see the open modal */ }
     }
-    // Health probe — if engine binary is missing, surface that
+    // Health probe — surface a missing engine binary.
     try {
       const h = await api("/api/health");
       if (!h.engine_exists) {
-        setStatus("⚠ Engine binary not found. Build the C++ project (cmake --build build) or set SQLCOMPILER_BIN.", "error");
+        setSub("⚠ 未找到引擎二进制。请构建 C++ 工程 (cmake --build build) 或设置 SQLCOMPILER_BIN。", "error");
+        if (engineDot) engineDot.classList.add("is-warn");
+        setSbStatus("引擎缺失");
+      } else {
+        document.getElementById("engine-status-text").textContent = `引擎已连接 · ${h.version || ""}`;
+        setSbStatus("就绪");
       }
-    } catch (_) { /* server may be down */ }
+    } catch (_) {
+      setSbStatus("后端未连接");
+      if (engineDot) engineDot.classList.add("is-warn");
+    }
   }
 
   boot();
