@@ -319,9 +319,24 @@ def _split_blocks(stdout: str, statements: list[str], stderr: str = "") -> list[
             blk = _parse_one_block(stmt, leftover, stderr)
             blk.statement = stmt
             blocks.append(blk)
-    # pad with empty success blocks if we ended up with fewer blocks than statements
+    # pad with empty blocks if we ended up with fewer blocks than statements.
+    # When stderr carries an "Error:" line, every padded statement is
+    # marked as a failure so the UI surfaces the engine's diagnostic
+    # instead of silently showing "OK" for an unparseable block.
+    has_stderr_error = bool(
+        stderr
+        and any(
+            ln.lstrip().startswith("Error:") or ln.lstrip().startswith("error:")
+            for ln in stderr.splitlines()
+        )
+    )
     while len(blocks) < len(statements):
-        blocks.append(ParsedBlock(success=True, kind="other", statement=statements[len(blocks)]))
+        pad = ParsedBlock(success=not has_stderr_error, kind="other",
+                          statement=statements[len(blocks)])
+        if has_stderr_error:
+            pad.message = stderr.strip().splitlines()[0]
+            pad.kind = "error"
+        blocks.append(pad)
     return blocks
 
 
