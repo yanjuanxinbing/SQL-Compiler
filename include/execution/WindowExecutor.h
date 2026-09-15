@@ -43,6 +43,17 @@ private:
         std::vector<Value> partition_values;
         // 排序后的行索引（在 materialized_ 中的下标）
         std::vector<size_t> ordered_indices;
+        // Items #7/8/9 (perf)：每个位置上的 ORDER BY 键向量（按主 spec）。
+        // 排序后写入；ComputeWindowValue 直接读 p.order_keys[pos]，避免
+        // per-row EvalAggExpr 重算。
+        std::vector<std::vector<Value>> order_keys;
+        // Item #8 (perf)：分区内"UNBOUNDED PRECEDING AND CURRENT ROW" 帧
+        // 的前缀状态：prefix_sum[i] / prefix_count_non_null[i] /
+        // prefix_min[i] / prefix_max[i] 表示 [0..i] 区间内的累计值。
+        std::vector<double>  prefix_sum;
+        std::vector<int64_t> prefix_count_non_null;
+        std::vector<Value>   prefix_min;
+        std::vector<Value>   prefix_max;
     };
 
     // 已物化的子算子输出
@@ -88,6 +99,11 @@ private:
     // 单个窗口函数表达式是否为 window 列
     static bool IsWindowExpr(const ExprPtr& e);
 
+public:
+    // Item #3 (perf)：ApplyExecutor 探测相关性时读取 select_list。
+    const std::vector<ExprPtr>& select_list_for_scan() const { return select_list_; }
+
+private:
     size_t cursor_;
 };
 

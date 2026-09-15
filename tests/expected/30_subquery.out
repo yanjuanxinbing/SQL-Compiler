@@ -61,9 +61,106 @@ Charlie
 David  
 Eve    
 (4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> id | val
+---+----
+2  | 20 
+3  | 30 
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | val
+---+----
+1  | 10 
+2  | 20 
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | val
+---+----
+2  | 20 
+3  | 30 
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | val
+---+----
+1  | 10 
+(1 row)
+sqlcompiler> sqlcompiler> id | val
+---+----
+2  | 20 
+3  | 30 
+(2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> id | val
+---+----
+1  | 10 
+2  | 20 
+3  | 30 
+(3 rows)
+sqlcompiler> OK
 sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> name
 ----
 Bob 
 Eve 
 (2 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler>        ->        -> grp | total
+----+------
+A   | 30   
+B   | 30   
+C   | 40   
+(3 rows)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler>        ->        -> id | category | price | max_in_cat
+---+----------+-------+-----------
+1  | Fruit    | 1.5   | 3         
+2  | Fruit    | 3     | 3         
+3  | Meat     | 10    | 10        
+4  | Meat     | 5     | 10        
+(4 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> cat   | cnt | max_price
+------+-----+----------
+Fruit | 2   | 3        
+Meat  | 2   | 10       
+(2 rows)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler>        ->        -> id | cat | val | cat_sum
+---+-----+-----+--------
+1  | A   | 10  | 30     
+2  | A   | 20  | 30     
+3  | B   | 30  | 60     
+4  | B   | 30  | 60     
+(4 rows)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler>        ->        -> OK
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler>        ->        ->        ->        -> cat       | cnt | total_qty_for_cat
+----------+-----+------------------
+Fruit     | 2   | 9                
+Meat      | 2   | 6                
+Vegetable | 1   | 2                
+(3 rows)
+sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> OK
+sqlcompiler>        ->        -> id | cat | val | s 
+---+-----+-----+---
+1  | A   | 10  | 30
+2  | A   | 20  | 30
+3  | B   | 30  | 60
+4  | B   | 30  | 60
+(4 rows)
+sqlcompiler> OK
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        -> 
+Error: [Lexical] line=1, col=4: unexpected character: 'è'
+sqlcompiler> 
+Error: semantic error [TableNotFound] line=1, col=1: table not found: bare_t2
+sqlcompiler>        ->        -> 
+Error: semantic error [TableNotFound] line=1, col=1: table not found: bare_t2; semantic error [ColumnNotFound] line=1, col=8: column not found: id; semantic error [ColumnNotFound] line=1, col=20: column not found: cat; semantic error [ColumnNotFound] line=1, col=33: column not found: val; semantic error [ColumnNotFound] line=3, col=23: column not found: id
+sqlcompiler> 
+Error: semantic error [TableNotFound] line=1, col=1: table not found: bare_t2
 sqlcompiler> sqlcompiler> 

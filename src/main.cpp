@@ -155,97 +155,92 @@ bool IsOnlyCommentsOrWhitespace(const std::string& s) {
     return true;
 }
 
-// 判断缓冲区中是否已出现语句结束符 ';'。
-// 必须跳过字符串字面量与行注释，否则 `INSERT ... VALUES ('a;b')` 会被提前截断，
-// 而 `-- 注释里的分号;` 会被误认为语句已完整。
-// 额外规则：在 CREATE FUNCTION/PROCEDURE 类语句的 BEGIN ... END 块内的 ';'
-// 不算语句结束；通过简单扫描文本中的 BEGIN / END 大写关键字计数实现。
-bool HasCompleteStatement(const std::string& s) {
+// item #4/#6: 增量式语句边界检测。
+//
+// 原来 HasCompleteStatement 每次调用都重新扫描整个 buffer：N 行脚本累积
+// buffer 长度 O(N²)，每次 HasCompleteStatement 又把 buffer 全扫一次 →
+// O(N³) 总开销。这里把状态提取到 ReplLineParser：
+//   * in_string / create_fn_seen / begin_depth 仅在新行上更新；
+//   * FeedLine 单次调用 O(line.length())；
+//   * RunScriptFile 与 REPL 各持有一个 ReplLineParser 实例；REPL 在
+//     ExecuteSQL 后调用 Reset()，RunScriptFile 局部变量天然只活到函数返回。
+//
+// 语义与原 HasCompleteStatement 一致：跳过字符串字面量与行注释；
+// CREATE FUNCTION/PROCEDURE 体内 BEGIN/END 嵌套深度内的 ';' 不算语句结束。
+struct ReplLineParser {
     bool in_string = false;
-    auto extract_word_upper = [](const std::string& s, size_t i) -> std::string {
-        std::string w;
-        while (i < s.size() &&
-               (std::isalpha(static_cast<unsigned char>(s[i])) || s[i] == '_')) {
-            w.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(s[i]))));
-            ++i;
-        }
-        return w;
-    };
-    int begin_depth = 0;
-    // 仅当显式看到 CREATE FUNCTION/PROCEDURE 时才启用 BEGIN...END 计数。
-    // 这样独立的 BEGIN; 事务语句不会被误识别为函数体起点。
     bool create_fn_seen = false;
-    auto upper_contains = [](const std::string& s, const std::string& needle) -> bool {
-        if (needle.size() > s.size()) return false;
-        for (size_t k = 0; k + needle.size() <= s.size(); ++k) {
-            bool match = true;
-            for (size_t j = 0; j < needle.size(); ++j) {
-                char a = static_cast<char>(std::toupper(
-                    static_cast<unsigned char>(s[k + j])));
-                char b = needle[j];
-                if (a != b) { match = false; break; }
+    int begin_depth = 0;
+
+    void Reset() {
+        in_string = false;
+        create_fn_seen = false;
+        begin_depth = 0;
+    }
+
+    bool FeedLine(const std::string& line) {
+        auto extract_word_upper = [](const std::string& s, size_t i) -> std::string {
+            std::string w;
+            while (i < s.size() &&
+                   (std::isalpha(static_cast<unsigned char>(s[i])) || s[i] == '_')) {
+                w.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(s[i]))));
+                ++i;
             }
-            if (match) return true;
+            return w;
+        };
+        for (size_t i = 0; i < line.size(); ++i) {
+            char c = line[i];
+            if (in_string) {
+                if (c == '\'') {
+                    if (i + 1 < line.size() && line[i + 1] == '\'') { ++i; continue; }
+                    in_string = false;
+                }
+                continue;
+            }
+            if (c == '\'') { in_string = true; continue; }
+            if (c == '-' && i + 1 < line.size() && line[i + 1] == '-') {
+                while (i < line.size() && line[i] != '\n') ++i;
+                continue;
+            }
+            if (std::isalpha(static_cast<unsigned char>(c))) {
+                std::string w = extract_word_upper(line, i);
+                // 检测 "CREATE FUNCTION/PROCEDURE" 触发 BEGIN/END 计数。
+                if (!create_fn_seen && w == "CREATE") {
+                    size_t j = i + w.size();
+                    while (j < line.size() &&
+                           std::isspace(static_cast<unsigned char>(line[j]))) ++j;
+                    std::string next = extract_word_upper(line, j);
+                    if (next == "FUNCTION" || next == "PROCEDURE") {
+                        create_fn_seen = true;
+                    }
+                }
+                if (create_fn_seen && w == "BEGIN") {
+                    ++begin_depth;
+                } else if (create_fn_seen && w == "END") {
+                    // END IF / END WHILE / END LOOP / END REPEAT / END CASE 都是
+                    // 子块的结束，不是函数/过程体的 END。看到 END 后看下一个非
+                    // 空白关键字：若是上述关键字之一，则跳过。
+                    size_t j = i + w.size();
+                    while (j < line.size() &&
+                           std::isspace(static_cast<unsigned char>(line[j]))) ++j;
+                    std::string next = extract_word_upper(line, j);
+                    if (next == "IF" || next == "WHILE" || next == "LOOP" ||
+                        next == "REPEAT" || next == "CASE") {
+                        i += w.size() + (j - (i + w.size())) + next.size() - 1;
+                        continue;
+                    }
+                    if (begin_depth > 0) --begin_depth;
+                }
+                i += w.size() - 1;
+                continue;
+            }
+            if (c == ';' && begin_depth == 0) {
+                return true;
+            }
         }
         return false;
-    };
-    for (size_t i = 0; i < s.size(); ++i) {
-        char c = s[i];
-        if (in_string) {
-            if (c == '\'') {
-                if (i + 1 < s.size() && s[i + 1] == '\'') { ++i; continue; }
-                in_string = false;
-            }
-            continue;
-        }
-        if (c == '\'') { in_string = true; continue; }
-        if (c == '-' && i + 1 < s.size() && s[i + 1] == '-') {
-            while (i < s.size() && s[i] != '\n') ++i;
-            continue;
-        }
-        if (std::isalpha(static_cast<unsigned char>(c))) {
-            std::string w = extract_word_upper(s, i);
-            // 检测 "CREATE FUNCTION/PROCEDURE" 触发 BEGIN/END 计数。
-            if (w == "CREATE" && create_fn_seen == false) {
-                // 看后续 token：FUNCTION / PROCEDURE / TRIGGER。
-                size_t j = i + w.size();
-                while (j < s.size() &&
-                       (std::isspace(static_cast<unsigned char>(s[j])))) ++j;
-                std::string next = extract_word_upper(s, j);
-                if (next == "FUNCTION" || next == "PROCEDURE") {
-                    create_fn_seen = true;
-                }
-            }
-            if (create_fn_seen && w == "BEGIN") {
-                ++begin_depth;
-            } else if (create_fn_seen && w == "END") {
-                // END IF / END WHILE / END LOOP / END REPEAT / END CASE 都是
-                // 子块的结束，不是函数/过程体的 END。看到 END 后看下一个非空白
-                // 关键字：若是上述关键字之一，则跳过。
-                size_t j = i + w.size();
-                while (j < s.size() &&
-                       (std::isspace(static_cast<unsigned char>(s[j])))) ++j;
-                std::string next = extract_word_upper(s, j);
-                if (next == "IF" || next == "WHILE" || next == "LOOP" ||
-                    next == "REPEAT" || next == "CASE") {
-                    // 跳过整个 next 词，避免下一次循环再处理它
-                    i += w.size() + (j - (i + w.size())) + next.size() - 1;
-                    continue;
-                }
-                if (begin_depth > 0) --begin_depth;
-            }
-            i += w.size() - 1;
-            continue;
-        }
-        if (c == ';' && begin_depth == 0) {
-            // 行尾单独的 ';' 之前的整段若包含 CREATE FUNCTION + END（depth 已
-            // 归零），也认作语句完成。否则只信任 depth==0 时退出。
-            (void)upper_contains;
-            return true;
-        }
     }
-    return false;
-}
+};
 
 // 终端显示宽度（近似）：ASCII 记 1 列，CJK 等宽字符记 2 列，
 // UTF-8 续字节不计。用于把结果集对齐成表格。
@@ -331,15 +326,15 @@ void PrintResult(const sqlcompiler::ExecutionResult& result) {
 // 失败时打印错误并继续（与 REPL 行为一致），不中断后续语句。
 // 返回 true 表示文件被成功打开（即使里面所有语句都失败）。
 //
-// 切分策略：按行扫描（行内仍走 HasCompleteStatement 检测 ';'）。这样能让
+// 切分策略：按行扫描（行内仍走 ReplLineParser::FeedLine 检测 ';'）。这样能让
 // `.tables` / `.exit` / `\.tokens` 等不带 ';' 的元命令/调试命令被识别为
 // 行边界,而不是被错误拼到下一条 SQL 之后——之前的实现会把 `.tables\nINSERT`
 // 整体交给解析器,因 `.` 报错而**静默丢弃**后续 INSERT 的数据(行数显示 OK
 // 但表里少一条)。现在把元命令作为独立 ExecuteSQL 调用执行,失败仅影响该行,
 // 不再污染相邻 SQL,与 REPL 的"累加器非空时不处理元命令"语义一致。
 //
-// 复杂度：HasCompleteStatement 自身是 O(|buffer|)，整体 O(N²)。对教学用的
-// 脚本（KB 级）足够快；工业级可换成单趟扫描的 statement splitter。
+// 复杂度：ReplLineParser::FeedLine 单行 O(line.length())，buffer append 预
+// reserve 后单次摊销 O(1)；整体 O(L)（L = 总字符数）。
 bool RunScriptFile(sqlcompiler::Database* database, const std::string& path) {
     std::ifstream in(path);
     if (!in) {
@@ -362,11 +357,13 @@ bool RunScriptFile(sqlcompiler::Database* database, const std::string& path) {
     };
 
     std::string buffer;
+    ReplLineParser line_parser;  // item #4/#6: 局部状态，每条完整语句后 Reset。
     size_t statements_run = 0;
     auto flush_sql_buffer = [&]() {
         if (buffer.empty()) return false;
         bool ran = run_one(buffer);
         buffer.clear();
+        line_parser.Reset();  // 与语句边界同步：state 从零开始累计下一条。
         return ran;
     };
 
@@ -398,9 +395,11 @@ bool RunScriptFile(sqlcompiler::Database* database, const std::string& path) {
             continue;
         }
 
+        // item #5: 预 reserve 一次性分配，避免 += 触发多次 realloc。
+        buffer.reserve(buffer.size() + line.size() + 1);
         buffer += line;
         buffer += "\n";
-        if (HasCompleteStatement(buffer)) {
+        if (line_parser.FeedLine(line)) {
             if (flush_sql_buffer()) ++statements_run;
         }
     }
@@ -480,6 +479,7 @@ int main(int argc, char** argv) {
 
     std::string line;
     std::string sql;
+    ReplLineParser line_parser;  // item #4: REPL 持久化的解析状态。
     std::cout << "sqlcompiler> " << std::flush;
     // Phase 1.5：首次启动时打印一行帮助，让用户知道有调试元命令可用。
     // 启动 banner 之前已在外层输出"sqlcompiler> "，这里再追加一行避免覆盖 prompt。
@@ -583,9 +583,11 @@ int main(int argc, char** argv) {
             }
         }
 
+        // item #5: 预 reserve 一次性分配，避免 += 触发多次 realloc。
+        sql.reserve(sql.size() + line.size() + 1);
         sql += line;
         sql += "\n";
-        if (!HasCompleteStatement(sql)) {
+        if (!line_parser.FeedLine(line)) {
             // 纯注释/空行不应进入"续行"状态，否则脚本开头的注释会刷出一串
             // "       -> " 提示，干扰输出。
             if (IsOnlyCommentsOrWhitespace(sql)) {
@@ -611,12 +613,14 @@ int main(int argc, char** argv) {
         // 注释掉的语句）。
         if (IsOnlyCommentsOrWhitespace(trimmed)) {
             sql.clear();
+            line_parser.Reset();
             std::cout << "sqlcompiler> " << std::flush;
             continue;
         }
         auto result = database->ExecuteSQL(trimmed);
         PrintResult(result);
         sql.clear();
+        line_parser.Reset();  // 与下一条语句对齐：从干净状态开始累计。
         std::cout << "sqlcompiler> " << std::flush;
     }
     database->Shutdown();

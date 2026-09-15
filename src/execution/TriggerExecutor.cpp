@@ -2,6 +2,8 @@
 
 #include "execution/ExpressionEvaluator.h"
 
+#include <cassert>
+
 namespace sqlcompiler {
 
 namespace {
@@ -93,7 +95,12 @@ void TriggerExecutor::FireBefore(SystemCatalog* catalog,
 
     for (const auto* trigger : triggers) {
         if (trigger == nullptr) continue;
-        for (const auto& asg : trigger->assignments) {
+        // Item #14: 触发器 assignments 用惰性解析：第一次访问时把
+        // raw_assignments_text 解析为 ExprPtr 并缓存在 lazy_assignments_；
+        // 后续 fire 直接走 cached AST——避免每次启动都 T·K·|text| 解析。
+        SystemCatalog::EnsureTriggerAssignmentsResolved(*trigger);
+        const auto& resolved = trigger->lazy_assignments_;
+        for (const auto& asg : resolved) {
             std::string q, col;
             if (!ParseTriggerLhs(asg.first, &q, &col)) continue;
             Value v = eval.Evaluate(asg.second, Tuple());
@@ -173,7 +180,11 @@ void TriggerExecutor::FireAfter(SystemCatalog* catalog,
 
         std::unordered_map<std::string, size_t> empty_cmap;
         ExpressionEvaluator eval(empty_cmap, context, &frame);
-        for (const auto& asg : t->assignments) {
+        // Item #14: 触发器 assignments 用惰性解析；首次访问把
+        // raw_assignments_text 解析并缓存，后续 fire 走 cached AST。
+        SystemCatalog::EnsureTriggerAssignmentsResolved(*t);
+        const auto& resolved = t->lazy_assignments_;
+        for (const auto& asg : resolved) {
             std::string q, col;
             if (!ParseTriggerLhs(asg.first, &q, &col)) continue;
             if (asg.second == nullptr) continue;

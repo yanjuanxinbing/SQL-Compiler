@@ -47,6 +47,8 @@ page_id_t DiskManager::AllocatePage() {
     if (!free_pages_.empty()) {
         page_id_t pid = free_pages_.back();
         free_pages_.pop_back();
+        // 同步从 free_set_ 移除，保证下一次 DeallocatePage(pid) 仍然能进栈。
+        free_set_.erase(pid);
         return pid;
     }
     return next_page_id_++;
@@ -54,6 +56,9 @@ page_id_t DiskManager::AllocatePage() {
 
 void DiskManager::DeallocatePage(page_id_t page_id) {
     std::lock_guard<std::mutex> lock(db_io_latch_);
+    // 去重：同一 page_id 被多次 DeallocatePage 时只在回收池里出现一次。
+    // 防止后续 AllocatePage 吐出重复 id、把两个"页"映射到同一个物理盘块。
+    if (!free_set_.insert(page_id).second) return;
     free_pages_.push_back(page_id);
 }
 

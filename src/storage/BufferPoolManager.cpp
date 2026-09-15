@@ -104,7 +104,11 @@ bool BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) {
 bool BufferPoolManager::FlushPage(page_id_t page_id) {
     auto it = page_table_.find(page_id);
     if (it == page_table_.end()) return false;
-    int frame_id = it->second;
+    FlushPageImpl(it->second, page_id);
+    return true;
+}
+
+void BufferPoolManager::FlushPageImpl(int frame_id, page_id_t pid) {
     // Phase B：WAL-before-data 规则。
     // 若该页的 page_lsn 尚未被日志持久化，必须先 LogManager::Flush，
     // 否则磁盘上的 page 会"领先"日志，导致崩溃后 redo 看不到原始写入。
@@ -115,24 +119,25 @@ bool BufferPoolManager::FlushPage(page_id_t page_id) {
             log_manager_->Flush();
         }
     }
-    disk_manager_->WritePage(page_id, pages_[frame_id].GetData());
+    disk_manager_->WritePage(pid, pages_[frame_id].GetData());
     pages_[frame_id].SetDirty(false);
-    return true;
 }
 
 void BufferPoolManager::FlushAllDirtyPages() {
-    // Phase B：仅刷脏页；Lsn-aware 的 FlushPage 保证 WAL 顺序。
+    // Phase B：仅刷脏页；Lsn-aware 的 FlushPageImpl 保证 WAL 顺序。
+    // 直接迭代 page_table_ 并调用 FlushPageImpl(frame_id, pid)，省掉
+    // FlushPage(page_id) 里再做一次 page_table_.find 的开销。
     for (const auto& kv : page_table_) {
         int frame_id = kv.second;
         if (pages_[frame_id].IsDirty()) {
-            FlushPage(kv.first);
+            FlushPageImpl(frame_id, kv.first);
         }
     }
 }
 
 void BufferPoolManager::FlushAllPages() {
     for (const auto& kv : page_table_) {
-        FlushPage(kv.first);
+        FlushPageImpl(kv.second, kv.first);
     }
 }
 

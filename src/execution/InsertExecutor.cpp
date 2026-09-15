@@ -271,6 +271,57 @@ void InsertExecutor::Init() {
     // 这里不再调用 source_->Init()，否则会触发 nullptr->Init() 崩溃。
     // 60_view_trigger: 重置 STATEMENT 级 AFTER 触发器的"已 fire"标记。
     TriggerExecutor::ResetStatementFireState(context_);
+    // Item #11 (perf)：一次性扫堆建立 AUTO_INCREMENT baseline。
+    // 之前 InsertRow 每行都全表扫描求 max(id)，批 INSERT N 行 → O(N²)；
+    // 现在 Init 时扫一次，本地 counter 自增。表为空时 baseline = 0，
+    // 第一行分配 1。
+    PrepareAutoIncBaselines();
+}
+
+// Item #11 (perf)：扫描堆一次计算每列 AUTO_INCREMENT 列的当前 max(id)。
+// 对没有 AUTO_INCREMENT 列的表是 no-op（autoinc_next_ 为空）。该函数
+// 会被多次调用但仅第一次真正扫堆（autoinc_baseline_ready_ 守卫）。
+void InsertExecutor::PrepareAutoIncBaselines() {
+    if (autoinc_baseline_ready_) return;
+    autoinc_baseline_ready_ = true;
+    const TableInfo* info = context_->GetCatalog()->GetTable(table_name_);
+    if (info == nullptr) return;
+    TableHeap* heap = context_->GetCatalog()->GetTableHeap(table_name_);
+    if (heap == nullptr) return;
+    // 第一遍：收集所有需要 baseline 的 AUTO_INCREMENT 列下标。
+    std::vector<size_t> ai_indexes;
+    for (size_t i = 0; i < info->columns.size(); ++i) {
+        if (info->columns[i].is_auto_increment) ai_indexes.push_back(i);
+    }
+    if (ai_indexes.empty()) return;
+    // 用 column_types 序列化读 Tuple。
+    std::vector<ValueType> schema;
+    schema.reserve(info->columns.size());
+    for (const auto& c : info->columns) {
+        schema.push_back(ValueTypeFromString(c.data_type));
+    }
+    // 一次性扫堆，累计每列 max。
+    std::unordered_map<size_t, int32_t> max_per_col;
+    for (size_t idx : ai_indexes) max_per_col[idx] = 0;
+    auto it = heap->Begin();
+    while (it.HasNext()) {
+        Tuple t = it.Next(schema);
+        for (size_t idx : ai_indexes) {
+            if (t.ColumnCount() <= idx) continue;
+            const Value& v = t.GetValue(idx);
+            if (v.IsNull()) continue;
+            if (v.GetType() != ValueType::INTEGER) continue;
+            int32_t cur = v.AsInt();
+            auto mit = max_per_col.find(idx);
+            if (mit != max_per_col.end() && cur > mit->second) {
+                mit->second = cur;
+            }
+        }
+    }
+    // 下一个要分配的值 = max + 1。InsertRow 消费后本地 +1。
+    for (const auto& kv : max_per_col) {
+        autoinc_next_[kv.first] = kv.second + 1;
+    }
 }
 
 bool InsertExecutor::InsertRow(const std::vector<Value>& row_values_in, bool is_replace) {
@@ -288,14 +339,10 @@ bool InsertExecutor::InsertRow(const std::vector<Value>& row_values_in, bool is_
         row_values.resize(info->columns.size());
     }
 
-    // AUTO_INCREMENT 处理与既有 InsertRow 完全一致。
+    // AUTO_INCREMENT 处理：原本每行全表扫描求 max(id)（O(N²) 总成本）。
+    // Item #11 (perf) 优化：Init 时已一次性建好 autoinc_next_ baseline，
+    // 这里直接读本地 counter 并自增。每行 O(1)。
     {
-        std::vector<ValueType> schema;
-        schema.reserve(info->columns.size());
-        for (const auto& c : info->columns) {
-            ValueType vt = ValueTypeFromString(c.data_type);
-            schema.push_back(vt);
-        }
         for (size_t idx = 0; idx < info->columns.size() && idx < row_values.size(); ++idx) {
             const auto& col = info->columns[idx];
             if (!col.is_auto_increment) continue;
@@ -313,18 +360,17 @@ bool InsertExecutor::InsertRow(const std::vector<Value>& row_values_in, bool is_
                 needs_autoinc = true;
             }
             if (!needs_autoinc) continue;
-            int32_t max_val = 0;
-            auto it = heap->Begin();
-            while (it.HasNext()) {
-                Tuple t = it.Next(schema);
-                if (t.ColumnCount() <= idx) continue;
-                const Value& cur = t.GetValue(idx);
-                if (cur.IsNull()) continue;
-                if (cur.GetType() == ValueType::INTEGER && cur.AsInt() > max_val) {
-                    max_val = cur.AsInt();
-                }
+            auto ait = autoinc_next_.find(idx);
+            if (ait == autoinc_next_.end()) {
+                // baseline 未建立（理论上不该走到；Init 应已填充）。
+                // 兜底：assign 1 并把 baseline 设为 2。
+                row_values[idx] = Value::MakeInt(1);
+                autoinc_next_[idx] = 2;
+                continue;
             }
-            row_values[idx] = Value::MakeInt(max_val + 1);
+            int32_t next_val = ait->second;
+            row_values[idx] = Value::MakeInt(next_val);
+            ait->second = next_val + 1;
         }
     }
 

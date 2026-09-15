@@ -56,4 +56,16 @@ sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->  
 4  | David   | non-IT   
 5  | Eve     | non-IT   
 (5 rows)
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        ->        ->        ->        -> tier | n
+-----+--
+high | 2
+low  | 1
+mid  | 2
+(3 rows)
+sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        ->        -> dept | seniority | cnt
+-----+-----------+----
+FIN  | J         | 1  
+HR   | J         | 2  
+IT   | S         | 2  
+(3 rows)
 sqlcompiler> sqlcompiler> 
