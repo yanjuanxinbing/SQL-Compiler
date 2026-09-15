@@ -4,6 +4,8 @@ Endpoints
 ---------
 GET  /api/health                     liveness + engine path discovery
 POST /api/db/open                    bind a `.db` file path (creates if missing)
+POST /api/db/close                   drop the session engine + path (idempotent)
+POST /api/db/unlink?path=…           delete a `.db` (or companion WAL) file
 GET  /api/db/ls?directory=…          list `.db` files in a directory
 POST /api/schema/tables              list tables (SHOW TABLES + per-table count)
 POST /api/schema/table               describe one table (SHOW COLUMNS + CREATE)
@@ -39,6 +41,7 @@ from backend.schemas import (
     BrowseEntry,
     BrowseRequest,
     BrowseResponse,
+    CloseDatabaseResponse,
     ColumnInfo,
     DatabaseFileInfo,
     ExecuteRequest,
@@ -51,6 +54,8 @@ from backend.schemas import (
     StatementResult,
     TableSchemaResponse,
     TableSummary,
+    TokenInfo,
+    UnlinkFileResponse,
     ValidatePathRequest,
     ValidatePathResponse,
 )
@@ -95,15 +100,20 @@ def _to_statement_result(block, elapsed_ms: int) -> StatementResult:
     `block.statement` carries the per-statement text the engine parser
     associated with this block; fall back to the caller-provided string
     for empty blocks (e.g. trailing scripts that produced no output).
+    On failure the raw diagnostic is surfaced in a dedicated `error`
+    field so the UI can show the exact message independently of the
+    human-friendly `message`.
     """
     return StatementResult(
         success=block.success,
         statement=block.statement or "",
-        message=block.message if block.message else ("OK" if block.success else ""),
+        message=block.message if block.message else ("OK" if block.success else "Execution failed"),
+        error=block.message if not block.success else "",
         column_names=block.column_names,
         rows=block.rows,
         elapsed_ms=elapsed_ms,
         kind=block.kind,  # type: ignore[arg-type]
+        debug=getattr(block, "debug", None),
     )
 
 
@@ -169,6 +179,158 @@ async def open_database(req: OpenDatabaseRequest) -> OpenDatabaseResponse:
         is_new=is_new,
         message="Database opened" if not is_new else "Database created",
     )
+
+
+@router.post("/api/db/close", response_model=CloseDatabaseResponse)
+async def close_database() -> CloseDatabaseResponse:
+    """Drop the currently-bound engine + path.
+
+    Idempotent: calling on an empty session returns `was_open=False`
+    rather than 404, so the frontend can use it as part of a
+    delete-then-reopen flow without first having to probe whether a
+    database is open.
+    """
+    if SESSION.engine is None and SESSION.db_path is None:
+        return CloseDatabaseResponse(success=True, was_open=False)
+    previous = SESSION.db_path or ""
+    SESSION.engine = None
+    SESSION.db_path = None
+    SESSION.last_stats_raw = None
+    SESSION.last_repl_log_raw = None
+    return CloseDatabaseResponse(
+        success=True,
+        was_open=True,
+        previous_db_path=previous,
+        message="Database closed",
+    )
+
+
+@router.post("/api/db/unlink", response_model=UnlinkFileResponse)
+async def unlink_db_file(path: str = Query(..., min_length=1)) -> UnlinkFileResponse:
+    """Delete a single `.db` (or `.wal` / `.shm`) file by absolute path.
+
+    Safety constraints — this endpoint can destroy user data:
+
+    1. Path must be absolute.
+    2. Parent directory must exist.
+    3. Only `.db`, `.wal`, `-wal`, `.shm`, `-shm` suffixes are allowed.
+       Rejecting other extensions prevents callers from asking us to
+       delete `.exe` / source code / arbitrary files.
+    4. If the path matches the currently-open database, the session
+       is cleared so the next read doesn't touch a deleted file.
+
+    A `.db` delete also removes the engine's side-car files
+    (`<db>.wal`, `<db>.shm`) — see `_delete_companions`.  Without that,
+    the next `Database` open runs ARIES recovery on the orphaned WAL
+    and replays the old catalog back into the freshly created file.
+
+    A missing file returns `deleted=False, success=True` so the
+    delete-then-reopen flow is idempotent.
+    """
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        raise HTTPException(status_code=400, detail=f"Path must be absolute: {path}")
+    parent = p.parent
+    if not parent.exists() or not parent.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Parent directory does not exist: {parent}",
+        )
+    suffix = p.suffix.lower()
+    # Strip a leading dash variant (e.g. ".db-wal" parsed by Path as suffix "-wal").
+    raw_suffix = p.name.lower()
+    allowed_suffixes = {".db", ".wal", "-wal", ".shm", "-shm", ".tmp"}
+    if suffix not in allowed_suffixes and not any(
+        raw_suffix.endswith(s) for s in (".db.wal", ".db-wal")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Refusing to delete files with suffix {suffix!r}; "
+                f"only .db / .wal / .shm are allowed"
+            ),
+        )
+
+    cleared = False
+    if SESSION.db_path and str(p).lower() == SESSION.db_path.lower():
+        SESSION.engine = None
+        SESSION.db_path = None
+        SESSION.last_stats_raw = None
+        SESSION.last_repl_log_raw = None
+        cleared = True
+
+    if not p.exists():
+        # The `.db` may already be gone while its WAL survives from an
+        # earlier partial reset — still take the companion with us, so
+        # this call acts as a real recovery rather than a no-op.
+        companions_deleted = _delete_companions(p, suffix)
+        return UnlinkFileResponse(
+            success=True,
+            deleted=False,
+            cleared_session=cleared,
+            path=str(p),
+            companions_deleted=companions_deleted,
+            message="File does not exist (already gone or never created)",
+        )
+    try:
+        p.unlink()
+    except PermissionError as e:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Permission denied deleting {p}: {e}",
+        ) from e
+    except OSError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete {p}: {e}",
+        ) from e
+    companions_deleted = _delete_companions(p, suffix)
+    return UnlinkFileResponse(
+        success=True,
+        deleted=True,
+        cleared_session=cleared,
+        path=str(p),
+        companions_deleted=companions_deleted,
+        message="File deleted",
+    )
+
+
+def _delete_companions(p: Path, suffix: str) -> list[str]:
+    """Delete the engine's side-car files for a `.db` and return them.
+
+    `Database` keeps its ARIES write-ahead log at `<db_file>.wal`
+    (`src/db/Database.cpp`) and opens it on every startup, running
+    analysis → redo → undo *even for a brand-new, empty database*
+    (`src/db/Database.cpp`'s recovery block).  So a reset that deletes
+    only `foo.db` leaves `foo.db.wal` behind, and the next open replays
+    the old log into the recreated file — the tables the user just
+    wiped come back.  Deleting the WAL together with the `.db` is what
+    makes "重置库" actually stick.
+
+    `<db>.shm` is removed opportunistically for forward compatibility
+    (this engine does not currently create one).  A non-`.db` path has
+    no companions, so the call is a no-op for direct `.wal` deletes.
+    """
+    if suffix != ".db":
+        return []
+    removed: list[str] = []
+    for cp in (Path(str(p) + ".wal"), Path(str(p) + ".shm")):
+        if not cp.exists():
+            continue
+        try:
+            cp.unlink()
+        except PermissionError as e:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Permission denied deleting {cp}: {e}",
+            ) from e
+        except OSError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to delete {cp}: {e}",
+            ) from e
+        removed.append(str(cp))
+    return removed
 
 
 @router.get("/api/db/ls", response_model=ListDatabasesResponse)
@@ -415,17 +577,28 @@ async def execute_query(req: ExecuteRequest) -> ExecuteResponse:
     if not statement.strip():
         raise HTTPException(status_code=400, detail="Empty statement")
     t0 = time.monotonic()
-    try:
-        run = await engine.execute(statement)
-    except EngineError as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    async with _engine_call() as engine:
+        try:
+            run = await engine.execute(
+                statement, on_error=req.on_error, transaction=req.transaction
+            )
+        except EngineError as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
     total_ms = int((time.monotonic() - t0) * 1000)
     per_stmt_ms = (total_ms // max(1, len(run.blocks))) if run.blocks else total_ms
     results = [_to_statement_result(blk, per_stmt_ms) for blk in run.blocks]
     overall_success = all(r.success for r in results) and run.success
+    # In "abort" mode a failing block at the end means we stopped early.
+    aborted = (
+        req.on_error == "abort"
+        and bool(run.blocks)
+        and not run.blocks[-1].success
+    )
     return ExecuteResponse(
         success=overall_success,
         results=results,
         db_path=SESSION.db_path or "",
         total_elapsed_ms=total_ms,
+        statement_count=len(results),
+        aborted=aborted,
     )

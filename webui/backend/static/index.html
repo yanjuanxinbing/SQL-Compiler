@@ -7,14 +7,58 @@
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <!-- ── Top bar ─────────────────────────────────────────────────────── -->
-  <header class="topbar">
-    <div class="brand">
-      <div class="logo">SQL</div>
-      <div class="title-block">
-        <div class="title">SQL-Compiler Console</div>
-        <div class="subtitle">C++17 &nbsp;·&nbsp; Volcano Executor &nbsp;·&nbsp; B+Tree / WAL / ARIES</div>
-      </div>
+
+<!-- ===== 顶部工具栏 ===== -->
+<header class="toolbar">
+  <div class="toolbar-brand">
+    <div class="logo">DB</div>
+    <div class="title">MiniDB IDE</div>
+    <div class="subtitle">C++17 Volcano · B+Tree / WAL / ARIES</div>
+  </div>
+  <div class="toolbar-divider"></div>
+  <button class="tb-btn primary" id="run-btn" type="button" title="执行（Ctrl+Enter）">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+    执行
+  </button>
+  <button class="tb-btn" id="format-btn" type="button" title="格式化 SQL（关键字大写）">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="21" y1="10" x2="7" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="21" y1="18" x2="7" y2="18"/></svg>
+    格式化
+  </button>
+  <button class="tb-btn" id="clear-btn" type="button" title="清空编辑器">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+  </button>
+  <div class="toolbar-divider"></div>
+  <span class="tb-file mono">query.sql</span>
+
+  <div class="toolbar-spacer"></div>
+
+  <button class="tb-btn" id="db-pill" type="button" title="选择数据库">
+    <span class="tb-status-hint" id="db-pill-label">未连接数据库</span>
+  </button>
+  <button class="tb-btn tb-btn-ghost" id="db-reset-btn" type="button" hidden
+    title="删除当前 .db 并以同名 + 时间戳重新打开，适合在测试用例加载失败时清除残留状态">
+    重置库
+  </button>
+
+  <div class="toolbar-status" id="engine-status">
+    <span class="status-dot"></span>
+    <span id="engine-status-text">引擎</span>
+  </div>
+</header>
+<div class="subbar">
+  <span id="sub-status" class="sub-status">就绪 — 在 SQL 编辑器输入语句后点击「执行」</span>
+</div>
+
+<!-- ===== 主布局 ===== -->
+<div class="main-layout">
+
+  <!-- 左侧侧边栏 -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <span>导航</span>
+      <button id="sidebar-toggle" type="button" title="收起侧边栏" aria-label="收起侧边栏">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
     </div>
     <div class="db-pill" id="db-pill" title="Click to switch database">
       <span class="db-pill-dot" id="db-pill-dot"></span>
@@ -129,43 +173,28 @@
         <h2>Tables</h2>
         <button class="icon-btn" id="refresh-tables" type="button" title="Refresh">↻</button>
       </div>
-      <div class="sidebar-body">
-        <ul class="table-list" id="table-list">
-          <li class="table-empty" id="table-empty">Open a database to see tables.</li>
-        </ul>
-      </div>
-      <div class="sidebar-foot">
-        <button class="btn btn-secondary btn-block" id="new-table-btn" type="button">+ New table</button>
-      </div>
-    </aside>
+      <div class="panel-body">
 
-    <!-- Workspace: tabs + editor + results -->
-    <section class="workspace">
-      <nav class="tabs" role="tablist">
-        <button class="tab is-active" data-tab="query" role="tab">Query</button>
-        <button class="tab" data-tab="schema" role="tab" id="tab-schema">Schema</button>
-        <button class="tab" data-tab="history" role="tab">History <span class="tab-count" id="history-count"></span></button>
-      </nav>
+        <!-- 执行结果 -->
+        <div class="panel-content is-active" data-panel="result">
+          <div class="panel-scroll" id="results-root">
+            <div class="viz-empty"><p>执行 SQL 后，结果集将在此展示。</p></div>
+          </div>
+        </div>
 
-      <!-- ── Query tab ──────────────────────────────────────────────── -->
-      <div class="tab-panel is-active" data-panel="query">
-        <div class="editor-wrap">
-          <textarea
-            id="sql-editor"
-            spellcheck="false"
-            autocomplete="off"
-            autocorrect="off"
-            autocapitalize="off"
-            placeholder="-- Type SQL here. Press Ctrl+Enter to run.&#10;SELECT * FROM users WHERE age &gt; 25;"
-          ></textarea>
-          <div class="editor-actions">
-            <div class="editor-actions-left">
-              <button class="btn btn-secondary" id="format-btn" type="button" title="Pretty-print uppercase keywords">Format</button>
-              <button class="btn btn-secondary" id="clear-btn" type="button" title="Clear editor">Clear</button>
-            </div>
-            <div class="editor-actions-right">
-              <span class="shortcut-hint">Ctrl+Enter to run</span>
-              <button class="btn btn-primary" id="run-btn" type="button">Run ▶</button>
+        <!-- 可视化（Token/AST/Plan/Compare/Storage 共享容器） -->
+        <div class="panel-content" data-panel="viz">
+          <div class="viz-status" id="viz-status" role="status" aria-live="polite" hidden></div>
+          <div class="viz-context" id="viz-context" hidden>
+            <span class="viz-context-idx"><span id="viz-context-idx">—</span></span>
+            <span class="viz-context-kind" id="viz-context-kind"></span>
+            <code class="viz-context-sql mono" id="viz-context-sql"></code>
+            <span class="viz-context-meta" id="viz-context-meta"></span>
+          </div>
+          <div class="panel-scroll" id="viz-content">
+            <div class="viz-empty">
+              <p>在上方输入 SQL 并点击「执行」，编译管线（词法 / 语法 / 执行计划 / 存储）将在此可视化。</p>
+              <p class="hint">点击下方的面板标题切换视图。</p>
             </div>
           </div>
         </div>

@@ -1,3 +1,20 @@
 /build
 /.vscode
 /tests/tmp
+
+# Python bytecode (re-generated on first import; never track it)
+__pycache__/
+*.pyc
+*.pyo
+
+# Database files: engine runtime data + local playground, never source
+*.db
+*.db.wal
+*.db-shm
+*.db-wal
+
+# Temp databases produced by tests / smoke runs / dev experiments
+TMP_*.db
+TMP_*.db.wal
+_e2e_test_*.db
+_e2e_test_*.db.wal
