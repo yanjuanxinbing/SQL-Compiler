@@ -277,8 +277,6 @@ AggregateExecutor::AggregateExecutor(ExecutionContext* context, ExecutorPtr chil
 void AggregateExecutor::Init() {
     cursor_ = 0;
     groups_.clear();
-    // [perf] groupby-expr-autoinc: 同步清空 hash 索引，避免上次执行残留。
-    group_index_.clear();
     if (!child_) {
         // 无输入子节点：保证无 GROUP BY 时仍发射一行（聚合初始值：COUNT=0, SUM=0, AVG/MIN/MAX=NULL）。
         if (group_by_exprs_.empty()) {
@@ -303,23 +301,20 @@ void AggregateExecutor::Init() {
         }
         std::string key_str = GroupKeyOf(key);
 
-        // [perf] groupby-expr-autoinc: 用 hash 索引做 O(1) 分组查找，避免
-        // 每行线性扫描 groups_ + 对每个候选重做 GroupKeyOf(key_values)。
-        // 命中时 key_str 与 g.key_cache 已构造时完全一致（首次写入即同步），不必再重算。
+        // Find or create the group
         Group* grp = nullptr;
-        auto it = group_index_.find(key_str);
-        if (it != group_index_.end()) {
-            grp = &groups_[it->second];
-        } else {
+        for (auto& g : groups_) {
+            if (GroupKeyOf(g.key_values) == key_str) {
+                grp = &g;
+                break;
+            }
+        }
+        if (!grp) {
             Group g;
             g.key_values = std::move(key);
-            g.key_cache = key_str;  // 首次序列化写入缓存
             g.sample_tuple = t;
             g.agg_states.resize(aggregate_exprs_.size());
-            const size_t new_idx = groups_.size();
             groups_.push_back(std::move(g));
-            // emplace 在 key 不存在时插入并返回；hash 冲突时也安全（key 不存在才走这条分支）。
-            group_index_.emplace(key_str, new_idx);
             grp = &groups_.back();
         }
         // Update sample tuple (in case a column ref evaluates differently for first row)

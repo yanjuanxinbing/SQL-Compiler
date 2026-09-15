@@ -12,16 +12,6 @@ namespace sqlcompiler {
 
 namespace {
 
-// [perf] catalog-indexes: 小写化字符串。Lookup* / ci_index_* 旁路使用。
-// 单独抽出来便于在 SystemCatalog 多个位置复用，避免重复内联实现。
-std::string ToLowerHelper(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s)
-        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-    return out;
-}
-
 // 把落盘的 CHECK / DEFAULT 文本重新解析为 AST。失败时返回 nullptr 并让
 // 调用方静默继续 —— CHECK/DEFAULT 是"约束增强"，缺失不应阻塞表被打开。
 // 抛异常的代价是下次启动后所有用户都拿不到这张表，这与"约束可选"的语义
@@ -255,16 +245,13 @@ std::string EncodeTableInfo(const TableInfo& info, page_id_t first_page_id) {
     // 这里把 column-level UNIQUE 列也收集成单列 UNIQUE 分组，保证唯一性
     // 校验在 catalog 一侧完整——便于运行时统一走索引路径。
     std::vector<std::vector<std::string>> uniq_groups = info.unique_constraints;
-    // [perf] catalog-indexes: 用 set 跟踪已经被收进 uniq_groups 的单列名。
-    // 旧实现 O(C·G) 每列扫所有现有分组；现在 O(C) 单遍 hash。
-    std::unordered_set<std::string> seen;
-    seen.reserve(info.unique_constraints.size() + info.columns.size());
-    for (const auto& g : info.unique_constraints) {
-        if (g.size() == 1) seen.insert(g[0]);
-    }
     for (const auto& c : info.columns) {
-        if (c.is_unique && seen.insert(c.name).second) {
-            uniq_groups.push_back({c.name});
+        if (c.is_unique) {
+            bool dup = false;
+            for (const auto& g : uniq_groups) {
+                if (g.size() == 1 && g[0] == c.name) { dup = true; break; }
+            }
+            if (!dup) uniq_groups.push_back({c.name});
         }
     }
     WriteU16(buf, static_cast<uint16_t>(uniq_groups.size()));
@@ -434,9 +421,6 @@ void SystemCatalog::LoadFromDisk() {
     TableHeap* sys_heap = table_heaps_[kSysTablesKey].get();
     if (!sys_heap) return;
 
-    // [perf] catalog-indexes: 加载阶段重建 table_rid_by_name_。
-    table_rid_by_name_.clear();
-
     const std::vector<ValueType> schema = {ValueType::VARCHAR};
     auto iter = sys_heap->Begin();
     while (iter.HasNext()) {
@@ -450,14 +434,6 @@ void SystemCatalog::LoadFromDisk() {
             uint32_t pid_u32 = 0;
             std::memcpy(&pid_u32, blob.data() + blob.size() - 4, sizeof(uint32_t));
             user_pid = static_cast<page_id_t>(pid_u32);
-        }
-        // [perf] catalog-indexes: 把这条 sys_tables 记录的 RID 记下。系统目录
-        // 自身的记录（__sys_tables__ / __sys_indexes__ / __sys_triggers__）
-        // 不入 map——它们不参与按 table_name 查 RID 的查找路径。
-        if (info.table_name != kSysTablesKey &&
-            info.table_name != kSysIndexesKey &&
-            info.table_name != kSysTriggersKey) {
-            table_rid_by_name_[info.table_name] = t.GetRid();
         }
         if (info.table_name == kSysIndexesKey) {
             // 索引目录的定位记录，不是用户表
@@ -473,58 +449,10 @@ void SystemCatalog::LoadFromDisk() {
         if (user_pid >= 0) {
             table_heaps_[info.table_name].reset(
                 TableHeap::Open(storage_, user_pid));
-            // [perf] groupby-expr-autoinc: 表刚加载完，顺手扫一次找出 MAX(pk)
-            // 并把 TableInfo::next_auto_id_ 初始化为 MAX(pk) + 1。
-            // 后续 UpsertExecutor::PrepareCandidateRow 在 PK 为 NULL 时
-            // 直接 ++ 取下一个 id，不再每行 SeqScan 计行数。
-            // 仅在存在 PRIMARY KEY 列时才有意义（其他列的 AUTO_INCREMENT 不走 PK 补号）。
-            // 通过 GetMutableTable 拿到 symbol_table_ 里那份拷贝的指针（AddTable 已复制）；
-            // local `info` 不会反映到 tables_ 里。
-            if (TableInfo* stored = symbol_table_.GetMutableTable(info.table_name)) {
-                InitializeNextAutoId(*stored, table_heaps_[info.table_name].get());
-            }
         }
     }
     LoadIndexesFromDisk();
     LoadTriggersFromDisk();
-}
-
-// [perf] groupby-expr-autoinc: 一次性扫描表，初始化 TableInfo::next_auto_id_。
-// 仅在 LoadFromDisk 后调用一次：把 first-PK 列（最常见的 AUTO_INCREMENT 路径）扫描
-// 一遍，取 MAX(pk) 作为新 id 起点。等价于原 UpsertExecutor 每次都跑 SeqScan 的累计效果。
-// 行为等价性：原版 `row_values[idx] = Value::MakeInt(count + 1)` ——「count」= 扫到的
-// 非 NULL PK 行数，count+1 = 「如果表里最大 PK 是 count（每行 PK 严格递增 1）则正确」，
-// 否则 count+1 可能与新插入行 PK 冲突。但实际自增 ID 永远连续递增——所以「累计新插入
-// 行数 + 1」与「MAX(pk) + 1」结果一致（PK 单调递增 / 每次补号填下一个新值）。
-//
-// 仅当 PK 是 INTEGER 类型时才递增；其它类型或无 PK 时保持 next_auto_id_ = 1。
-void SystemCatalog::InitializeNextAutoId(TableInfo& info, TableHeap* heap) {
-    if (!heap) return;
-    if (info.columns.empty() || !info.columns[0].is_primary_key) return;
-    const ColumnInfo& pk = info.columns[0];
-    // 仅 INTEGER 类型走 MAX(pk) 路径；其它类型保持默认 1。
-    // 原 UpsertExecutor 也仅在 INTEGER 时赋值，其它类型仍会因 row_values[idx].IsNull() 而被跳过。
-    std::string up;
-    up.reserve(pk.data_type.size());
-    for (char c : pk.data_type) up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-    bool pk_is_int = (up == "INT" || up == "INTEGER" || up == "BIGINT");
-    if (!pk_is_int) return;
-    int64_t max_pk = 0;
-    bool seen_any = false;
-    auto it = heap->Begin();
-    while (it.HasNext()) {
-        Tuple t = it.Next({ValueTypeFromString(pk.data_type)});
-        if (t.ColumnCount() == 0) continue;
-        const Value& v = t.GetValue(0);
-        if (v.IsNull()) continue;
-        if (v.GetType() != ValueType::INTEGER) continue;
-        int64_t cur = v.AsInt();
-        if (!seen_any || cur > max_pk) {
-            max_pk = cur;
-            seen_any = true;
-        }
-    }
-    info.next_auto_id_ = seen_any ? (max_pk + 1) : 1;
 }
 
 bool SystemCatalog::CreateTable(const TableInfo& table_info) {
@@ -543,13 +471,19 @@ bool SystemCatalog::DropTable(const std::string& table_name) {
     DropIndexesOfTable(table_name);
     bool removed = symbol_table_.RemoveTable(table_name);
     table_heaps_.erase(table_name);
-    // [perf] catalog-indexes: 走 RID 旁路一次 lookup + DeleteTuple。
-    // 旧实现 O(R) 扫整张 sys_tables 堆；现在 O(1) 哈希查。
-    auto rit = table_rid_by_name_.find(table_name);
-    if (rit != table_rid_by_name_.end()) {
-        TableHeap* sys_heap = table_heaps_[kSysTablesKey].get();
-        if (sys_heap) sys_heap->DeleteTuple(rit->second);
-        table_rid_by_name_.erase(rit);
+    TableHeap* sys_heap = table_heaps_[kSysTablesKey].get();
+    if (sys_heap) {
+        const std::vector<ValueType> schema = {ValueType::VARCHAR};
+        auto iter = sys_heap->Begin();
+        while (iter.HasNext()) {
+            Tuple t = iter.Next(schema);
+            if (t.ColumnCount() == 0) continue;
+            TableInfo info = DecodeTableMetadata(t);
+            if (info.table_name == table_name) {
+                sys_heap->DeleteTuple(t.GetRid());
+                break;
+            }
+        }
     }
     return removed;
 }
@@ -716,7 +650,7 @@ SymbolTable& SystemCatalog::GetSymbolTable() {
     return symbol_table_;
 }
 
-bool SystemCatalog::PersistTableMetadata(const TableInfo& table_info, RID* out_rid) {
+bool SystemCatalog::PersistTableMetadata(const TableInfo& table_info) {
     TableHeap* sys_heap = table_heaps_[kSysTablesKey].get();
     if (!sys_heap) {
         if (sys_tables_first_page_id_ == INVALID_PAGE_ID) return false;
@@ -733,17 +667,7 @@ bool SystemCatalog::PersistTableMetadata(const TableInfo& table_info, RID* out_r
     std::string blob = EncodeTableInfo(table_info, user_pid);
     Tuple t({Value::MakeVarchar(blob)});
     RID rid;
-    if (!sys_heap->InsertTuple(t, &rid, {ValueType::VARCHAR})) return false;
-    // [perf] catalog-indexes: 把这条记录的 RID 记到 table_rid_by_name_。
-    // 仅当 table_name 不是 __sys_tables__ / __sys_indexes__ / __sys_triggers__
-    // 三条系统定位记录时登记——这些记录不参与按表名查 RID。
-    if (out_rid) *out_rid = rid;
-    if (table_info.table_name != kSysTablesKey &&
-        table_info.table_name != kSysIndexesKey &&
-        table_info.table_name != kSysTriggersKey) {
-        table_rid_by_name_[table_info.table_name] = rid;
-    }
-    return true;
+    return sys_heap->InsertTuple(t, &rid, {ValueType::VARCHAR});
 }
 
 TableInfo SystemCatalog::DecodeTableMetadata(const Tuple& tuple) const {
@@ -918,26 +842,27 @@ bool SystemCatalog::EnsureSysIndexesHeap() {
     return sys_heap->InsertTuple(t, &rid, {ValueType::VARCHAR});
 }
 
-bool SystemCatalog::PersistIndexMetadata(const IndexInfo& index_info, RID* out_rid) {
+bool SystemCatalog::PersistIndexMetadata(const IndexInfo& index_info) {
     if (!EnsureSysIndexesHeap()) return false;
     std::string blob = EncodeIndexInfo(index_info);
     Tuple t({Value::MakeVarchar(blob)});
     RID rid;
-    if (!index_heap_->InsertTuple(t, &rid, {ValueType::VARCHAR})) return false;
-    if (out_rid) *out_rid = rid;
-    // [perf] catalog-indexes: 记录 RID 到 index_rid_by_name_，供 RemoveIndexMetadata
-    // 一次 lookup 后 DeleteTuple 调用即可。原本要遍历 __sys_indexes__ 全表。
-    index_rid_by_name_[index_info.index_name] = rid;
-    return true;
+    return index_heap_->InsertTuple(t, &rid, {ValueType::VARCHAR});
 }
 
 void SystemCatalog::RemoveIndexMetadata(const std::string& index_name) {
-    // [perf] catalog-indexes: 由 RID 旁路一次 lookup + DeleteTuple。
-    // 旧实现是 O(R) 扫 __sys_indexes__ 整个堆。
-    auto it = index_rid_by_name_.find(index_name);
-    if (it == index_rid_by_name_.end()) return;
-    if (index_heap_) index_heap_->DeleteTuple(it->second);
-    index_rid_by_name_.erase(it);
+    if (index_heap_ == nullptr) return;
+    const std::vector<ValueType> schema = {ValueType::VARCHAR};
+    auto iter = index_heap_->Begin();
+    while (iter.HasNext()) {
+        Tuple t = iter.Next(schema);
+        if (t.ColumnCount() == 0) continue;
+        IndexInfo info = DecodeIndexInfo(t.GetValue(0).AsVarchar());
+        if (info.index_name == index_name) {
+            index_heap_->DeleteTuple(t.GetRid());
+            return;
+        }
+    }
 }
 
 void SystemCatalog::LoadIndexesFromDisk() {
@@ -946,9 +871,6 @@ void SystemCatalog::LoadIndexesFromDisk() {
         TableHeap::Open(storage_, sys_indexes_first_page_id_));
     if (index_heap_ == nullptr) return;
     if (log_manager_ != nullptr) index_heap_->SetLogManager(log_manager_);
-    // [perf] catalog-indexes: 加载阶段同步重建旁路。
-    index_rid_by_name_.clear();
-    indexes_by_table_.clear();
 
     const std::vector<ValueType> schema = {ValueType::VARCHAR};
     auto iter = index_heap_->Begin();
@@ -957,22 +879,13 @@ void SystemCatalog::LoadIndexesFromDisk() {
         if (t.ColumnCount() == 0) continue;
         IndexInfo info = DecodeIndexInfo(t.GetValue(0).AsVarchar());
         if (info.index_name.empty()) continue;
-        // [perf] catalog-indexes: 记录这条元数据在 __sys_indexes__ 堆上的 RID。
-        // 即使后续 BuildIndexKeyTypes / OpenIndexTree 失败也要保留条目——
-        // 老库里的失效索引元数据仍然能被 DropIndex / RemoveIndexMetadata 找到。
-        index_rid_by_name_[info.index_name] = t.GetRid();
         const TableInfo* table = symbol_table_.GetTable(info.table_name);
         if (table == nullptr) continue;  // 表已被删，遗留元数据直接忽略
         if (!BuildIndexKeyTypes(*table, info.key_columns, &info.key_types)) {
             continue;  // 列已不存在：索引失效，当作没有这个索引
         }
         if (!OpenIndexTree(info)) continue;
-        // 注意：emplace 之后 indexes_[info.index_name] 不再失效；地址稳定。
-        auto ins = indexes_.emplace(info.index_name, std::move(info));
-        // [perf] catalog-indexes: 同步索引 → 表 → IndexInfo* 旁路。
-        if (ins.second) {
-            indexes_by_table_[ins.first->second.table_name].push_back(&ins.first->second);
-        }
+        indexes_[info.index_name] = std::move(info);
     }
 }
 
@@ -1012,19 +925,13 @@ bool SystemCatalog::CreateIndex(const IndexInfo& index_info, std::string* error)
     if (log_manager_ != nullptr) tree->SetLogManager(log_manager_);
     info.root_page_id = tree->GetRootPageId();
 
-    RID persisted_rid;
-    if (!PersistIndexMetadata(info, &persisted_rid)) {
+    if (!PersistIndexMetadata(info)) {
         // 元数据落不了盘就把刚分配的树回收掉，否则页面永久泄漏
         BPlusTree::Destroy(buffer_pool_manager_, info.root_page_id);
         return fail("failed to persist index metadata");
     }
     index_trees_[info.index_name] = std::move(tree);
-    // [perf] catalog-indexes: 同步建立 table → IndexInfo* 旁路。
-    // 注意：emplace 返回的 iterator 指向 indexes_ 中的节点，地址稳定；
-    // 后续 insert / erase 操作不会让本指针失效（C++17 unordered_map
-    // 保证：插入新元素时仅失效被插入节点的迭代器，已有节点的引用/指针稳定）。
-    auto ins = indexes_.emplace(info.index_name, std::move(info));
-    indexes_by_table_[ins.first->second.table_name].push_back(&ins.first->second);
+    indexes_[info.index_name] = std::move(info);
     return true;
 }
 
@@ -1032,16 +939,7 @@ bool SystemCatalog::DropIndex(const std::string& index_name) {
     auto it = indexes_.find(index_name);
     if (it == indexes_.end()) return false;
     const page_id_t root = it->second.root_page_id;
-    const std::string table_name = it->second.table_name;
     index_trees_.erase(index_name);
-    // [perf] catalog-indexes: 必须先把指针从 indexes_by_table_ 移除，再 erase
-    // indexes_ 节点。否则 indexes_ 析构 IndexInfo 后指针悬空。
-    auto bit = indexes_by_table_.find(table_name);
-    if (bit != indexes_by_table_.end()) {
-        auto& vec = bit->second;
-        vec.erase(std::remove(vec.begin(), vec.end(), &it->second), vec.end());
-        if (vec.empty()) indexes_by_table_.erase(bit);
-    }
     indexes_.erase(it);
     RemoveIndexMetadata(index_name);
     BPlusTree::Destroy(buffer_pool_manager_, root);
@@ -1049,15 +947,9 @@ bool SystemCatalog::DropIndex(const std::string& index_name) {
 }
 
 void SystemCatalog::ResetIndexesOfTable(const std::string& table_name) {
-    // [perf] catalog-indexes: 走 indexes_by_table_ 直接拿该表的全部 IndexInfo*，
-    // 不再 O(K) 扫所有索引。
-    auto bit = indexes_by_table_.find(table_name);
-    if (bit == indexes_by_table_.end()) return;
-    // 复制一份指针列表：循环里会修改 indexes_trees_ / index_rid_by_name_，
-    // 但不修改 indexes_by_table_[table_name]（ResetIndexesOfTable 不 drop，
-    // 只替换 root），所以直接遍历没问题。
-    for (IndexInfo* p_info : bit->second) {
-        IndexInfo& info = *p_info;
+    for (auto& kv : indexes_) {
+        IndexInfo& info = kv.second;
+        if (info.table_name != table_name) continue;
         // 旧树整棵回收，换一棵空树。这里必须回收而不是简单地重指向新根，
         // 否则每次 TRUNCATE 都会永久泄漏一批页面。
         BPlusTree::Destroy(buffer_pool_manager_, info.root_page_id);
@@ -1067,22 +959,16 @@ void SystemCatalog::ResetIndexesOfTable(const std::string& table_name) {
         if (log_manager_ != nullptr) tree->SetLogManager(log_manager_);
         info.root_page_id = tree->GetRootPageId();
         index_trees_[info.index_name] = std::move(tree);
-        // 根页变了，元数据要跟着落盘 —— RemoveIndexMetadata 会从
-        // index_rid_by_name_ 摘掉旧 RID，PersistIndexMetadata 写新 RID 进去。
+        // 根页变了，元数据要跟着落盘
         RemoveIndexMetadata(info.index_name);
         PersistIndexMetadata(info);
     }
 }
 
 void SystemCatalog::DropIndexesOfTable(const std::string& table_name) {
-    // [perf] catalog-indexes: 通过 indexes_by_table_ 拿到该表全部索引名（O(1)
-    // + 列表长度），再逐一 DropIndex。DropIndex 自身会从 indexes_by_table_
-    // 把对应指针摘掉，所以这里复制一份名字列表后再循环。
     std::vector<std::string> names;
-    auto bit = indexes_by_table_.find(table_name);
-    if (bit != indexes_by_table_.end()) {
-        names.reserve(bit->second.size());
-        for (const IndexInfo* p : bit->second) names.push_back(p->index_name);
+    for (const auto& kv : indexes_) {
+        if (kv.second.table_name == table_name) names.push_back(kv.first);
     }
     for (const auto& name : names) DropIndex(name);
 }
@@ -1099,25 +985,21 @@ BPlusTree* SystemCatalog::GetIndexTree(const std::string& index_name) {
 
 std::vector<const IndexInfo*> SystemCatalog::GetIndexesForTable(
     const std::string& table_name) const {
-    // [perf] catalog-indexes: 直接返回 indexes_by_table_ 中的指针列表副本。
-    // 此前 O(K) 扫所有索引；典型场景每张表的索引数 ≪ 总索引数。
-    // 容器内存储的是 IndexInfo*（非 const），返回时按 GetIndexesForTable
-    // 公共签名转为 const IndexInfo*。
-    auto it = indexes_by_table_.find(table_name);
-    if (it == indexes_by_table_.end()) return {};
-    return std::vector<const IndexInfo*>(it->second.begin(), it->second.end());
+    std::vector<const IndexInfo*> out;
+    for (const auto& kv : indexes_) {
+        if (kv.second.table_name == table_name) out.push_back(&kv.second);
+    }
+    return out;
 }
 
 BPlusTree* SystemCatalog::GetPrimaryKeyIndexTree(
     const std::string& table_name, const std::vector<std::string>& pk_columns) {
-    // [perf] catalog-indexes: 直接查 indexes_by_table_[table_name]。每张表上
-    // 唯一索引数 ≪ 总索引数（通常是 1），循环代价可忽略。
-    auto it = indexes_by_table_.find(table_name);
-    if (it == indexes_by_table_.end()) return nullptr;
-    for (const IndexInfo* p : it->second) {
-        if (!p->is_unique) continue;
-        if (p->key_columns != pk_columns) continue;
-        return GetIndexTree(p->index_name);
+    for (const auto& kv : indexes_) {
+        const IndexInfo& info = kv.second;
+        if (info.table_name != table_name) continue;
+        if (!info.is_unique) continue;
+        if (info.key_columns != pk_columns) continue;
+        return GetIndexTree(info.index_name);
     }
     return nullptr;
 }
@@ -1130,8 +1012,6 @@ bool SystemCatalog::CreateView(const ViewDefinition& def) {
     if (def.view_name.empty()) return false;
     if (views_.count(def.view_name) != 0) return false;
     views_[def.view_name] = def;
-    // [perf] catalog-indexes: 同步 CI 旁路，便于 LookupView O(1) 命中。
-    ci_index_views_[ToLowerHelper(def.view_name)] = def.view_name;
     return true;
 }
 
@@ -1148,8 +1028,6 @@ void SystemCatalog::SetViewCheckOption(const std::string& view_name,
 bool SystemCatalog::DropView(const std::string& view_name) {
     auto it = views_.find(view_name);
     if (it == views_.end()) return false;
-    // [perf] catalog-indexes: 按 lowercased(name) 摘除 CI 旁路条目。
-    ci_index_views_.erase(ToLowerHelper(view_name));
     views_.erase(it);
     return true;
 }
@@ -1158,16 +1036,12 @@ bool SystemCatalog::DropView(const std::string& view_name) {
 bool SystemCatalog::CreateMaterializedView(const MaterializedViewInfo& info) {
     if (info.view_name.empty()) return false;
     materialized_views_[info.view_name] = info;
-    // [perf] catalog-indexes: 同步 CI 旁路，便于 LookupMaterializedView O(1) 命中。
-    ci_index_materialized_views_[ToLowerHelper(info.view_name)] = info.view_name;
     return true;
 }
 
 bool SystemCatalog::DropMaterializedView(const std::string& view_name) {
     auto it = materialized_views_.find(view_name);
     if (it == materialized_views_.end()) return false;
-    // [perf] catalog-indexes: 按 lowercased(name) 摘除 CI 旁路条目。
-    ci_index_materialized_views_.erase(ToLowerHelper(view_name));
     materialized_views_.erase(it);
     return true;
 }
@@ -1184,14 +1058,18 @@ SystemCatalog::GetMaterializedView(const std::string& view_name) const {
 
 const SystemCatalog::MaterializedViewInfo*
 SystemCatalog::LookupMaterializedView(const std::string& view_name) const {
-    // [perf] catalog-indexes: 原大小写先 find，命中即返回；未命中走 CI 旁路。
-    // 旧实现是 O(K·L) 线性扫所有键（每键 uppercase 拷贝比较）。
+    // 与 LookupView 一致：大小写不敏感的回退路径
     auto it = materialized_views_.find(view_name);
     if (it != materialized_views_.end()) return &it->second;
-    auto ci = ci_index_materialized_views_.find(ToLowerHelper(view_name));
-    if (ci != ci_index_materialized_views_.end()) {
-        auto mit = materialized_views_.find(ci->second);
-        if (mit != materialized_views_.end()) return &mit->second;
+    std::string upper;
+    upper.reserve(view_name.size());
+    for (char c : view_name)
+        upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    for (const auto& kv : materialized_views_) {
+        std::string k = kv.first;
+        for (char& c : k)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (k == upper) return &kv.second;
     }
     return nullptr;
 }
@@ -1212,14 +1090,16 @@ const SystemCatalog::ViewDefinition* SystemCatalog::GetView(
 
 const SystemCatalog::ViewDefinition* SystemCatalog::LookupView(
     const std::string& view_name) const {
-    // [perf] catalog-indexes: 原大小写先 find，命中即返回；未命中走 CI 旁路。
-    // 旧实现是 O(K·L) 线性扫所有键（每键 uppercase 拷贝比较）。
+    // 大小写不敏感的回退：UDF / view 调用方可能使用与 CREATE 时不同的大小写。
     auto it = views_.find(view_name);
     if (it != views_.end()) return &it->second;
-    auto ci = ci_index_views_.find(ToLowerHelper(view_name));
-    if (ci != ci_index_views_.end()) {
-        auto vit = views_.find(ci->second);
-        if (vit != views_.end()) return &vit->second;
+    std::string upper;
+    upper.reserve(view_name.size());
+    for (char c : view_name) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    for (const auto& kv : views_) {
+        std::string k = kv.first;
+        for (char& c : k) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (k == upper) return &kv.second;
     }
     return nullptr;
 }
@@ -1228,16 +1108,12 @@ bool SystemCatalog::CreateFunction(const FunctionDefinition& def) {
     if (def.function_name.empty()) return false;
     if (functions_.count(def.function_name) != 0) return false;
     functions_[def.function_name] = def;
-    // [perf] catalog-indexes: 同步 CI 旁路，便于 LookupFunction O(1) 命中。
-    ci_index_functions_[ToLowerHelper(def.function_name)] = def.function_name;
     return true;
 }
 
 bool SystemCatalog::DropFunction(const std::string& function_name) {
     auto it = functions_.find(function_name);
     if (it == functions_.end()) return false;
-    // [perf] catalog-indexes: 按 lowercased(name) 摘除 CI 旁路条目。
-    ci_index_functions_.erase(ToLowerHelper(function_name));
     functions_.erase(it);
     return true;
 }
@@ -1254,13 +1130,15 @@ const SystemCatalog::FunctionDefinition* SystemCatalog::GetFunction(
 
 const SystemCatalog::FunctionDefinition* SystemCatalog::LookupFunction(
     const std::string& name) const {
-    // [perf] catalog-indexes: 原大小写先 find；未命中走 CI 旁路。
     auto it = functions_.find(name);
     if (it != functions_.end()) return &it->second;
-    auto ci = ci_index_functions_.find(ToLowerHelper(name));
-    if (ci != ci_index_functions_.end()) {
-        auto fit = functions_.find(ci->second);
-        if (fit != functions_.end()) return &fit->second;
+    std::string upper;
+    upper.reserve(name.size());
+    for (char c : name) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    for (const auto& kv : functions_) {
+        std::string k = kv.first;
+        for (char& c : k) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (k == upper) return &kv.second;
     }
     return nullptr;
 }
@@ -1273,8 +1151,6 @@ bool SystemCatalog::CreateProcedure(const ProcedureDefinition& def) {
     if (def.procedure_name.empty()) return false;
     if (procedures_.count(def.procedure_name) != 0) return false;
     procedures_[def.procedure_name] = def;
-    // [perf] catalog-indexes: 同步 CI 旁路，便于 LookupProcedure O(1) 命中。
-    ci_index_procedures_[ToLowerHelper(def.procedure_name)] = def.procedure_name;
     return true;
 }
 
@@ -1283,8 +1159,6 @@ bool SystemCatalog::DropProcedure(const std::string& procedure_name, bool if_exi
     if (it == procedures_.end()) {
         return if_exists;  // 不存在时返回 if_exists（true 表示静默成功）
     }
-    // [perf] catalog-indexes: 按 lowercased(name) 摘除 CI 旁路条目。
-    ci_index_procedures_.erase(ToLowerHelper(procedure_name));
     procedures_.erase(it);
     return true;
 }
@@ -1301,13 +1175,15 @@ const SystemCatalog::ProcedureDefinition* SystemCatalog::GetProcedure(
 
 const SystemCatalog::ProcedureDefinition* SystemCatalog::LookupProcedure(
     const std::string& name) const {
-    // [perf] catalog-indexes: 原大小写先 find；未命中走 CI 旁路。
     auto it = procedures_.find(name);
     if (it != procedures_.end()) return &it->second;
-    auto ci = ci_index_procedures_.find(ToLowerHelper(name));
-    if (ci != ci_index_procedures_.end()) {
-        auto pit = procedures_.find(ci->second);
-        if (pit != procedures_.end()) return &pit->second;
+    std::string upper;
+    upper.reserve(name.size());
+    for (char c : name) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    for (const auto& kv : procedures_) {
+        std::string k = kv.first;
+        for (char& c : k) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (k == upper) return &kv.second;
     }
     return nullptr;
 }
@@ -1357,16 +1233,20 @@ SystemCatalog::LookupTriggers(const std::string& table_name,
 // ============================================================================
 
 bool SystemCatalog::DropPersistedTableMetadata(const std::string& table_name) {
-    // [perf] catalog-indexes: 走 table_rid_by_name_ 一次 lookup + DeleteTuple，
-    // 不再 O(R) 扫整张 sys_tables。注意：table_name 不是 kSys*Key（那些
-    // 是系统目录自身的定位记录，不进入该 map）。
-    auto rit = table_rid_by_name_.find(table_name);
-    if (rit == table_rid_by_name_.end()) return false;
     TableHeap* sys_heap = table_heaps_[kSysTablesKey].get();
     if (!sys_heap) return false;
-    sys_heap->DeleteTuple(rit->second);
-    table_rid_by_name_.erase(rit);
-    return true;
+    const std::vector<ValueType> schema = {ValueType::VARCHAR};
+    auto iter = sys_heap->Begin();
+    while (iter.HasNext()) {
+        Tuple t = iter.Next(schema);
+        if (t.ColumnCount() == 0) continue;
+        TableInfo info = DecodeTableMetadata(t);
+        if (info.table_name == table_name) {
+            sys_heap->DeleteTuple(t.GetRid());
+            return true;
+        }
+    }
+    return false;
 }
 
 bool SystemCatalog::PersistTableInfo(const TableInfo& info) {
@@ -1592,7 +1472,7 @@ bool SystemCatalog::EnsureSysTriggersHeap() {
     return sys_heap->InsertTuple(row_t, &rid, schema);
 }
 
-bool SystemCatalog::PersistTriggerMetadata(const TriggerDefinition& def, RID* out_rid) {
+bool SystemCatalog::PersistTriggerMetadata(const TriggerDefinition& def) {
     if (!EnsureSysTriggersHeap()) return false;
     if (!trigger_heap_) return false;
     std::ostringstream oss;
@@ -1612,27 +1492,30 @@ bool SystemCatalog::PersistTriggerMetadata(const TriggerDefinition& def, RID* ou
     Tuple row_t(std::move(row));
     RID rid;
     std::vector<ValueType> schema = {ValueType::VARCHAR};
-    if (!trigger_heap_->InsertTuple(row_t, &rid, schema)) return false;
-    if (out_rid) *out_rid = rid;
-    // [perf] catalog-indexes: 记录 RID 到 trigger_rid_by_name_，便于
-    // RemoveTriggerMetadata 一次 lookup + DeleteTuple 调用即可。
-    trigger_rid_by_name_[def.trigger_name] = rid;
-    return true;
+    return trigger_heap_->InsertTuple(row_t, &rid, schema);
 }
 
 void SystemCatalog::RemoveTriggerMetadata(const std::string& trigger_name) {
-    // [perf] catalog-indexes: 走 trigger_rid_by_name_ 一次 lookup + DeleteTuple。
-    // 旧实现是 O(R) 扫整张 __sys_triggers__ 堆。
-    auto it = trigger_rid_by_name_.find(trigger_name);
-    if (it == trigger_rid_by_name_.end()) return;
     if (sys_triggers_first_page_id_ == INVALID_PAGE_ID) return;
     if (!trigger_heap_) {
         trigger_heap_.reset(TableHeap::Open(storage_,
                                              sys_triggers_first_page_id_));
     }
     if (!trigger_heap_) return;
-    trigger_heap_->DeleteTuple(it->second);
-    trigger_rid_by_name_.erase(it);
+    const std::vector<ValueType> schema = {ValueType::VARCHAR};
+    auto iter = trigger_heap_->Begin();
+    while (iter.HasNext()) {
+        Tuple t = iter.Next(schema);
+        if (t.ColumnCount() == 0) continue;
+        const std::string& blob = t.GetValue(0).AsVarchar();
+        // 解析 trigger_name 段（首个 '|' 之前）。
+        auto pipe = blob.find('|');
+        std::string name = (pipe == std::string::npos) ? blob : blob.substr(0, pipe);
+        if (name == trigger_name) {
+            trigger_heap_->DeleteTuple(t.GetRid());
+            return;
+        }
+    }
 }
 
 void SystemCatalog::LoadTriggersFromDisk() {
@@ -1642,8 +1525,6 @@ void SystemCatalog::LoadTriggersFromDisk() {
                                              sys_triggers_first_page_id_));
     }
     if (!trigger_heap_) return;
-    // [perf] catalog-indexes: 加载阶段重建 trigger_rid_by_name_。
-    trigger_rid_by_name_.clear();
     const std::vector<ValueType> schema = {ValueType::VARCHAR};
     auto iter = trigger_heap_->Begin();
     while (iter.HasNext()) {
@@ -1670,10 +1551,6 @@ void SystemCatalog::LoadTriggersFromDisk() {
         def.for_each_row = (parts[4] == "1");
         def.assignments = DeserializeTriggerAssignments(parts[5]);
         if (def.trigger_name.empty()) continue;
-        // [perf] catalog-indexes: 把这条触发器记录在 __sys_triggers__ 堆上的
-        // RID 记下。无论后续是否被 triggers_ 拒绝覆盖，都要登记 —— 这样
-        // 老库里"内存态里没有但磁盘上仍在"的孤儿 trigger 也能被清理。
-        trigger_rid_by_name_[def.trigger_name] = t.GetRid();
         // 已存在同名 trigger 时（异常路径）不覆盖。
         if (triggers_.count(def.trigger_name) != 0) continue;
         triggers_[def.trigger_name] = std::move(def);
