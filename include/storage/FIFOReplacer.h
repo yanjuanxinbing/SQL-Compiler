@@ -1,7 +1,7 @@
 #pragma once
 
-#include <cstddef>
-#include <vector>
+#include <list>
+#include <unordered_map>
 
 #include "storage/Replacer.h"
 
@@ -18,20 +18,20 @@ namespace sqlcompiler {
 // This class augments plain FIFO with a per-frame reference bit, exactly as
 // in the classical second-chance / clock algorithm:
 //
-//   * Each Unpin(frame) either sets ref_bit=true (frame already in the ring)
-//     or appends the frame at the clock hand's current position with
-//     ref_bit=false (frame is brand-new to the ring).
-//   * Victim walks the ring from the clock hand like a clock hand. If the
-//     frame under the hand has ref_bit=true, we clear the bit and advance;
-//     otherwise we evict that frame.
-//
-// 内部用稀疏数组实现：ring_[slot] 存该槽位的 frame_id（-1 表示空槽），
-// position_[frame_id] 反查 frame_id 所在的 slot 以支持 O(1) Pin/erase。
-// clock_hand_ 是单向推进的环形游标，Unpin 与 Victim 共用它定位下一位置。
+//   * Each Unpin(frame) either sets ref_bit=true (frame already in the queue
+//     from a prior Unpin) or appends the frame to the back with ref_bit=false
+//     (frame is brand-new to the queue).
+//   * Victim walks the queue from the front like a clock hand. If the front
+//     frame has ref_bit=true, we clear the bit, push the frame to the back,
+//     and continue. If ref_bit=false, we evict that frame.
 //
 // Net effect: a frame whose Unpin is called repeatedly (a hot page) accumulates
 // ref_bits=true and survives cold churn, while truly cold frames eventually
-// reach the hand with ref_bit=false and are evicted.
+// reach the front with ref_bit=false and are evicted.
+//
+// Possible future refinement (intentionally NOT implemented in V1): hot/cold
+// partition (a.k.a. 2Q / CAR family) — keep a separate "hot" prefix and only
+// evict from the "cold" suffix. Worth doing if workload skew grows.
 class FIFOReplacer : public Replacer {
 public:
     explicit FIFOReplacer(size_t num_frames);
@@ -44,18 +44,15 @@ public:
 
 private:
     size_t num_frames_;
-    // ring_[slot] = frame_id at that slot, -1 if empty.
-    // slot 索引 ∈ [0, num_frames_)，与 frame_id 独立（slot 由 clock 顺序决定）。
-    std::vector<int> ring_;
-    // ref_[slot] = reference bit for the frame currently at that slot.
-    std::vector<char> ref_;
-    // position_[frame_id] = 该 frame_id 所在的 slot，-1 表示不在 ring 中。
-    // 提供 O(1) 的 Pin / Unpin-再标记 路径，避免扫整个 ring。
-    std::vector<int> position_;
-    // 时钟指针：同时承担「新帧入环插入点」与「Victim 扫描起点」两个角色。
-    size_t clock_hand_ = 0;
-    // 当前 ring 中真实持有的 frame 数量（即 ref_ 中有效位之外的活跃元素数）。
-    size_t size_ = 0;
+    std::list<int> fifo_queue_;
+    // Mirror of the frames currently sitting in fifo_queue_, kept for O(1)
+    // erase on Pin. We intentionally track iterators (not raw indices) so
+    // list splice/erase remains O(1).
+    std::unordered_map<int, std::list<int>::iterator> position_map_;
+    // Second-chance reference bit for each unpinned frame. Always in sync with
+    // position_map_: a frame is present in ref_bits_ iff it is also present in
+    // position_map_. We erase from both maps together on Pin/Victim.
+    std::unordered_map<int, bool> ref_bits_;
 };
 
 }  // namespace sqlcompiler

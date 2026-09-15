@@ -84,21 +84,19 @@ NodeType LiteralExpr::GetType() const {
 }
 
 std::string LiteralExpr::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
-    std::string result;
     if (literal_type == LiteralType::STRING) {
-        result = "'" + value + "'";
-    } else if (literal_type == LiteralType::NULL_VALUE) {
-        result = "NULL";
-    } else if (literal_type == LiteralType::DATE) {
-        result = "DATE '" + value + "'";
-    } else if (literal_type == LiteralType::TIMESTAMP) {
-        result = "TIMESTAMP '" + value + "'";
-    } else {
-        result = value;
+        return "'" + value + "'";
     }
-    cached_to_string_ = result;
-    return result;
+    if (literal_type == LiteralType::NULL_VALUE) {
+        return "NULL";
+    }
+    if (literal_type == LiteralType::DATE) {
+        return "DATE '" + value + "'";
+    }
+    if (literal_type == LiteralType::TIMESTAMP) {
+        return "TIMESTAMP '" + value + "'";
+    }
+    return value;
 }
 
 // ============ ColumnRefExpr ============
@@ -112,10 +110,10 @@ NodeType ColumnRefExpr::GetType() const {
 }
 
 std::string ColumnRefExpr::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
-    std::string result = table_name.empty() ? column_name : (table_name + "." + column_name);
-    cached_to_string_ = result;
-    return result;
+    if (!table_name.empty()) {
+        return table_name + "." + column_name;
+    }
+    return column_name;
 }
 
 // ============ BinaryExpr ============
@@ -129,12 +127,9 @@ NodeType BinaryExpr::GetType() const {
 }
 
 std::string BinaryExpr::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
     std::string l = left ? left->ToString() : "?";
     std::string r = right ? right->ToString() : "?";
-    std::string result = "(" + l + " " + BinaryOpToString(op) + " " + r + ")";
-    cached_to_string_ = result;
-    return result;
+    return "(" + l + " " + BinaryOpToString(op) + " " + r + ")";
 }
 
 // ============ UnaryExpr ============
@@ -148,13 +143,11 @@ NodeType UnaryExpr::GetType() const {
 }
 
 std::string UnaryExpr::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
     std::string inner = operand ? operand->ToString() : "?";
-    std::string result = (op == UnaryOperator::NOT)
-                            ? ("NOT (" + inner + ")")
-                            : ("-" + inner);
-    cached_to_string_ = result;
-    return result;
+    if (op == UnaryOperator::NOT) {
+        return "NOT (" + inner + ")";
+    }
+    return "-" + inner;
 }
 
 // ============ FunctionCallExpr ============
@@ -168,7 +161,6 @@ NodeType FunctionCallExpr::GetType() const {
 }
 
 std::string FunctionCallExpr::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
     std::ostringstream oss;
     oss << function_name << "(";
     if (is_distinct) oss << "DISTINCT ";
@@ -194,9 +186,7 @@ std::string FunctionCallExpr::ToString() const {
         }
         oss << ")";
     }
-    std::string result = oss.str();
-    cached_to_string_ = result;
-    return result;
+    return oss.str();
 }
 
 // ============ SelectStatement ============
@@ -509,7 +499,6 @@ NodeType CaseExprNode::GetType() const {
 }
 
 std::string CaseExprNode::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
     std::ostringstream oss;
     oss << "CASE";
     if (subject) {
@@ -523,9 +512,7 @@ std::string CaseExprNode::ToString() const {
         oss << " ELSE " << else_expr->ToString();
     }
     oss << " END";
-    std::string result = oss.str();
-    cached_to_string_ = result;
-    return result;
+    return oss.str();
 }
 
 // ============ CastExprNode ============
@@ -539,7 +526,6 @@ NodeType CastExprNode::GetType() const {
 }
 
 std::string CastExprNode::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
     std::string inner = expr ? expr->ToString() : "?";
     std::string out = "CAST(" + inner + " AS " + target_type;
     if (char_length >= 0) {
@@ -550,7 +536,6 @@ std::string CastExprNode::ToString() const {
         out += ")";
     }
     out += ")";
-    cached_to_string_ = out;
     return out;
 }
 
@@ -571,7 +556,6 @@ NodeType WindowFuncNode::GetType() const {
 }
 
 std::string WindowFuncNode::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
     std::ostringstream oss;
     oss << function_name << "(";
     for (size_t i = 0; i < arguments.size(); ++i) {
@@ -603,9 +587,7 @@ std::string WindowFuncNode::ToString() const {
         }
         oss << ")";
     }
-    std::string result = oss.str();
-    cached_to_string_ = result;
-    return result;
+    return oss.str();
 }
 
 // ============ SubqueryExprNode ============
@@ -625,7 +607,6 @@ NodeType SubqueryExprNode::GetType() const {
 }
 
 std::string SubqueryExprNode::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
     std::ostringstream oss;
     if (kind == SubqueryType::EXISTS) {
         oss << "EXISTS(";
@@ -645,9 +626,7 @@ std::string SubqueryExprNode::ToString() const {
         if (subquery) oss << subquery->ToString();
         oss << ")";
     }
-    std::string result = oss.str();
-    cached_to_string_ = result;
-    return result;
+    return oss.str();
 }
 
 // ============ UpsertValuesRefExpr (43_upsert) ============
@@ -661,10 +640,7 @@ NodeType UpsertValuesRefExpr::GetType() const {
 }
 
 std::string UpsertValuesRefExpr::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
-    std::string result = "VALUES(" + column_name + ")";
-    cached_to_string_ = result;
-    return result;
+    return "VALUES(" + column_name + ")";
 }
 
 // ============ LikeExprNode (44_pattern_match) ============
@@ -686,7 +662,6 @@ NodeType LikeExprNode::GetType() const {
 }
 
 std::string LikeExprNode::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
     std::ostringstream oss;
     oss << "("
         << (operand ? operand->ToString() : "?") << " ";
@@ -702,9 +677,7 @@ std::string LikeExprNode::ToString() const {
         oss << " ESCAPE '" << escape_char << "'";
     }
     oss << ")";
-    std::string result = oss.str();
-    cached_to_string_ = result;
-    return result;
+    return oss.str();
 }
 
 // ============ WithClauseStatement ============
@@ -1167,13 +1140,10 @@ NodeType ExtractExprNode::GetType() const {
 }
 
 std::string ExtractExprNode::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
     std::ostringstream oss;
     oss << "EXTRACT(" << ExtractFieldName(field) << " FROM "
         << (source ? source->ToString() : "?") << ")";
-    std::string result = oss.str();
-    cached_to_string_ = result;
-    return result;
+    return oss.str();
 }
 
 IntervalExprNode::IntervalExprNode(int64_t count, int unit)
@@ -1185,12 +1155,9 @@ NodeType IntervalExprNode::GetType() const {
 }
 
 std::string IntervalExprNode::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
     std::ostringstream oss;
     oss << "INTERVAL " << count << " " << ExtractFieldName(unit);
-    std::string result = oss.str();
-    cached_to_string_ = result;
-    return result;
+    return oss.str();
 }
 
 // ============ 46_meta：EXPLAIN / SHOW ============
@@ -1293,10 +1260,7 @@ NodeType NextvalExpr::GetType() const {
     return NodeType::NEXTVAL_EXPR;
 }
 std::string NextvalExpr::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
-    std::string result = "NEXTVAL FOR " + sequence_name;
-    cached_to_string_ = result;
-    return result;
+    return "NEXTVAL FOR " + sequence_name;
 }
 
 // ============ DefaultExprNode (INSERT ... DEFAULT) ============
@@ -1311,10 +1275,8 @@ NodeType DefaultExprNode::GetType() const {
 }
 
 std::string DefaultExprNode::ToString() const {
-    if (cached_to_string_) return *cached_to_string_;
-    std::string result = column_name.empty() ? "DEFAULT" : ("DEFAULT(" + column_name + ")");
-    cached_to_string_ = result;
-    return result;
+    if (column_name.empty()) return "DEFAULT";
+    return "DEFAULT(" + column_name + ")";
 }
 
 // ============ 54_dml：MERGE 语句 ============

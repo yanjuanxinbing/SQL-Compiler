@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,13 +30,6 @@ struct WindowSpec;
 // 也在 SelectStatement / WindowSpec 等处使用。前置声明以便在 FunctionCallExpr
 // 引用该类型。
 struct OrderByItem;
-
-// 4.6 / 4.4: Expr 节点可选缓存（single-threaded 编译器，无需同步）。
-//   - cached_to_string_ : 首次 ToString() 后写入，避免后续重复字符串拼接。
-//   - cached_type_      : InferExprType 推断出的类型（"INT"/"FLOAT"/"VARCHAR"/...），
-//                          由 Planner::InferSelectOutputSchema 主动写入。
-// 用 mutable 是因为 ToString() / InferExprType 是 const，但缓存值确实属于
-// 「按需记忆化」的典型用例（std::call_once 等价语义，无需锁）。
 
 // AST节点类型标识
 enum class NodeType {
@@ -155,22 +147,6 @@ using StatementPtr = std::shared_ptr<Statement>;
 class Expr : public Node {
 public:
     ~Expr() override = default;
-
-    // 4.6 / 4.4: Expr 节点缓存槽（见文件顶部注释）。protected 让所有 Expr
-    // 子类直接读写，避免给每个 ToString() 加 setter/getter 样板代码。
-protected:
-    mutable std::optional<std::string> cached_to_string_;
-    mutable std::optional<std::string> cached_type_;
-
-public:
-    // 取 ToString 缓存；若存在则直接返回，否则空。调用方可以自行决定是否
-    // 写入缓存（AggregateCallsEqual 这种结构化比较场景根本不需要字符串）。
-    const std::optional<std::string>& GetCachedToString() const { return cached_to_string_; }
-    void SetCachedToString(std::string s) const { cached_to_string_ = std::move(s); }
-
-    // 类型缓存：Planner::InferSelectOutputSchema 在写入时使用。
-    const std::optional<std::string>& GetCachedType() const { return cached_type_; }
-    void SetCachedType(std::string t) const { cached_type_ = std::move(t); }
 };
 
 // ============ 表达式节点 ============

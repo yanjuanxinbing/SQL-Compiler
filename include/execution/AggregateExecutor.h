@@ -70,17 +70,9 @@ private:
         std::vector<Value> key_values;
         std::vector<AggregateState> agg_states;   // 与 aggregate_exprs 等长
         Tuple  sample_tuple;                       // 用于求值非聚合子表达式
-        // [perf] groupby-expr-autoinc: GroupKeyOf(key_values) 的序列化结果缓存。
-        // 创建分组时写入一次；FindOrCreate 时直接拿这个缓存 key 走 hash 查找，
-        // 不必为每个候选行重做一次 Value::ToString 序列化。
-        std::string key_cache;
     };
 
     std::vector<Group> groups_;
-    // [perf] groupby-expr-autoinc: 分组 key 字符串 → 在 groups_ 中的下标。
-    // Init 主循环把 O(n·g) 线性扫描降到 O(n) 单次 hash 查找；
-    // 插入新分组时同步写入；Next() 发射阶段只读 groups_。
-    std::unordered_map<std::string, size_t> group_index_;
     size_t cursor_;
 
     // 评估 aggregate_exprs[i]，将其中聚合函数调用替换为已计算的状态值

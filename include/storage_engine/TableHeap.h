@@ -94,11 +94,6 @@ public:
 private:
     StorageAccess* storage_;
     page_id_t first_page_id_;
-    // 上次成功 InsertTuple 的 page_id。InsertTuple 从该 hint 起沿链扫，
-    // 而不是每次都从 first_page_id_ 走起——把 O(P) 的「沿链找空页」摊到
-    // O(1) 起步。链耗尽（hint 自身失效，如 TRUNCATE 把 hint 页回收）时
-    // 自动回退到 first_page_id_ 起步。
-    page_id_t last_insert_hint_ = INVALID_PAGE_ID;
     Transaction* active_txn_ = nullptr;
     LogManager* log_manager_ = nullptr;  // Phase B：可选 WAL 写出器
 

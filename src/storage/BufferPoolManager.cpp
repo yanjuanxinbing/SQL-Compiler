@@ -26,18 +26,6 @@ BufferPoolManager::BufferPoolManager(size_t pool_size, DiskManager* disk_manager
     for (size_t i = 0; i < pool_size; ++i) {
         free_list_.push_back(static_cast<int>(pool_size - 1 - i));
     }
-    // 把每帧的 dirty 翻转同步到 dirty_frames_。lambda 按值捕获 frame_id，
-    // this 指针隐式引用 BPM；BPM 拥有 pages_，所以回调生命周期永远不会悬空。
-    for (size_t i = 0; i < pool_size; ++i) {
-        const int fid = static_cast<int>(i);
-        pages_[i].SetDirtyCallback([this, fid](bool now_dirty) {
-            if (now_dirty) {
-                dirty_frames_.insert(fid);
-            } else {
-                dirty_frames_.erase(fid);
-            }
-        });
-    }
 }
 
 BufferPoolManager::~BufferPoolManager() {
@@ -134,22 +122,15 @@ bool BufferPoolManager::FlushPage(page_id_t page_id) {
 
 void BufferPoolManager::FlushAllDirtyPages() {
     // Phase B：仅刷脏页；Lsn-aware 的 FlushPage 保证 WAL 顺序。
-    // 走 dirty_frames_ 旁路集合（O(K)，K=脏页数），不再扫所有 frame。
-    // 注意 FlushPage 会 SetDirty(false) → dirty_frames_.erase(frame_id)，
-    // 所以先快照一份再迭代，避免迭代器失效。
-    std::vector<int> frames(dirty_frames_.begin(), dirty_frames_.end());
-    for (int frame_id : frames) {
-        // dirty_frames_ 与 page_table_ 是同步的（脏帧必定仍在 page_table_）
-        // 但防御性检查 page_table_ 仍能挡住任何漂移。
-        page_id_t pid = pages_[frame_id].GetPageId();
-        if (page_table_.find(pid) == page_table_.end()) continue;
-        FlushPage(pid);
+    for (const auto& kv : page_table_) {
+        int frame_id = kv.second;
+        if (pages_[frame_id].IsDirty()) {
+            FlushPage(kv.first);
+        }
     }
 }
 
 void BufferPoolManager::FlushAllPages() {
-    // FlushAllPages 要刷所有页（含干净页），仍按 page_table_ 走一遍。
-    // FlushPage 内 SetDirty(false) 会顺手清掉 dirty_frames_，无须额外处理。
     for (const auto& kv : page_table_) {
         FlushPage(kv.first);
     }
@@ -182,14 +163,12 @@ bool BufferPoolManager::DeletePage(page_id_t page_id) {
 }
 
 std::vector<std::pair<page_id_t, uint64_t>> BufferPoolManager::CollectDirtyPages() {
-    // 直接迭代 dirty_frames_ 旁路集合（O(K)，K=脏页数）。
     std::vector<std::pair<page_id_t, uint64_t>> out;
-    out.reserve(dirty_frames_.size());
-    for (int frame_id : dirty_frames_) {
-        page_id_t pid = pages_[frame_id].GetPageId();
-        // 防御性：脏帧一定在 page_table_；但若漂移导致不一致，这里跳过避免越界。
-        if (page_table_.find(pid) == page_table_.end()) continue;
-        out.emplace_back(pid, pages_[frame_id].GetPageLsn());
+    for (const auto& kv : page_table_) {
+        int frame_id = kv.second;
+        if (pages_[frame_id].IsDirty()) {
+            out.emplace_back(kv.first, pages_[frame_id].GetPageLsn());
+        }
     }
     return out;
 }
@@ -227,10 +206,6 @@ bool BufferPoolManager::FindFreeFrame(int* frame_id, page_id_t to_load) {
             }
         }
         disk_manager_->WritePage(evicted_pid, pages_[victim].GetData());
-        // 写盘后该帧不再 dirty。SetDirty(false) 走回调把 frame 从
-        // dirty_frames_ 移除；GetPage/NewPage 接下来 SetDirty(false) 时
-        // 因为状态未变会短路（无副作用）。
-        pages_[victim].SetDirty(false);
     }
     page_table_.erase(evicted_pid);
     ReplacementLogEntry entry;
