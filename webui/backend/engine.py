@@ -343,23 +343,56 @@ def _split_blocks(stdout: str, statements: list[str], stderr: str = "") -> list[
 # ── Engine executor ────────────────────────────────────────────────────────
 
 
-def _align_file_segments(stdout: str, count: int) -> list[str]:
-    """Split combined stdout into exactly `count` per-file segments.
+def _segment_by_envelopes(stdout: str, count: int) -> tuple[list[str], list[dict | None]]:
+    """Split `--debug-output` stdout into per-statement segments + payloads.
 
-    When the engine runs with N `-f` files it appends a
-    `[script] <path>: ran N statement(s)` trailer after each file, so the
-    output splits into N trailer-terminated segments — including for a
-    file whose statement failed and printed nothing (its segment is simply
-    empty).  Anything after the last trailer is a post-script artifact and
-    gets dropped.  Missing segments are padded with "", surplus trimmed,
-    so the result always has exactly `count` entries aligned 1:1 with the
-    input statements.
+    With `--debug-output` the engine emits, for every statement it runs,
+    the statement's stdout lines followed by exactly one
+    `[DEBUG_JSON_START]…[DEBUG_JSON_END]` envelope — verified
+    experimentally for successful, DDL/DML, failing (semantic AND syntax)
+    and BEGIN/COMMIT statements.  The envelopes are therefore hard
+    per-statement delimiters: statement *i*'s plain output is the text
+    between envelope i-1's end and envelope i's start.  Everything after
+    the last envelope (the `[script]` trailer, trailing newlines) is
+    discarded.
+
+    This replaces the old per-`-f`-file split.  Segmentation on envelopes
+    lets a whole batch travel as ONE `-f` file, which keeps the command
+    line short — the one-`-f`-per-statement form grew ~54 chars per
+    statement and blew past the Windows 32767-char CreateProcess limit at
+    ~600 statements (WinError 206).
+
+    Returns `(segments, debug_dicts)`, both padded/trimmed to `count` so
+    they align 1:1 with the input statements.  A failing statement's
+    segment is empty (its diagnostic went to stderr); its envelope still
+    parses (the engine emits one even for failures).
     """
-    parts = re.split(r"^\[script\][^\n]*\n?", stdout, flags=re.MULTILINE)
-    segs = parts[:count]
-    while len(segs) < count:
-        segs.append("")
-    return segs
+    import json as _json
+
+    env_re = re.compile(
+        r"\[DEBUG_JSON_START\]\s*(.*?)\s*\[DEBUG_JSON_END\]", re.DOTALL
+    )
+    matches = list(env_re.finditer(stdout))
+    debug_dicts: list[dict | None] = []
+    for m in matches:
+        try:
+            debug_dicts.append(_json.loads(m.group(1)))
+        except _json.JSONDecodeError:
+            debug_dicts.append(None)
+
+    segments: list[str] = []
+    prev_end = 0
+    for m in matches:
+        segments.append(stdout[prev_end:m.start()])
+        prev_end = m.end()
+
+    if len(segments) > count:
+        segments = segments[:count]
+        debug_dicts = debug_dicts[:count]
+    elif len(segments) < count:
+        segments += [""] * (count - len(segments))
+        debug_dicts += [None] * (count - len(debug_dicts))
+    return segments, debug_dicts
 
 
 @dataclass
@@ -582,37 +615,40 @@ class SqlEngine:
 
     # ── implicit (automatic) transaction wrapper ──────────────────────────
     def _run_multi_f_sync(self, full: list[str]) -> EngineRunResult:
-        """Run each statement as its own `-f` file in ONE engine subprocess.
+        """Run a whole batch as ONE script in ONE engine subprocess.
 
-        The engine keeps a single session across all `-f` files of one
-        invocation (verified experimentally: a BEGIN in file 1 is still
-        open when file 4 runs COMMIT, and an uncommitted txn auto-rolls
-        back when the process exits).  The per-file layout is what makes
-        result attribution exact: every statement — including a failing
-        one that prints nothing — owns a `[script] …`-terminated stdout
-        segment, so an empty segment pinpoints the failure instead of
-        shifting the next statement's output onto it (which is what a
-        merged script does and silently swallowed errors).
+        The engine keeps a single session for the duration of one
+        invocation (a BEGIN in the first statement is still open when the
+        last COMMIT runs, and an uncommitted txn auto-rolls back on exit),
+        which is exactly what a transaction needs.  To attribute results
+        per statement we run with `--debug-output` purely for its
+        `[DEBUG_JSON_START]…[DEBUG_JSON_END]` envelope markers: they are
+        emitted once per statement (even failures) and give hard
+        boundaries, so a failing statement's segment is simply empty
+        instead of stealing the next statement's output.  The envelope
+        payloads themselves are discarded here — this is the non-debug
+        execute path.
+
+        (The previous implementation wrote one `-f` file per statement,
+        but that grew the command line ~54 chars/statement and hit the
+        Windows 32767-char CreateProcess limit at ~600 statements.)
 
         Returns one block per entry in `full`, with stderr "Error:" lines
         attributed in order to the empty segments.
         """
-        tmp_paths: list[str] = []
+        script_text = "".join(_norm_statement(s) + "\n" for s in full)
         t0 = time.monotonic()
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".sql", delete=False,
+            encoding="utf-8", dir=tempfile.gettempdir(),
+        ) as f:
+            f.write(script_text)
+            tmp_path = f.name
         try:
-            for stmt in full:
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".sql", delete=False,
-                    encoding="utf-8", dir=tempfile.gettempdir(),
-                ) as f:
-                    f.write(_norm_statement(stmt) + "\n")
-                    tmp_paths.append(f.name)
-            cmd = [str(self.binary), str(self.db_path)]
-            for p in tmp_paths:
-                cmd.extend(["-f", p])
             try:
                 proc = subprocess.run(
-                    cmd, capture_output=True, text=True,
+                    [str(self.binary), str(self.db_path), "-f", tmp_path, "--debug-output"],
+                    capture_output=True, text=True,
                     encoding="utf-8", errors="replace", timeout=120,
                 )
             except subprocess.TimeoutExpired as e:
@@ -625,14 +661,13 @@ class SqlEngine:
             except FileNotFoundError as e:
                 raise EngineError(f"engine binary not found: {e}") from e
         finally:
-            for p in tmp_paths:
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
         stderr_clean = proc.stderr or ""
-        segs = _align_file_segments(proc.stdout or "", len(full))
+        segs, _debug = _segment_by_envelopes(proc.stdout or "", len(full))
         blocks: list[ParsedBlock] = []
         err_lines = [
             ln.strip()
@@ -747,36 +782,35 @@ class SqlEngine:
     def _execute_debug_multistatement_sync(
         self, stmts: list[str]
     ) -> tuple[EngineRunResult, dict | None]:
-        """Run N statements via N `-f` files in one subprocess and parse all.
+        """Run N statements as ONE `-f` script in one subprocess, with debug.
 
-        Each -f file contains exactly one statement.  The engine writes
-        each file's stdout and debug envelope back-to-back; we capture
-        them in order and zip with the input statements.
+        Historically we wrote one temp file per statement and passed N
+        `-f` flags, because a failing statement (which prints no stdout)
+        would otherwise shift the next statement's output onto it.  That
+        works, but the command line grows ~54 chars per statement, so a
+        600+ statement script overflows the Windows 32767-char
+        CreateProcess limit (WinError 206).  `--debug-output` gives us a
+        far better delimiter: the engine emits exactly one
+        `[DEBUG_JSON_START]…[DEBUG_JSON_END]` envelope per statement —
+        verified experimentally for successful, DDL/DML, failing
+        (semantic AND syntax) and BEGIN/COMMIT statements — so we can
+        segment stdout on the envelope boundaries instead of on `-f`
+        files.  One file, one short command line, transaction state
+        naturally preserved (it is a single process).
         """
-        tmp_paths: list[str] = []
+        script_text = "".join(_norm_statement(s) + "\n" for s in stmts)
         t0 = time.monotonic()
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".sql", delete=False,
+            encoding="utf-8", dir=tempfile.gettempdir(),
+        ) as f:
+            f.write(script_text)
+            tmp_path = f.name
         try:
-            for stmt in stmts:
-                # Each statement gets its own temp file so the engine's
-                # line-buffered parser sees clean, isolated input.  We
-                # re-emit the comment-only block-leading content by
-                # writing `stmt` verbatim (it may include leading
-                # comment text the splitter preserved).  The C++ lexer
-                # happily skips `-- …` and `/* … */` lines.
-                norm = _norm_statement(stmt) + "\n"
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".sql", delete=False,
-                    encoding="utf-8", dir=tempfile.gettempdir(),
-                ) as f:
-                    f.write(norm)
-                    tmp_paths.append(f.name)
-            cmd = [str(self.binary), str(self.db_path)]
-            for p in tmp_paths:
-                cmd.extend(["-f", p])
-            cmd.append("--debug-output")
             try:
                 proc = subprocess.run(
-                    cmd, capture_output=True, text=True,
+                    [str(self.binary), str(self.db_path), "-f", tmp_path, "--debug-output"],
+                    capture_output=True, text=True,
                     encoding="utf-8", errors="replace", timeout=120,
                 )
             except subprocess.TimeoutExpired:
@@ -790,11 +824,10 @@ class SqlEngine:
             except FileNotFoundError as e:
                 raise EngineError(f"engine binary not found: {e}") from e
         finally:
-            for p in tmp_paths:
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
         raw = proc.stdout or ""
         stderr_clean = proc.stderr or ""
@@ -810,91 +843,21 @@ class SqlEngine:
     ) -> tuple[EngineRunResult, dict | None]:
         """Parse per-statement stdout + per-statement debug envelopes.
 
-        The engine layout for N files is: for each file, the file's
-        stdout lines, then its `[DEBUG_JSON_START]…[DEBUG_JSON_END]`
-        envelope, then optionally a `[script] file: ran N statement(s)`
-        trailer.  We split on the envelopes, then for each segment
-        strip its own envelope and hand the remainder to
-        `_split_blocks([stmt], raw, stderr)`.
-
-        When a file's statement fails (e.g. `SELECT * FROM missing_table`)
-        the engine still emits its envelope but the file's stdout is
-        empty (the error went to stderr).  We then fabricate a
-        failure block carrying the engine's error message.
+        Segmentation is delegated to `_segment_by_envelopes` (see its
+        docstring): the engine emits exactly one envelope per statement,
+        so envelope boundaries isolate each statement's stdout — including
+        failures, whose segment is empty and whose diagnostic is dequeued
+        from stderr in order below.
         """
-        import json as _json
-
-        # 1. collect every envelope (in order) and strip them out of `raw`.
-        # `finditer` on the start marker gives us positions to slice; we
-        # then locate the matching END on each segment.
-        starts = [m.start() for m in re.finditer(r"\[DEBUG_JSON_START\]", raw)]
-        ends = [m.end() for m in re.finditer(r"\[DEBUG_JSON_END\]", raw)]
-        debug_dicts: list[dict | None] = []
-        prev_end = 0
-        new_raw_parts: list[str] = []
-        for i, s_pos in enumerate(starts):
-            e_pos = ends[i] if i < len(ends) else len(raw)
-            envelope = raw[s_pos:e_pos]
-            new_raw_parts.append(raw[prev_end:s_pos])
-            prev_end = e_pos
-            m = re.search(r"\[DEBUG_JSON_START\]\s*(.*?)\s*\[DEBUG_JSON_END\]", envelope, re.DOTALL)
-            if m:
-                try:
-                    debug_dicts.append(_json.loads(m.group(1)))
-                except _json.JSONDecodeError:
-                    debug_dicts.append(None)
-            else:
-                debug_dicts.append(None)
-        new_raw_parts.append(raw[prev_end:])
-        raw_no_envelope = "".join(new_raw_parts)
-
-        # 2. split the remaining stdout by file-trailer boundaries so
-        # each file's stdout is isolated.  The trailer is a line
-        # `[script] <path>: ran N statement(s)` that the engine appends
-        # after each -f file's content.
-        file_segments = re.split(r"^\[script\][^\n]*\n?", raw_no_envelope, flags=re.MULTILINE)
-
-        # 3. zip statements with file segments and debug envelopes.
-        #
-        # CRITICAL: every empty slot in `file_segments` corresponds to a
-        # statement whose `-f` produced no stdout (CREATE / DDL / failed
-        # statements fall here).  We must NOT drop those slots — they
-        # carry the per-statement "fingerprint" that block ordering
-        # depends on.  Previously this routine popped all leading and
-        # trailing empty entries, which silently collapsed all failing
-        # statements' empty slots into one and associated the FIRST
-        # non-empty stdout (a successful SELECT) with the FIRST
-        # statement (a failed CREATE).  The fix is to strip ONLY the
-        # trailing empty after the last `[script]` trailer (the engine
-        # always emits an extra empty segment after the final file),
-        # then pad / trim to exactly len(stmts).
-        cleaned_segments = list(file_segments)
-        # Strip trailing empties that exist after the last `[script]`
-        # line — those are post-script artifacts that don't correspond
-        # to any input statement.  We POP all consecutive trailing
-        # empties (there's typically just one, but engine edge cases
-        # can produce several) and never touch leading empties, because
-        # a leading empty IS the first statement's stdout slot.
-        while cleaned_segments and cleaned_segments[-1].strip() == "":
-            cleaned_segments.pop()
-        # Defensive: align with statement count.  If fewer segments
-        # than statements, pad with empty strings (engine emitted fewer
-        # `[script]` trailers than we expect — fall back to a "no stdout"
-        # attribution for the missing ones).  If more, trim (very rare;
-        # usually means an unexpected blank inside stdout that survived
-        # the `[script]` split).
-        if len(cleaned_segments) > len(stmts):
-            cleaned_segments = cleaned_segments[: len(stmts)]
-        elif len(cleaned_segments) < len(stmts):
-            while len(cleaned_segments) < len(stmts):
-                cleaned_segments.append("")
+        # 1-3. segment stdout on envelope boundaries; align to len(stmts).
+        cleaned_segments, debug_dicts = _segment_by_envelopes(raw, len(stmts))
 
         # 4. Pair up stderr errors with empty-stdout blocks IN ORDER.
-        # The C++ engine writes one stderr line per failed `-f` file (in
+        # The C++ engine writes one stderr line per failed statement (in
         # the same order as the inputs), so we dequeue one error per
-        # empty-stdout block.  This is the only reliable way to
-        # attribute errors to the right statement when stdout and
-        # stderr are interleaved across `-f` invocations.
+        # empty-stdout block.  This is the reliable way to attribute
+        # errors to the right statement when a failing statement prints
+        # no stdout of its own.
         err_lines = [
             ln.strip()
             for ln in stderr_clean.splitlines()
@@ -911,7 +874,7 @@ class SqlEngine:
             # Pass `stderr_clean` only to `_split_blocks` for blocks with
             # actual stdout — that path catches errors written into the
             # output stream.  For empty-stdout blocks we attribute
-            # errors ourselves below (one stderr line per failing `-f`)
+            # errors ourselves below (one stderr line per failure)
             # because `_split_blocks`'s pad branch would otherwise
             # over-attribute the shared stderr to every empty block.
             blk_list = _split_blocks(seg, [stmt], "" if seg.strip() == "" else stderr_clean)
@@ -922,7 +885,7 @@ class SqlEngine:
                 blk = ParsedBlock(success=True, statement=stmt)
             blk.debug = dbg
             # Failed-statement attribution: a successful-looking block
-            # whose `-f` produced no stdout is almost certainly the
+            # whose statement produced no stdout is almost certainly the
             # statement the engine just failed on.  Dequeue the next
             # stderr error to surface the real diagnostic.  Statements
             # that already reported failure via their own stdout
