@@ -399,6 +399,10 @@ private:
     // 反序列化（用 Parser 把字符串重新解析为 ExprPtr）；失败返回空 vector。
     static std::vector<std::pair<std::string, ExprPtr>> DeserializeTriggerAssignments(
         const std::string& text);
+
+    // [perf] groupby-expr-autoinc: 一次性扫描表，初始化 TableInfo::next_auto_id_
+    // 为 MAX(pk) + 1。无 PK 或 PK 没有任何非 NULL 整数时保持默认 1。
+    void InitializeNextAutoId(TableInfo& info, TableHeap* heap);
 };
 
 }  // namespace sqlcompiler

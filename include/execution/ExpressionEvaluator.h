@@ -46,6 +46,11 @@ public:
 
 private:
     const std::unordered_map<std::string, size_t>& column_index_map_;
+    // [perf] groupby-expr-autoinc: 大小写折叠旁路。key = lowercased(column_index_map_ 的原 key)，
+    // value = 原 key 在 column_index_map_ 中的下标。EvaluateColumnRef miss 后做 O(1) 命中，
+    // 不必每次调用都对 column_index_map_ 的所有键做一次 lowercase 拷贝再逐键比较。
+    // mutable 因为 EvaluateColumnRef 是 const 方法。
+    mutable std::unordered_map<std::string, size_t> ci_cmap_;
     ExecutionContext* ctx_ = nullptr;
     const std::unordered_map<std::string, Value>* outer_bind_ = nullptr;
     // 59_procs (Category 8): procedure 局部变量绑定回退。
@@ -71,6 +76,10 @@ private:
     Value EvaluateInterval(const IntervalExprNode& expr, const Tuple& tuple) const;
     // 53_ddl: NEXTVAL FOR sequence_name —— 推进序列并返回当前值。
     Value EvaluateNextval(const NextvalExpr& expr) const;
+
+    // [perf] groupby-expr-autoinc: 由 column_index_map_ 重建 ci_cmap_。
+    // 构造期调用一次；运行期 column_index_map_ 不可变（const &），所以无需再次 rebuild。
+    void BuildCiCmap() const;
 };
 
 }  // namespace sqlcompiler

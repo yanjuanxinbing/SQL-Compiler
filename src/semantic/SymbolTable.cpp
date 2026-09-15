@@ -89,6 +89,12 @@ const TableInfo* SymbolTable::GetTable(const std::string& table_name) const {
     return &it->second;
 }
 
+TableInfo* SymbolTable::GetMutableTable(const std::string& table_name) {
+    auto it = tables_.find(ToLower(table_name));
+    if (it == tables_.end()) return nullptr;
+    return &it->second;
+}
+
 bool SymbolTable::AddTableFromCreateStatement(const CreateTableStatement& stmt) {
     TableInfo info;
     info.table_name = stmt.table_name;

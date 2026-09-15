@@ -473,10 +473,58 @@ void SystemCatalog::LoadFromDisk() {
         if (user_pid >= 0) {
             table_heaps_[info.table_name].reset(
                 TableHeap::Open(storage_, user_pid));
+            // [perf] groupby-expr-autoinc: 表刚加载完，顺手扫一次找出 MAX(pk)
+            // 并把 TableInfo::next_auto_id_ 初始化为 MAX(pk) + 1。
+            // 后续 UpsertExecutor::PrepareCandidateRow 在 PK 为 NULL 时
+            // 直接 ++ 取下一个 id，不再每行 SeqScan 计行数。
+            // 仅在存在 PRIMARY KEY 列时才有意义（其他列的 AUTO_INCREMENT 不走 PK 补号）。
+            // 通过 GetMutableTable 拿到 symbol_table_ 里那份拷贝的指针（AddTable 已复制）；
+            // local `info` 不会反映到 tables_ 里。
+            if (TableInfo* stored = symbol_table_.GetMutableTable(info.table_name)) {
+                InitializeNextAutoId(*stored, table_heaps_[info.table_name].get());
+            }
         }
     }
     LoadIndexesFromDisk();
     LoadTriggersFromDisk();
+}
+
+// [perf] groupby-expr-autoinc: 一次性扫描表，初始化 TableInfo::next_auto_id_。
+// 仅在 LoadFromDisk 后调用一次：把 first-PK 列（最常见的 AUTO_INCREMENT 路径）扫描
+// 一遍，取 MAX(pk) 作为新 id 起点。等价于原 UpsertExecutor 每次都跑 SeqScan 的累计效果。
+// 行为等价性：原版 `row_values[idx] = Value::MakeInt(count + 1)` ——「count」= 扫到的
+// 非 NULL PK 行数，count+1 = 「如果表里最大 PK 是 count（每行 PK 严格递增 1）则正确」，
+// 否则 count+1 可能与新插入行 PK 冲突。但实际自增 ID 永远连续递增——所以「累计新插入
+// 行数 + 1」与「MAX(pk) + 1」结果一致（PK 单调递增 / 每次补号填下一个新值）。
+//
+// 仅当 PK 是 INTEGER 类型时才递增；其它类型或无 PK 时保持 next_auto_id_ = 1。
+void SystemCatalog::InitializeNextAutoId(TableInfo& info, TableHeap* heap) {
+    if (!heap) return;
+    if (info.columns.empty() || !info.columns[0].is_primary_key) return;
+    const ColumnInfo& pk = info.columns[0];
+    // 仅 INTEGER 类型走 MAX(pk) 路径；其它类型保持默认 1。
+    // 原 UpsertExecutor 也仅在 INTEGER 时赋值，其它类型仍会因 row_values[idx].IsNull() 而被跳过。
+    std::string up;
+    up.reserve(pk.data_type.size());
+    for (char c : pk.data_type) up.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    bool pk_is_int = (up == "INT" || up == "INTEGER" || up == "BIGINT");
+    if (!pk_is_int) return;
+    int64_t max_pk = 0;
+    bool seen_any = false;
+    auto it = heap->Begin();
+    while (it.HasNext()) {
+        Tuple t = it.Next({ValueTypeFromString(pk.data_type)});
+        if (t.ColumnCount() == 0) continue;
+        const Value& v = t.GetValue(0);
+        if (v.IsNull()) continue;
+        if (v.GetType() != ValueType::INTEGER) continue;
+        int64_t cur = v.AsInt();
+        if (!seen_any || cur > max_pk) {
+            max_pk = cur;
+            seen_any = true;
+        }
+    }
+    info.next_auto_id_ = seen_any ? (max_pk + 1) : 1;
 }
 
 bool SystemCatalog::CreateTable(const TableInfo& table_info) {

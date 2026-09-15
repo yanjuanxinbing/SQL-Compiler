@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -60,6 +61,14 @@ struct TableInfo {
     // 表加载后只读——SymbolTable::AddTable 在插入前会 RebuildColumnIndex()。
     std::unordered_map<std::string, size_t> column_index_;
 
+    // [perf] groupby-expr-autoinc: 自增 ID 缓存。下一条要分配的自增值；
+    // 初始值 1。UpsertExecutor::PrepareCandidateRow 在 PK 为 NULL 时直接
+    // next_auto_id_++ 取下一个 id，不再全表 SeqScan 计行数。
+    // 持久化：仅内存态；LoadFromDisk 时一次性扫描表把字段初始化为 MAX(pk)+1。
+    // mutable 因为 UpsertExecutor 拿到的是 const TableInfo*（公共 API 不变）。
+    // 并发：当前执行层按 SQL 单语句单线程驱动，无需原子。
+    mutable int64_t next_auto_id_ = 1;
+
     bool HasColumn(const std::string& column_name) const;
     const ColumnInfo* GetColumn(const std::string& column_name) const;
 
@@ -84,6 +93,9 @@ public:
     bool RemoveTable(const std::string& table_name);
     bool HasTable(const std::string& table_name) const;
     const TableInfo* GetTable(const std::string& table_name) const;
+    // [perf] groupby-expr-autoinc: 可变 getter，仅供 catalog 在 LoadFromDisk 等
+    // 初始化路径上回填 next_auto_id_ 等运行期缓存使用。普通执行路径仍然走 const 版本。
+    TableInfo* GetMutableTable(const std::string& table_name);
 
     // 根据 CREATE TABLE 语句注册一张新表
     bool AddTableFromCreateStatement(const CreateTableStatement& stmt);
