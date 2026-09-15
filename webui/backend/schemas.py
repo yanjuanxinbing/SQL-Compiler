@@ -340,20 +340,6 @@ class ResetStorageResponse(BaseModel):
     message: str = ""
 
 
-class PageInfo(BaseModel):
-    page_id: int
-    allocated: bool
-    dirty: bool
-    pin_count: int = 0
-
-
-class StoragePagesResponse(BaseModel):
-    success: bool
-    total_pages: int = 0
-    pages: list[PageInfo] = Field(default_factory=list)
-    message: str = ""
-
-
 # ── Misc ────────────────────────────────────────────────────────────────────
 
 
