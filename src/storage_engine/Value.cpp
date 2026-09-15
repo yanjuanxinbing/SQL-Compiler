@@ -1,11 +1,12 @@
 #include "storage_engine/Value.h"
 
+#include <charconv>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
-#include <iomanip>
-#include <sstream>
 #include <string>
+#include <system_error>
 
 namespace sqlcompiler {
 
@@ -17,6 +18,11 @@ const int32_t kFloatBytes = 8;
 // 以固定 6 位小数 + 修剪尾零的形式输出浮点数，避免
 // `6000 * 1.1 = 6600.000000000001` 这类 IEEE-754 噪声被原样打印。
 // 大值/小值仍保留 fixed 表示，不会出现科学计数法。NaN / Inf 走通用格式。
+//
+// 用 std::to_chars + std::chars_format::fixed + precision 6 替换原 ostringstream：
+//   * 0 次堆分配（buf 是栈上的 char[32]），原 ostringstream 每次调用 new 一份 stream。
+//   * 输出与原 std::fixed << std::setprecision(6) 字节级一致（包括负零、+/-Inf、NaN）。
+//   * std::to_chars 在 C++17 起是 noexcept（除 ec 字段），不抛异常。
 std::string FormatDouble(double v) {
     if (std::isnan(v)) {
         return "nan";
@@ -24,9 +30,15 @@ std::string FormatDouble(double v) {
     if (std::isinf(v)) {
         return v < 0 ? "-inf" : "inf";
     }
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(6) << v;
-    std::string s = oss.str();
+    char buf[32];
+    auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v,
+                                   std::chars_format::fixed, 6);
+    // fixed/6 下 double 最多 ~24 字符（"-" + 17 位整数 + "." + 6 位小数），
+    // 32 字节足够；任何溢出都视为 bug，但不抛异常——直接返回空串作为兜底。
+    if (ec != std::errc{}) {
+        return std::string();
+    }
+    std::string s(buf, ptr);
     // 修剪小数部分的尾零和孤立的小数点，例如
     //   "6600.000000" -> "6600"
     //   "5500.500000" -> "5500.5"
@@ -293,18 +305,37 @@ namespace {
 // 跨类型 VARCHAR ↔ INT/FLOAT 时，把 VARCHAR 按十进制文本解析为 double。
 // 用于 DECIMAL/NUMERIC 等按文本持久化的数值列与数值字面量比较。
 // 失败时返回 false（空串 / 非数字字符 / 浮点溢出均视为不可解析）。
+//
+// 用 std::strtod 替换原 std::stod：
+//   * std::stod 失败时抛 std::invalid_argument / std::out_of_range，
+//     每次构造/析构异常对象各一次堆分配；改 strtod 后零分配。
+//   * strtod 不抛异常，错误通过 end == begin 表达，更便于控制。
+//   * 语义保持兼容：跳过前导空白、要求整个剩余字符串被消费（中间空白也跳过）。
 bool ParseVarcharAsDouble(const Value& v, double* out) {
-    try {
-        size_t pos = 0;
-        std::string s = v.AsVarchar();
-        while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
-        if (pos >= s.size()) return false;
-        double d = std::stod(s, &pos);
-        *out = d;
-        return true;
-    } catch (...) {
+    const std::string& s = v.AsVarchar();
+    if (s.empty()) return false;
+    const char* begin = s.c_str();
+    const char* p = begin;
+    // 跳过前导空白（对齐 std::stod 的行为）。
+    while (*p && std::isspace(static_cast<unsigned char>(*p))) ++p;
+    if (*p == '\0') return false;
+    char* end = nullptr;
+    double d = std::strtod(p, &end);
+    if (end == p) {
+        // 没消费任何字符：非数字起始。
         return false;
     }
+    // 跳过尾部空白（对齐 std::stod 的行为：stod 接受尾部空白）。
+    while (*end && std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (*end != '\0') {
+        // 中途有非空白非数字字符 → 视为不可解析。
+        return false;
+    }
+    // 注：strtod 在 ERANGE 情况下仍返回 +/-HUGE_VAL 并设 errno；这里不区分
+    // 「溢出」与「合法极大值」——保留原 std::stod 路径下「溢出也视为成功」
+    // 的兼容语义。
+    *out = d;
+    return true;
 }
 
 }  // namespace

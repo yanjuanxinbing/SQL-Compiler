@@ -1,6 +1,7 @@
 #include "semantic/SymbolTable.h"
 
 #include <cctype>
+#include <unordered_set>
 
 namespace sqlcompiler {
 
@@ -39,17 +40,24 @@ std::vector<std::vector<std::string>> TableInfo::GetPrimaryKeyGroups() const {
 }
 
 bool TableInfo::HasColumn(const std::string& column_name) const {
-    for (const auto& c : columns) {
-        if (EqualsIgnoreCase(c.name, column_name)) return true;
-    }
-    return false;
+    // [perf] catalog-indexes: O(1) hash 查，先小写化键。原先 O(C·L·allocs)
+    // 的 EqualsIgnoreCase 线性扫描改为一次 ToLower + map find。
+    return column_index_.find(ToLower(column_name)) != column_index_.end();
 }
 
 const ColumnInfo* TableInfo::GetColumn(const std::string& column_name) const {
-    for (const auto& c : columns) {
-        if (EqualsIgnoreCase(c.name, column_name)) return &c;
+    auto it = column_index_.find(ToLower(column_name));
+    if (it == column_index_.end()) return nullptr;
+    return &columns[it->second];
+}
+
+void TableInfo::RebuildColumnIndex() {
+    column_index_.clear();
+    column_index_.reserve(columns.size());
+    // emplace 保证「首次出现优先」——与原 HasColumn 线性扫描返回首个匹配的语义一致。
+    for (size_t i = 0; i < columns.size(); ++i) {
+        column_index_.emplace(ToLower(columns[i].name), i);
     }
-    return nullptr;
 }
 
 SymbolTable::SymbolTable() {
@@ -60,7 +68,10 @@ bool SymbolTable::AddTable(const TableInfo& table_info) {
     if (tables_.find(key) != tables_.end()) return false;
     TableInfo ti = table_info;
     ti.table_name = table_info.table_name;
-    tables_[key] = ti;
+    // [perf] catalog-indexes: 进入 tables_ 前一次性建立列名旁路。
+    // 后续 HasColumn/GetColumn 是 O(1) hash 查，不再每次分配 ToUpper 字符串。
+    ti.RebuildColumnIndex();
+    tables_[key] = std::move(ti);
     return true;
 }
 
@@ -73,6 +84,12 @@ bool SymbolTable::HasTable(const std::string& table_name) const {
 }
 
 const TableInfo* SymbolTable::GetTable(const std::string& table_name) const {
+    auto it = tables_.find(ToLower(table_name));
+    if (it == tables_.end()) return nullptr;
+    return &it->second;
+}
+
+TableInfo* SymbolTable::GetMutableTable(const std::string& table_name) {
     auto it = tables_.find(ToLower(table_name));
     if (it == tables_.end()) return nullptr;
     return &it->second;
@@ -110,17 +127,18 @@ bool SymbolTable::AddTableFromCreateStatement(const CreateTableStatement& stmt) 
     // 同时投影到每列的 is_primary_key，便于既有执行路径（如 InsertExecutor 的
     // 自增逻辑）保持按单列判定的一致性。
     if (!stmt.primary_keys.empty()) {
+        // [perf] catalog-indexes: 先把所有 PK 列名收集进 set，再单遍扫
+        // columns 把命中列标记 is_primary_key。原先是 k·C 嵌套循环，
+        // 改成 O(k + C) —— k 是所有 PK 列展开后的总数（含复合组重复列）。
+        std::unordered_set<std::string> pk_cols;
+        pk_cols.reserve(stmt.columns.size());
         for (const auto& pk : stmt.primary_keys) {
             if (pk.empty()) continue;
             info.primary_keys.push_back(pk);
-            for (const auto& col_name : pk) {
-                for (auto& ci : info.columns) {
-                    if (ci.name == col_name) {
-                        ci.is_primary_key = true;
-                        break;
-                    }
-                }
-            }
+            for (const auto& col_name : pk) pk_cols.insert(col_name);
+        }
+        for (auto& ci : info.columns) {
+            if (pk_cols.count(ci.name)) ci.is_primary_key = true;
         }
     } else {
         // 列内联的 PRIMARY KEY：合并为一个组。若有多列内联标注，按复合主键处理，

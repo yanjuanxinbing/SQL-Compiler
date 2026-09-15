@@ -314,17 +314,46 @@ private:
     std::unique_ptr<TableHeap> index_heap_;  // __sys_indexes__ 堆
     std::unordered_map<std::string, IndexInfo> indexes_;
     std::unordered_map<std::string, std::unique_ptr<BPlusTree>> index_trees_;
+    // [perf] catalog-indexes: table_name → 该表全部 IndexInfo* 的旁路 map。
+    // 指针指向 indexes_ 的 value；unordered_map 的引用在插入时不会失效，
+    // 删除时仅失效被删元素的引用。DropIndex 必须先把指针从本 map 移除，
+    // 再 erase indexes_ 的对应节点，避免悬空指针。
+    std::unordered_map<std::string, std::vector<IndexInfo*>> indexes_by_table_;
+    // [perf] catalog-indexes: 索引名 → 在 __sys_indexes__ 堆上的 RID。
+    // RemoveIndexMetadata 一次 lookup + DeleteTuple，不再 O(R) 扫表。
+    // LoadIndexesFromDisk / PersistIndexMetadata 同步维护。
+    std::unordered_map<std::string, RID> index_rid_by_name_;
 
     // 60_view_trigger (Category 9)：触发器目录堆与物化视图字典。
     std::unique_ptr<TableHeap> trigger_heap_;  // __sys_triggers__ 堆
     std::unordered_map<std::string, MaterializedViewInfo> materialized_views_;
+    // [perf] catalog-indexes: 大小写不敏感旁路。key = lowercased(view_name),
+    // value = views_ / materialized_views_ 中的实际大小写键。
+    // Lookup* 入口先在原 map find，命中即返回；未命中再走 ci_index_。
+    std::unordered_map<std::string, std::string> ci_index_views_;
+    std::unordered_map<std::string, std::string> ci_index_materialized_views_;
 
     // 40_txn_view_udf：视图 / UDF / 触发器字典。
     std::unordered_map<std::string, ViewDefinition> views_;
     std::unordered_map<std::string, FunctionDefinition> functions_;
     std::unordered_map<std::string, TriggerDefinition> triggers_;
+    // [perf] catalog-indexes: 函数名大小写不敏感旁路。
+    std::unordered_map<std::string, std::string> ci_index_functions_;
     // 59_procs (Category 8)：过程字典。
     std::unordered_map<std::string, ProcedureDefinition> procedures_;
+    // [perf] catalog-indexes: 过程名大小写不敏感旁路。
+    std::unordered_map<std::string, std::string> ci_index_procedures_;
+
+    // 60_view_trigger: 触发器名 → 在 __sys_triggers__ 堆上的 RID。
+    // RemoveTriggerMetadata 一次 lookup + DeleteTuple，不再 O(R) 扫表。
+    std::unordered_map<std::string, RID> trigger_rid_by_name_;
+
+    // [perf] catalog-indexes: 表名 → 在 __sys_tables__ 堆上的 RID。
+    // DropPersistedTableMetadata / DropTable 一次 lookup + DeleteTuple，
+    // 不再扫描整张 sys_tables。注意：标记 __sys_tables__ / __sys_indexes__ /
+    // __sys_triggers__ 三条特殊记录不进入此 map（它们的 table_name 是 kSys*Key，
+    // 但不会用作查找）。
+    std::unordered_map<std::string, RID> table_rid_by_name_;
 
     // 53_ddl：schema / sequence / FK 内存态。
     std::unordered_set<std::string> schemas_;
@@ -333,7 +362,9 @@ private:
     std::unordered_map<std::string, std::vector<ForeignKeyDef>> foreign_keys_;
 
     // 将一条表的元数据（表名、列定义列表）编码为记录，追加写入sys_tables堆表
-    bool PersistTableMetadata(const TableInfo& table_info);
+    // [perf] catalog-indexes: out_rid 非空时把插入行的 RID 写回，便于上层建立
+    // table_rid_by_name_ 旁路。失败时不写 out_rid。
+    bool PersistTableMetadata(const TableInfo& table_info, RID* out_rid = nullptr);
 
     // 将sys_tables堆表中的一条记录解码为TableInfo
     TableInfo DecodeTableMetadata(const Tuple& tuple) const;
@@ -341,7 +372,8 @@ private:
     // ---- 索引目录内部实现 ----
     // 确保 __sys_indexes__ 堆存在（必要时创建并把首页 id 记入 sys_tables）
     bool EnsureSysIndexesHeap();
-    bool PersistIndexMetadata(const IndexInfo& index_info);
+    // [perf] catalog-indexes: out_rid 非空时返回新插入的 RID，用于 index_rid_by_name_。
+    bool PersistIndexMetadata(const IndexInfo& index_info, RID* out_rid = nullptr);
     // 从 __sys_indexes__ 删除某条索引元数据
     void RemoveIndexMetadata(const std::string& index_name);
     // 从 __sys_indexes__ 重建全部索引元数据与 B+Tree 句柄
@@ -355,7 +387,8 @@ private:
     // 确保 __sys_triggers__ 堆存在（必要时创建并把首页 id 记入 sys_tables）。
     bool EnsureSysTriggersHeap();
     // 把一条 trigger 元数据写到 __sys_triggers__ 堆。
-    bool PersistTriggerMetadata(const TriggerDefinition& def);
+    // [perf] catalog-indexes: out_rid 非空时返回新插入的 RID。
+    bool PersistTriggerMetadata(const TriggerDefinition& def, RID* out_rid = nullptr);
     // 从 __sys_triggers__ 删除 trigger_name 对应的那条记录。
     void RemoveTriggerMetadata(const std::string& trigger_name);
     // 从 __sys_triggers__ 重新加载全部触发器到内存态。
@@ -366,6 +399,10 @@ private:
     // 反序列化（用 Parser 把字符串重新解析为 ExprPtr）；失败返回空 vector。
     static std::vector<std::pair<std::string, ExprPtr>> DeserializeTriggerAssignments(
         const std::string& text);
+
+    // [perf] groupby-expr-autoinc: 一次性扫描表，初始化 TableInfo::next_auto_id_
+    // 为 MAX(pk) + 1。无 PK 或 PK 没有任何非 NULL 整数时保持默认 1。
+    void InitializeNextAutoId(TableInfo& info, TableHeap* heap);
 };
 
 }  // namespace sqlcompiler

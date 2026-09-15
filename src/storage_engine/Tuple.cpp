@@ -43,40 +43,47 @@ void Tuple::SetRid(const RID& rid) {
 }
 
 std::vector<char> Tuple::Serialize(const std::vector<ValueType>& column_types) const {
-    std::vector<char> out;
     size_t n = std::min(values_.size(), column_types.size());
 
     // BUG-5 (round 2): NULL bitmap —— 每列 1 bit，置于 tuple 字节流的最前面。
     // 旧实现依赖 in-band marker（特殊字节模式），总会与合法值碰撞。
     // 新实现把 NULL 信息外置到 bitmap，per-column slot 只存值本身，
     // 任何 INT（包括 -2147483648 / -1）/ FLOAT / VARCHAR 都可正常存储。
-    size_t bitmap_bytes = (n + 7) / 8;
-    size_t cur = out.size();
-    out.resize(cur + bitmap_bytes);
-    std::memset(out.data() + cur, 0, bitmap_bytes);
-    for (size_t i = 0; i < n; ++i) {
-        if (values_[i].IsNull()) {
-            out[cur + i / 8] |= static_cast<char>(1 << (i % 8));
-        }
-    }
+    const size_t bitmap_bytes = (n + 7) / 8;
 
+    // 第一遍：算总长度，避开逐列 resize 的 O(log n) 重分配链。
+    // vector::resize 在容量不够时触发整体重分配，n 列就触发 O(log n) 次。
+    // 改成两遍后只一次 resize(total)，分配次数从 O(log n) 降到 O(1)。
+    size_t total = bitmap_bytes;
     for (size_t i = 0; i < n; ++i) {
-        const Value& v = values_[i];
-        ValueType col_ty = column_types[i];
-        size_t sz = v.SerializedSize(col_ty);
-        size_t at = out.size();
-        out.resize(at + sz);
-        v.SerializeTo(out.data() + at, col_ty);
+        total += values_[i].SerializedSize(column_types[i]);
     }
-    // Trailing values without column metadata fall back to the previous size.
+    // Trailing values without column metadata fall back to INTEGER width.
     // 这些"无 schema 尾段"的 NULL bitmap 信息已由 n 列的 bitmap 覆盖；
     // 尾段值不会被 Deserialize 读回（Deserialize 只看 column_types.size()）。
     for (size_t i = n; i < values_.size(); ++i) {
-        const Value& v = values_[i];
-        size_t sz = v.SerializedSize(ValueType::INTEGER);
-        size_t at = out.size();
-        out.resize(at + sz);
-        v.SerializeTo(out.data() + at, ValueType::INTEGER);
+        total += values_[i].SerializedSize(ValueType::INTEGER);
+    }
+
+    // 一次性分配目标缓冲区。
+    std::vector<char> out(total);
+    char* dst = out.data();
+
+    // NULL bitmap 清零并按列填位。
+    std::memset(dst, 0, bitmap_bytes);
+    for (size_t i = 0; i < n; ++i) {
+        if (values_[i].IsNull()) {
+            dst[i / 8] |= static_cast<char>(1 << (i % 8));
+        }
+    }
+
+    // 第二遍：把每列值直接 memcpy 到 out 的指定偏移。
+    size_t at = bitmap_bytes;
+    for (size_t i = 0; i < n; ++i) {
+        at += values_[i].SerializeTo(dst + at, column_types[i]);
+    }
+    for (size_t i = n; i < values_.size(); ++i) {
+        at += values_[i].SerializeTo(dst + at, ValueType::INTEGER);
     }
     return out;
 }

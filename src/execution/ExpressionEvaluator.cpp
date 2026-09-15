@@ -391,6 +391,8 @@ ExpressionEvaluator::ExpressionEvaluator(
     const std::unordered_map<std::string, size_t>& column_index_map)
     : column_index_map_(column_index_map), ctx_(nullptr) {
     // 1-arg constructor：ctx/outer_bind/proc_locals 均为 nullptr。
+    // [perf] groupby-expr-autoinc: 构造期建大小写折叠旁路（lowercased key → 下标）。
+    BuildCiCmap();
 }
 
 ExpressionEvaluator::ExpressionEvaluator(
@@ -404,6 +406,26 @@ ExpressionEvaluator::ExpressionEvaluator(
     // proc_locals 优先级低于 outer_bind：当 outer_bind 为空时，列引用优先
     // 解析为 procedure 局部变量；否则按 outer_bind 解析。
     if (!proc_locals_ && ctx_) proc_locals_ = ctx_->GetProcLocals();
+    // [perf] groupby-expr-autoinc: 同上，构造期建大小写折叠旁路。
+    BuildCiCmap();
+}
+
+// [perf] groupby-expr-autoinc: 把 column_index_map_ 的每个 key 一次性 lowercase 化
+// 写入 ci_cmap_。运行期 EvaluateColumnRef miss 后只做一次 hash 查找，不再做 O(C) 扫表。
+// 与原路径语义一致：原 key 优先（find 命中即返回），未命中再走 ci_cmap_（lowercased lookup）。
+// 注意 column_index_map_ 可能存在「同 lowercase 形式不同原 key」的情形——按语义保留
+// 第一个出现的位置（emplace 不覆盖），与原 HasColumn/GetColumn 的线性扫描"先出现优先"一致。
+void ExpressionEvaluator::BuildCiCmap() const {
+    ci_cmap_.clear();
+    ci_cmap_.reserve(column_index_map_.size());
+    for (const auto& kv : column_index_map_) {
+        std::string lc;
+        lc.reserve(kv.first.size());
+        for (char c : kv.first) {
+            lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        }
+        ci_cmap_.emplace(std::move(lc), kv.second);
+    }
 }
 
 Value ExpressionEvaluator::Evaluate(const ExprPtr& expr, const Tuple& tuple) const {
@@ -482,24 +504,22 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
                                               const Tuple& tuple) const {
     // 限定列引用（如 u.id / users.id）优先按 "qualifier.column_name" 精确查找，
     // 找不到时回退到大小写不敏感扫描；仍未命中则退化为裸列名查找。
+    // [perf] groupby-expr-autoinc: 返回 ci_cmap_ 的 iterator（与 column_index_map_
+    // 的 value type 相同，均为 size_t 列下标）。ci_cmap_ 在构造期由 BuildCiCmap 一次性
+    // 把 column_index_map_ 的所有 key lowercase 化写入；调用方原样用 `it->second` 取下标，
+    // 仅把 end 比较从 column_index_map_.end() 改为 ci_cmap_.end()。
+    // 语义保持完全一致：原版「主表精确命中优先；未命中再 lowercase 扫表」等价于
+    // 「ci_cmap_ 命中即返回对应下标」——ci_cmap_ 在 BuildCiCmap 时 emplace 不覆盖，
+    // 同 lowercase 形式只保留首个出现的下标，与原 HasColumn/GetColumn 线性扫描
+    // 「先出现优先」一致。
     auto find_ci = [&](const std::string& key)
         -> std::unordered_map<std::string, size_t>::const_iterator {
-        auto it = column_index_map_.find(key);
-        if (it != column_index_map_.end()) return it;
         std::string lc;
         lc.reserve(key.size());
         for (char c : key) {
             lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
         }
-        for (auto it2 = column_index_map_.begin(); it2 != column_index_map_.end(); ++it2) {
-            std::string kc;
-            kc.reserve(it2->first.size());
-            for (char c : it2->first) {
-                kc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-            }
-            if (kc == lc) return it2;
-        }
-        return column_index_map_.end();
+        return ci_cmap_.find(lc);
     };
     // 子查询求值上下文：当 qualifier 非空且不在内层表集合中时，
     // 该限定列必定引用外层（相关子查询），应优先回退到 outer_bind 而非裸列名。
@@ -539,7 +559,9 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
     if (!expr.table_name.empty()) {
         std::string qkey = expr.table_name + "." + expr.column_name;
         auto itq = find_ci(qkey);
-        if (itq != column_index_map_.end() && itq->second < tuple.ColumnCount()) {
+        // [perf] groupby-expr-autoinc: find_ci 返回 ci_cmap_ 的 iterator，
+        // end 比较针对 ci_cmap_；value 仍然是 size_t 列下标。
+        if (itq != ci_cmap_.end() && itq->second < tuple.ColumnCount()) {
             return tuple.GetValue(itq->second);
         }
         // 限定列未命中时仍尝试未限定列名查找（保持宽恕语义，避免 alias 拼错
@@ -547,7 +569,7 @@ Value ExpressionEvaluator::EvaluateColumnRef(const ColumnRefExpr& expr,
         // 空 qualifier 的 ColumnRefExpr，自然走下面的 fallback 路径。
     }
     auto it = find_ci(expr.column_name);
-    if (it == column_index_map_.end()) {
+    if (it == ci_cmap_.end()) {
         // 相关子查询回退：到外层行绑定中找同名列。
         if (outer_bind_) {
             auto ob = outer_bind_->find(expr.column_name);
