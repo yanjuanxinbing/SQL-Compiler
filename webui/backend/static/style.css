@@ -221,6 +221,7 @@ kbd{font-family:var(--font-mono);font-size:10px;background:var(--bg-active);padd
 
 .result-block{background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;margin-bottom:10px;overflow:hidden}
 .result-block.is-error{border-color:var(--error)}
+.result-block.has-viz{border-left:2px solid var(--accent)}
 .result-head{display:flex;align-items:center;gap:10px;padding:8px 10px;background:var(--bg-tertiary)}
 .result-kind{font-size:10px;text-transform:uppercase;font-weight:700;letter-spacing:0.4px;padding:2px 7px;border-radius:8px;background:var(--bg-active);color:var(--text-secondary)}
 .result-kind.kind-select{background:var(--accent-dim);color:var(--accent)}
@@ -232,9 +233,53 @@ kbd{font-family:var(--font-mono);font-size:10px;background:var(--bg-active);padd
 .result-time{font-size:11px;color:var(--text-faint);font-family:var(--font-mono)}
 .result-toggle{font-size:10px;color:var(--text-muted);border:1px solid var(--border);border-radius:4px;padding:2px 6px}
 .result-toggle:hover{color:var(--text-primary)}
+.result-viz-dot{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:14px;height:14px;border-radius:50%;
+  background:var(--accent-dim);color:var(--accent);
+  font-size:9px;font-weight:700;letter-spacing:0;line-height:1;
+}
+.result-viz-dot[hidden]{display:none}
 .result-statement{font-family:var(--font-mono);font-size:11px;color:var(--text-faint);padding:8px 10px;background:var(--bg-primary);white-space:pre-wrap;word-break:break-all}
 .result-block:not(.is-expanded) .result-statement{display:none}
+.result-block.is-viz-focus{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+.result-block .result-head{cursor:pointer;user-select:none}
+.result-block .result-head:hover{background:var(--bg-hover, var(--bg-secondary))}
 .result-table-wrap{padding:8px 10px;overflow:auto}
+.result-table-wrap .row-count{font-size:11px;color:var(--text-faint);padding:6px 10px 0}
+
+/* 可视化上下文条 — 在 viz 面板顶端显示「当前在可视化哪条语句」 */
+.viz-context{
+  display:flex;flex-wrap:wrap;align-items:center;gap:10px;
+  padding:8px 14px;font-size:12px;color:var(--text-secondary);
+  border-bottom:1px solid var(--border);
+  background:var(--bg-secondary);
+}
+.viz-context[hidden]{display:none}
+.viz-context-idx{
+  font-family:var(--font-mono);font-size:11px;
+  padding:1px 8px;border-radius:10px;
+  background:var(--accent-dim);color:var(--accent);font-weight:600;
+}
+.viz-context-kind{
+  font-size:10px;text-transform:uppercase;font-weight:700;letter-spacing:0.4px;
+  padding:2px 7px;border-radius:8px;background:var(--bg-active);color:var(--text-secondary);
+}
+.viz-context-kind.kind-select{background:var(--accent-dim);color:var(--accent)}
+.viz-context-kind.kind-ddl{background:rgba(196,132,252,0.16);color:var(--purple)}
+.viz-context-kind.kind-dml{background:rgba(74,222,128,0.14);color:var(--success)}
+.viz-context-kind.kind-error{background:rgba(248,113,113,0.16);color:var(--error)}
+.viz-context-sql{
+  font-size:12px;color:var(--text-primary);background:var(--bg-primary);
+  padding:4px 8px;border-radius:4px;border:1px solid var(--border);
+  max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.viz-context-meta{font-size:11px;color:var(--text-muted);font-family:var(--font-mono)}
+
+/* 「重置库」按钮：默认隐藏，连接数据库后启用 */
+.tb-btn-ghost{background:transparent;color:var(--text-muted);border-color:var(--border)}
+.tb-btn-ghost:hover{color:var(--error);border-color:var(--error);background:transparent}
+.tb-btn-ghost[hidden]{display:none}
 .panel.empty-panel{padding:24px;color:var(--text-muted);text-align:center}
 .panel.error-panel{padding:16px;color:var(--error);background:var(--red-soft);border:1px solid var(--error);border-radius:6px;margin:8px 0}
 .panel.error-panel strong{display:block;margin-bottom:6px}

@@ -233,6 +233,165 @@ class TestApiVisualization(unittest.TestCase):
         r = self.client.post("/api/storage/reset", json={})
         self.assertEqual(r.status_code, 409)
 
+    # ── /api/db/close + /api/db/unlink (database reset affordance) ────
+
+    def test_close_db_is_idempotent_on_empty_session(self):
+        """Calling /api/db/close with no open DB returns was_open=False
+        rather than raising — this lets the frontend use it as part of
+        a delete-then-reopen flow without first having to probe."""
+        api_module.SESSION.engine = None
+        api_module.SESSION.db_path = None
+        r = self.client.post("/api/db/close")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["success"])
+        self.assertFalse(body["was_open"])
+        self.assertEqual(body["previous_db_path"], "")
+
+    def test_close_db_drops_session_when_open(self):
+        """When a DB is bound, /api/db/close clears the session and
+        reports was_open=True so the frontend can refresh its UI."""
+        self._open_db()
+        r = self.client.post("/api/db/close")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["success"])
+        self.assertTrue(body["was_open"])
+        self.assertEqual(body["previous_db_path"], "/tmp/fake.db")
+        # The SESSION must be cleared, otherwise the next /api/query/debug
+        # would still try to use a closed engine.
+        self.assertIsNone(api_module.SESSION.engine)
+        self.assertIsNone(api_module.SESSION.db_path)
+
+    def test_unlink_refuses_non_db_extensions(self):
+        """Safety: only `.db` / `.wal` / `.shm` (and variants) are
+        deletable.  Anything else returns 400 to make it impossible to
+        ask the API to delete user source / executables."""
+        r = self.client.post(
+            "/api/db/unlink?path=" + "%5C%5Cevil%5Cmalware.exe"
+            if False else  # never encode a real malware path
+            "/api/db/unlink?path=" + "C:%2FUsers%2FLenovo%2FAppData%2FLocal%2FTemp%2Fevil.exe"
+        )
+        self.assertEqual(r.status_code, 400, msg=r.text)
+        self.assertIn("Refusing", r.json()["detail"])
+
+    def test_unlink_refuses_relative_path(self):
+        """The delete endpoint requires an absolute path.  Relative paths
+        are rejected so the caller can't accidentally target the cwd."""
+        r = self.client.post("/api/db/unlink?path=relative.db")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("absolute", r.json()["detail"])
+
+    def test_unlink_missing_file_is_idempotent(self):
+        """A missing file returns success=True, deleted=False so the
+        delete-then-reopen flow doesn't need a pre-check."""
+        import tempfile as _tf, os as _os
+        path = Path(_tf.gettempdir()) / ("missing_unlink_" + _os.urandom(4).hex() + ".db")
+        self.assertFalse(path.exists())
+        r = self.client.post("/api/db/unlink?path=" + str(path))
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["success"])
+        self.assertFalse(body["deleted"])
+        self.assertFalse(body["cleared_session"])
+
+    def test_unlink_existing_db_clears_open_session(self):
+        """When the path being deleted matches the open DB, the
+        session must be cleared so subsequent requests don't try to
+        read from a now-deleted file."""
+        import tempfile as _tf, os as _os
+        path = Path(_tf.gettempdir()) / ("live_unlink_" + _os.urandom(4).hex() + ".db")
+        path.write_bytes(b"placeholder")
+        try:
+            api_module.SESSION.db_path = str(path)
+            api_module.SESSION.engine = self.fake_engine
+            r = self.client.post("/api/db/unlink?path=" + str(path))
+            self.assertEqual(r.status_code, 200)
+            body = r.json()
+            self.assertTrue(body["deleted"])
+            self.assertTrue(body["cleared_session"])
+            self.assertIsNone(api_module.SESSION.engine)
+            self.assertIsNone(api_module.SESSION.db_path)
+            self.assertFalse(path.exists(), msg="file should be removed")
+        finally:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def test_unlink_db_also_removes_wal_companion(self):
+        """Regression: the engine keeps its ARIES WAL at `<db>.wal` and
+        replays it on every open — even into a freshly created, empty
+        database file.  Deleting only the `.db` therefore left the old
+        catalog recoverable, so "重置库" appeared to succeed while the
+        next run hit the exact same `DuplicateName` / `ArityMismatch` /
+        `ColumnNotFound` errors.  The `.db` delete must take the WAL
+        with it."""
+        import tempfile as _tf, os as _os
+        stem = Path(_tf.gettempdir()) / ("wal_unlink_" + _os.urandom(4).hex() + ".db")
+        wal = Path(str(stem) + ".wal")
+        stem.write_bytes(b"placeholder")
+        wal.write_bytes(b"stale-wal-records")
+        try:
+            r = self.client.post("/api/db/unlink?path=" + str(stem))
+            self.assertEqual(r.status_code, 200, msg=r.text)
+            body = r.json()
+            self.assertTrue(body["deleted"])
+            self.assertEqual(body["companions_deleted"], [str(wal)])
+            self.assertFalse(stem.exists())
+            self.assertFalse(wal.exists(), msg="orphaned WAL must not survive a reset")
+        finally:
+            for f in (stem, wal):
+                try:
+                    f.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def test_unlink_recovers_orphaned_wal_when_db_already_gone(self):
+        """The half-deleted state (`.db` removed, `.wal` left behind) is
+        exactly what the buggy reset produced.  Calling unlink on the
+        missing `.db` path must still clean the orphaned WAL so the user
+        can recover without hunting for the file."""
+        import tempfile as _tf, os as _os
+        stem = Path(_tf.gettempdir()) / ("orphan_wal_" + _os.urandom(4).hex() + ".db")
+        wal = Path(str(stem) + ".wal")
+        wal.write_bytes(b"stale-wal-records")
+        self.assertFalse(stem.exists())
+        try:
+            r = self.client.post("/api/db/unlink?path=" + str(stem))
+            self.assertEqual(r.status_code, 200, msg=r.text)
+            body = r.json()
+            self.assertTrue(body["success"])
+            self.assertFalse(body["deleted"])
+            self.assertEqual(body["companions_deleted"], [str(wal)])
+            self.assertFalse(wal.exists())
+        finally:
+            for f in (stem, wal):
+                try:
+                    f.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def test_unlink_direct_wal_delete_has_no_companions(self):
+        """A direct `.wal` delete must not recurse into `<x>.wal.wal`."""
+        import tempfile as _tf, os as _os
+        base = Path(_tf.gettempdir()) / ("direct_wal_" + _os.urandom(4).hex() + ".db")
+        wal = Path(str(base) + ".wal")
+        wal.write_bytes(b"stale-wal-records")
+        try:
+            r = self.client.post("/api/db/unlink?path=" + str(wal))
+            self.assertEqual(r.status_code, 200, msg=r.text)
+            body = r.json()
+            self.assertTrue(body["deleted"])
+            self.assertEqual(body["companions_deleted"], [])
+            self.assertFalse(wal.exists())
+        finally:
+            for f in (base, wal, Path(str(wal) + ".wal")):
+                try:
+                    f.unlink()
+                except FileNotFoundError:
+                    pass
+
     # ── /api/query/debug populates the stats cache ──────────────────────
 
     def test_query_debug_populates_session_storage_cache(self):
@@ -344,6 +503,60 @@ class TestApiVisualization(unittest.TestCase):
         data = r.json()
         self.assertFalse(data["success"])
         self.assertIn("not found", data["results"][0]["message"])
+
+    def test_execute_forwards_isolation_knobs(self):
+        # on_error / transaction must reach the engine unchanged.
+        self._open_db()
+        self.fake_engine.next_blocks = [_block(True, "OK", kind="dml")]
+        r = self.client.post("/api/query/execute", json={
+            "statement": "INSERT INTO t VALUES (1)",
+            "on_error": "continue",
+            "transaction": True,
+        })
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(
+            self.fake_engine.execute_kwargs,
+            [{"on_error": "continue", "transaction": True}],
+        )
+
+    def test_execute_continue_reports_per_statement_results(self):
+        # A mid-batch failure must not stop later statements, and the API
+        # must expose exactly one result per statement with the diagnostic
+        # on the failing one only.
+        self._open_db()
+        self.fake_engine.next_blocks = [
+            _block(True, "OK", kind="dml"),
+            _block(False, "Error: table not found", kind="error"),
+            _block(True, "OK", kind="dml"),
+        ]
+        r = self.client.post("/api/query/execute", json={
+            "statement": "INSERT INTO t VALUES (1); SELECT * FROM bad; INSERT INTO t VALUES (2);",
+            "on_error": "continue",
+        })
+        data = r.json()
+        self.assertEqual(data["statement_count"], 3)
+        self.assertFalse(data["aborted"])
+        results = data["results"]
+        self.assertTrue(results[0]["success"])
+        self.assertFalse(results[1]["success"])
+        self.assertEqual(results[1]["error"], "Error: table not found")
+        self.assertTrue(results[2]["success"])
+
+    def test_execute_abort_flags_aborted(self):
+        # In abort mode a trailing failure marks the batch as truncated.
+        self._open_db()
+        self.fake_engine.next_blocks = [
+            _block(True, "OK", kind="dml"),
+            _block(False, "Error: table not found", kind="error"),
+        ]
+        r = self.client.post("/api/query/execute", json={
+            "statement": "INSERT INTO t VALUES (1); SELECT * FROM bad;",
+            "on_error": "abort",
+        })
+        data = r.json()
+        self.assertFalse(data["success"])
+        self.assertTrue(data["aborted"])
+        self.assertEqual(data["statement_count"], 2)
 
     # ── API edge cases (boundary / error paths) ────────────────────────
 
@@ -649,9 +862,11 @@ class _FakeEngine:
         self.next_debug: dict | None = None
         self.next_stderr: str = ""
         self.calls: list[tuple[str, str]] = []  # (method, statement)
+        self.execute_kwargs: list[dict] = []  # kwargs passed to execute()
 
-    async def execute(self, statement):
+    async def execute(self, statement, *, on_error="abort", transaction=False):
         self.calls.append(("execute", statement))
+        self.execute_kwargs.append({"on_error": on_error, "transaction": transaction})
         return EngineRunResult(
             success=all(b.success for b in self.next_blocks),
             blocks=list(self.next_blocks),

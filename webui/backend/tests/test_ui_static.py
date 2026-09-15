@@ -245,6 +245,57 @@ class TestAppJsStructure(unittest.TestCase):
         self.assertIn("setVizStatus", self.src)
         self.assertIn("viz-status", self.src)
 
+    def test_db_reset_button_wired(self):
+        # The toolbar must offer a "重置库" button that calls the new
+        # `/api/db/unlink` + `/api/db/close` flow so the user can
+        # recover from stale-state errors without leaving the page.
+        self.assertIn("db-reset-btn", self.src)
+        self.assertIn("resetCurrentDatabase", self.src)
+        self.assertIn("/api/db/unlink", self.src)
+        # The reset button must be visible only when a DB is open —
+        # we expect `dbResetBtn.hidden = !app.dbPath`.
+        self.assertIn("dbResetBtn.hidden", self.src)
+
+    def test_per_statement_viz_badge_added(self):
+        # Each result row should expose a `result-viz-dot` element so
+        # the user can see at a glance which statements have debug
+        # data, and click them to switch the visualisation focus.
+        self.assertIn("result-viz-dot", self.src)
+        self.assertIn("has-viz", self.src)
+        self.assertIn("perStatementDebug", self.src)
+
+    def test_viz_context_bar_present(self):
+        # The viz panel must have a context bar showing which
+        # statement is currently being visualized (#viz-context,
+        # #viz-context-sql, #viz-context-meta, #viz-context-kind).
+        for sid in (
+            "viz-context",
+            "viz-context-idx",
+            "viz-context-sql",
+            "viz-context-kind",
+            "viz-context-meta",
+            "updateVizContext",
+        ):
+            with self.subTest(symbol=sid):
+                self.assertIn(sid, self.src)
+
+    def test_viz_fallback_for_no_debug_envelope(self):
+        # When the engine emits no debug envelope for any statement
+        # (e.g. all statements failed at parse time), the viz panel
+        # should still show a script summary via `ensureVizFallback`.
+        self.assertIn("ensureVizFallback", self.src)
+        # It must reuse the result rows' data so the user can click
+        # through to switch focus.
+        self.assertIn("setActiveResult", self.src)
+
+    def test_close_and_unlink_endpoints_in_app_js(self):
+        # The frontend must call both endpoints to support the reset
+        # flow.  GET/POST forms don't matter here — we only check
+        # URL presence.
+        for ep in ("/api/db/close", "/api/db/unlink"):
+            with self.subTest(endpoint=ep):
+                self.assertIn(ep, self.src)
+
     def test_storage_baseline_resets_on_db_switch(self):
         # The DB-open path must clear storageBaseline + cache + debug
         # so switching databases doesn't show stale deltas.  We use
@@ -321,6 +372,18 @@ class TestStyleCss(unittest.TestCase):
             ".json-raw",
             ".btn-ghost",
             ".badge",
+            # Visualization affordances added by the latest round of
+            # optimization — viz availability badge on result rows,
+            # viz context bar (which statement am I looking at?) and
+            # the toolbar "重置库" button ghost variant.
+            ".result-viz-dot",
+            ".result-block.has-viz",
+            ".viz-context",
+            ".viz-context-idx",
+            ".viz-context-kind",
+            ".viz-context-sql",
+            ".viz-context-meta",
+            ".tb-btn-ghost",
         ):
             with self.subTest(cls=cls):
                 self.assertIn(cls, self.css)

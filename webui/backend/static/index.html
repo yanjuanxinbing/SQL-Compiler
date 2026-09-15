@@ -36,6 +36,10 @@
   <button class="tb-btn" id="db-pill" type="button" title="选择数据库">
     <span class="tb-status-hint" id="db-pill-label">未连接数据库</span>
   </button>
+  <button class="tb-btn tb-btn-ghost" id="db-reset-btn" type="button" hidden
+    title="删除当前 .db 并以同名 + 时间戳重新打开，适合在测试用例加载失败时清除残留状态">
+    重置库
+  </button>
 
   <div class="toolbar-status" id="engine-status">
     <span class="status-dot"></span>
@@ -175,6 +179,12 @@
         <!-- 可视化（Token/AST/Plan/Compare/Storage 共享容器） -->
         <div class="panel-content" data-panel="viz">
           <div class="viz-status" id="viz-status" role="status" aria-live="polite" hidden></div>
+          <div class="viz-context" id="viz-context" hidden>
+            <span class="viz-context-idx"><span id="viz-context-idx">—</span></span>
+            <span class="viz-context-kind" id="viz-context-kind"></span>
+            <code class="viz-context-sql mono" id="viz-context-sql"></code>
+            <span class="viz-context-meta" id="viz-context-meta"></span>
+          </div>
           <div class="panel-scroll" id="viz-content">
             <div class="viz-empty">
               <p>在上方输入 SQL 并点击「执行」，编译管线（词法 / 语法 / 执行计划 / 存储）将在此可视化。</p>

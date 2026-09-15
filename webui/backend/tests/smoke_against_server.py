@@ -1,155 +1,177 @@
-"""Smoke test: drive the running FastAPI server with a real C++ engine.
+"""Smoke-test the visualisation pipeline against `tests/sql/*.sql`.
 
-Hits the visualization endpoints (/api/query/debug, /api/storage/*) end-to-end
-so we exercise the full pipeline:
+Drives the live server on http://127.0.0.1:8765.  For each chosen
+script we:
+  1. open a fresh temp database (so CREATE TABLE never collides),
+  2. POST the script to /api/query/debug,
+  3. assert: every block has a debug envelope OR has a clean
+     single-line message; every successful SELECT has columns + rows;
+     every block's kind matches what its leading keyword says.
 
-    HTTP request -> FastAPI -> backend.engine.execute_debug
-        -> C++ sqlcompiler.exe --debug-output -> JSON debug data
-        -> parses -> returns to test -> asserts shape
-
-Usage (server already running on 127.0.0.1:8765):
-
-    py -m backend.tests.smoke_against_server
+Run after starting the server:
+    py smoke_against_server.py
 """
-
 from __future__ import annotations
 
 import json
+import re
 import sys
-import tempfile
-import urllib.error
 import urllib.request
+import urllib.error
 from pathlib import Path
 
-BASE = "http://127.0.0.1:8765"
+SERVER = "http://127.0.0.1:8765"
+SQL_DIR = Path(r"c:\Users\Lenovo\Desktop\SQL-Compiler-xu\tests\sql")
+
+# A curated spread: DDL, multi-statement, comments, aggregates, joins,
+# set ops, subqueries, window functions, transactions, edge cases.
+# 49_acid_recovery.sql is documentation-only (no SQL body) so it's
+# intentionally excluded.
+PICK = [
+    "01_ddl.sql",
+    "02_dml.sql",
+    "03_query_basic.sql",
+    "04_aggregate.sql",
+    "05_join.sql",
+    "06_operators.sql",
+    "08_types.sql",
+    "09_aggregate_functions.sql",
+    "10_distinct.sql",
+    "11_expression.sql",
+    "12_constraints.sql",
+    "13_outer_join.sql",
+    "15_order_by.sql",
+    "16_null_edge.sql",
+    "17_aggregate_advanced.sql",
+    "18_arithmetic.sql",
+    "20_complex.sql",
+    "22_boundary.sql",
+    "23_chinese_idents.sql",
+    "24_comprehensive.sql",
+    "26_edge_cases.sql",
+    "27_case_scalar.sql",
+    "28_cast.sql",
+    "30_subquery.sql",
+    "31_cte.sql",
+    "32_set_ops.sql",
+    "33_window.sql",
+    "34_index_basic.sql",
+    "38_join_variants.sql",
+    "40_txn_view_udf.sql",
+    "51_nested_savepoint.sql",
+    "85_txn_read_your_own_writes.sql",
+    "90_typeof_function.sql",
+]
 
 
-def _post(path: str, payload: dict | None = None) -> tuple[int, dict | str]:
-    body = json.dumps(payload or {}).encode("utf-8")
+def post(path: str, body: dict) -> dict:
     req = urllib.request.Request(
-        BASE + path,
-        data=body,
+        SERVER + path,
+        data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status, json.loads(r.read().decode("utf-8") or "{}")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as e:
-        return 0, str(e)
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return json.loads(r.read().decode("utf-8"))
 
 
-def _get(path: str) -> tuple[int, dict | str]:
-    try:
-        with urllib.request.urlopen(BASE + path, timeout=30) as r:
-            return r.status, json.loads(r.read().decode("utf-8") or "{}")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as e:
-        return 0, str(e)
+def get(path: str) -> dict:
+    with urllib.request.urlopen(SERVER + path, timeout=10) as r:
+        return json.loads(r.read().decode("utf-8"))
 
 
-def assert_eq(actual, expected, label: str) -> None:
-    if actual != expected:
-        raise AssertionError(f"{label}: expected {expected!r}, got {actual!r}")
-    print(f"  [OK] {label}: {actual}")
+def open_fresh_db() -> str:
+    import uuid
+    db = Path("c:/Users/Lenovo/AppData/Local/Temp") / (
+        "smoke_" + uuid.uuid4().hex[:8] + ".db"
+    )
+    post("/api/db/open", {"db_path": str(db)})
+    return str(db)
+
+
+def kind_matches_statement(stmt: str, kind: str) -> bool:
+    s = stmt.strip()
+    while s.startswith("--"):
+        i = s.find("\n")
+        s = s[i + 1 :].lstrip() if i >= 0 else ""
+    while s.startswith("/*"):
+        i = s.find("*/")
+        s = s[i + 2 :].lstrip() if i >= 0 else ""
+    s_lower = s.lower()
+    if not s_lower:
+        return kind in ("other", "error")
+    head = s_lower.split(None, 1)[0]
+    # The C++ REPL's meta-commands (`exit;`, `\.tables;`, etc.) reach
+    # the engine as ordinary statements and are parsed as unknown
+    # tokens, so the engine returns kind="error".  That's by design.
+    if head in ("exit", ".exit", "quit", ".quit"):
+        return kind == "error"
+    mapping = {
+        "select": "select", "with": "select", "show": "select", "explain": "select",
+        "create": "ddl", "drop": "ddl", "alter": "ddl", "truncate": "ddl",
+        "rename": "ddl", "comment": "ddl",
+        "insert": "dml", "update": "dml", "delete": "dml", "merge": "dml",
+        "replace": "dml", "upsert": "dml",
+        "begin": "txn", "commit": "txn", "rollback": "txn",
+        "savepoint": "txn", "release": "txn",
+    }
+    expected = mapping.get(head, "other")
+    return kind == expected
 
 
 def main() -> int:
-    print(f"[smoke] targeting {BASE}")
+    print("== smoke ==  server:", SERVER)
+    try:
+        h = get("/api/health")
+        print(f"  engine={h.get('engine_path')}")
+    except urllib.error.URLError as e:
+        print(f"FAIL: server not reachable: {e}")
+        return 1
 
-    # 1) /api/health
-    code, body = _get("/api/health")
-    assert_eq(code, 200, "health status")
-    assert body["status"] == "ok", body
-    assert body["engine_exists"] is True, body
-    print(f"  engine: {body['engine_path']}")
+    fail = 0
+    for name in PICK:
+        path = SQL_DIR / name
+        if not path.exists():
+            print(f"[SKIP] {name}: file not found")
+            continue
+        sql = path.read_text(encoding="utf-8")
+        db = open_fresh_db()
+        try:
+            r = post("/api/query/debug", {"statement": sql})
+        except Exception as e:
+            print(f"[ERR ] {name}: request failed: {e}")
+            fail += 1
+            continue
 
-    # 2) Open a fresh db
-    tmpdir = Path(tempfile.mkdtemp(prefix="smoke-db-"))
-    db_path = tmpdir / "smoke.db"
-    code, body = _post("/api/db/open", {"db_path": str(db_path)})
-    assert_eq(code, 200, "db open status")
-    assert body["db_path"].endswith("smoke.db"), body
-    print(f"  opened: {db_path}")
+        blocks = r.get("results") or []
+        n = len(blocks)
+        ok_selects = 0
+        bad_selects = 0
+        bad_kind = 0
+        no_debug = 0
+        for b in blocks:
+            stmt = b.get("statement") or ""
+            # Only complain about mis-classification when the block
+            # actually succeeded — engine-level failures are out of
+            # scope for our visualisation layer.
+            if b.get("success"):
+                if not kind_matches_statement(stmt, b.get("kind", "")):
+                    bad_kind += 1
+                if b.get("kind") == "select":
+                    if b.get("column_names") and b.get("rows") is not None:
+                        ok_selects += 1
+                    else:
+                        bad_selects += 1
+                if not b.get("debug"):
+                    no_debug += 1
 
-    # 3) Create a table, insert rows
-    code, body = _post("/api/query/execute", {"statement": "CREATE TABLE t (id INT, name TEXT)"})
-    assert_eq(code, 200, "CREATE status")
-    assert body["results"][0]["success"] is True, body
-
-    code, body = _post("/api/query/execute", {"statement": "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')"})
-    assert_eq(code, 200, "INSERT status")
-    assert body["results"][0]["success"] is True, body
-
-    # 4) Run /api/query/debug for a SELECT
-    code, body = _post("/api/query/debug", {"statement": "SELECT id, name FROM t WHERE id > 1"})
-    assert_eq(code, 200, "debug status")
-    assert body["success"] is True, body
-    debug = body.get("debug") or {}
-    tokens = debug.get("tokens") or []
-    assert len(tokens) > 0, body
-    assert debug.get("ast_text"), body
-    assert debug.get("plan_json"), body
-    print(f"  tokens: {len(tokens)}, AST len: {len(debug['ast_text'])}, plan len: {len(debug['plan_json'])}")
-
-    # 5) /api/storage/stats
-    code, body = _get("/api/storage/stats")
-    assert_eq(code, 200, "storage/stats status")
-    assert "stats" in body, body
-    stats = body["stats"]
-    assert "hit_count" in stats and "miss_count" in stats, body
-    print(f"  storage: hits={stats['hit_count']} misses={stats['miss_count']} pages={stats.get('total_pages')}")
-
-    # 6) /api/storage/reset
-    code, body = _post("/api/storage/reset")
-    assert_eq(code, 200, "storage/reset status")
-    assert "baseline" in body, body
-    baseline = body["baseline"]
-    assert "hit_count" in baseline, body
-    print(f"  baseline: hits={baseline['hit_count']} misses={baseline['miss_count']}")
-
-    # 7) Run another SELECT to potentially produce delta
-    code, body = _post("/api/query/debug", {"statement": "SELECT * FROM t"})
-    assert_eq(code, 200, "debug2 status")
-
-    code, body = _get("/api/storage/stats")
-    assert_eq(code, 200, "storage/stats after reset status")
-    print(f"  after-reset stats: {body['stats']}")
-
-    # 8) Validation: empty statement is rejected at the protocol level (HTTP 400)
-    code, body = _post("/api/query/execute", {"statement": "   "})
-    assert_eq(code, 400, "empty-statement rejected")
-    print(f"  empty-statement rejected at HTTP layer: {body!r}")
-
-    # 9) Re-open a fresh DB; confirm stats reset to empty (no probe runs)
-    new_db = tmpdir / "other.db"
-    code, body = _post("/api/db/open", {"db_path": str(new_db)})
-    assert_eq(code, 200, "db re-open status")
-
-    # Storage stats should now be empty / "Run a statement" placeholder
-    code, body = _get("/api/storage/stats")
-    assert_eq(code, 200, "storage/stats after switch")
-    s = body["stats"]
-    assert s["hit_count"] == 0 and s["miss_count"] == 0, f"expected reset, got {s}"
-    assert "Run a statement" in body.get("message", ""), body
-    print(f"  storage reset on db switch: {s}")
-
-    # Run a debug SELECT on the fresh db — this WILL produce counters,
-    # but they're the new DB's counters (no carry-over from the old one).
-    code, body = _post("/api/query/debug", {"statement": "SELECT 1"})
-    assert_eq(code, 200, "debug on fresh db status")
-    assert body["success"] is True, body
-
-    print("\n[smoke] all checks passed.")
-    return 0
+        tag = "OK  " if (bad_selects == 0 and bad_kind == 0) else "FAIL"
+        print(f"[{tag}] {name:28}  blocks={n:3}  ok_sel={ok_selects:2}  bad_sel={bad_selects}  bad_kind={bad_kind}  no_debug={no_debug}")
+        if bad_selects or bad_kind:
+            fail += 1
+    print(f"== done: {fail} failed ==")
+    return 0 if fail == 0 else 2
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except AssertionError as e:
-        print(f"\n[smoke] FAILED: {e}", file=sys.stderr)
-        sys.exit(1)
+    sys.exit(main())

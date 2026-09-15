@@ -32,9 +32,11 @@ if str(_PKG_PARENT) not in sys.path:
     sys.path.insert(0, str(_PKG_PARENT))
 
 from backend.engine import (  # noqa: E402
+    EngineRunResult,
     ParsedBlock,
     SqlEngine,
     _classify_kind,
+    _norm_statement,
     _parse_one_block,
     _split_blocks,
     _strip_cell_padding,
@@ -586,13 +588,13 @@ class TestSplitBlocksEdgeCases(unittest.TestCase):
         stderr = "Error: runtime error at line 5\n"
         blocks = _split_blocks(stdout, ["SELECT 1", "SELECT 2"], stderr)
         self.assertEqual(len(blocks), 2)
-        # First block: parser sees the successful SELECT in stdout but
-        # also sees an Error in stderr — the current implementation is
-        # pessimistic and tags the block as a failure so the user
-        # never sees a green "OK" while an error was emitted.  This
-        # regression-guard documents that behaviour.
-        self.assertFalse(blocks[0].success)
-        # Second block: padded, inherits the error.
+        # First block: has its own stdout (a successful SELECT).  The
+        # new implementation trusts the block's stdout before stderr
+        # (stderr is shared in multi-file mode and may belong to a
+        # *different* statement).  So the first block stays successful.
+        self.assertTrue(blocks[0].success)
+        # Second block: padded, inherits the error (its stdout is empty
+        # AND stderr has an error, so we still report failure here).
         self.assertFalse(blocks[1].success)
         self.assertEqual(blocks[1].kind, "error")
 
@@ -773,6 +775,425 @@ class TestSchemas(unittest.TestCase):
         self.assertEqual(d2.storage_stats.hit_count, 2)
         self.assertEqual(d2.replacement_log[0].evicted, 1)
         self.assertTrue(d2.replacement_log[0].dirty)
+
+
+# ── Multi-statement: block comments / noise / txn-control helpers ───────────
+
+
+class TestSplitStatementsBlockComments(unittest.TestCase):
+    """The splitter must also honour `/* … */` block comments."""
+
+    def test_block_comment_with_semicolon_not_a_split(self):
+        out = SqlEngine._split_statements("/* ; ; */ SELECT 1;")
+        # The `;` inside the block comment must NOT split.
+        self.assertEqual(len(out), 1)
+        self.assertIn("SELECT 1", out[0])
+
+    def test_block_comment_between_statements(self):
+        out = SqlEngine._split_statements(
+            "SELECT 1 /* ; */; SELECT 2 /* ; */;"
+        )
+        self.assertEqual(out, ["SELECT 1 /* ; */", "SELECT 2 /* ; */"])
+
+    def test_unterminated_block_comment_swallows_semicolons(self):
+        # An unterminated /* keeps running; every `;` stays inside it and
+        # the whole input collapses into one statement (parser rejects it
+        # later).  We must not crash.
+        out = SqlEngine._split_statements("/* a ; b ; c")
+        self.assertEqual(len(out), 1)
+        self.assertIn("/* a", out[0])
+
+    def test_literal_newline_in_string_kept_by_norm(self):
+        # A string literal containing a real newline must be preserved by
+        # the statement normaliser (a whitespace collapse would corrupt it).
+        stmt = "INSERT INTO t VALUES ('line1\nline2')"
+        self.assertEqual(_norm_statement(stmt), stmt + ";")
+
+
+class TestIsEmptyOrComment(unittest.TestCase):
+    """Distinguish executable SQL from blank / comment-only noise."""
+
+    def test_blank_is_empty(self):
+        self.assertTrue(SqlEngine._is_empty_or_comment(""))
+        self.assertTrue(SqlEngine._is_empty_or_comment("   \n\t "))
+
+    def test_line_comment_only(self):
+        self.assertTrue(SqlEngine._is_empty_or_comment("-- nothing here"))
+
+    def test_block_comment_only(self):
+        self.assertTrue(SqlEngine._is_empty_or_comment("/* just a note */"))
+
+    def test_leading_comment_with_sql_is_not_empty(self):
+        self.assertFalse(SqlEngine._is_empty_or_comment("-- note\nSELECT 1"))
+
+    def test_real_statement(self):
+        self.assertFalse(SqlEngine._is_empty_or_comment("SELECT 1"))
+
+
+class TestIsTxnControl(unittest.TestCase):
+    """Transaction control statements must be recognised so they route to
+    single-process execution (the C++ engine commits/rolls back in-process)."""
+
+    def test_begin_commit_rollback(self):
+        for kw in ("BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT sp", "RELEASE SAVEPOINT sp"):
+            self.assertTrue(SqlEngine._is_txn_control(kw))
+
+    def test_lowercase_and_semicolon_ok(self):
+        self.assertTrue(SqlEngine._is_txn_control("begin"))
+        self.assertTrue(SqlEngine._is_txn_control("COMMIT;"))
+
+    def test_leading_comment_then_txn(self):
+        self.assertTrue(SqlEngine._is_txn_control("-- start\nBEGIN"))
+
+    def test_non_txn_returns_false(self):
+        for kw in ("SELECT 1", "INSERT INTO t", "CREATE TABLE", "UPDATE t"):
+            self.assertFalse(SqlEngine._is_txn_control(kw))
+
+
+class TestIsReplMeta(unittest.TestCase):
+    """REPL meta-commands (`exit;`, `\\.tokens;`, `.source …`) must be
+    stripped from user SQL scripts before execution — the C++ engine
+    banner lists them as prompt commands, and every `tests/sql/*.sql`
+    file ends with `exit;` which used to surface as a red syntax
+    error block at the end of every batch run."""
+
+    def test_exit_and_quit_variants(self):
+        for kw in ("exit", "exit;", "EXIT", "Exit;", "quit", "QUIT;"):
+            self.assertTrue(SqlEngine._is_repl_meta(kw), msg=kw)
+
+    def test_dot_and_backslash_meta(self):
+        for kw in (".source foo.sql", "\\.tokens", "\\.ast", "\\.plan", ".read bar.sql"):
+            self.assertTrue(SqlEngine._is_repl_meta(kw), msg=kw)
+
+    def test_leading_comment_then_meta(self):
+        self.assertTrue(SqlEngine._is_repl_meta("-- goodbye\nexit"))
+        self.assertTrue(SqlEngine._is_repl_meta("/* bye */ exit;"))
+
+    def test_real_sql_returns_false(self):
+        for kw in ("SELECT 1", "INSERT INTO t VALUES (1)", "CREATE TABLE t(id INT)",
+                   "BEGIN", "COMMIT", "ROLLBACK", "EXPLAIN SELECT 1"):
+            self.assertFalse(SqlEngine._is_repl_meta(kw), msg=kw)
+
+    def test_select_column_named_exit_returns_false(self):
+        """`SELECT exit_value FROM t` must NOT be treated as a meta-command.
+        We classify by the *first whitespace-separated token*, so an
+        identifier starting with `exit` is fine."""
+        self.assertFalse(SqlEngine._is_repl_meta("SELECT exit_value FROM t"))
+
+
+class TestNormStatement(unittest.TestCase):
+    """`_norm_statement` fixes the terminator without touching the body."""
+
+    def test_adds_semicolon(self):
+        self.assertEqual(_norm_statement("SELECT 1"), "SELECT 1;")
+
+    def test_dedupes_trailing_semicolons(self):
+        self.assertEqual(_norm_statement("SELECT 1;;;"), "SELECT 1;")
+
+    def test_strips_outer_whitespace(self):
+        self.assertEqual(_norm_statement("  SELECT 1 ; "), "SELECT 1;")
+
+
+# ── Multi-statement: per-statement isolation strategies ─────────────────────
+
+
+class _ScriptedEngine(SqlEngine):
+    """SqlEngine whose `run_script` feeds canned blocks per statement."""
+
+    def __init__(self, outcomes):
+        self.calls: list[str] = []
+        self._outcomes = outcomes
+        super().__init__(Path("C:/nonexistent/sqlcompiler.exe"), Path("C:/tmp/x.db"))
+
+    async def run_script(self, sql):
+        self.calls.append(sql)
+        idx = len(self.calls) - 1
+        blk = self._outcomes[min(idx, len(self._outcomes) - 1)]
+        return EngineRunResult(success=blk.success, blocks=[blk])
+
+
+class TestRunEachStatement(unittest.TestCase):
+    """The per-statement executor honours abort-vs-continue isolation."""
+
+    def _ok(self):
+        return ParsedBlock(success=True, message="OK", kind="dml")
+
+    def _fail(self):
+        return ParsedBlock(success=False, message="Error: baseline", kind="error")
+
+    def test_abort_stops_at_first_failure(self):
+        eng = _ScriptedEngine([self._ok(), self._fail(), self._ok()])
+        import asyncio
+        run = asyncio.run(eng.execute("INSERT 1; SELECT bad; INSERT 2;"))
+        # aborted → only the first two statements ran
+        self.assertEqual(len(eng.calls), 2)
+        self.assertEqual(len(run.blocks), 2)
+        self.assertFalse(run.success)
+        self.assertTrue(run.blocks[0].success)
+        self.assertFalse(run.blocks[1].success)
+
+    def test_continue_isolates_each_failure(self):
+        eng = _ScriptedEngine([self._ok(), self._fail(), self._ok()])
+        import asyncio
+        run = asyncio.run(eng.execute("INSERT 1; SELECT bad; INSERT 2;", on_error="continue"))
+        # continue → all three statements run
+        self.assertEqual(len(eng.calls), 3)
+        self.assertEqual(len(run.blocks), 3)
+        self.assertFalse(run.blocks[1].success)
+        self.assertTrue(run.blocks[0].success and run.blocks[2].success)
+
+    def test_single_statement_uses_run_script_directly(self):
+        eng = _ScriptedEngine([self._ok()])
+        import asyncio
+        asyncio.run(eng.execute("INSERT INTO t VALUES (1)"))
+        # single statement → go straight to run_script (one call), no split loop
+        self.assertEqual(len(eng.calls), 1)
+
+    def test_comment_only_script_yields_no_blocks(self):
+        eng = _ScriptedEngine([])
+        import asyncio
+        run = asyncio.run(eng.execute("-- only a comment\n"))
+        self.assertTrue(run.success)
+        self.assertEqual(run.blocks, [])
+
+
+# ── Real-engine integration: multi-statement, transaction, concurrency ──────
+
+_NATIVE = find_engine_binary()
+
+
+@unittest.skipUnless(_NATIVE, "sqlcompiler engine binary not available")
+class TestNativeMultiStatement(unittest.TestCase):
+    """End-to-end against the compiled engine, using throwaway DB files.
+
+    These prove the *observable* multi-statement behaviour: exact result
+    attribution when a statement fails mid-batch, abort vs continue, the
+    implicit transaction wrapper, and explicit ROLLBACK consistency.
+    """
+
+    @staticmethod
+    def _fresh_engine():
+        import tempfile as _tf
+        db = Path(_tf.gettempdir()) / (
+            "intg_" + os.urandom(4).hex() + ".db"
+        )
+        return SqlEngine(_NATIVE, db), db
+
+    def test_failed_statement_does_not_corrupt_neighbours(self):
+        # Regression: a failing statement used to shift every subsequent
+        # statement's output.  Per-statement execution must keep them exact.
+        import asyncio
+        eng, db = self._fresh_engine()
+        try:
+            sql = ("CREATE TABLE t (id INT);"
+                   "INSERT INTO t VALUES (1);"
+                   "SELECT * FROM missing_x;"
+                   "INSERT INTO t VALUES (2);"
+                   "SELECT COUNT(*) AS n FROM t;")
+            run = asyncio.run(eng.execute(sql, on_error="continue"))
+            self.assertEqual(len(run.blocks), 5)
+            self.assertTrue(run.blocks[0].success)   # CREATE
+            self.assertTrue(run.blocks[1].success)   # INSERT 1
+            self.assertFalse(run.blocks[2].success)  # missing table
+            self.assertEqual(run.blocks[2].kind, "error")
+            self.assertIn("missing_x", run.blocks[2].message)
+            self.assertTrue(run.blocks[3].success)  # INSERT 2 (after the failure)
+            # The final SELECT sees BOTH inserts, not the failing query.
+            self.assertEqual(run.blocks[4].column_names, ["n"])
+            self.assertEqual(run.blocks[4].rows, [["2"]])
+        finally:
+            db.unlink(missing_ok=True)
+
+    def test_abort_stops_execution(self):
+        import asyncio
+        eng, db = self._fresh_engine()
+        try:
+            sql = "CREATE TABLE t (id INT); INSERT INTO t VALUES (1); SELECT * FROM missing; INSERT INTO t VALUES (2);"
+            run = asyncio.run(eng.execute(sql))  # default abort
+            self.assertFalse(run.success)
+            # abort → stops at the failing statement
+            self.assertEqual(len(run.blocks), 3)
+            self.assertTrue(run.blocks[0].success)
+            self.assertTrue(run.blocks[1].success)
+            self.assertFalse(run.blocks[2].success)
+            self.assertEqual(len(run.blocks), 3)
+        finally:
+            db.unlink(missing_ok=True)
+
+    def test_implicit_transaction_commits_atomically(self):
+        import asyncio
+        eng, db = self._fresh_engine()
+        try:
+            sql = ("CREATE TABLE t (id INT);"
+                   "INSERT INTO t VALUES (1);"
+                   "INSERT INTO t VALUES (2);"
+                   "SELECT COUNT(*) AS n FROM t;")
+            run = asyncio.run(eng.execute(sql, transaction=True))
+            # transaction wrapper must NOT leak BEGIN/COMMIT as results
+            self.assertTrue(run.success)
+            self.assertEqual(len(run.blocks), 4)
+            self.assertEqual(run.blocks[3].rows, [["2"]])
+        finally:
+            db.unlink(missing_ok=True)
+
+    def test_explicit_rollback_discards_changes(self):
+        import asyncio
+        eng, db = self._fresh_engine()
+        try:
+            eng_boot = asyncio.run(eng.execute("CREATE TABLE tt (id INT);"))
+            self.assertTrue(eng_boot.success)
+            sql = "BEGIN; INSERT INTO tt VALUES (99); ROLLBACK; SELECT COUNT(*) AS n FROM tt;"
+            run = asyncio.run(eng.execute(sql))
+            self.assertTrue(run.success)
+            self.assertEqual(len(run.blocks), 4)  # BEGIN, INSERT, ROLLBACK, SELECT
+            # the rolled-back INSERT must be absent
+            self.assertEqual(run.blocks[3].rows, [["0"]])
+        finally:
+            db.unlink(missing_ok=True)
+
+    def test_concurrent_batches_on_isolated_databases(self):
+        # Each batch uses its own DB file and its own subprocess, so
+        # concurrent execution must not cross-contaminate.
+        import asyncio
+        engines = [self._fresh_engine() for _ in range(4)]
+
+        async def run_one(i):
+            eng, _db = engines[i]
+            return await eng.execute(
+                "CREATE TABLE t (id INT);"
+                f"INSERT INTO t VALUES ({i});"
+                f"SELECT COUNT(*) AS n FROM t;",
+                on_error="continue",
+            )
+
+        async def main():
+            return await asyncio.gather(*(run_one(i) for i in range(4)))
+
+        try:
+            runs = asyncio.run(main())
+            for i, run in enumerate(runs):
+                self.assertTrue(run.success)
+                self.assertEqual(len(run.blocks), 3)
+                self.assertEqual(run.blocks[2].rows, [["1"]])
+        finally:
+            for _eng, db in engines:
+                db.unlink(missing_ok=True)
+
+    def test_debug_multi_statement_isolates_results(self):
+        # The editor runs through execute_debug; a multi-statement script
+        # must isolate results too, without re-running DML (no side effects).
+        import asyncio
+        eng, db = self._fresh_engine()
+        try:
+            sql = ("CREATE TABLE t (id INT);"
+                   "INSERT INTO t VALUES (1);"
+                   "SELECT * FROM missing_x;"
+                   "INSERT INTO t VALUES (2);"
+                   "SELECT COUNT(*) AS n FROM t;")
+            run, debug = asyncio.run(eng.execute_debug(sql))
+            self.assertEqual(len(run.blocks), 5)
+            self.assertTrue(run.blocks[0].success)
+            self.assertTrue(run.blocks[1].success)
+            self.assertFalse(run.blocks[2].success)  # missing table
+            self.assertTrue(run.blocks[3].success)
+            # final SELECT sees both inserts exactly (isolation regression)
+            self.assertEqual(run.blocks[4].rows, [["2"]])
+            # debug JSON captured from the last successfully-compiled stmt
+            self.assertIsNotNone(debug)
+        finally:
+            db.unlink(missing_ok=True)
+
+    def test_debug_multi_statement_stderr_per_statement_attribution(self):
+        """Regression: previously `_assemble_multistatement_debug` popped
+        every leading/trailing empty segment and assigned ONE shared
+        first-stderr-error to every empty block — so a multi-statement
+        script with 4 distinct errors would show all 4 blocks carrying
+        the SAME first error (DuplicateName) and the (empty-stdout)
+        CREATE block would even receive a successful SELECT's stdout
+        because the popping collapsed segment slots.
+
+        Per-statement stderr attribution must now mark each empty-
+        stdout block with its own error (in order) and not mis-align
+        the SELECT output of a successful block onto a CREATE block.
+        The way to provoke this reliably is to first seed the DB with
+        a `t(id, name)` table and then run the user's exact 06_operators
+        prologue (CREATE 4-col, 5 INSERTs of 4 vals, 14 SELECTs).
+        """
+        import asyncio
+        eng, db = self._fresh_engine()
+        try:
+            # Seed a 2-col `t` table so subsequent 4-col CREATE/INSERTs fail.
+            asyncio.run(eng.execute(
+                "CREATE TABLE t(id INT, name VARCHAR);"
+            ))
+
+            sql = ("CREATE TABLE t(id INT, name VARCHAR, age INT, status VARCHAR);"
+                   "INSERT INTO t VALUES (1, 'A', 20, 'active');"
+                   "INSERT INTO t VALUES (2, 'B', 25, 'inactive');"
+                   "SELECT * FROM t WHERE id = 1;")  # works against 2-col seed
+
+            run, _ = asyncio.run(eng.execute_debug(sql))
+            self.assertEqual(len(run.blocks), 4)
+
+            # Block 0 must be attributed with DuplicateName (not assigned
+            # the SELECT output from block 3 — the historic mis-alignment).
+            self.assertFalse(run.blocks[0].success)
+            self.assertEqual(run.blocks[0].kind, "error")
+            self.assertIn("DuplicateName", run.blocks[0].message)
+
+            # Block 1 must be ArityMismatch (the next stderr error in
+            # order — not the same DuplicateName copy-pasted).
+            self.assertFalse(run.blocks[1].success)
+            self.assertEqual(run.blocks[1].kind, "error")
+            self.assertIn("ArityMismatch", run.blocks[1].message)
+
+            # Block 2: same — its own error, not a duplicate.
+            self.assertFalse(run.blocks[2].success)
+            self.assertIn("ArityMismatch", run.blocks[2].message)
+
+            # Block 3: the SELECT succeeded (against the 2-col seed) and
+            # must carry `kind=select`, NOT ddl/dml (the kind mis-tag
+            # that happened when its stdout migrated to block 0).
+            self.assertTrue(run.blocks[3].success)
+            self.assertEqual(run.blocks[3].kind, "select")
+            self.assertEqual(run.blocks[3].column_names, ["id", "name"])
+        finally:
+            db.unlink(missing_ok=True)
+
+    def test_debug_multi_statement_clean_db_does_not_get_errors(self):
+        """Sanity: against a fresh DB, every block must succeed (no
+        spurious stderr attribution).  Guards against accidentally
+        over-eagerly flagging successful blocks as failed."""
+        import asyncio
+        eng, db = self._fresh_engine()
+        try:
+            sql = ("CREATE TABLE t(id INT, name VARCHAR, age INT, status VARCHAR);"
+                   "INSERT INTO t VALUES (1, 'Alice', 20, 'active');"
+                   "SELECT * FROM t WHERE id = 1;")
+            run, _ = asyncio.run(eng.execute_debug(sql))
+            self.assertEqual(len(run.blocks), 3)
+            for i, b in enumerate(run.blocks):
+                with self.subTest(block=i):
+                    self.assertTrue(b.success, msg=f"block {i} failed: {b.message}")
+        finally:
+            db.unlink(missing_ok=True)
+
+    def test_boundary_long_and_special_chars(self):
+        # Long-ish statements + special characters in one script run cleanly.
+        import asyncio
+        eng, db = self._fresh_engine()
+        try:
+            long_val = "x" * 500
+            sql = ("CREATE TABLE t (id INT, v VARCHAR);"
+                   "INSERT INTO t VALUES (1, 'a;b -- not a comment');"
+                   f"INSERT INTO t VALUES (2, '{long_val}');"
+                   "SELECT id, v FROM t WHERE id = 2;")
+            run = asyncio.run(eng.execute(sql, on_error="continue"))
+            self.assertEqual(len(run.blocks), 4)
+            self.assertTrue(all(b.success for b in run.blocks))
+            self.assertEqual(run.blocks[3].rows, [["2", long_val]])
+        finally:
+            db.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

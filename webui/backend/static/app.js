@@ -23,6 +23,7 @@
   const editor      = $("#sql-editor");
   const dbPill      = $("#db-pill");
   const dbPillLabel = $("#db-pill-label");
+  const dbResetBtn  = $("#db-reset-btn");
   const engineDot   = $("#engine-status .status-dot");
 
   // Sub-status + statusbar
@@ -133,9 +134,15 @@
   function setDbPillText() {
     dbPillLabel.textContent = app.dbPath ? app.dbPath : "未连接数据库（点击选择）";
     sbDbPath.textContent = app.dbPath ? app.dbPath : "暂无数据库";
+    if (dbResetBtn) dbResetBtn.hidden = !app.dbPath;
   }
 
   const vizStatus = $("#viz-status");
+  const vizContext = $("#viz-context");
+  const vizContextIdx = $("#viz-context-idx");
+  const vizContextKind = $("#viz-context-kind");
+  const vizContextSql = $("#viz-context-sql");
+  const vizContextMeta = $("#viz-context-meta");
   let vizStatusTimer = null;
   function setVizStatus(msg, kind = "info", sticky = false) {
     if (!vizStatus) return;
@@ -342,6 +349,18 @@
       vizState.lastSql = "";
       vizState.lastElapsedMs = 0;
       vizState.storageBaseline = null;
+      perStatementDebug = [];
+      activeResultIndex = -1;
+      lastResults = [];
+      lastSql = "";
+      // Drop the viz context bar so a previous-DB row's "stmt 3/11"
+      // doesn't linger after the user opened a new file.
+      updateVizContext(-1);
+      // Clear the viz fallback text too.
+      const vc = document.getElementById("viz-content");
+      if (vc) {
+        vc.innerHTML = `<div class="viz-empty"><p>请先执行 SQL 以填充可视化面板。</p></div>`;
+      }
       await refreshCatalog();
       refreshSidebarStorage();
       setSbStatus("就绪");
@@ -362,6 +381,53 @@
       return;
     }
     await openPathAndClose(p);
+  }
+
+  // Reset the current database: delete the underlying .db + WAL, then
+  // reopen the same path so the engine starts over on a clean file.
+  // This is the recovery path for "stale state" failures — e.g. a test
+  // script's CREATE TABLE failing because the table already exists with
+  // a different shape.
+  //
+  // The WAL matters: the engine keeps it at `<db>.wal` and runs ARIES
+  // recovery on every open, so a leftover WAL is replayed into the
+  // freshly created file and resurrects the tables we just deleted.
+  // The backend deletes that companion itself; we also name it here so
+  // the reset stays correct against an older backend.
+  async function resetCurrentDatabase() {
+    if (!app.dbPath) return;
+    const old = app.dbPath;
+    const candidates = [old];
+    if (old.toLowerCase().endsWith(".db")) candidates.push(old + ".wal");
+    const deleted = [];
+    const failed  = [];
+    // Tell the backend to close its file handle, then delete locally.
+    try { await api("/api/db/close", { method: "POST", body: {} }); } catch (_) { /* idempotent */ }
+    for (const p of candidates) {
+      try {
+        const r = await fetch(`/api/db/unlink?path=${encodeURIComponent(p)}`, { method: "POST" });
+        if (!r.ok) { failed.push(`${p} (${r.status})`); continue; }
+        const info = await r.json().catch(() => null);
+        // Count only files the backend actually removed — a missing
+        // file also returns 200, and reporting it as "deleted" made a
+        // failed reset look successful.
+        if (info && info.deleted) deleted.push(p);
+        if (info && Array.isArray(info.companions_deleted)) deleted.push(...info.companions_deleted);
+      } catch (e) {
+        failed.push(`${p} (${e && e.message ? e.message : e})`);
+      }
+    }
+    if (deleted.length === 0 && failed.length === candidates.length) {
+      setSub(`无法重置 ${old}：所有底层文件删除失败`, "error");
+      return;
+    }
+    // Reopen the same path (engine will create a new empty file).
+    await openPathAndClose(old);
+    if (deleted.length) {
+      setSub(`已重置数据库 ${pathBasename(old)}（删除 ${deleted.length} 个文件：${deleted.map(pathBasename).join("、")}）`, "success");
+    } else {
+      setSub(`数据库 ${pathBasename(old)} 已重新打开（无文件可删除）`, "info");
+    }
   }
 
   function pathBasename(p) {
@@ -693,6 +759,17 @@
   });
 
   // ── Result rendering ───────────────────────────────────────────────────
+  // `vizState.perStatementDebug[i]` mirrors `res.results[i].debug` so
+  // the user can click any result row to switch the visualisation
+  // (Tokens / AST / Plan / Storage) to that statement's compile product.
+  let perStatementDebug = [];
+  let activeResultIndex = -1;
+  // The latest run's full results + source SQL, cached so the viz
+  // context bar can compute "statement N / total" without round-tripping
+  // to the API.  Cleared when the user opens a fresh DB.
+  let lastResults = [];
+  let lastSql = "";
+
   function renderResults(results) {
     const root = $("results-root") || document.getElementById("results-root");
     root.innerHTML = "";
@@ -703,10 +780,26 @@
     results.forEach((r, idx) => {
       const block = document.createElement("div");
       block.className = "result-block";
+      block.dataset.idx = String(idx);
+      // Per-statement visualisation availability: we surface a small
+      // accent badge on the result card whenever the engine emitted
+      // a debug envelope for this statement, so the user can tell at
+      // a glance which rows are clickable into the visualisation
+      // pipeline.  The click handler still works on every row (a
+      // failed statement's debug may still be partially populated),
+      // but the badge highlights *with confidence* that there's data
+      // for that specific statement.
+      const hasViz = !!perStatementDebug[idx];
+      if (hasViz) block.classList.add("has-viz");
+      if (idx === activeResultIndex) block.classList.add("is-viz-focus");
       if (r.kind === "error") block.classList.add("is-error");
       const stmt = r.statement || "";
+      const vizDot = hasViz
+        ? `<span class="result-viz-dot" title="此语句有可视化数据：点击后切换 Token/AST/Plan/Storage">V</span>`
+        : `<span class="result-viz-dot" hidden title="无可视化数据"></span>`;
       const head = `
         <div class="result-head">
+          ${vizDot}
           <span class="result-kind kind-${escapeHtml(r.kind)}">${escapeHtml(r.kind)}</span>
           <span class="result-msg ${r.success ? "" : "is-error"}">${escapeHtml(r.message || (r.success ? "OK" : ""))}</span>
           <span class="result-time">${formatTime(r.elapsed_ms)}</span>
@@ -718,15 +811,94 @@
       if (r.column_names && r.column_names.length) {
         body = `<div class="result-table-wrap">${renderResultTableHTML(r)}</div>`;
       } else if (!r.success) {
-        body = `<div class="result-statement" style="display:block;color:var(--error);background:var(--red-soft);">${escapeHtml(r.message)}</div>`;
+        body = `<div class="result-statement" style="display:block;color:var(--error);background:var(--red-soft);">${escapeHtml(r.error || r.message)}</div>`;
       } else {
         body = `<div class="result-statement" style="display:block;color:var(--text-mute);">${escapeHtml(r.message || "(no rows)")}</div>`;
       }
       block.innerHTML = head + body;
+      // Click anywhere on the block (except the SQL toggle button) to
+      // make that statement the visualisation focus.  We attach the
+      // listener on the head row to avoid stealing toggles.
+      const headEl = block.querySelector(".result-head");
+      headEl.addEventListener("click", (ev) => {
+        if (ev.target.closest(".result-toggle")) return;
+        setActiveResult(idx);
+      });
       root.appendChild(block);
       const toggle = block.querySelector(".result-toggle");
-      toggle.addEventListener("click", () => block.classList.toggle("is-expanded"));
+      toggle.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        block.classList.toggle("is-expanded");
+      });
     });
+  }
+
+  // Switch the visualisation focus to the result at `idx`.  `idx === -1`
+  // restores the global (last-statement) debug returned by the API.
+  function setActiveResult(idx) {
+    activeResultIndex = idx;
+    const dbg = (idx >= 0 && perStatementDebug[idx]) || vizState.debug;
+    if (dbg) {
+      vizState.debug = dbg;
+      renderViz();
+    }
+    // highlight the focused row
+    $$(".result-block").forEach((b) => b.classList.remove("is-viz-focus"));
+    const target = document.querySelector(`.result-block[data-idx="${idx}"]`);
+    if (target) target.classList.add("is-viz-focus");
+    updateVizContext(idx);
+  }
+
+  // Update the slim context bar at the top of the viz panel so the
+  // user always knows which statement the visualisation belongs to.
+  // `idx === -1` falls back to the API's top-level result (a single
+  // statement or the last debug envelope).
+  function updateVizContext(idx) {
+    if (!vizContext) return;
+    const root = idx >= 0 ? (perStatementDebug[idx] || null) : (vizState.debug || null);
+    if (!root) {
+      vizContext.hidden = true;
+      return;
+    }
+    const results = lastResults || [];
+    const row = idx >= 0 ? results[idx] : null;
+    const stmtRaw = row && row.statement ? row.statement : (lastSql || "");
+    const idxText = idx >= 0
+      ? `语句 ${idx + 1} / ${results.length}`
+      : (results.length > 1 ? `最后 (${results.length} 条)` : "语句");
+    const kind = row && row.kind ? row.kind : "other";
+    const stmtTrim = stmtRaw.length > 80 ? stmtRaw.slice(0, 78) + "…" : stmtRaw;
+
+    const tokens = Array.isArray(root.tokens) ? root.tokens : [];
+    const tokenCount = tokens.length;
+    const planOps = (() => {
+      try {
+        const obj = typeof root.plan_json === "string" ? JSON.parse(root.plan_json) : root.plan_json;
+        if (!obj) return 0;
+        const walk = (n) => {
+          if (!n || typeof n !== "object") return 0;
+          let c = 1;
+          for (const ch of (n.children || n.inputs || [])) c += walk(ch);
+          return c;
+        };
+        return walk(obj);
+      } catch (_) { return 0; }
+    })();
+
+    if (vizContextIdx) vizContextIdx.textContent = idxText;
+    if (vizContextKind) {
+      vizContextKind.className = `viz-context-kind kind-${escapeHtml(kind)}`;
+      vizContextKind.textContent = kind.toUpperCase();
+    }
+    if (vizContextSql) vizContextSql.textContent = stmtTrim;
+    if (vizContextMeta) {
+      const meta = [];
+      if (tokenCount) meta.push(`${tokenCount} token${tokenCount === 1 ? "" : "s"}`);
+      if (planOps)  meta.push(`${planOps} 计划算子`);
+      if (!meta.length) meta.push("无结构化元数据");
+      vizContextMeta.textContent = meta.join(" · ");
+    }
+    vizContext.hidden = false;
   }
 
   function renderResultTableHTML(r) {
@@ -797,18 +969,53 @@
       const elapsed = Math.round(performance.now() - t0);
       sbElapsed.textContent = formatTime(elapsed);
 
+      // Cache the full run so the viz context bar and any later
+      // "click to switch" navigation can recompute things without
+      // hitting the API again.
+      lastResults = (res.results || []).slice();
+      lastSql = sql;
+
       renderResults(res.results || []);
       renderErrors(res);
       refreshSidebarStorage();
 
+      // Per-statement debug envelopes (one per result).  Each is the
+      // engine's `[DEBUG_JSON_START]…[DEBUG_JSON_END]` payload for
+      // that specific statement — tokens, AST text, plan JSON, storage
+      // stats.  Statements that didn't reach the optimisation stage
+      // (e.g. failed `exit;`) carry `debug=null`.
+      perStatementDebug = (res.results || []).map((r) => r.debug || null);
+      // Initial focus: prefer the last successful SELECT (its tokens
+      // are most interesting to inspect); fall back to the last
+      // statement that produced any debug envelope; finally to whatever
+      // the API returned at the top level.
+      let focusIdx = -1;
+      const selects = (res.results || [])
+        .map((r, i) => ({ r, i }))
+        .filter(({ r, i }) => r.success && r.kind === "select" && perStatementDebug[i]);
+      if (selects.length) focusIdx = selects[selects.length - 1].i;
+      else {
+        for (let i = (res.results || []).length - 1; i >= 0; i--) {
+          if (perStatementDebug[i]) { focusIdx = i; break; }
+        }
+      }
+      activeResultIndex = focusIdx;
+
       if (res.debug) {
-        vizState.debug = res.debug;
+        const dbg = (focusIdx >= 0 && perStatementDebug[focusIdx]) || res.debug;
+        vizState.debug = dbg;
         vizState.lastSql = sql;
         vizState.lastElapsedMs = elapsed;
-        if (res.success) cacheSet(makeCacheKey(sql), { debug: res.debug, elapsedMs: elapsed });
+        if (res.success) cacheSet(makeCacheKey(sql), { debug: dbg, elapsedMs: elapsed });
       } else {
         vizState.debug = null;
       }
+      // Refresh the viz context strip + fallback content.  This must
+      // happen AFTER vizState.debug is set and AFTER renderResults has
+      // populated `perStatementDebug`, otherwise the context bar would
+      // see stale `lastResults` from a prior run.
+      updateVizContext(focusIdx);
+      ensureVizFallback(res);
 
       const kinds = (res.results || []).map((r) => r.kind);
       if (kinds.some((k) => k === "ddl" || k === "dml" || k === "txn")) {
@@ -827,14 +1034,79 @@
       switchPanel("result");
     } catch (e) {
       sbElapsed.textContent = "";
+      lastResults = [];
+      lastSql = "";
+      perStatementDebug = [];
+      activeResultIndex = -1;
+      vizState.debug = null;
       renderErrors({ results: [{ success: false, statement: sql, message: e.message || String(e), kind: "error" }] });
       setSub(e.message || String(e), "error");
       setSbStatus("错误");
       setVizStatus(e.message || String(e), "error", true);
+      updateVizContext(-1);
     } finally {
       app.busy = false;
       runBtn.disabled = false;
     }
+  }
+
+  // When a run finished but no debug envelope survived (typically
+  // because every statement failed before the optimisation stage),
+  // the standard viz empty-state ("compile your SQL above…") is
+  // misleading.  Replace it with a script-summary screen that tells
+  // the user what happened and lists the statements that DO have
+  // viz data so they can click to switch.
+  function ensureVizFallback(res) {
+    const content = document.getElementById("viz-content");
+    if (!content) return;
+    if (vizState.debug) return; // standard path: keep renderViz's output
+    const results = (res && res.results) || [];
+    const stats = results.reduce(
+      (acc, r) => {
+        acc.total += 1;
+        acc[r.success ? "ok" : "err"] += 1;
+        if (r.debug) acc.viz += 1;
+        return acc;
+      },
+      { total: 0, ok: 0, err: 0, viz: 0 },
+    );
+    const sample = results.slice(0, 6).map((r, i) => {
+      const tag = r.success
+        ? `<span class="result-kind kind-${escapeHtml(r.kind)}">${escapeHtml(r.kind)}</span>`
+        : `<span class="result-kind kind-error">ERROR</span>`;
+      return `
+        <button class="result-block ${r.success ? "" : "is-error"}" data-idx="${i}" style="text-align:left;width:100%;margin:6px 0;padding:0;border:1px solid var(--border);background:var(--bg-secondary);border-radius:6px;cursor:pointer">
+          <div class="result-head" style="display:flex;align-items:center;gap:10px;padding:8px 10px">
+            ${tag}
+            <span style="flex:1;font-size:12px;color:var(--text-secondary)">${escapeHtml(r.statement || "")}</span>
+            ${r.debug ? '<span class="result-viz-dot" title="有可视化数据">V</span>' : ""}
+          </div>
+        </button>`;
+    }).join("");
+    const tail = results.length > 6 ? `<p class="hint" style="margin-top:6px">仅展示前 6 条，共 ${results.length} 条。</p>` : "";
+    const summaryLine = stats.err
+      ? `本次 ${stats.total} 条语句中 <strong style="color:var(--error)">${stats.err} 条失败</strong>，${stats.viz} 条有可视化数据。`
+      : `本次执行未产生可视化数据（${stats.total} 条语句均无 debug envelope）。`;
+    content.innerHTML = `
+      <div class="viz-empty" style="align-items:stretch;justify-content:flex-start;padding:24px">
+        <p>${summaryLine}</p>
+        <p class="hint">点击下方任意一条以查看其编译产物；或前往 <strong>错误控制台</strong> 查看失败原因。</p>
+        <div style="width:100%;max-width:780px;margin:0 auto">${sample || "<p class='hint'>无可显示的语句。</p>"}${tail}</div>
+      </div>`;
+    // Wire the sample rows to setActiveResult so the click switches
+    // the visualisation focus even when the row is in this fallback
+    // panel rather than the main results list.
+    content.querySelectorAll(".result-block[data-idx]").forEach((el) => {
+      el.addEventListener("click", () => {
+        const i = Number(el.dataset.idx);
+        if (Number.isNaN(i)) return;
+        // Populate vizState.debug from this row, then re-render.
+        if (perStatementDebug[i]) {
+          vizState.debug = perStatementDebug[i];
+        }
+        setActiveResult(i);
+      });
+    });
   }
 
   function setVizLoading() {
@@ -908,6 +1180,21 @@
   });
 
   dbPill.addEventListener("click", openDbModal);
+  if (dbResetBtn) {
+    dbResetBtn.addEventListener("click", async () => {
+      if (!app.dbPath) return;
+      const yes = window.confirm(
+        `确定要删除并重建数据库 ${app.dbPath} 吗？\n该操作会丢失当前库中所有表与数据。`
+      );
+      if (!yes) return;
+      try { dbResetBtn.disabled = true; } catch (_) {}
+      try {
+        await resetCurrentDatabase();
+      } finally {
+        try { dbResetBtn.disabled = false; } catch (_) {}
+      }
+    });
+  }
   dbModalClose.addEventListener("click", closeDbModal);
   dbModalBack.addEventListener("click", closeDbModal);
   dbCancelBtn.addEventListener("click", closeDbModal);
