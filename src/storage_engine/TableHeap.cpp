@@ -213,10 +213,32 @@ bool TableHeap::InsertTuple(const Tuple& tuple, RID* rid,
     if (prev_pid != INVALID_PAGE_ID) {
         Page* prev = storage_->GetPage(prev_pid);
         if (prev) {
+            // Phase B：把「前页 next_pid 指向新页」这一步也写进 WAL。
+            // 这一步只改页头、不写 slot，过去被漏掉了：重开时 RedoPass
+            // 会用前页「最后一次插入的 after_image」（那时 next_pid 还是
+            // INVALID）覆盖前页，抹掉页链，导致 SeqScan 停在首页、后续
+            // 页的数据在磁盘上完好却查不出来（>1 页的表只返回第一页）。
+            std::vector<char> link_before;
+            if (log_manager_ != nullptr) {
+                link_before.assign(prev->GetData(), prev->GetData() + PAGE_SIZE);
+            }
             int32_t next_pid, slot_count, free_off;
             ReadPageHeader(prev->GetData(), next_pid, slot_count, free_off);
             WritePageHeader(prev->GetData(), new_pid, slot_count, free_off);
             prev->SetDirty(true);
+            if (log_manager_ != nullptr) {
+                LogRecord rec;
+                rec.type_ = LogRecordType::UPDATE;
+                rec.txn_id_ = (active_txn_ != nullptr) ? active_txn_->GetTxnId() : 0;
+                rec.page_id_ = prev_pid;
+                rec.before_image_ = std::move(link_before);
+                rec.after_image_.assign(prev->GetData(), prev->GetData() + PAGE_SIZE);
+                lsn_t lsn = log_manager_->AppendRecord(std::move(rec));
+                prev->SetPageLsn(lsn);
+                if (active_txn_ != nullptr && active_txn_->IsActive()) {
+                    active_txn_->SetLastUndoLSN(lsn);
+                }
+            }
             storage_->UnpinPage(prev_pid, true);
         }
     } else {
