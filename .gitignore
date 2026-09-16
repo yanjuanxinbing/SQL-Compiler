@@ -11,3 +11,4 @@
 sqlcompiler.db*
 *.bin.crc
 *.bin.fpl
+/webui/backend/__pycache__

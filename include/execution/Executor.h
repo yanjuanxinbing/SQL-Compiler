@@ -96,6 +96,16 @@ public:
     const std::unordered_set<std::string>* GetInnerTables() const {
         return inner_tables_;
     }
+    // 60_query 相关子查询：仅包含「from_table_alias / join alias / derived_alias」
+    // 的内层别名集合。EvaluateColumnRef 用来区分「内层别名 → 必内层」与「内层
+    // from_table 原名（被 alias 屏蔽）→ 可解析为外层」。nullptr 表示无子查询
+    // 上下文，按旧行为回退。
+    void SetInnerAliases(const std::unordered_set<std::string>* aliases) {
+        inner_aliases_ = aliases;
+    }
+    const std::unordered_set<std::string>* GetInnerAliases() const {
+        return inner_aliases_;
+    }
     // 55_query: ApplyExecutor 在 LATERAL 路径下需要把右子计划视为「子查询上下文」，
     // 让 EvaluateColumnRef 知道哪些表名是右子计划的内部表，从而把同名 outer
     // 引用回退到 outer_bind。本方法在 ApplyExecutor 构造时被调用一次，
@@ -236,6 +246,10 @@ private:
     const std::unordered_map<std::string, Value>* outer_bind_ = nullptr;
     // 当前子查询的内层表名集合（含别名）。
     const std::unordered_set<std::string>* inner_tables_ = nullptr;
+    // 60_query：仅包含 from_table_alias / join alias 的内层别名集合，与
+    // inner_tables_ 配合用于 EvaluateColumnRef 区分「内层别名 → 必内层」与
+    // 「内层 from_table 原名 → 优先外层」。
+    const std::unordered_set<std::string>* inner_aliases_ = nullptr;
     // 43_upsert: ON DUPLICATE KEY UPDATE 中 VALUES(col) 的候选行绑定。
     const std::unordered_map<std::string, Value>* upsert_values_bind_ = nullptr;
     // 55_query: LATERAL 内层表集合（在 ApplyExecutor 启动时一次性设置，

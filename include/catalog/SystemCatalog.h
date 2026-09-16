@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -160,7 +161,16 @@ public:
         // 60_view_trigger (Category 9)：FOR EACH ROW (默认 true) /
         // FOR EACH STATEMENT (false)。STATEMENT 级触发器在每条 DML 上只跑一次。
         bool for_each_row = true;
+        // Item #14: 内存态保留"原始 assignments 文本"（与磁盘格式同款），
+        // 第一次 fire 时才解析为 ExprPtr 并缓存到 lazy_assignments_，避免
+        // 启动时 T·K·|text| 的 re-parse 工作。后续 fire 走 cached AST。
+        // 旧 path（直接放 ExprPtr assignments）保留为可空；惰性路径下为空。
         std::vector<std::pair<std::string, ExprPtr>> assignments;
+        // 惰性解析缓存（首次 fire 填充）；空文本表示"已尝试但解析失败"。
+        mutable std::vector<std::pair<std::string, ExprPtr>> lazy_assignments_;
+        mutable bool lazy_resolved_ = false;
+        // 原始序列化文本（与磁盘格式一致："lhs1 = expr1; lhs2 = expr2; ..."）。
+        std::string raw_assignments_text;
     };
 
     // 60_view_trigger (Category 9)：物化视图的元数据。
@@ -224,6 +234,10 @@ public:
     bool CreateTrigger(const TriggerDefinition& def);
     bool DropTrigger(const std::string& trigger_name);
     bool HasTrigger(const std::string& trigger_name) const;
+    // Item #14: 触发器 assignments 的惰性解析入口（public，TriggerExecutor 调用）。
+    // 首次访问时把 raw_assignments_text 解析为 ExprPtr 列表并缓存在
+    // lazy_assignments_，后续访问直接返回 cached AST。
+    static bool EnsureTriggerAssignmentsResolved(const TriggerDefinition& def);
     // 列出匹配 (table, timing, event) 的全部触发器，按注册顺序返回。
     // 触发器内部无序约束，目前任意顺序均可。
     std::vector<const TriggerDefinition*> LookupTriggers(
@@ -306,6 +320,20 @@ public:
     std::vector<std::pair<std::string, ForeignKeyDef>> GetForeignKeysReferencing(
         const std::string& parent_table) const;
 
+    // ---- Item #11 (perf)：AUTO_INCREMENT / SERIAL 计数器 ----
+    //
+    // 给指定表分配下一个自增值并把计数器推进 1。O(1) per call（counter 自身
+    // 增量；首次调用时一次性扫堆初始化到 max(id)，之后纯哈希命中）。
+    //
+    // 语义与原"max(id)+1"等价的关键：首次调用时按当前堆中第一列
+    // is_auto_increment 列的最大值做 baseline，使得重启数据库后仍能续号、
+    // 避免与已有行冲突。本实现是 in-memory only（不持久化），但因为 baseline
+    // 由堆现状决定，所以即使重启也不会出现重复 id。
+    //
+    // 不存在该表 / 该表无 AUTO_INCREMENT 列时返回 -1；调用方应直接放弃
+    // 自增路径而非报错（与既有"无自增列的表走 default value 路径"语义一致）。
+    int64_t NextAutoInc(const std::string& table_name);
+
 private:
     // 主存句柄：统一存储门面。TableHeap 等高层组件走 storage_；
     // BPlusTree / PageGuard 等需要直接持有 BPM 的低层组件通过
@@ -350,11 +378,52 @@ private:
     // 59_procs (Category 8)：过程字典。
     std::unordered_map<std::string, ProcedureDefinition> procedures_;
 
+    // Item #12: 并行大小写不敏感查找表：upper(name) → 原始大小写 key。
+    // LookupView/Function/Procedure/MaterializedView 优先尝试原大小写，再
+    // 走这张表，避免每次未命中时 O(M) 把所有 key 重新 toupper。
+    std::unordered_map<std::string, std::string> views_by_upper_;
+    std::unordered_map<std::string, std::string> functions_by_upper_;
+    std::unordered_map<std::string, std::string> procedures_by_upper_;
+    std::unordered_map<std::string, std::string> matviews_by_upper_;
+
     // 53_ddl：schema / sequence / FK 内存态。
     std::unordered_set<std::string> schemas_;
     std::unordered_map<std::string, SequenceState> sequences_;
     // FK 按 child_table 索引；每条 FK 的 child_table 字段冗余存储以便遍历。
     std::unordered_map<std::string, std::vector<ForeignKeyDef>> foreign_keys_;
+    // Item #11: FK 按 parent_table 索引；DELETE/UPDATE 父表时 O(1) 取回所有
+    // 引用它的 child FK。值里 pair<child_table, fk> 与 GetForeignKeysReferencing
+    // 接口语义一致。
+    std::unordered_map<std::string,
+                       std::vector<std::pair<std::string, ForeignKeyDef>>>
+        fk_by_parent_;
+
+    // Item #11 (perf): AUTO_INCREMENT 计数器内存态。per-table，每次 NextAutoInc
+    // 调用原子 +1。auto_inc_initialized_ 标记是否已经完成"扫堆求 max"的初始化
+    // —— 已初始化的表后续纯 O(1) 哈希命中。recompute-on-first-use 策略：
+    // 重启数据库后首次插入自动扫描堆并以 max(id)+1 为起点，避免与已有行冲突；
+    // 之后只走 counter++。
+    std::unordered_map<std::string, int64_t> auto_inc_counters_;
+    std::unordered_set<std::string> auto_inc_initialized_;
+
+    // Item #9: 索引按 table_name 索引；GetIndexesForTable 走 O(K) 而不是 O(M)。
+    std::unordered_map<std::string, std::vector<std::string>>
+        indexes_by_table_;  // table_name -> [index_name...]
+
+    // Item #10: 触发器按 (table_name, timing, event) 索引；
+    // LookupTriggers 走 O(K) 而不是 O(M)。
+    // 三层：[timing(BEFORE=0, AFTER=1)][event(INSERT/UPDATE/DELETE)]
+    //     → vector<trigger_name>
+    using TriggerBucketKey = std::array<
+        std::array<std::vector<std::string>, 3>,  // event
+        2>;  // timing (BEFORE=0, AFTER=1)
+    std::unordered_map<std::string, TriggerBucketKey> triggers_by_table_;
+
+    // Item #13: name -> RID for each system heap, used by Drop/Remove
+    // 元数据落盘时同步记录 RID，Drop 时不再扫描整个 sys heap。
+    std::unordered_map<std::string, RID> table_name_to_rid_;
+    std::unordered_map<std::string, RID> index_name_to_rid_;
+    std::unordered_map<std::string, RID> trigger_name_to_rid_;
 
     // 将一条表的元数据（表名、列定义列表）编码为记录，追加写入sys_tables堆表
     bool PersistTableMetadata(const TableInfo& table_info);
@@ -365,7 +434,7 @@ private:
     // ---- 索引目录内部实现 ----
     // 确保 __sys_indexes__ 堆存在（必要时创建并把首页 id 记入 sys_tables）
     bool EnsureSysIndexesHeap();
-    bool PersistIndexMetadata(const IndexInfo& index_info);
+    bool PersistIndexMetadata(const IndexInfo& index_info, RID* out_rid = nullptr);
     // 从 __sys_indexes__ 删除某条索引元数据
     void RemoveIndexMetadata(const std::string& index_name);
     // 从 __sys_indexes__ 重建全部索引元数据与 B+Tree 句柄
@@ -374,6 +443,24 @@ private:
     bool OpenIndexTree(const IndexInfo& index_info);
     // 删除某张表的全部索引（含 B+Tree 页面回收）
     void DropIndexesOfTable(const std::string& table_name);
+
+    // ---- 元数据并行索引维护（items #9-13） ----
+    // 维护 indexes_by_table_ / triggers_by_table_ / fk_by_parent_ /
+    // table_name_to_rid_ / index_name_to_rid_ / trigger_name_to_rid_。
+    void AddIndexToByTable(const IndexInfo& info);
+    void RemoveIndexFromByTable(const std::string& index_name,
+                                 const std::string& table_name);
+    void AddTriggerToByTable(const TriggerDefinition& def);
+    void RemoveTriggerFromByTable(const std::string& trigger_name,
+                                  const std::string& table_name);
+    void AddForeignKeyToByParent(const std::string& parent_table,
+                                 const std::string& child_table,
+                                 const ForeignKeyDef& fk);
+    static std::string ToUpperKey(const std::string& s);
+    void RegisterUpperAlias(std::unordered_map<std::string, std::string>& table,
+                            const std::string& key);
+    void UnregisterUpperAlias(std::unordered_map<std::string, std::string>& table,
+                              const std::string& key);
 
     // ---- 60_view_trigger (Category 9)：触发器目录内部实现 ----
     // 确保 __sys_triggers__ 堆存在（必要时创建并把首页 id 记入 sys_tables）。

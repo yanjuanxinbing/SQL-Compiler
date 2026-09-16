@@ -20,10 +20,10 @@ David   | Physics
 sqlcompiler> sqlcompiler> sqlcompiler>        ->        ->        ->        -> name    | title     | teacher    
 --------+-----------+------------
 Alice   | Math      | Mr. Smith  
-Alice   | Physics   | Ms. Johnson
 Bob     | Math      | Mr. Smith  
-Charlie | Chemistry | Dr. Lee    
+Alice   | Physics   | Ms. Johnson
 David   | Physics   | Ms. Johnson
+Charlie | Chemistry | Dr. Lee    
 (5 rows)
 sqlcompiler> sqlcompiler> sqlcompiler>        ->        -> title     | teacher    
 ----------+------------

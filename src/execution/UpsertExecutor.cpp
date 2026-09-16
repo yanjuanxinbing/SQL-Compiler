@@ -134,7 +134,12 @@ void UpsertExecutor::PrepareCandidateRow(std::vector<Value>& row_values) {
     if (row_values.size() < info->columns.size()) {
         row_values.resize(info->columns.size());
     }
-    // AUTO_INCREMENT：第一列为 PRIMARY KEY 且未赋值时按当前行数 + 1 自动编号。
+    // AUTO_INCREMENT：第一列为 PRIMARY KEY 且未赋值时按 catalog 计数器分配。
+    // Item #11 (perf)：原实现对每条候选行都全表扫一遍求 count+1，既 O(N²)
+    // 又语义错误（同语句内的兄弟插入会被错误计入 count，导致 id 跳号或
+    // 重复）。改用 SystemCatalog::NextAutoInc：首次调用一次性扫描堆建 baseline，
+    // 之后 O(1) 哈希命中与自增。recompute-on-first-use 保证重启后与已有
+    // 行不冲突。
     if (!info->columns.empty() && info->columns[0].is_primary_key) {
         size_t idx = 0;
         bool need_autoinc = row_values[idx].IsNull();
@@ -145,14 +150,10 @@ void UpsertExecutor::PrepareCandidateRow(std::vector<Value>& row_values) {
             }
         }
         if (need_autoinc) {
-            TableHeap* heap = context_->GetCatalog()->GetTableHeap(table_name_);
-            auto it = heap->Begin();
-            int count = 0;
-            while (it.HasNext()) {
-                Tuple t = it.Next(column_types_);
-                if (t.ColumnCount() > 0) ++count;
+            int64_t next_id = context_->GetCatalog()->NextAutoInc(table_name_);
+            if (next_id > 0) {
+                row_values[idx] = Value::MakeInt(static_cast<int32_t>(next_id));
             }
-            row_values[idx] = Value::MakeInt(count + 1);
         }
     }
     // ApplyDefaults 已在 InsertExecutor::InsertRow 里走过；这里也覆盖同名 DEFAULT 列，

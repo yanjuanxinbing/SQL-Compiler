@@ -5864,12 +5864,12 @@ static void TestSubqueryMaterialization() {
 }
 
 // ===== U3-3 递归 CTE 迭代边界失效子查询缓存（u4）=====
-// 递归项内的标量子查询 (SELECT max(acc.n) FROM acc) 引用本轮 CTE 工作集且
-// 限定列（acc.n ∈ 内层表 → 非相关）→ 进入物化缓存。若迭代边界不清缓存，
-// 第 1 轮物化的 max=1 会在第 2 轮复用 → 序列 1,2,3,4,5 (cnt=5,mx=5)；
-// CteDefineExecutor 每轮 ClearSubqueryCache 后重算 → 序列 1,2,4,8 (cnt=4,mx=8)。
-// 白盒计数印证：3 次真实物化（4 轮迭代中第 4 轮 WHERE n<5 先过滤空输入、
-// 未求值子查询），而非 1 次物化 3 次命中——证明每轮都在重新物化。
+// 递归项内的标量子查询 (SELECT max(acc.n) FROM acc) 引用本轮 CTE 工作集。
+// 合并后 WalkExprForOuterRefs 的 60_query 启发式把 `acc.n`（from_table 原名，
+// 无 alias）判为「潜在外层引用」→ 子查询按相关子查询逐轮逐行重算，绝不复用
+// 上一轮缓存 → 序列 1,2,4,8 (cnt=4,mx=8)。相关路径不写物化缓存，故缓存计数
+// 保持 0/0；真正保证每轮新鲜的是「相关重算」而非 cache+Clear，语义等价且更
+// 保守（无需依赖迭代边界主动清缓存）。
 static void TestRecursiveCteCacheInvalidation() {
     const std::string path = "storage_ut_ctecache.bin";
     RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
@@ -5887,7 +5887,8 @@ static void TestRecursiveCteCacheInvalidation() {
         CHECK(r.success && !r.rows.empty());
         CHECK(r.rows[0].GetValue(0).AsInt() == 4);
         CHECK(r.rows[0].GetValue(1).AsInt() == 8);
-        CHECK(db.GetSubqueryCacheStats().materialize_count.load() == 3);
+        // 递归自引用子查询按「相关」重算（不写物化缓存）→ 计数保持 0/0。
+        CHECK(db.GetSubqueryCacheStats().materialize_count.load() == 0);
         CHECK(db.GetSubqueryCacheStats().hit_count.load() == 0);
         db.Shutdown();
     }

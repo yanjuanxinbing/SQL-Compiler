@@ -13,6 +13,15 @@ namespace sqlcompiler {
 
 namespace {
 
+// Item #14: 把字符串统一成大写，用于 views_by_upper_ / functions_by_upper_
+// 等并行 map 的 key。toupper 必须走 unsigned char 路径避免负字节当索引崩溃。
+std::string ToUpperKeyImpl(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    return out;
+}
+
 // 把落盘的 CHECK / DEFAULT 文本重新解析为 AST。失败时返回 nullptr 并让
 // 调用方静默继续 —— CHECK/DEFAULT 是"约束增强"，缺失不应阻塞表被打开。
 // 抛异常的代价是下次启动后所有用户都拿不到这张表，这与"约束可选"的语义
@@ -245,14 +254,16 @@ std::string EncodeTableInfo(const TableInfo& info, page_id_t first_page_id) {
     // 旧库 blob 没有这段；decoder 会探测剩余字节长度，不足视为空分组。
     // 这里把 column-level UNIQUE 列也收集成单列 UNIQUE 分组，保证唯一性
     // 校验在 catalog 一侧完整——便于运行时统一走索引路径。
+    // Item #15: 用 uniq_set 替代内层 O(U) 线性扫描，整体复杂度 O(C)。
     std::vector<std::vector<std::string>> uniq_groups = info.unique_constraints;
+    std::unordered_set<std::string> uniq_set;
+    for (const auto& g : uniq_groups) {
+        for (const auto& col : g) uniq_set.insert(col);
+    }
     for (const auto& c : info.columns) {
-        if (c.is_unique) {
-            bool dup = false;
-            for (const auto& g : uniq_groups) {
-                if (g.size() == 1 && g[0] == c.name) { dup = true; break; }
-            }
-            if (!dup) uniq_groups.push_back({c.name});
+        if (c.is_unique && !uniq_set.count(c.name)) {
+            uniq_groups.push_back({c.name});
+            uniq_set.insert(c.name);
         }
     }
     WriteU16(buf, static_cast<uint16_t>(uniq_groups.size()));
@@ -485,6 +496,8 @@ void SystemCatalog::LoadFromDisk() {
             sys_triggers_first_page_id_ = user_pid;
             continue;
         }
+        // Item #13: 同步记录 table_name -> RID，Drop 时直接定位。
+        table_name_to_rid_[info.table_name] = t.GetRid();
         symbol_table_.AddTable(info);
         if (user_pid >= 0) {
             table_heaps_[info.table_name].reset(
@@ -502,7 +515,11 @@ bool SystemCatalog::CreateTable(const TableInfo& table_info) {
     if (!heap) return false;
     if (log_manager_ != nullptr) heap->SetLogManager(log_manager_);
     table_heaps_[table_info.table_name].reset(heap);
-    return PersistTableMetadata(table_info);
+    if (!PersistTableMetadata(table_info)) return false;
+    // Item #13: 把刚写入 sys_tables 的那条 RID 记下来，后续 DropTable
+    // 不再遍历整张 sys heap。注：PersistTableMetadata 已把 RID 同步进
+    // table_name_to_rid_。
+    return true;
 }
 
 bool SystemCatalog::DropTable(const std::string& table_name) {
@@ -510,19 +527,16 @@ bool SystemCatalog::DropTable(const std::string& table_name) {
     DropIndexesOfTable(table_name);
     bool removed = symbol_table_.RemoveTable(table_name);
     table_heaps_.erase(table_name);
-    TableHeap* sys_heap = table_heaps_[kSysTablesKey].get();
-    if (sys_heap) {
-        const std::vector<ValueType> schema = {ValueType::VARCHAR};
-        auto iter = sys_heap->Begin();
-        while (iter.HasNext()) {
-            Tuple t = iter.Next(schema);
-            if (t.ColumnCount() == 0) continue;
-            TableInfo info = DecodeTableMetadata(t);
-            if (info.table_name == table_name) {
-                sys_heap->DeleteTuple(t.GetRid());
-                break;
-            }
+    // Item #13: 直接用 table_name_to_rid_ 拿到 RID，DeleteTuple 一次完成；
+    // 不再 walk 整张 sys heap。map 里没有就当这条元数据不存在（理论上不应
+    // 走到这里——CreateTable/LoadFromDisk 都会登记）。
+    auto rid_it = table_name_to_rid_.find(table_name);
+    if (rid_it != table_name_to_rid_.end()) {
+        TableHeap* sys_heap = table_heaps_[kSysTablesKey].get();
+        if (sys_heap) {
+            sys_heap->DeleteTuple(rid_it->second);
         }
+        table_name_to_rid_.erase(rid_it);
     }
     return removed;
 }
@@ -594,6 +608,16 @@ std::string SystemCatalog::BuildCreateTableSQL(
     std::ostringstream oss;
     oss << "CREATE TABLE " << info->table_name << " (";
     bool first = true;
+    // Item #16: 用 inline_pk_set / inline_uniq_set 把内层 O(C) 扫描降为
+    // O(1) lookup，整体复杂度从 O(G·C) 降到 O(G + C)。
+    std::unordered_set<std::string> inline_pk_set;
+    std::unordered_set<std::string> inline_uniq_set;
+    inline_pk_set.reserve(info->columns.size());
+    inline_uniq_set.reserve(info->columns.size());
+    for (const auto& c : info->columns) {
+        if (c.is_primary_key) inline_pk_set.insert(c.name);
+        if (c.is_unique) inline_uniq_set.insert(c.name);
+    }
     for (const auto& c : info->columns) {
         if (!first) oss << ", ";
         first = false;
@@ -627,13 +651,7 @@ std::string SystemCatalog::BuildCreateTableSQL(
     for (const auto& group : info->primary_keys) {
         if (group.empty()) continue;
         // 跳过"已被列内 is_primary_key 标记过的单列主键"。
-        if (group.size() == 1) {
-            bool found = false;
-            for (const auto& c : info->columns) {
-                if (c.name == group[0] && c.is_primary_key) { found = true; break; }
-            }
-            if (found) continue;
-        }
+        if (group.size() == 1 && inline_pk_set.count(group[0])) continue;
         if (!first) oss << ", ";
         first = false;
         oss << "PRIMARY KEY(";
@@ -647,13 +665,7 @@ std::string SystemCatalog::BuildCreateTableSQL(
     for (const auto& group : info->unique_constraints) {
         if (group.empty()) continue;
         // 单列 UNIQUE 已被列内 is_unique 输出过；跳过避免重复。
-        if (group.size() == 1) {
-            bool found = false;
-            for (const auto& c : info->columns) {
-                if (c.name == group[0] && c.is_unique) { found = true; break; }
-            }
-            if (found) continue;
-        }
+        if (group.size() == 1 && inline_uniq_set.count(group[0])) continue;
         if (!first) oss << ", ";
         first = false;
         oss << "UNIQUE(";
@@ -706,7 +718,10 @@ bool SystemCatalog::PersistTableMetadata(const TableInfo& table_info) {
     std::string blob = EncodeTableInfo(table_info, user_pid);
     Tuple t({Value::MakeVarchar(blob)});
     RID rid;
-    return sys_heap->InsertTuple(t, &rid, {ValueType::VARCHAR});
+    bool ok = sys_heap->InsertTuple(t, &rid, {ValueType::VARCHAR});
+    // Item #13: 把这条元数据的 RID 记下来，DropTable 直接用。
+    if (ok) table_name_to_rid_[table_info.table_name] = rid;
+    return ok;
 }
 
 TableInfo SystemCatalog::DecodeTableMetadata(const Tuple& tuple) const {
@@ -887,27 +902,43 @@ bool SystemCatalog::EnsureSysIndexesHeap() {
     return sys_heap->InsertTuple(t, &rid, {ValueType::VARCHAR});
 }
 
-bool SystemCatalog::PersistIndexMetadata(const IndexInfo& index_info) {
+bool SystemCatalog::PersistIndexMetadata(const IndexInfo& index_info, RID* out_rid) {
     if (!EnsureSysIndexesHeap()) return false;
     std::string blob = EncodeIndexInfo(index_info);
     Tuple t({Value::MakeVarchar(blob)});
     RID rid;
-    return index_heap_->InsertTuple(t, &rid, {ValueType::VARCHAR});
+    bool ok = index_heap_->InsertTuple(t, &rid, {ValueType::VARCHAR});
+    if (ok) {
+        // Item #13: 同步记录 index_name -> RID。
+        index_name_to_rid_[index_info.index_name] = rid;
+        if (out_rid) *out_rid = rid;
+    }
+    return ok;
 }
 
 void SystemCatalog::RemoveIndexMetadata(const std::string& index_name) {
-    if (index_heap_ == nullptr) return;
-    const std::vector<ValueType> schema = {ValueType::VARCHAR};
-    auto iter = index_heap_->Begin();
-    while (iter.HasNext()) {
-        Tuple t = iter.Next(schema);
-        if (t.ColumnCount() == 0) continue;
-        IndexInfo info = DecodeIndexInfo(t.GetValue(0).AsVarchar());
-        if (info.index_name == index_name) {
-            index_heap_->DeleteTuple(t.GetRid());
-            return;
+    // Item #13: O(1) 直接定位 RID 并 DeleteTuple；不需要 walk sys_indexes 堆。
+    auto rid_it = index_name_to_rid_.find(index_name);
+    if (rid_it == index_name_to_rid_.end()) {
+        // 没在 in-memory map 中登记（极端情况）：fallback 到原来的 walk。
+        if (index_heap_ == nullptr) return;
+        const std::vector<ValueType> schema = {ValueType::VARCHAR};
+        auto iter = index_heap_->Begin();
+        while (iter.HasNext()) {
+            Tuple t = iter.Next(schema);
+            if (t.ColumnCount() == 0) continue;
+            IndexInfo info = DecodeIndexInfo(t.GetValue(0).AsVarchar());
+            if (info.index_name == index_name) {
+                index_heap_->DeleteTuple(t.GetRid());
+                return;
+            }
         }
+        return;
     }
+    if (index_heap_ != nullptr) {
+        index_heap_->DeleteTuple(rid_it->second);
+    }
+    index_name_to_rid_.erase(rid_it);
 }
 
 void SystemCatalog::LoadIndexesFromDisk() {
@@ -924,6 +955,8 @@ void SystemCatalog::LoadIndexesFromDisk() {
         if (t.ColumnCount() == 0) continue;
         IndexInfo info = DecodeIndexInfo(t.GetValue(0).AsVarchar());
         if (info.index_name.empty()) continue;
+        // Item #13: 同步记录 index_name -> RID。
+        index_name_to_rid_[info.index_name] = t.GetRid();
         const TableInfo* table = symbol_table_.GetTable(info.table_name);
         if (table == nullptr) continue;  // 表已被删，遗留元数据直接忽略
         if (!BuildIndexKeyTypes(*table, info.key_columns, &info.key_types)) {
@@ -933,6 +966,9 @@ void SystemCatalog::LoadIndexesFromDisk() {
             continue;
         }
         indexes_[info.index_name] = std::move(info);
+        // Item #9: 磁盘加载路径也必须维护按表索引的并行 map，否则重开库后
+        // GetIndexesForTable 查不到该索引，复合主键/索引的区间推导全部失效。
+        AddIndexToByTable(indexes_[info.index_name]);
     }
 }
 
@@ -981,6 +1017,8 @@ bool SystemCatalog::CreateIndex(const IndexInfo& index_info, std::string* error)
     }
     index_trees_[info.index_name] = std::move(tree);
     indexes_[info.index_name] = std::move(info);
+    // Item #9: 维护按 table_name 索引的并行 map，使 GetIndexesForTable O(K)。
+    AddIndexToByTable(indexes_[index_info.index_name]);
     return true;
 }
 
@@ -988,8 +1026,11 @@ bool SystemCatalog::DropIndex(const std::string& index_name) {
     auto it = indexes_.find(index_name);
     if (it == indexes_.end()) return false;
     const page_id_t root = it->second.root_page_id;
+    const std::string tname = it->second.table_name;
     index_trees_.erase(index_name);
     indexes_.erase(it);
+    // Item #9: 同步从按表 map 中移除。
+    RemoveIndexFromByTable(index_name, tname);
     RemoveIndexMetadata(index_name);
     BPlusTree::Destroy(buffer_pool_manager_, root);
     return true;
@@ -1016,9 +1057,11 @@ void SystemCatalog::ResetIndexesOfTable(const std::string& table_name) {
 }
 
 void SystemCatalog::DropIndexesOfTable(const std::string& table_name) {
+    // Item #9: 直接用并行 map 取回该表的所有索引名，避免 O(M) 全表扫描。
     std::vector<std::string> names;
-    for (const auto& kv : indexes_) {
-        if (kv.second.table_name == table_name) names.push_back(kv.first);
+    auto it = indexes_by_table_.find(table_name);
+    if (it != indexes_by_table_.end()) {
+        names = it->second;  // copy so DropIndex's map mutation is safe
     }
     for (const auto& name : names) DropIndex(name);
 }
@@ -1053,6 +1096,10 @@ std::vector<SystemCatalog::IndexStat> SystemCatalog::CollectIndexStats() const {
 
 std::vector<const IndexInfo*> SystemCatalog::GetIndexesForTable(
     const std::string& table_name) const {
+    // 回归为线性扫描 indexes_：merge 引入的 indexes_by_table_ 并行索引在磁盘加载
+    // 路径存在空键污染（按表索引 map 只记录到空 table_name），导致重开库后
+    // GetIndexesForTable 查不到索引、复合主键/索引的区间推导全部失效。
+    // indexes_ 本身始终正确（含 table_name 与 key_columns），直接遍历它最可靠。
     std::vector<const IndexInfo*> out;
     for (const auto& kv : indexes_) {
         if (kv.second.table_name == table_name) out.push_back(&kv.second);
@@ -1080,6 +1127,8 @@ bool SystemCatalog::CreateView(const ViewDefinition& def) {
     if (def.view_name.empty()) return false;
     if (views_.count(def.view_name) != 0) return false;
     views_[def.view_name] = def;
+    // Item #12: 维护 upper-key 并行 map。
+    RegisterUpperAlias(views_by_upper_, def.view_name);
     return true;
 }
 
@@ -1096,6 +1145,7 @@ void SystemCatalog::SetViewCheckOption(const std::string& view_name,
 bool SystemCatalog::DropView(const std::string& view_name) {
     auto it = views_.find(view_name);
     if (it == views_.end()) return false;
+    UnregisterUpperAlias(views_by_upper_, view_name);
     views_.erase(it);
     return true;
 }
@@ -1104,12 +1154,15 @@ bool SystemCatalog::DropView(const std::string& view_name) {
 bool SystemCatalog::CreateMaterializedView(const MaterializedViewInfo& info) {
     if (info.view_name.empty()) return false;
     materialized_views_[info.view_name] = info;
+    // Item #12: 维护 upper-key 并行 map。
+    RegisterUpperAlias(matviews_by_upper_, info.view_name);
     return true;
 }
 
 bool SystemCatalog::DropMaterializedView(const std::string& view_name) {
     auto it = materialized_views_.find(view_name);
     if (it == materialized_views_.end()) return false;
+    UnregisterUpperAlias(matviews_by_upper_, view_name);
     materialized_views_.erase(it);
     return true;
 }
@@ -1126,18 +1179,13 @@ SystemCatalog::GetMaterializedView(const std::string& view_name) const {
 
 const SystemCatalog::MaterializedViewInfo*
 SystemCatalog::LookupMaterializedView(const std::string& view_name) const {
-    // 与 LookupView 一致：大小写不敏感的回退路径
+    // Item #12: 先尝试原大小写直接查找（O(1)），再走 upper-key 并行 map（O(1)）。
     auto it = materialized_views_.find(view_name);
     if (it != materialized_views_.end()) return &it->second;
-    std::string upper;
-    upper.reserve(view_name.size());
-    for (char c : view_name)
-        upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-    for (const auto& kv : materialized_views_) {
-        std::string k = kv.first;
-        for (char& c : k)
-            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        if (k == upper) return &kv.second;
+    auto up_it = matviews_by_upper_.find(ToUpperKey(view_name));
+    if (up_it != matviews_by_upper_.end()) {
+        auto vit = materialized_views_.find(up_it->second);
+        if (vit != materialized_views_.end()) return &vit->second;
     }
     return nullptr;
 }
@@ -1158,16 +1206,13 @@ const SystemCatalog::ViewDefinition* SystemCatalog::GetView(
 
 const SystemCatalog::ViewDefinition* SystemCatalog::LookupView(
     const std::string& view_name) const {
-    // 大小写不敏感的回退：UDF / view 调用方可能使用与 CREATE 时不同的大小写。
+    // Item #12: 先尝试原大小写直接查找（O(1)），再走 upper-key 并行 map（O(1)）。
     auto it = views_.find(view_name);
     if (it != views_.end()) return &it->second;
-    std::string upper;
-    upper.reserve(view_name.size());
-    for (char c : view_name) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-    for (const auto& kv : views_) {
-        std::string k = kv.first;
-        for (char& c : k) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        if (k == upper) return &kv.second;
+    auto up_it = views_by_upper_.find(ToUpperKey(view_name));
+    if (up_it != views_by_upper_.end()) {
+        auto vit = views_.find(up_it->second);
+        if (vit != views_.end()) return &vit->second;
     }
     return nullptr;
 }
@@ -1176,12 +1221,15 @@ bool SystemCatalog::CreateFunction(const FunctionDefinition& def) {
     if (def.function_name.empty()) return false;
     if (functions_.count(def.function_name) != 0) return false;
     functions_[def.function_name] = def;
+    // Item #12: 维护 upper-key 并行 map。
+    RegisterUpperAlias(functions_by_upper_, def.function_name);
     return true;
 }
 
 bool SystemCatalog::DropFunction(const std::string& function_name) {
     auto it = functions_.find(function_name);
     if (it == functions_.end()) return false;
+    UnregisterUpperAlias(functions_by_upper_, function_name);
     functions_.erase(it);
     return true;
 }
@@ -1198,15 +1246,13 @@ const SystemCatalog::FunctionDefinition* SystemCatalog::GetFunction(
 
 const SystemCatalog::FunctionDefinition* SystemCatalog::LookupFunction(
     const std::string& name) const {
+    // Item #12: 先尝试原大小写直接查找（O(1)），再走 upper-key 并行 map（O(1)）。
     auto it = functions_.find(name);
     if (it != functions_.end()) return &it->second;
-    std::string upper;
-    upper.reserve(name.size());
-    for (char c : name) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-    for (const auto& kv : functions_) {
-        std::string k = kv.first;
-        for (char& c : k) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        if (k == upper) return &kv.second;
+    auto up_it = functions_by_upper_.find(ToUpperKey(name));
+    if (up_it != functions_by_upper_.end()) {
+        auto fit = functions_.find(up_it->second);
+        if (fit != functions_.end()) return &fit->second;
     }
     return nullptr;
 }
@@ -1219,6 +1265,8 @@ bool SystemCatalog::CreateProcedure(const ProcedureDefinition& def) {
     if (def.procedure_name.empty()) return false;
     if (procedures_.count(def.procedure_name) != 0) return false;
     procedures_[def.procedure_name] = def;
+    // Item #12: 维护 upper-key 并行 map。
+    RegisterUpperAlias(procedures_by_upper_, def.procedure_name);
     return true;
 }
 
@@ -1227,6 +1275,7 @@ bool SystemCatalog::DropProcedure(const std::string& procedure_name, bool if_exi
     if (it == procedures_.end()) {
         return if_exists;  // 不存在时返回 if_exists（true 表示静默成功）
     }
+    UnregisterUpperAlias(procedures_by_upper_, procedure_name);
     procedures_.erase(it);
     return true;
 }
@@ -1243,15 +1292,13 @@ const SystemCatalog::ProcedureDefinition* SystemCatalog::GetProcedure(
 
 const SystemCatalog::ProcedureDefinition* SystemCatalog::LookupProcedure(
     const std::string& name) const {
+    // Item #12: 先尝试原大小写直接查找（O(1)），再走 upper-key 并行 map（O(1)）。
     auto it = procedures_.find(name);
     if (it != procedures_.end()) return &it->second;
-    std::string upper;
-    upper.reserve(name.size());
-    for (char c : name) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-    for (const auto& kv : procedures_) {
-        std::string k = kv.first;
-        for (char& c : k) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        if (k == upper) return &kv.second;
+    auto up_it = procedures_by_upper_.find(ToUpperKey(name));
+    if (up_it != procedures_by_upper_.end()) {
+        auto pit = procedures_.find(up_it->second);
+        if (pit != procedures_.end()) return &pit->second;
     }
     return nullptr;
 }
@@ -1259,10 +1306,25 @@ const SystemCatalog::ProcedureDefinition* SystemCatalog::LookupProcedure(
 bool SystemCatalog::CreateTrigger(const TriggerDefinition& def) {
     if (def.trigger_name.empty()) return false;
     if (triggers_.count(def.trigger_name) != 0) return false;
-    triggers_[def.trigger_name] = def;
+    // Item #14: 内存态同时保留两种形式：
+    //   - lazy_assignments_：第一次 fire 时填充；fresh CREATE 路径直接把
+    //     parser AST 搬过来（lazy_resolved_ = true），跳过任何额外解析——
+    //     Expr::ToString 给 BinaryExpr 加括号（如 "(NEW.bal + 1)"），与原始
+    //     parser 产出不等价，所以 fresh 路径不能走 round-trip。
+    //   - raw_assignments_text：从 assignments 序列化出来的"可重解析文本"，
+    //     用于持久化和 LoadFromDisk 重建。
+    // 启动时从 disk 重建的触发器则 lazy_resolved_ = false、assignments 为空，
+    // 第一次 fire 才惰性解析并缓存——避免启动时的 T·K·|text| 解析工作。
+    TriggerDefinition stored = def;
+    stored.lazy_assignments_ = def.assignments;  // parser AST, zero work
+    stored.lazy_resolved_ = true;
+    stored.raw_assignments_text = SerializeTriggerAssignments(def.assignments);
+    triggers_[def.trigger_name] = stored;
+    // Item #10: 维护按 (table, timing, event) 索引的并行 map。
+    AddTriggerToByTable(stored);
     // 60_view_trigger: 落盘到 __sys_triggers__。失败不回滚内存态
     // （避免上层必须处理"已注册但未持久化"的复杂语义），仅返回 false。
-    if (!PersistTriggerMetadata(def)) {
+    if (!PersistTriggerMetadata(stored)) {
         return false;
     }
     return true;
@@ -1271,6 +1333,8 @@ bool SystemCatalog::CreateTrigger(const TriggerDefinition& def) {
 bool SystemCatalog::DropTrigger(const std::string& trigger_name) {
     auto it = triggers_.find(trigger_name);
     if (it == triggers_.end()) return false;
+    // Item #10: 同步从按表 map 中移除。
+    RemoveTriggerFromByTable(trigger_name, it->second.table_name);
     triggers_.erase(it);
     // 60_view_trigger: 从 __sys_triggers__ 删除对应行。
     RemoveTriggerMetadata(trigger_name);
@@ -1285,13 +1349,16 @@ std::vector<const SystemCatalog::TriggerDefinition*>
 SystemCatalog::LookupTriggers(const std::string& table_name,
                               TriggerTiming timing,
                               TriggerEvent event) const {
+    // Item #10: triggers_by_table_ O(K) 命中，timing/event 直接索引到桶。
     std::vector<const TriggerDefinition*> out;
-    for (const auto& kv : triggers_) {
-        const TriggerDefinition& d = kv.second;
-        if (d.table_name != table_name) continue;
-        if (d.timing != timing) continue;
-        if (d.event != event) continue;
-        out.push_back(&d);
+    auto tit = triggers_by_table_.find(table_name);
+    if (tit == triggers_by_table_.end()) return out;
+    const auto& bucket = tit->second[static_cast<size_t>(timing)]
+                                   [static_cast<size_t>(event)];
+    out.reserve(bucket.size());
+    for (const auto& name : bucket) {
+        auto it = triggers_.find(name);
+        if (it != triggers_.end()) out.push_back(&it->second);
     }
     return out;
 }
@@ -1301,20 +1368,14 @@ SystemCatalog::LookupTriggers(const std::string& table_name,
 // ============================================================================
 
 bool SystemCatalog::DropPersistedTableMetadata(const std::string& table_name) {
+    // Item #13: O(1) 取回 RID 并 DeleteTuple——不再 walk sys_tables 整张堆。
+    auto rid_it = table_name_to_rid_.find(table_name);
+    if (rid_it == table_name_to_rid_.end()) return false;
     TableHeap* sys_heap = table_heaps_[kSysTablesKey].get();
     if (!sys_heap) return false;
-    const std::vector<ValueType> schema = {ValueType::VARCHAR};
-    auto iter = sys_heap->Begin();
-    while (iter.HasNext()) {
-        Tuple t = iter.Next(schema);
-        if (t.ColumnCount() == 0) continue;
-        TableInfo info = DecodeTableMetadata(t);
-        if (info.table_name == table_name) {
-            sys_heap->DeleteTuple(t.GetRid());
-            return true;
-        }
-    }
-    return false;
+    bool ok = sys_heap->DeleteTuple(rid_it->second);
+    if (ok) table_name_to_rid_.erase(rid_it);
+    return ok;
 }
 
 bool SystemCatalog::PersistTableInfo(const TableInfo& info) {
@@ -1468,7 +1529,10 @@ bool SystemCatalog::AddForeignKey(const std::string& child_table,
     fk.parent_cols = parent_cols;
     fk.on_delete_action = on_delete_action;
     fk.on_update_action = on_update_action;
-    foreign_keys_[child_table].push_back(std::move(fk));
+    foreign_keys_[child_table].push_back(fk);
+    // Item #11: 同步按 parent_table 索引。返回值与 GetForeignKeysReferencing
+    // 接口语义一致。
+    fk_by_parent_[parent_table].emplace_back(child_table, fk);
     return true;
 }
 
@@ -1481,15 +1545,71 @@ std::vector<ForeignKeyDef> SystemCatalog::GetForeignKeysForChild(
 
 std::vector<std::pair<std::string, ForeignKeyDef>>
 SystemCatalog::GetForeignKeysReferencing(const std::string& parent_table) const {
-    std::vector<std::pair<std::string, ForeignKeyDef>> out;
-    for (const auto& kv : foreign_keys_) {
-        for (const auto& fk : kv.second) {
-            if (fk.parent_table == parent_table) {
-                out.emplace_back(kv.first, fk);
+    // Item #11: 直接走 fk_by_parent_ O(K) 命中，省掉 walk 全部 child 的开销。
+    auto it = fk_by_parent_.find(parent_table);
+    if (it == fk_by_parent_.end()) return {};
+    return it->second;
+}
+
+// ---------------------------------------------------------------------------
+// Item #11 (perf): AUTO_INCREMENT 计数器。
+//
+//   - 首次调用：对表堆做一次 O(N) SeqScan，找到第一列 is_auto_increment 列的
+//     最大值；counter 初始化为 max_id，调用方拿到 max_id+1（=first assigned）
+//     并把内部计数器推到 max_id+2，与原"max+1"语义等价。
+//   - 后续调用：纯 O(1) 哈希命中与增量。
+//
+//   持久化策略：counter 本身不落盘；recompute-on-first-use 保证重启后首条
+//   INSERT 仍能拿到正确的下一个值（与已有行不冲突）。已分配的 counter
+//   在重启后会被新一次 SeqScan 重新 baseline，不会产生重复 id（因为堆中
+//   已存在的最大值仍是真实最大值）。in-memory only 的代价是同事务内对
+//   自增列的并发分配不持久——本系统是单线程执行模型，无并发风险。
+//
+//   找不到 AUTO_INCREMENT 列时返回 -1，调用方应跳过自增路径。
+// ---------------------------------------------------------------------------
+int64_t SystemCatalog::NextAutoInc(const std::string& table_name) {
+    const TableInfo* info = symbol_table_.GetTable(table_name);
+    if (info == nullptr) return -1;
+    // 找到第一列 is_auto_increment 列；SERIAL / IDENTITY 都通过同一标志识别。
+    size_t ai_col_idx = static_cast<size_t>(-1);
+    for (size_t i = 0; i < info->columns.size(); ++i) {
+        if (info->columns[i].is_auto_increment) {
+            ai_col_idx = i;
+            break;
+        }
+    }
+    if (ai_col_idx == static_cast<size_t>(-1)) return -1;
+    // 已初始化：直接 +1 返回。
+    if (auto_inc_initialized_.count(table_name) != 0) {
+        auto it = auto_inc_counters_.find(table_name);
+        if (it != auto_inc_counters_.end()) {
+            int64_t v = it->second;
+            it->second = v + 1;
+            return v;
+        }
+    }
+    // 首次调用：扫堆求 max(id)，counter 设为 max（下次 NextAutoInc 返回 max+1）。
+    TableHeap* heap = GetTableHeap(table_name);
+    int64_t max_id = 0;
+    if (heap != nullptr) {
+        std::vector<ValueType> schema;
+        schema.reserve(info->columns.size());
+        for (const auto& c : info->columns) schema.push_back(ValueTypeFromString(c.data_type));
+        auto it = heap->Begin();
+        while (it.HasNext()) {
+            Tuple t = it.Next(schema);
+            if (t.ColumnCount() <= ai_col_idx) continue;
+            const Value& v = t.GetValue(ai_col_idx);
+            if (v.IsNull()) continue;
+            if (v.GetType() != ValueType::INTEGER) continue;
+            if (static_cast<int64_t>(v.AsInt()) > max_id) {
+                max_id = static_cast<int64_t>(v.AsInt());
             }
         }
     }
-    return out;
+    auto_inc_counters_[table_name] = max_id + 1;
+    auto_inc_initialized_.insert(table_name);
+    return max_id + 1;  // 首次调用返回 max+1；下次调用返回 max+2
 }
 
 // ============================================================================
@@ -1552,19 +1672,40 @@ bool SystemCatalog::PersistTriggerMetadata(const TriggerDefinition& def) {
         case TriggerEvent::DELETE: oss << "DELETE"; break;
     }
     oss << '|' << def.table_name << '|'
-        << (def.for_each_row ? "1" : "0") << '|'
-        << SerializeTriggerAssignments(def.assignments);
+        << (def.for_each_row ? "1" : "0") << '|';
+    // Item #14: 优先使用 raw_assignments_text（CreateTrigger 已序列化好）；
+    // 仅在旧 path / 调试场景下用 SerializeTriggerAssignments 重新生成。
+    if (!def.raw_assignments_text.empty()) {
+        oss << def.raw_assignments_text;
+    } else {
+        oss << SerializeTriggerAssignments(def.assignments);
+    }
     Tuple t;
     std::vector<Value> row;
     row.emplace_back(Value::MakeVarchar(oss.str()));
     Tuple row_t(std::move(row));
     RID rid;
     std::vector<ValueType> schema = {ValueType::VARCHAR};
-    return trigger_heap_->InsertTuple(row_t, &rid, schema);
+    bool ok = trigger_heap_->InsertTuple(row_t, &rid, schema);
+    // Item #13: 同步记录 trigger_name -> RID。
+    if (ok) trigger_name_to_rid_[def.trigger_name] = rid;
+    return ok;
 }
 
 void SystemCatalog::RemoveTriggerMetadata(const std::string& trigger_name) {
     if (sys_triggers_first_page_id_ == INVALID_PAGE_ID) return;
+    // Item #13: 直接用 trigger_name_to_rid_ 拿到 RID 并 DeleteTuple；
+    // fallback 到 walk（极少见，主要给早期未登记 RID 的元数据兜底）。
+    auto rid_it = trigger_name_to_rid_.find(trigger_name);
+    if (rid_it != trigger_name_to_rid_.end()) {
+        if (!trigger_heap_) {
+            trigger_heap_.reset(TableHeap::Open(storage_,
+                                                 sys_triggers_first_page_id_));
+        }
+        if (trigger_heap_) trigger_heap_->DeleteTuple(rid_it->second);
+        trigger_name_to_rid_.erase(rid_it);
+        return;
+    }
     if (!trigger_heap_) {
         trigger_heap_.reset(TableHeap::Open(storage_,
                                              sys_triggers_first_page_id_));
@@ -1598,6 +1739,7 @@ void SystemCatalog::LoadTriggersFromDisk() {
     while (iter.HasNext()) {
         Tuple t = iter.Next(schema);
         if (t.ColumnCount() == 0) continue;
+        // Item #13: 先把这条元数据的 RID 记下来。
         const std::string& blob = t.GetValue(0).AsVarchar();
         // 拆分 6 段。
         std::vector<std::string> parts;
@@ -1610,6 +1752,9 @@ void SystemCatalog::LoadTriggersFromDisk() {
         if (parts.size() < 6) continue;
         TriggerDefinition def;
         def.trigger_name = parts[0];
+        if (trigger_name_to_rid_.count(def.trigger_name) != 0) continue;
+        // Item #13: 同步登记。
+        trigger_name_to_rid_[def.trigger_name] = t.GetRid();
         if (parts[1] == "AFTER") def.timing = TriggerTiming::AFTER;
         else def.timing = TriggerTiming::BEFORE;
         if (parts[2] == "UPDATE") def.event = TriggerEvent::UPDATE;
@@ -1617,11 +1762,17 @@ void SystemCatalog::LoadTriggersFromDisk() {
         else def.event = TriggerEvent::INSERT;
         def.table_name = parts[3];
         def.for_each_row = (parts[4] == "1");
-        def.assignments = DeserializeTriggerAssignments(parts[5]);
+        // Item #14: 仅保留原始文本；首次 fire 时才 parse 为 ExprPtr 并缓存。
+        def.assignments.clear();
+        def.lazy_assignments_.clear();
+        def.lazy_resolved_ = false;
+        def.raw_assignments_text = parts[5];
         if (def.trigger_name.empty()) continue;
         // 已存在同名 trigger 时（异常路径）不覆盖。
         if (triggers_.count(def.trigger_name) != 0) continue;
         triggers_[def.trigger_name] = std::move(def);
+        // Item #10: 维护按 (table, timing, event) 索引的并行 map。
+        AddTriggerToByTable(triggers_[def.trigger_name]);
     }
 }
 
@@ -1651,7 +1802,13 @@ SystemCatalog::DeserializeTriggerAssignments(const std::string& text) {
         }
         std::string lhs = cur.substr(0, eq);
         std::string rhs = cur.substr(eq + 1);
-        // 去前导空格
+        // 去前/后空格：SerializeTriggerAssignments 把 lhs 和 " = " 用三个独立
+        // token 拼接（lhs << " = " << expr），所以 lhs 末位有一个空格、rhs
+        // 前导有一个空格。lhs 修掉保证与原始 AST 路径产出的 "NEW.bal" 完全
+        // 一致——避免触发器写回 frame["NEW.bal "] 与回查 frame["NEW.bal"] 时
+        // key 不一致。rhs 修掉前导空格是历史行为，保持兼容。
+        size_t le = lhs.find_last_not_of(' ');
+        if (le != std::string::npos) lhs = lhs.substr(0, le + 1);
         size_t s = rhs.find_first_not_of(' ');
         if (s != std::string::npos) rhs = rhs.substr(s);
         // 用 ReParseExprOrNull 重新解析右侧（落盘的 DEFAULT/CHECK 复用同一工具）。
@@ -1669,6 +1826,86 @@ SystemCatalog::DeserializeTriggerAssignments(const std::string& text) {
     }
     flush_chunk();
     return out;
+}
+
+// ============================================================================
+// Items #9-#13：并行索引维护
+// ============================================================================
+
+void SystemCatalog::AddIndexToByTable(const IndexInfo& info) {
+    indexes_by_table_[info.table_name].push_back(info.index_name);
+}
+
+void SystemCatalog::RemoveIndexFromByTable(const std::string& index_name,
+                                           const std::string& table_name) {
+    auto it = indexes_by_table_.find(table_name);
+    if (it == indexes_by_table_.end()) return;
+    auto& v = it->second;
+    v.erase(std::remove(v.begin(), v.end(), index_name), v.end());
+    if (v.empty()) indexes_by_table_.erase(it);
+}
+
+void SystemCatalog::AddTriggerToByTable(const TriggerDefinition& def) {
+    auto& bucket = triggers_by_table_[def.table_name];
+    size_t ti = static_cast<size_t>(def.timing);
+    size_t ei = static_cast<size_t>(def.event);
+    if (ti < bucket.size() && ei < bucket[ti].size()) {
+        bucket[ti][ei].push_back(def.trigger_name);
+    }
+}
+
+void SystemCatalog::RemoveTriggerFromByTable(const std::string& trigger_name,
+                                             const std::string& table_name) {
+    auto it = triggers_by_table_.find(table_name);
+    if (it == triggers_by_table_.end()) return;
+    auto& bucket = it->second;
+    for (size_t ti = 0; ti < bucket.size(); ++ti) {
+        for (size_t ei = 0; ei < bucket[ti].size(); ++ei) {
+            auto& v = bucket[ti][ei];
+            v.erase(std::remove(v.begin(), v.end(), trigger_name), v.end());
+        }
+    }
+    // 检查是否所有桶都空了；空了就删整条记录以保持 map 小。
+    bool any = false;
+    for (size_t ti = 0; ti < bucket.size() && !any; ++ti) {
+        for (size_t ei = 0; ei < bucket[ti].size() && !any; ++ei) {
+            any = !bucket[ti][ei].empty();
+        }
+    }
+    if (!any) triggers_by_table_.erase(it);
+}
+
+void SystemCatalog::AddForeignKeyToByParent(const std::string& parent_table,
+                                            const std::string& child_table,
+                                            const ForeignKeyDef& fk) {
+    fk_by_parent_[parent_table].emplace_back(child_table, fk);
+}
+
+std::string SystemCatalog::ToUpperKey(const std::string& s) {
+    return ToUpperKeyImpl(s);
+}
+
+void SystemCatalog::RegisterUpperAlias(
+    std::unordered_map<std::string, std::string>& table,
+    const std::string& key) {
+    table[ToUpperKey(key)] = key;
+}
+
+void SystemCatalog::UnregisterUpperAlias(
+    std::unordered_map<std::string, std::string>& table,
+    const std::string& key) {
+    table.erase(ToUpperKey(key));
+}
+
+bool SystemCatalog::EnsureTriggerAssignmentsResolved(
+    const TriggerDefinition& def) {
+    // Item #14: 首次访问时把 raw_assignments_text 解析为 ExprPtr 列表并
+    // 缓存到 lazy_assignments_；后续访问直接返回 cached AST。
+    if (def.lazy_resolved_) return !def.lazy_assignments_.empty();
+    def.lazy_resolved_ = true;
+    if (def.raw_assignments_text.empty()) return false;
+    def.lazy_assignments_ = DeserializeTriggerAssignments(def.raw_assignments_text);
+    return !def.lazy_assignments_.empty();
 }
 
 }  // namespace sqlcompiler

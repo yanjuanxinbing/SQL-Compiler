@@ -108,6 +108,44 @@ bool ExprContainsAgg(const ExprPtr& e) {
     }
 }
 
+// 递归检查表达式内是否出现子查询节点（标量/IN/EXISTS 等一律拦截）。
+// 用于 PreAgg 资格判定：聚合项内含子查询时，PreAggScan 的简化 cmap 与
+// 相关子查询的外层绑定（BuildOuterBind / GROUP BY 别名映射）无法正确衔接，
+// 必须退回标准 AggregateExecutor 路径（该路径已被相关子查询完整支持）。
+bool ExprContainsSubquery(const ExprPtr& e) {
+    if (!e) return false;
+    switch (e->GetType()) {
+        case NodeType::SUBQUERY_EXPR:
+            return true;
+        case NodeType::FUNCTION_CALL_EXPR: {
+            auto f = std::static_pointer_cast<FunctionCallExpr>(e);
+            for (const auto& a : f->arguments)
+                if (ExprContainsSubquery(a)) return true;
+            return false;
+        }
+        case NodeType::BINARY_EXPR: {
+            auto b = std::static_pointer_cast<BinaryExpr>(e);
+            return ExprContainsSubquery(b->left) || ExprContainsSubquery(b->right);
+        }
+        case NodeType::UNARY_EXPR:
+            return ExprContainsSubquery(std::static_pointer_cast<UnaryExpr>(e)->operand);
+        case NodeType::CASE_EXPR: {
+            auto c = std::static_pointer_cast<CaseExprNode>(e);
+            if (c->subject && ExprContainsSubquery(c->subject)) return true;
+            for (const auto& w : c->whens) {
+                if (ExprContainsSubquery(w.when_expr)) return true;
+                if (ExprContainsSubquery(w.then_expr)) return true;
+            }
+            if (c->else_expr && ExprContainsSubquery(c->else_expr)) return true;
+            return false;
+        }
+        case NodeType::CAST_EXPR:
+            return ExprContainsSubquery(std::static_pointer_cast<CastExprNode>(e)->expr);
+        default:
+            return false;
+    }
+}
+
 PlanNodePtr Optimizer::ReorderJoins(PlanNodePtr plan) {
     if (!plan) return plan;
     // 若本节点就是一棵可直接重排的 JOIN 子树根，整棵一次重排（而非先递归子节点，
@@ -231,10 +269,14 @@ bool Optimizer::IsPreAggEligible(const PlanNodePtr& agg_node) const {
 
     // 2) 每个 aggregate_expr 须为「裸 COUNT/SUM」或「不含任何聚合调用的普通表达式」。
     //    含 AVG/MIN/MAX/DISTINCT/标量包装（如 COALESCE(SUM(x),0)）的项 → 不合格。
+    //    聚合项内含子查询（含相关标量/IN/嵌套）→ 不合格：PreAggScan 的简化 cmap
+    //    无法衔接相关子查询的外层绑定（BuildOuterBind / GROUP BY 别名映射），
+    //    必须退回标准 AggregateExecutor（该路径已完整支持相关子查询）。
     for (const auto& e : a->aggregate_exprs) {
         if (!e) return false;
         if (IsBareCountSumExpr(e)) continue;
         if (ExprContainsAgg(e)) return false;
+        if (ExprContainsSubquery(e)) return false;
     }
 
     // 3) 防御：GROUP BY 表达式不得含聚合调用（合法 SQL 不会出现，仅保险）。
@@ -436,6 +478,14 @@ PlanNodePtr Optimizer::TryDecorrelateFilter(const PlanNodePtr& filter) {
             }
         }
         if (!sq) continue;
+
+        // ---- 量化守卫：expr op ALL / expr op SOME (...) 不是存在性连接语义 ----
+        // ALL（全称量化）与 SOME 无法表达为 SEMI/ANTI JOIN；且若把它们当作
+        // EXISTS/IN/ANY 去关联、又不为它们构建比较条件（下方仅 IN/ANY 生成
+        // 等值/比较条件），会被改写成"恒真条件的 SEMI JOIN"——非空子查询全行
+        // 放行、空子查询 0 行，语义完全错误。保守守底：ALL/SOME 一律保留原
+        // ExpressionEvaluator 逐行求值路径（那里按三值逻辑正确实现）。
+        if (sq->kind == SubqueryType::ALL || sq->kind == SubqueryType::SOME) continue;
 
         // ---- 形态守卫 ----
         if (!sq->subquery || !sq->subquery_plan) continue;
@@ -934,7 +984,7 @@ PlanNodePtr Optimizer::ChooseAccessPaths(PlanNodePtr plan) {
     PlanNodePtr rewritten = TryRewriteWithIndex(catalog_, scan->table_name,
                                                 scan->table_alias,
                                                 filter->predicate);
-    // 改写不成立时保持原计划：宁可慢，也不能因为改写出错而少返回行
+    // 改写不成立时保持原计划：宁可慢，也不能因为改产出而少返回行
     return rewritten ? rewritten : plan;
 }
 
@@ -1002,6 +1052,9 @@ void CollectColumns(const ExprPtr& e, ColumnUsage& out) {
 //      table_name / table_alias（限定到本表）
 //   3. 当 ColumnRefExpr 不带限定名时，若 Catalog 里该表存在同名列，视为
 //      本表引用；否则不下推（可能引用了其他表的同名列，留给 Filter）
+//
+// 优化点 item #5: 用 TableInfo::GetColumn(col)（O(1) hash 命中）替代
+// 线性扫描 info->columns，让每个 unqualified ref 的检查从 O(K) 降到 O(1)。
 bool CanPushIntoScan(const ExprPtr& c, const SeqScanNode* scan,
                      SystemCatalog* catalog) {
     if (!c) return false;
@@ -1026,13 +1079,9 @@ bool CanPushIntoScan(const ExprPtr& c, const SeqScanNode* scan,
         const TableInfo* info = catalog->GetTable(scan->table_name);
         for (const auto& [tbl, col] : u.refs) {
             if (!tbl.empty()) continue;
-            bool found = false;
-            if (info) {
-                for (const auto& ci : info->columns) {
-                    if (ci.name == col) { found = true; break; }
-                }
-            }
-            if (!found) return false;
+            if (!info) return false;
+            // item #5: O(1) hash 命中（symbol_table 已建 GetColumnFast 索引）。
+            if (info->GetColumn(col) == nullptr) return false;
         }
     }
     return true;
@@ -1127,6 +1176,24 @@ void CollectScanTables(const PlanNodePtr& node, std::unordered_set<std::string>*
         return;
     }
     for (const auto& c : node->children) CollectScanTables(c, out);
+}
+
+// item #7: 把 JoinNode 的 left / right 子树表集合 lazy-init 后挂到
+// join->left_tables / right_tables 上。后续 PushDownPredicates / PruneNode
+// 直接读 join->left_tables，避免 N 次递归收集（O(N²) → O(N)）。
+//
+// left_out / right_out：调用方提供的输出 vector（确定性迭代顺序，存到
+// JoinNode 时让后续按相同顺序消费）。
+void CacheJoinTableSets(JoinNode* join,
+                       std::vector<std::string>* left_out,
+                       std::vector<std::string>* right_out) {
+    std::unordered_set<std::string> lset, rset;
+    if (join->children.size() >= 1) CollectScanTables(join->children[0], &lset);
+    if (join->children.size() >= 2) CollectScanTables(join->children[1], &rset);
+    left_out->assign(lset.begin(), lset.end());
+    right_out->assign(rset.begin(), rset.end());
+    join->left_tables = *left_out;
+    join->right_tables = *right_out;
 }
 
 // Filter -> Join 形态：拆分合取项，按列所属表分别下沉到两侧的 SeqScan。
@@ -1256,74 +1323,85 @@ PlanNodePtr Optimizer::PruneColumns(PlanNodePtr plan) {
 
 namespace {
 
-// 把表达式中所有列引用记录到 ColumnUsage。
-// 已存在于本文件中，沿用即可。
+// 把表达式中所有列引用记录到调用方的两个 vector。
+// item #11: 改用输出参数（qual* / unqual*）替代返回 PruneColumnUsage。
+// 递归过程中不再为每次调用分配 / 释放 PruneColumnUsage scratch；所有结果
+// 直接 push_back 到调用方的 vector。
+//
+// 保留 PruneColumnUsage 类型以便外部代码继续使用旧接口（若将来需要）。
 struct PruneColumnUsage {
-    // 限定列引用（"tbl.col" 或 "alias.col"），用于在 JOIN 上做左右分派
     std::vector<std::pair<std::string, std::string>> qualified;  // (tbl, col)
-    // 未限定列引用，只存列名；具体归属哪张表由叶子节点根据 catalog 决定
     std::vector<std::string> unqualified;
 };
 
-// 与 PushDownPredicates 中 CollectColumns 同一份语义。复用即可。
-void CollectPruneColumns(const ExprPtr& e, PruneColumnUsage& out) {
+// item #11: 内部递归实现。直接写到调用方的 qual* / unqual* vector。
+namespace {
+void CollectPruneColumnsInto(const ExprPtr& e,
+                             std::vector<std::pair<std::string, std::string>>* qual,
+                             std::vector<std::string>* unqual) {
     if (!e) return;
     switch (e->GetType()) {
         case NodeType::COLUMN_REF_EXPR: {
             const auto* c = static_cast<const ColumnRefExpr*>(e.get());
             if (c->table_name.empty()) {
-                out.unqualified.push_back(c->column_name);
+                unqual->push_back(c->column_name);
             } else {
-                out.qualified.emplace_back(c->table_name, c->column_name);
+                qual->emplace_back(c->table_name, c->column_name);
             }
             break;
         }
         case NodeType::BINARY_EXPR: {
             const auto* b = static_cast<const BinaryExpr*>(e.get());
-            CollectPruneColumns(b->left, out);
-            CollectPruneColumns(b->right, out);
+            CollectPruneColumnsInto(b->left, qual, unqual);
+            CollectPruneColumnsInto(b->right, qual, unqual);
             break;
         }
         case NodeType::UNARY_EXPR: {
             const auto* u = static_cast<const UnaryExpr*>(e.get());
-            CollectPruneColumns(u->operand, out);
+            CollectPruneColumnsInto(u->operand, qual, unqual);
             break;
         }
         case NodeType::FUNCTION_CALL_EXPR: {
             const auto* f = static_cast<const FunctionCallExpr*>(e.get());
-            for (const auto& a : f->arguments) CollectPruneColumns(a, out);
+            for (const auto& a : f->arguments) CollectPruneColumnsInto(a, qual, unqual);
             // FILTER (WHERE ...) 子句里的列也要算进去
-            if (f->filter_expr) CollectPruneColumns(f->filter_expr, out);
+            if (f->filter_expr) CollectPruneColumnsInto(f->filter_expr, qual, unqual);
             break;
         }
         case NodeType::CASE_EXPR: {
             const auto* c = static_cast<const CaseExprNode*>(e.get());
             for (const auto& w : c->whens) {
-                CollectPruneColumns(w.when_expr, out);
-                CollectPruneColumns(w.then_expr, out);
+                CollectPruneColumnsInto(w.when_expr, qual, unqual);
+                CollectPruneColumnsInto(w.then_expr, qual, unqual);
             }
-            CollectPruneColumns(c->else_expr, out);
+            CollectPruneColumnsInto(c->else_expr, qual, unqual);
             break;
         }
         case NodeType::CAST_EXPR: {
             const auto* c = static_cast<const CastExprNode*>(e.get());
-            CollectPruneColumns(c->expr, out);
+            CollectPruneColumnsInto(c->expr, qual, unqual);
             break;
         }
         case NodeType::LIKE_EXPR: {
             const auto* l = static_cast<const LikeExprNode*>(e.get());
-            CollectPruneColumns(l->operand, out);
-            CollectPruneColumns(l->pattern, out);
+            CollectPruneColumnsInto(l->operand, qual, unqual);
+            CollectPruneColumnsInto(l->pattern, qual, unqual);
             break;
         }
         case NodeType::EXTRACT_EXPR: {
             const auto* ee = static_cast<const ExtractExprNode*>(e.get());
-            CollectPruneColumns(ee->source, out);
+            CollectPruneColumnsInto(ee->source, qual, unqual);
             break;
         }
         default:
             break;
     }
+}
+}  // namespace
+
+// 旧接口（仍保留为 thin wrapper）。新代码优先用 CollectPruneColumnsInto。
+void CollectPruneColumns(const ExprPtr& e, PruneColumnUsage& out) {
+    CollectPruneColumnsInto(e, &out.qualified, &out.unqualified);
 }
 
 // 判断 ProjectNode 是否表达「SELECT *」。
@@ -1349,6 +1427,12 @@ bool ProjectIsSelectStar(const ProjectNode* proj) {
 // 把 (qual, unqual) 中的列挑出属于指定表 (table_name / table_alias) 的列。
 // 返回值按表 schema 的列序排列，保证下游 Executor 的 column_index_map
 // 与 prune 前一致（前提：catalog 中表的列序未被列裁剪改动）。
+//
+// 优化点 item #3: 用 std::unordered_set + std::unordered_map 把整个
+// 函数从 O(K² + C·K) 降到 O(K + C)。具体：
+//   - 收集阶段用 set（O(1) push，无 dedup 扫描）；
+//   - existence check 走 TableInfo::GetColumn 的 O(1) hash 命中；
+//   - 列序重排阶段用 col_index 索引直接定位（O(1)），无需 result 嵌套循环。
 std::vector<std::string> ResolveColumnsForTable(
     const std::vector<std::pair<std::string, std::string>>& qualified,
     const std::vector<std::string>& unqualified,
@@ -1357,44 +1441,50 @@ std::vector<std::string> ResolveColumnsForTable(
     const TableInfo* info) {
     std::vector<std::string> result;
     if (!info) return result;
-    auto add_unique = [&](const std::string& col) {
-        for (const auto& x : result) {
-            if (x == col) return;
-        }
-        result.push_back(col);
-    };
+    // 用 set 收集（不做 dedup 扫描；O(K) 总计）。
+    std::unordered_set<std::string> result_set;
+    result_set.reserve(qualified.size() + unqualified.size() + 1);
+    // 用 col_index 在 schema 列序阶段做 O(1) 定位。
+    std::unordered_map<std::string, size_t> col_index;
+    col_index.reserve(info->columns.size() * 2 + 1);
+    for (size_t i = 0; i < info->columns.size(); ++i) {
+        col_index[info->columns[i].name] = i;
+    }
     for (const auto& [tbl, col] : qualified) {
         if (tbl == table_name || (!table_alias.empty() && tbl == table_alias)) {
-            add_unique(col);
+            if (result_set.insert(col).second) result.push_back(col);
         }
     }
     for (const auto& col : unqualified) {
-        bool found = false;
-        for (const auto& ci : info->columns) {
-            if (ci.name == col) { found = true; break; }
+        if (col_index.count(col) && result_set.insert(col).second) {
+            result.push_back(col);
         }
-        if (found) add_unique(col);
     }
-    // 按表 schema 列序重新排列，保留下推谓词与上层 column_index_map 的稳定次序
+    // 按表 schema 列序重新排列：每个 result 元素 O(1) 查到 schema 位置，
+    // 然后按位置顺序 emit。原实现是嵌套 O(K·C) 循环，这里降到 O(K + C)。
+    std::vector<size_t> positions;
+    positions.reserve(result.size());
+    for (const auto& c : result) {
+        auto it = col_index.find(c);
+        if (it != col_index.end()) positions.push_back(it->second);
+    }
+    std::sort(positions.begin(), positions.end());
     std::vector<std::string> ordered;
-    ordered.reserve(result.size());
-    for (const auto& ci : info->columns) {
-        for (const auto& c : result) {
-            if (c == ci.name) { ordered.push_back(c); break; }
-        }
+    ordered.reserve(positions.size());
+    for (size_t pos : positions) {
+        ordered.push_back(info->columns[pos].name);
     }
     return ordered;
 }
 
 // 在表达式向量上做并集：把每个 expr 的列引用合并到 (qual, unqual)。
+// item #11: 直接调用 CollectPruneColumnsInto 写入调用方的 vector，
+// 不再为每次 expr 调用分配 / 释放 PruneColumnUsage scratch。
 void MergeExprColumns(const std::vector<ExprPtr>& exprs,
                       std::vector<std::pair<std::string, std::string>>* qual,
                       std::vector<std::string>* unqual) {
     for (const auto& e : exprs) {
-        PruneColumnUsage u;
-        CollectPruneColumns(e, u);
-        for (auto& q : u.qualified) qual->push_back(std::move(q));
-        for (auto& uq : u.unqualified) unqual->push_back(std::move(uq));
+        CollectPruneColumnsInto(e, qual, unqual);
     }
 }
 

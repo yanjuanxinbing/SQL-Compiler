@@ -16,6 +16,11 @@ namespace {
 
 ExprPtr RewriteAggregateRefs(const ExprPtr& expr,
                               const std::vector<ExprPtr>& aggregate_exprs);
+ExprPtr CloneExpr(const ExprPtr& expr);
+std::vector<ExprPtr> SubstituteGroupByAliases(
+    const std::vector<ExprPtr>& group_by,
+    const std::vector<ExprPtr>& select_list,
+    const std::vector<std::string>& select_aliases);
 
 bool ContainsAggregateExpr(const ExprPtr& e) {
     if (!e) return false;
@@ -301,6 +306,167 @@ ExprPtr RewriteAggregateRefs(const ExprPtr& expr,
     return expr;
 }
 
+// Deep-clone a single expression node. 表达式 AST 是只读形态的「模板」，构建计划时
+// 经常需要把同一棵子树挂到多个父节点（例如 GROUP BY 别名替换、GROUPING SETS 拆分），
+// 因此必须有显式的克隆；shared_ptr 的浅拷贝会让别名替换后的两份 group_by 共享同一棵
+// CASE 子树，后续任意一方被改写都会污染另一方。该函数覆盖语义层涉及的全部节点类型
+// （LITERAL/COLUMN_REF/BINARY/UNARY/FUNCTION_CALL/CASE/CAST/LIKE/SUBQUERY/WINDOW）。
+// window_func_node 与 subquery_expr 等仅出现在 SELECT 列表的节点也覆盖，
+// 保证替换别名时不会因节点类型遗漏而 silent-fail。
+ExprPtr CloneExpr(const ExprPtr& expr) {
+    if (!expr) return nullptr;
+    switch (expr->GetType()) {
+        case NodeType::LITERAL_EXPR: {
+            auto e = std::static_pointer_cast<LiteralExpr>(expr);
+            auto n = std::make_shared<LiteralExpr>(e->literal_type, e->value);
+            n->line = e->line; n->column = e->column;
+            return n;
+        }
+        case NodeType::COLUMN_REF_EXPR: {
+            auto e = std::static_pointer_cast<ColumnRefExpr>(expr);
+            auto n = std::make_shared<ColumnRefExpr>(e->table_name, e->column_name);
+            n->line = e->line; n->column = e->column;
+            return n;
+        }
+        case NodeType::BINARY_EXPR: {
+            auto e = std::static_pointer_cast<BinaryExpr>(expr);
+            auto n = std::make_shared<BinaryExpr>(
+                e->op, CloneExpr(e->left), CloneExpr(e->right));
+            n->line = e->line; n->column = e->column;
+            return n;
+        }
+        case NodeType::UNARY_EXPR: {
+            auto e = std::static_pointer_cast<UnaryExpr>(expr);
+            auto n = std::make_shared<UnaryExpr>(e->op, CloneExpr(e->operand));
+            n->line = e->line; n->column = e->column;
+            return n;
+        }
+        case NodeType::FUNCTION_CALL_EXPR: {
+            auto e = std::static_pointer_cast<FunctionCallExpr>(expr);
+            std::vector<ExprPtr> args;
+            args.reserve(e->arguments.size());
+            for (const auto& a : e->arguments) args.push_back(CloneExpr(a));
+            auto n = std::make_shared<FunctionCallExpr>(e->function_name, std::move(args));
+            n->is_distinct = e->is_distinct;
+            n->table_qualifier = e->table_qualifier;
+            n->filter_expr = CloneExpr(e->filter_expr);
+            n->within_group_order_by = e->within_group_order_by;  // value-copy 是足够的
+            n->line = e->line; n->column = e->column;
+            return n;
+        }
+        case NodeType::CASE_EXPR: {
+            auto e = std::static_pointer_cast<CaseExprNode>(expr);
+            auto n = std::make_shared<CaseExprNode>();
+            n->subject = CloneExpr(e->subject);
+            n->whens.reserve(e->whens.size());
+            for (const auto& w : e->whens) {
+                CaseWhen nw;
+                nw.when_expr = CloneExpr(w.when_expr);
+                nw.then_expr = CloneExpr(w.then_expr);
+                n->whens.push_back(std::move(nw));
+            }
+            n->else_expr = CloneExpr(e->else_expr);
+            n->line = e->line; n->column = e->column;
+            return n;
+        }
+        case NodeType::CAST_EXPR: {
+            auto e = std::static_pointer_cast<CastExprNode>(expr);
+            auto n = std::make_shared<CastExprNode>(CloneExpr(e->expr), e->target_type);
+            n->char_length = e->char_length;
+            n->numeric_scale = e->numeric_scale;
+            n->line = e->line; n->column = e->column;
+            return n;
+        }
+        case NodeType::LIKE_EXPR: {
+            auto e = std::static_pointer_cast<LikeExprNode>(expr);
+            auto n = std::make_shared<LikeExprNode>(
+                e->kind, CloneExpr(e->operand), CloneExpr(e->pattern),
+                e->escape_char, e->has_escape);
+            n->line = e->line; n->column = e->column;
+            return n;
+        }
+        case NodeType::WINDOW_FUNC_EXPR: {
+            auto e = std::static_pointer_cast<WindowFuncNode>(expr);
+            std::vector<ExprPtr> args;
+            args.reserve(e->arguments.size());
+            for (const auto& a : e->arguments) args.push_back(CloneExpr(a));
+            WindowSpec spec;
+            spec.partition_by.reserve(e->spec.partition_by.size());
+            for (const auto& p : e->spec.partition_by) spec.partition_by.push_back(CloneExpr(p));
+            spec.order_by = e->spec.order_by;
+            spec.has_frame = e->spec.has_frame;
+            spec.frame = e->spec.frame;
+            spec.ignore_nulls = e->spec.ignore_nulls;
+            auto n = std::make_shared<WindowFuncNode>(
+                e->function_name, std::move(args), std::move(spec), e->window_name);
+            n->ignore_nulls = e->ignore_nulls;
+            n->line = e->line; n->column = e->column;
+            return n;
+        }
+        case NodeType::SUBQUERY_EXPR: {
+            auto e = std::static_pointer_cast<SubqueryExprNode>(expr);
+            // subquery / subquery_plan 仅作为占位复制，planner 后续会再次扫描并填实。
+            auto n = std::make_shared<SubqueryExprNode>(
+                e->kind, e->subquery, e->comparison_op, CloneExpr(e->outer_expr));
+            n->subquery_plan = e->subquery_plan;
+            n->line = e->line; n->column = e->column;
+            return n;
+        }
+        default:
+            // 未覆盖的节点类型：返回原指针，调用方应避免依赖此路径。
+            return expr;
+    }
+}
+
+// GROUP BY 别名改写：把裸 ColumnRefExpr 形式的 group_by 项替换为对应 SELECT-list
+// 表达式的深拷贝。这是 SQL 标准的「别名在同 SELECT 块内可见」语义的实现：
+//   SELECT CASE WHEN val > 250 THEN 'high' ... END AS tier, COUNT(*)
+//   FROM t GROUP BY tier ORDER BY tier;
+// AggregateExecutor 用 column_index_map 在每条输入元组上求值 group_by_exprs_，// 而 cmap 只来自基表列（v_base.id / v_base.val），不包含派生别名 tier；直接保留
+// 裸 ColumnRefExpr 会让 eval 返回 NULL、所有行坍缩到同一组。这里把别名解析为
+// 对应 SELECT-list 表达式，CASE WHEN 会在每条输入行上按 val 求值，分组键稳定。
+//
+// 安全护栏：
+//   1) 仅当 group_by 项是「未限定 ColumnRefExpr(column_name)」时才替换；带
+//      table.col 形式不动（语义层不允许 `t.alias` 引用 SELECT 别名）。
+//   2) SELECT-list 对应表达式本身含聚合时跳过替换 —— 与 PG/SQL 标准的
+//      「aggregate functions are not allowed in GROUP BY」语义一致，
+//      保留原 ColumnRefExpr 让执行期报列缺失。
+//   3) 复用 ExprPtr 共享：替换前后 group_by[i] 是不同 ExprPtr 节点，避免
+//      改写 select_list 时破坏别名引用。
+std::vector<ExprPtr> SubstituteGroupByAliases(
+    const std::vector<ExprPtr>& group_by,
+    const std::vector<ExprPtr>& select_list,
+    const std::vector<std::string>& select_aliases) {
+    std::vector<ExprPtr> out;
+    out.reserve(group_by.size());
+    for (const auto& gb : group_by) {
+        if (gb && gb->GetType() == NodeType::COLUMN_REF_EXPR) {
+            auto cr = std::static_pointer_cast<ColumnRefExpr>(gb);
+            if (cr->table_name.empty()) {
+                bool resolved = false;
+                for (size_t i = 0; i < select_aliases.size(); ++i) {
+                    if (select_aliases[i] == cr->column_name && i < select_list.size()) {
+                        const auto& sel = select_list[i];
+                        // 聚合调用不允许出现在 GROUP BY：保留原 ColumnRefExpr，
+                        // 由执行器在 column_index_map 中查不到别名时返回 NULL，
+                        // 进而被 AggregateExecutor 视为同一组 —— 与 PG/SQL
+                        // 标准的错误语义一致。
+                        if (sel && !ContainsAggregateExpr(sel)) {
+                            out.push_back(CloneExpr(sel));
+                            resolved = true;
+                            break;
+                        }
+                    }
+                }
+                if (resolved) continue;
+            }
+        }
+        out.push_back(gb);
+    }
+    return out;
+}
+
 // 在 expr 中找出"扩展聚合列表里还没有的"聚合调用 —— 用于 PlanSelect 把
 // HAVING/ORDER BY 独有的聚合追加进 extended aggregate_exprs。
 std::vector<ExprPtr> CollectUniqueAggregates(const ExprPtr& expr,
@@ -488,29 +654,10 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
             f->children.push_back(current);
             current = f;
         }
-        bool has_window = SelectHasWindowFunc(stmt);
-        if (has_window) {
-            auto wn = std::make_shared<WindowNode>(stmt.select_list, stmt.select_aliases,
-                                                   stmt.named_windows);
-            wn->children.push_back(current);
-            current = wn;
-        } else {
-            auto proj = std::make_shared<ProjectNode>(stmt.select_list, stmt.select_aliases, stmt.is_distinct);
-            proj->children.push_back(current);
-            current = proj;
-        }
-        if (!stmt.order_by.empty()) {
-            auto s = std::make_shared<SortNode>(ResolveOrderByOrdinals(
-                stmt.order_by, stmt.select_list, stmt.line, stmt.column));
-            s->children.push_back(current);
-            current = s;
-        }
-        if (stmt.limit >= 0) {
-            auto l = std::make_shared<LimitNode>(stmt.limit, stmt.limit_offset);
-            l->children.push_back(current);
-            current = l;
-        }
-        return current;
+        // 共享 SELECT 尾段（见 PlanAggregateTail）：让 VALUES 也走
+        // Aggregate → HAVING → Window/Project → OrderBy → Limit，
+        // 不再跳过聚合路径。
+        return PlanAggregateTail(current, stmt);
     }
     // 派生表 FROM (SELECT ...) AS alias —— 把子查询递归规划成子树当作 FROM。
     // Bug 6 修复：内层可以是 SelectStatement（derived_table）或
@@ -542,41 +689,24 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
         // 在识别到 derived_alias 时会忽略 SeqScanNode 的 table_name 而改走子计划。
         scan->children.push_back(sub_plan);
         PlanNodePtr current = scan;
-        // outer WHERE
+        // Bug 13 修复：派生表在 JOIN 左侧时（旧实现直接 return 跳过 join 循环，
+        // 导致 JoinNode 完全不出现）。现在把 join 链构造抽到 PlanJoins，让
+        // 派生表分支也走与普通 FROM 一致的 join 处理路径；left_label 用
+        // stmt.derived_alias，使 NATURAL/USING 的 ColumnRef 限定符与占位一致。
+        // 注意：WHERE 必须在 PlanJoins 之后，否则 `WHERE t1.col = ...` 这类
+        // 引用右侧 JOIN 表的谓词在 FilterNode 评估时找不到表，触发「列 NULL
+        // 过滤后整表消失」的假象（Bug 13 第二段症状）。
+        current = PlanJoins(current, stmt, stmt.derived_alias);
+        // outer WHERE（位于 joins 之后，与 FROM-表路径语义一致）
         if (stmt.where_clause) {
             auto f = std::make_shared<FilterNode>(stmt.where_clause);
             f->children.push_back(current);
             current = f;
         }
-        // outer SELECT list 可能含窗口函数，递归走 PlanSelect 头部逻辑。
-        // 复制当前 SelectStatement 把 from_table 留空（derived_table 已显式置位）
-        // 的简化路径：直接构造 inner-aware 的后续逻辑：
-        // 由于外层 SELECT 的列引用走 `alias.col`，column_index_map 由 ExecutionEngine
-        // 通过 derived_alias 映射到子查询输出位置。这里不需要从子表列表中收集表。
-        // 直接走与简单 SELECT 相同的尾段（PROJECT / WINDOW / ORDER BY / LIMIT）。
-        bool has_window = SelectHasWindowFunc(stmt);
-        if (has_window) {
-            auto wn = std::make_shared<WindowNode>(stmt.select_list, stmt.select_aliases,
-                                                   stmt.named_windows);
-            wn->children.push_back(current);
-            current = wn;
-        } else {
-            auto proj = std::make_shared<ProjectNode>(stmt.select_list, stmt.select_aliases, stmt.is_distinct);
-            proj->children.push_back(current);
-            current = proj;
-        }
-        if (!stmt.order_by.empty()) {
-            auto s = std::make_shared<SortNode>(ResolveOrderByOrdinals(
-                stmt.order_by, stmt.select_list, stmt.line, stmt.column));
-            s->children.push_back(current);
-            current = s;
-        }
-        if (stmt.limit >= 0) {
-            auto l = std::make_shared<LimitNode>(stmt.limit, stmt.limit_offset);
-            l->children.push_back(current);
-            current = l;
-        }
-        return current;
+        // 共享 SELECT 尾段（见 PlanAggregateTail）：让 derived_table 也走
+        // Aggregate → HAVING → Window/Project → OrderBy → Limit。
+        // 旧实现跳过聚合路径，导致 SUM(s) 之类的外层聚合被当标量函数求值返回 NULL。
+        return PlanAggregateTail(current, stmt);
     }
 
     PlanNodePtr current;
@@ -586,83 +716,8 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
     // Joins: each join produces a JoinNode with two children
     //   children[0] = previous chain (left side)
     //   children[1] = new SeqScanNode(j.table_name) (right side)
-    for (const auto& j : stmt.joins) {
-        ExprPtr effective_condition = j.on_condition;
-        // USING / NATURAL 翻译为合成 ON 条件：a.col = b.col AND ...
-        if (!j.using_columns.empty() || j.is_natural) {
-            std::vector<std::string> cols = j.using_columns;
-            if (j.is_natural) {
-                cols.clear();
-                const TableInfo* left_info = symbol_table_.GetTable(stmt.from_table);
-                const TableInfo* right_info = symbol_table_.GetTable(j.table_name);
-                if (left_info && right_info) {
-                    for (const auto& lc : left_info->columns) {
-                        for (const auto& rc : right_info->columns) {
-                            if (lc.name == rc.name) {
-                                cols.push_back(lc.name);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            ExprPtr combined = nullptr;
-            std::string left_label = stmt.from_table;
-            std::string right_label = j.table_name;
-            for (const auto& cn : cols) {
-                auto lhs = std::make_shared<ColumnRefExpr>(left_label, cn);
-                auto rhs = std::make_shared<ColumnRefExpr>(right_label, cn);
-                auto eq = std::make_shared<BinaryExpr>(BinaryOperator::EQUAL, lhs, rhs);
-                if (!combined) {
-                    combined = eq;
-                } else {
-                    combined = std::make_shared<BinaryExpr>(
-                        BinaryOperator::AND, combined, eq);
-                }
-            }
-            effective_condition = combined;
-        }
-        // 55_query: LATERAL 派生表 join ——对每条外层行跑一次右子计划（带 outer_bind），
-        // 并把产生的右行与左行拼接。Planner 这里生成 ApplyNode；执行器负责每行重算。
-        // 右子查询用一个 SeqScanNode 占位（table_alias == table_name）包装，
-        // 让 BuildCombinedColumnIndexMapWithDerived 走「派生表」路径按输出列
-        // 暴露给外层 cmap，避免把内层 SeqScan 的真实表名写入 outer_cmap。
-        if (j.is_lateral) {
-            std::string derived_alias = !j.table_alias.empty() ? j.table_alias : j.table_name;
-            // 收集右子计划的「内层表名」：from_table_alias 与 joins 的别名/表名，
-            // 供 ApplyExecutor 在 ctx 中注册，让右子计划的 evaluator 知道哪些限定
-            // 列是内层（不走 outer_bind）。
-            std::vector<std::string> lateral_inner_tables;
-            if (j.lateral_subquery) {
-                if (!j.lateral_subquery->from_table_alias.empty()) {
-                    lateral_inner_tables.push_back(j.lateral_subquery->from_table_alias);
-                }
-                for (const auto& lj : j.lateral_subquery->joins) {
-                    if (!lj.table_name.empty()) {
-                        lateral_inner_tables.push_back(lj.table_name);
-                    }
-                    if (!lj.table_alias.empty()) {
-                        lateral_inner_tables.push_back(lj.table_alias);
-                    }
-                }
-            }
-            auto apply = std::make_shared<ApplyNode>(false, derived_alias,
-                                                    lateral_inner_tables);
-            apply->children.push_back(current);
-            if (j.lateral_subquery) {
-                PlanNodePtr lateral_plan = PlanSelect(*j.lateral_subquery);
-                auto placeholder = std::make_shared<SeqScanNode>(derived_alias, derived_alias);
-                placeholder->children.push_back(lateral_plan);
-                apply->children.push_back(placeholder);
-            }
-            current = apply;
-            continue;
-        }
-        auto join = std::make_shared<JoinNode>(j.join_type, effective_condition);
-        join->children.push_back(current);
-        join->children.push_back(std::make_shared<SeqScanNode>(j.table_name, j.table_alias));
-        current = join;
-    }
+    // 实现提取到 PlanJoins，让 FROM 派生表分支也能复用同一条 join 链。
+    current = PlanJoins(current, stmt, stmt.from_table);
     // WHERE
     if (current && stmt.where_clause) {
         auto f = std::make_shared<FilterNode>(stmt.where_clause);
@@ -699,20 +754,16 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
         }
         return current;
     }
-    // Aggregate: needed when GROUP BY present OR SELECT/HAVING uses aggregate functions
+    // 共享 SELECT 尾段：Aggregate → HAVING → Window/Project → OrderBy → Limit。
+    // 三个 PlanSelect 分支（main / values_rows / derived_table）共用，避免
+    // derived_table / values_rows 分支漏掉聚合路径。
+    return PlanAggregateTail(current, stmt);
+}
+
+PlanNodePtr Planner::PlanAggregateTail(PlanNodePtr current, const SelectStatement& stmt) {
+    // 1) AGGREGATE：GROUP BY 或 SELECT/HAVING 含聚合时构造 AggregateNode。
     bool needs_agg = !stmt.group_by.empty() || SelectHasAggregate(stmt);
     if (needs_agg) {
-        // ---- 扩展聚合列表 (extended aggregate_exprs) ----
-        // 旧实现直接用 select_list 作为 aggregate_exprs，所以 HAVING/ORDER BY
-        // 引用了不在 SELECT 里的聚合时，AggregateExecutor 输出 tuple 里没有对应
-        // slot，导致 HAVING 重写后的 ColumnRefExpr 找不到值、ORDER BY 直接 NULL。
-        //
-        // 新实现：aggregate_exprs = select_list ∪ HAVING/ORDER BY 中额外出现的聚合调用。
-        // PlanSelect 把 SELECT list 放在头部、extras 追加在尾部，因此：
-        //   - DISTINCT（ProjectNode over Aggregate / Filter-Aggregate）按 SELECT
-        //     list 大小取前 N 列做去重，前 N 列恰好是 SELECT 值，语义正确。
-        //   - HAVING 的 FilterNode / ORDER BY 的 SortNode 直接消费 extended tuple，
-        //     其 cmap 用 "agg_<index>" / 函数名映射到 aggregate_exprs 的位置。
         std::vector<ExprPtr> extended_aggs = stmt.select_list;
         if (stmt.having_clause) {
             auto extras = CollectUniqueAggregates(stmt.having_clause, extended_aggs);
@@ -722,17 +773,19 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
             auto extras = CollectUniqueAggregates(ob.expr, extended_aggs);
             extended_aggs.insert(extended_aggs.end(), extras.begin(), extras.end());
         }
-
+        // GROUP BY 别名改写：把 `GROUP BY tier` 形式的裸别名引用替换为对应
+        // SELECT-list 表达式的深拷贝。AggregateExecutor 的 column_index_map
+        // 仅来自基表，无法解析 SELECT 别名，不替换会让分组键退化为 NULL、
+        // 所有行坍缩到同一组（与用户的「按 tier 分组」意图相反）。
+        std::vector<ExprPtr> resolved_group_by = SubstituteGroupByAliases(
+            stmt.group_by, stmt.select_list, stmt.select_aliases);
         auto agg = std::make_shared<AggregateNode>(
-            stmt.group_by, std::move(extended_aggs), stmt.select_aliases);
+            std::move(resolved_group_by), std::move(extended_aggs), stmt.select_aliases);
         if (current) agg->children.push_back(current);
         current = agg;
     }
-    // HAVING (applied to Aggregate output)
+    // 2) HAVING：把聚合调用改写为对 AggregateNode 输出位置的 ColumnRef。
     if (stmt.having_clause && needs_agg) {
-        // Rewrite aggregate function calls in HAVING predicate into ColumnRef
-        // pointing at the corresponding position in the (extended) aggregate output tuple.
-        // 此时 AggregateNode 已经持有 extended_aggs，复用之。
         std::vector<ExprPtr> aggs;
         auto agg_node = std::static_pointer_cast<AggregateNode>(current);
         for (const auto& e : agg_node->aggregate_exprs) aggs.push_back(e);
@@ -741,6 +794,7 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
         f->children.push_back(current);
         current = f;
     }
+    // 3) WINDOW or PROJECT。
     bool has_window = SelectHasWindowFunc(stmt);
     if (has_window) {
         auto wn = std::make_shared<WindowNode>(stmt.select_list, stmt.select_aliases,
@@ -748,22 +802,17 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
         if (current) wn->children.push_back(current);
         current = wn;
     } else {
-        // PROJECT (始终在 Sort / Limit 之前，便于 ORDER BY 引用 SELECT 别名)
-        auto proj = std::make_shared<ProjectNode>(stmt.select_list, stmt.select_aliases, stmt.is_distinct);
+        auto proj = std::make_shared<ProjectNode>(
+            stmt.select_list, stmt.select_aliases, stmt.is_distinct);
         if (current) proj->children.push_back(current);
         current = proj;
     }
-    // ORDER BY (构建于 Project 之后，引用别名时即可见)
+    // 4) ORDER BY：必要时把聚合调用改写为对聚合输出位置的引用。
     if (!stmt.order_by.empty()) {
-        // 若底层包含 AggregateNode 且 ORDER BY 直接引用聚合函数，需要把
-        // 聚合调用替换为对 AggregateNode 输出 tuple 的 ColumnRef 引用；
-        // 否则 ExpressionEvaluator 收到原始 SUM(...)/COUNT(...) 等会返回 NULL。
         std::vector<OrderByItem> order_items = ResolveOrderByOrdinals(
             stmt.order_by, stmt.select_list, stmt.line, stmt.column);
         std::vector<ExprPtr> aggs_for_order;
         if (needs_agg) {
-            // 收集 (extended) aggregate_exprs 用于重写 ORDER BY 表达式。
-            // AggregateNode 在 SELECT 列表块之前已经构造；这里再次沿 plan 链向上找。
             auto p = current;
             while (p) {
                 if (p->GetType() == PlanNodeType::AGGREGATE) {
@@ -771,15 +820,12 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
                     for (const auto& e : an->aggregate_exprs) aggs_for_order.push_back(e);
                     break;
                 }
-                // Project/Filter/Wrapper 之上时，沿 children[0] 继续向上。
                 if (p->children.empty()) break;
                 p = p->children[0];
             }
             if (!aggs_for_order.empty()) {
                 for (auto& ob : order_items) {
-                    if (ob.expr) {
-                        ob.expr = RewriteAggregateRefs(ob.expr, aggs_for_order);
-                    }
+                    if (ob.expr) ob.expr = RewriteAggregateRefs(ob.expr, aggs_for_order);
                 }
             }
         }
@@ -787,11 +833,117 @@ PlanNodePtr Planner::PlanSelect(const SelectStatement& stmt) {
         if (current) s->children.push_back(current);
         current = s;
     }
-    // LIMIT
+    // 5) LIMIT。
     if (stmt.limit >= 0) {
         auto l = std::make_shared<LimitNode>(stmt.limit, stmt.limit_offset);
         l->children.push_back(current);
         current = l;
+    }
+    return current;
+}
+
+// 在 current（FROM 段已建好的子计划）之上，把 stmt.joins 逐个构造成
+// JoinNode / ApplyNode / 派生表占位 SeqScanNode 并挂入链尾。
+// left_label 由调用方传入：
+//   - 普通 FROM 表：左限定符是 stmt.from_table；
+//   - FROM 派生表：左限定符是 stmt.derived_alias（否则 USING / NATURAL 合成
+//     ON 时 ColumnRefExpr 的限定符会指向不存在的 from_table，导致执行期
+//     解析列失败）。
+//
+// 为什么单拎出来：旧实现里 derived_table 分支直接 return 跳过 join 循环，
+// 导致 `(SELECT ...) AS sub INNER JOIN t1 ON ...` 的 JoinNode 整体丢失、
+// t1 不进 plan、外层 SELECT/WHERE/ORDER BY 引用 t1.* 时全部返回 NULL。
+// 共享 helper 让两条 FROM 入口（普通表 / 派生表）走同一条 join 链。
+PlanNodePtr Planner::PlanJoins(PlanNodePtr current, const SelectStatement& stmt,
+                               const std::string& left_label) {
+    for (const auto& j : stmt.joins) {
+        ExprPtr effective_condition = j.on_condition;
+        // USING / NATURAL 翻译为合成 ON 条件：<left_label>.col = j.table_name.col AND ...
+        if (!j.using_columns.empty() || j.is_natural) {
+            std::vector<std::string> cols = j.using_columns;
+            if (j.is_natural) {
+                cols.clear();
+                // 左表元数据：优先用 left_label 在 symbol_table_ 中查找；
+                // 找不到时（典型场景：left_label 是派生表 alias），跳过自动
+                // 推导，由 ExecutionEngine 在执行期按列名补 USING 条件。
+                const TableInfo* left_info = symbol_table_.GetTable(left_label);
+                const TableInfo* right_info = symbol_table_.GetTable(j.table_name);
+                if (left_info && right_info) {
+                    for (const auto& lc : left_info->columns) {
+                        for (const auto& rc : right_info->columns) {
+                            if (lc.name == rc.name) {
+                                cols.push_back(lc.name);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            ExprPtr combined = nullptr;
+            std::string right_label = j.table_name;
+            for (const auto& cn : cols) {
+                auto lhs = std::make_shared<ColumnRefExpr>(left_label, cn);
+                auto rhs = std::make_shared<ColumnRefExpr>(right_label, cn);
+                auto eq = std::make_shared<BinaryExpr>(BinaryOperator::EQUAL, lhs, rhs);
+                if (!combined) {
+                    combined = eq;
+                } else {
+                    combined = std::make_shared<BinaryExpr>(
+                        BinaryOperator::AND, combined, eq);
+                }
+            }
+            effective_condition = combined;
+        }
+        // 派生表 JOIN 右操作数：JOIN (SELECT ...) [AS] alias
+        if (j.derived_subquery || j.derived_set_op) {
+            PlanNodePtr sub_plan;
+            if (j.derived_set_op) {
+                sub_plan = PlanSetOperation(*j.derived_set_op);
+            } else {
+                sub_plan = PlanSelect(*j.derived_subquery);
+            }
+            std::string derived_alias = !j.table_alias.empty() ? j.table_alias : j.table_name;
+            auto placeholder = std::make_shared<SeqScanNode>(derived_alias, derived_alias);
+            placeholder->children.push_back(sub_plan);
+            auto join = std::make_shared<JoinNode>(j.join_type, effective_condition);
+            join->children.push_back(current);
+            join->children.push_back(placeholder);
+            current = join;
+            continue;
+        }
+        // 55_query: LATERAL 派生表 join —— ApplyNode 路径。
+        if (j.is_lateral) {
+            std::string derived_alias = !j.table_alias.empty() ? j.table_alias : j.table_name;
+            std::vector<std::string> lateral_inner_tables;
+            if (j.lateral_subquery) {
+                if (!j.lateral_subquery->from_table_alias.empty()) {
+                    lateral_inner_tables.push_back(j.lateral_subquery->from_table_alias);
+                }
+                for (const auto& lj : j.lateral_subquery->joins) {
+                    if (!lj.table_name.empty()) {
+                        lateral_inner_tables.push_back(lj.table_name);
+                    }
+                    if (!lj.table_alias.empty()) {
+                        lateral_inner_tables.push_back(lj.table_alias);
+                    }
+                }
+            }
+            auto apply = std::make_shared<ApplyNode>(false, derived_alias,
+                                                    lateral_inner_tables);
+            apply->children.push_back(current);
+            if (j.lateral_subquery) {
+                PlanNodePtr lateral_plan = PlanSelect(*j.lateral_subquery);
+                auto placeholder = std::make_shared<SeqScanNode>(derived_alias, derived_alias);
+                placeholder->children.push_back(lateral_plan);
+                apply->children.push_back(placeholder);
+            }
+            current = apply;
+            continue;
+        }
+        auto join = std::make_shared<JoinNode>(j.join_type, effective_condition);
+        join->children.push_back(current);
+        join->children.push_back(std::make_shared<SeqScanNode>(j.table_name, j.table_alias));
+        current = join;
     }
     return current;
 }

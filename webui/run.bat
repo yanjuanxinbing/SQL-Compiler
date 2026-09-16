@@ -18,7 +18,7 @@ popd >nul
 set "WEBUI=%ROOT%\webui"
 set "BUILD=%ROOT%\build"
 set "PORT=8765"
-set "BIN_DIR=%BUILD%\Debug"
+set "BIN_DIR=%BUILD%\Release"
 set "BIN=%BIN_DIR%\sqlcompiler.exe"
 
 echo.

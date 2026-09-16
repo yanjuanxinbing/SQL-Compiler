@@ -97,6 +97,66 @@ void MergeExecutor::Init() {
     }
     if (source_child_) source_child_->Init();
     affected_rows_ = 0;
+
+    // Item #2 (perf)：探测 on_condition 形态。若是简单等值谓词
+    // `target.col = source.col`（target 是限定到 target 的列，source 是限定到
+    // source_alias 的列），则在 Init 时把 target 表按等值列建一张 hash 表，
+    // 跑 source 时按列做 O(1) 哈希探测，把每次 source 行的 O(T) SeqScan
+    // 降到 O(1) 探测。Hash 探测命中后仍需 on_condition 的其它复合项
+    // （AND 形式）评估；这里用复合谓词求值评估残余条件。
+    use_target_hash_ = false;
+    target_hash_.clear();
+    if (on_condition_ && on_condition_->GetType() == NodeType::BINARY_EXPR) {
+        auto b = std::static_pointer_cast<BinaryExpr>(on_condition_);
+        if (b->op == BinaryOperator::EQUAL &&
+            b->left && b->left->GetType() == NodeType::COLUMN_REF_EXPR &&
+            b->right && b->right->GetType() == NodeType::COLUMN_REF_EXPR) {
+            auto cr_l = std::static_pointer_cast<ColumnRefExpr>(b->left);
+            auto cr_r = std::static_pointer_cast<ColumnRefExpr>(b->right);
+            // target 的列：以 target_table_ / target_alias_ / 无限定名为准；
+            // source 的列：以 source_alias_ / 无限定名为准。
+            bool left_is_target = cr_l->table_name.empty() ||
+                                  cr_l->table_name == target_table_ ||
+                                  (!target_alias_.empty() && cr_l->table_name == target_alias_);
+            bool right_is_source = cr_r->table_name.empty() ||
+                                   (!source_alias_.empty() && cr_r->table_name == source_alias_);
+            if (left_is_target && right_is_source) {
+                eq_target_col_ = cr_l->column_name;
+                eq_source_col_ = cr_r->column_name;
+            } else if (!cr_l->table_name.empty() &&
+                       (!source_alias_.empty() && cr_l->table_name == source_alias_) &&
+                       (cr_r->table_name.empty() ||
+                        cr_r->table_name == target_table_ ||
+                        (!target_alias_.empty() && cr_r->table_name == target_alias_))) {
+                eq_target_col_ = cr_r->column_name;
+                eq_source_col_ = cr_l->column_name;
+            }
+            if (!eq_target_col_.empty() && !eq_source_col_.empty()) {
+                // 找 target 表上该列的下标。
+                size_t target_col_idx = static_cast<size_t>(-1);
+                if (info) {
+                    for (size_t i = 0; i < info->columns.size(); ++i) {
+                        if (info->columns[i].name == eq_target_col_) {
+                            target_col_idx = i;
+                            break;
+                        }
+                    }
+                }
+                if (target_col_idx != static_cast<size_t>(-1)) {
+                    // 预扫描 target 建 hash
+                    auto it = target_heap_->Begin();
+                    while (it.HasNext()) {
+                        Tuple cand = it.Next(target_column_types_);
+                        if (!cand.GetRid().IsValid()) continue;
+                        if (cand.ColumnCount() <= target_col_idx) continue;
+                        std::string k = cand.GetValue(target_col_idx).ToString();
+                        target_hash_[k].push_back(cand);
+                    }
+                    use_target_hash_ = true;
+                }
+            }
+        }
+    }
 }
 
 bool MergeExecutor::Next(Tuple* tuple) {
@@ -109,36 +169,60 @@ bool MergeExecutor::Next(Tuple* tuple) {
     ExpressionEvaluator eval(combined_column_index_map_, context_, nullptr);
     Tuple source_row;
     while (source_child_->Next(&source_row)) {
-        // 在 target 表上做一次完整 SeqScan，按 on_condition 寻找第一条命中。
+        // Item #2 (perf)：如果启用了 target hash 索引，按 eq_source_col_ 的
+        // 值做 O(1) 哈希探测；命中后只对桶内候选 target 行做 on_condition
+        // 完整评估。否则走原来的 O(T) SeqScan。
         bool matched = false;
         RID matched_rid;
         Tuple matched_target_tuple;
-        {
+        std::vector<Tuple> candidates;  // 本轮候选 target 行
+        if (use_target_hash_) {
+            // 找 source_row 上 eq_source_col_ 列的下标。source_row 只含
+            // source 表的列；combined_cmap 中"<source_alias>.<col>"指向
+            // target 列数 + i。需要把它映射回 source 表内的列下标 i。
+            size_t source_col_idx = static_cast<size_t>(-1);
+            std::string qk_source = source_alias_ + "." + eq_source_col_;
+            auto it_cmap = combined_column_index_map_.find(qk_source);
+            if (it_cmap == combined_column_index_map_.end()) {
+                it_cmap = combined_column_index_map_.find(eq_source_col_);
+            }
+            if (it_cmap != combined_column_index_map_.end() &&
+                it_cmap->second >= target_column_count_) {
+                source_col_idx = it_cmap->second - target_column_count_;
+            }
+            if (source_col_idx < source_row.ColumnCount()) {
+                std::string sk = source_row.GetValue(source_col_idx).ToString();
+                auto it_h = target_hash_.find(sk);
+                if (it_h != target_hash_.end()) candidates = it_h->second;
+            }
+        } else {
             auto it = target_heap_->Begin();
             while (it.HasNext()) {
                 Tuple cand = it.Next(target_column_types_);
                 if (!cand.GetRid().IsValid()) continue;
-                // 拼成 "target + source" 的 joined tuple 以便 on_condition 评估。
-                std::vector<Value> joined;
-                joined.reserve(cand.ColumnCount() + source_row.ColumnCount());
-                for (size_t i = 0; i < cand.ColumnCount(); ++i) {
-                    joined.push_back(cand.GetValue(i));
-                }
-                for (size_t i = 0; i < source_row.ColumnCount(); ++i) {
-                    joined.push_back(source_row.GetValue(i));
-                }
-                Tuple joined_t(std::move(joined));
-                bool ok = true;
-                if (on_condition_) {
-                    Value v = eval.Evaluate(on_condition_, joined_t);
-                    ok = !v.IsNull() && v.AsInt() != 0;
-                }
-                if (ok) {
-                    matched = true;
-                    matched_rid = cand.GetRid();
-                    matched_target_tuple = cand;
-                    break;
-                }
+                candidates.push_back(cand);
+            }
+        }
+        for (const auto& cand : candidates) {
+            std::vector<Value> joined;
+            joined.reserve(cand.ColumnCount() + source_row.ColumnCount());
+            for (size_t i = 0; i < cand.ColumnCount(); ++i) {
+                joined.push_back(cand.GetValue(i));
+            }
+            for (size_t i = 0; i < source_row.ColumnCount(); ++i) {
+                joined.push_back(source_row.GetValue(i));
+            }
+            Tuple joined_t(std::move(joined));
+            bool ok = true;
+            if (on_condition_) {
+                Value v = eval.Evaluate(on_condition_, joined_t);
+                ok = !v.IsNull() && v.AsInt() != 0;
+            }
+            if (ok) {
+                matched = true;
+                matched_rid = cand.GetRid();
+                matched_target_tuple = cand;
+                break;
             }
         }
         if (matched) {

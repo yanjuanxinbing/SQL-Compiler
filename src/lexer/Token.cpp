@@ -99,6 +99,7 @@ std::string TokenTypeToString(TokenType type) {
         case TokenType::KEYWORD_EXCEPT:        return "KEYWORD_EXCEPT";
         case TokenType::KEYWORD_ANY:           return "KEYWORD_ANY";
         case TokenType::KEYWORD_ALL:           return "KEYWORD_ALL";
+        case TokenType::KEYWORD_SOME:          return "KEYWORD_SOME";
         case TokenType::KEYWORD_EXISTS:        return "KEYWORD_EXISTS";
         case TokenType::KEYWORD_UPPER:         return "KEYWORD_UPPER";
         case TokenType::KEYWORD_LOWER:         return "KEYWORD_LOWER";

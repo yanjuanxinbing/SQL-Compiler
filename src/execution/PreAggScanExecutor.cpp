@@ -16,6 +16,26 @@ std::string Upper(const std::string& s) {
     return r;
 }
 
+// bug4_decimal: DECIMAL 列在运行期持久化为 VARCHAR。SUM 的累加路径需要把
+// VARCHAR 数值文本解析为 double 才能正确累加，否则 SUM(DECIMAL)=0。此 helper
+// 与 AggregateExecutor::NumericAsDouble 语义保持一致（空/非数字文本退化为 0.0）。
+double NumericAsDouble(const Value& v) {
+    if (v.GetType() == ValueType::FLOAT) return v.AsFloat();
+    if (v.GetType() == ValueType::INTEGER) return static_cast<double>(v.AsInt());
+    if (v.GetType() == ValueType::VARCHAR) {
+        try {
+            size_t pos = 0;
+            std::string s = v.AsVarchar();
+            while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+            if (pos >= s.size()) return 0.0;
+            return std::stod(s, &pos);
+        } catch (...) {
+            return 0.0;
+        }
+    }
+    return 0.0;
+}
+
 bool IsBareCountSum(const ExprPtr& e) {
     if (!e || e->GetType() != NodeType::FUNCTION_CALL_EXPR) return false;
     auto f = std::static_pointer_cast<FunctionCallExpr>(e);
@@ -121,8 +141,12 @@ void PreAggScanExecutor::Init() {
                     st.sum += static_cast<double>(v.AsInt());
                 } else if (v.GetType() == ValueType::FLOAT) {
                     st.sum += v.AsFloat();
+                } else if (v.GetType() == ValueType::VARCHAR) {
+                    // DECIMAL 列运行期为 VARCHAR：按 double 解析累加，与
+                    // AggregateExecutor 一致。空/非数字文本 NumericAsDouble 退化为 0.0。
+                    st.sum += NumericAsDouble(v);
                 }
-                // 其它类型（如 VARCHAR）：与 AggregateExecutor 一致地只计非 NULL 数，
+                // 其它类型（如布尔）：与 AggregateExecutor 一致地只计非 NULL 数，
                 // 不参与数值累计（any_numeric 已置位，SUM 输出 0.0）。
             }
         }

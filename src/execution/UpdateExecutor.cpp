@@ -370,11 +370,42 @@ bool UpdateFromExecutor::Next(Tuple* tuple) {
         }
         Tuple target_tuple(std::move(target_values));
         // target_tuple 没有 RID（来自 join），我们需要根据"更新前 target 列值"
-        // 找到 RID。简化实现：在 target 表上做一次 SeqScan，匹配所有列值。
-        // 性能权衡：本任务的 test 规模下 O(target × joined) 完全够用。
+        // 找到 RID。Item #1 (perf)：优先尝试走 target 表的 PK / UNIQUE 索引
+        // 做 O(log M) 点查；找不到匹配索引时退化为 SeqScan。
         RID target_rid;
         bool found = false;
-        {
+        SystemCatalog* catalog = context_->GetCatalog();
+        const TableInfo* info_for_pk = catalog->GetTable(table_name_);
+        std::vector<std::string> pk_cols;
+        if (info_for_pk) {
+            // Item #1 (perf)：优先尝试走 PK 索引。TableInfo.primary_keys 是
+            // 一组"主键列"的列表（支持复合 PK），取第一组作为查询键。
+            auto groups = info_for_pk->GetPrimaryKeyGroups();
+            if (!groups.empty()) pk_cols = groups[0];
+        }
+        BPlusTree* pk_tree = pk_cols.empty() ? nullptr
+            : catalog->GetPrimaryKeyIndexTree(table_name_, pk_cols);
+        if (pk_tree != nullptr && pk_cols.size() <= target_tuple.ColumnCount()) {
+            IndexKey key;
+            key.values.reserve(pk_cols.size());
+            bool null_in_key = false;
+            for (const auto& cn : pk_cols) {
+                auto it_cn = target_column_index_map_.find(cn);
+                if (it_cn == target_column_index_map_.end()) { null_in_key = true; break; }
+                if (it_cn->second >= target_tuple.ColumnCount()) { null_in_key = true; break; }
+                const Value& v = target_tuple.GetValue(it_cn->second);
+                if (v.IsNull()) { null_in_key = true; break; }
+                key.values.push_back(v);
+            }
+            if (!null_in_key) {
+                RID r = pk_tree->FindFirst(key);
+                if (r.IsValid()) {
+                    target_rid = r;
+                    found = true;
+                }
+            }
+        }
+        if (!found) {
             auto it = table_heap_->Begin();
             while (it.HasNext()) {
                 Tuple cand = it.Next(column_types_);

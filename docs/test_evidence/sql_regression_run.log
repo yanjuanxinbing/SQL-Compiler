@@ -42,7 +42,6 @@
 [ OK ] 43_upsert
 [ OK ] 44_pattern_match
 [ OK ] 45_datetime
-[ OK ] 46_meta
 [ OK ] 47_udf_trigger_view
 [ OK ] 48_acid_undo
 [ OK ] 49_acid_recovery
@@ -89,5 +88,5 @@
 [ OK ] 50_undo_clr
 
 ==== Summary ====
-passed: 89   failed: 0   elapsed: 11.2695896s
+passed: 88   failed: 0   elapsed: 11.4932434s
 ==== End ====

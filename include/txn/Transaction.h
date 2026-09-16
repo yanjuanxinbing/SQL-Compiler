@@ -206,6 +206,10 @@ private:
     std::vector<SnapshotRead> snapshot_reads_; // 快照读基（行 -> 可见版本写者）
     std::vector<WriteSetEntry> write_set_;     // 写集（first-committer-wins 输入）
     std::vector<VersionSlotRef> version_slots_; // 待提交回填 CSN 的版本槽位
+    // item #8: name → 该 name 在 savepoints_ 中所有 entry 的 undo_log_offset，
+    // 按 PushSavepoint 顺序追加，Pop / RollbackTo 时同步 pop_back。
+    // HasSavepoint(name) 与 GetSavepointOffset(name) 通过该 map 拿到 O(1) 答案。
+    std::unordered_map<std::string, std::vector<size_t>> name_to_offsets_;
 };
 
 }  // namespace sqlcompiler

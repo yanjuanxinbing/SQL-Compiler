@@ -125,6 +125,12 @@ private:
     bool SnapshotWriteConflict(const Transaction* txn);
     // 提交拿到 CSN 后，逐槽位回填 begin_csn/end_csn。
     void BackfillVersionCsn(Transaction* txn, int64_t csn);
+    // 单步 undo（ARIES CLR 写回）：把 before-image 写回 page，从同一 page
+    // 取「undo 后状态」写入 CLR，最后把 page.page_lsn 推进到 CLR 的 LSN。
+    // 整个流程只 GetPage 一次、UnpinPage 一次，避免 3× pin 造成的不必要
+    // page 抖动。返回 CLR LSN；log_manager_ 为 null 时返回 INVALID_LSN。
+    // txn_id 显式传入：避免 UndoOnePage 反向查 current_txn_ 引起的歧义。
+    lsn_t UndoOnePage(txn_id_t txn_id, const Transaction::UndoRecord& rec, lsn_t undo_next_lsn);
 
     BufferPoolManager* buffer_pool_manager_ = nullptr;
     LogManager* log_manager_ = nullptr;

@@ -47,6 +47,14 @@ private:
     SymbolTable& symbol_table_;
 
     PlanNodePtr PlanSelect(const SelectStatement& stmt);
+    // 共享 JOIN 链构造：在 current（FROM 段已建好的子计划）之上，把 stmt.joins
+    // 逐个构造成 JoinNode / ApplyNode / 派生表占位 SeqScanNode 并挂入链尾。
+    // 当 FROM 是普通表时 left_label = stmt.from_table，USING / NATURAL 的合成
+    // ON 条件按左表名生成 ColumnRefExpr；当 FROM 是派生表时
+    // left_label = stmt.derived_alias，避免派生表与 JOIN 真实表混在同一 SELECT
+    // 时 NATURAL/USING 走错 left_label（Bug 13 修复）。
+    PlanNodePtr PlanJoins(PlanNodePtr current, const SelectStatement& stmt,
+                          const std::string& left_label);
     PlanNodePtr PlanInsert(const InsertStatement& stmt);
     PlanNodePtr PlanUpdate(const UpdateStatement& stmt);
     PlanNodePtr PlanDelete(const DeleteStatement& stmt);
@@ -115,6 +123,12 @@ private:
     // 最后用 UNION ALL 把它们合并。scan_input 是 FROM + WHERE + JOIN
     // 链已经建好的子计划；HAVING 复制到每个子 SELECT 内部。
     PlanNodePtr PlanGroupingSets(const SelectStatement& stmt, PlanNodePtr scan_input);
+
+    // 共享 SELECT 尾段：在已经建好的 FROM/JOIN/derived/VALUES 链之上，
+    // 按需构造 AggregateNode → HAVING 重写 → Window/Project → ORDER BY（重写）→ LIMIT。
+    // 三个 PlanSelect 分支（main / values_rows / derived_table）共用此函数，
+    // 避免 derived_table / values_rows 分支漏掉聚合路径导致 SUM() 被当标量函数返回 NULL。
+    PlanNodePtr PlanAggregateTail(PlanNodePtr current, const SelectStatement& stmt);
 
     // ---- Bug 12: SELECT list 中 * 出现在其他表达式旁时的列展开 ----
     // parser 把 * 记为 FunctionCallExpr("*", [])，ProjectExecutor 单独处理

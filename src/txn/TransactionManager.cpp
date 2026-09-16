@@ -182,6 +182,47 @@ void TransactionManager::ApplyUndoRange(Transaction* txn, size_t from, size_t to
     }
 }
 
+// 单 pin undo：每步只 GetPage 一次，持续 pin 到 before-image 写回、CLR
+// 写入、page.page_lsn 推进三件事全部完成后才 UnpinPage。这样同一 page
+// 在 undo 链上多条 undo 记录之间也不会触发「UnpinPage → GetPage」往返。
+// 与原实现的等价性：
+//   * before-image 写回语义不变（仍是 PAGE_SIZE 整页 memcpy + SetDirty(true)）。
+//   * CLR 的 before_image_ 字段仍是「undo 后 page 状态」，与 redo pass 的
+//     before_image_ 字段语义一致。
+//   * page.page_lsn = clr_lsn 让 redo 阶段幂等（page_lsn >= rec.lsn_ 视为
+//     已重放）。
+lsn_t TransactionManager::UndoOnePage(txn_id_t txn_id,
+                                      const Transaction::UndoRecord& rec,
+                                      lsn_t undo_next_lsn) {
+    if (buffer_pool_manager_ == nullptr) return INVALID_LSN;
+    Page* page = buffer_pool_manager_->GetPage(rec.page_id);
+    if (page == nullptr) return INVALID_LSN;
+
+    // 1) 把 page 恢复到 before-image。
+    bool modified = false;
+    if (rec.before_image.size() == PAGE_SIZE) {
+        std::memcpy(page->GetData(), rec.before_image.data(), PAGE_SIZE);
+        page->SetDirty(true);
+        modified = true;
+    }
+
+    // 2) 写 CLR：从当前 page 取「undo 后状态」承载到 CLR.before_image_，
+    //    然后把 page.page_lsn 推进到该 CLR 的 LSN，让 redo 阶段幂等。
+    lsn_t clr_lsn = INVALID_LSN;
+    if (log_manager_ != nullptr) {
+        char post_undo[PAGE_SIZE];
+        std::memcpy(post_undo, page->GetData(), PAGE_SIZE);
+        clr_lsn = log_manager_->AppendCLR(txn_id, rec.page_id, post_undo,
+                                           undo_next_lsn);
+        page->SetPageLsn(clr_lsn);
+        modified = true;
+    }
+
+    // 3) 单 pin 收尾：unpin 一次，根据 modified 标脏。
+    buffer_pool_manager_->UnpinPage(rec.page_id, modified);
+    return clr_lsn;
+}
+
 // =============================================================================
 //  Rollback — Phase C：每步 undo 写一条 CLR（Compensation Log Record）。
 //
@@ -217,58 +258,25 @@ void TransactionManager::Rollback() {
     const auto& undo_log = txn->GetUndoLog();
     const size_t total = undo_log.size();
 
-    // Phase C：逐条反向撤销，每一步：抓页 -> 写回 before-image -> 写 CLR -> flush。
+    // Phase C：逐条反向撤销，每一步走单 pin 路径（UndoOnePage）。
     // crash_after_undo_steps_ 是测试用 crash 注入钩子：每撤销一步就扣减 1，归零后
     // 立即 _Exit(1)，模拟崩溃在 rollback 中途发生。
     for (size_t i = total; i-- > 0; ) {
         const auto& rec = undo_log[i];
-        // 1) 把 page 恢复到 before-image。
-        if (buffer_pool_manager_ != nullptr) {
-            Page* page = buffer_pool_manager_->GetPage(rec.page_id);
-            if (page != nullptr) {
-                if (rec.before_image.size() == PAGE_SIZE) {
-                    std::memcpy(page->GetData(), rec.before_image.data(),
-                                PAGE_SIZE);
-                    page->SetDirty(true);
-                }
-                buffer_pool_manager_->UnpinPage(rec.page_id, true);
-            }
-        }
-        // 2) 写一条 CLR，承载「undo 后状态」+ undo_next_lsn。
+        // 撤销链上下一个待撤销 LSN：i == 0 时是 INVALID_LSN。
+        lsn_t undo_next_lsn = (i > 0) ? undo_log[i - 1].lsn : INVALID_LSN;
+        // 单 pin undo：before-image 写回 + CLR 写回 + page_lsn 推进
+        // 在同一 pin 内完成，不再「GetPage → Unpin → GetPage」轮转。
+        UndoOnePage(txn->GetTxnId(), rec, undo_next_lsn);
+        // Flush WAL：保证日志先于 page 落盘（AHEAD-OF-DATA 规则）。
         if (log_manager_ != nullptr) {
-            lsn_t undo_next_lsn =
-                (i > 0) ? undo_log[i - 1].lsn : INVALID_LSN;
-            // 重新取一次 page 的当前内容（与 before_image 等价），保证 CLR
-            // 记录的确实是「undo 后状态」。即便前面 UnpinPage/Page 被换出，
-            // 重新 GetPage 拿到的也是最新 in-memory 副本。
-            std::vector<char> post_undo(PAGE_SIZE, 0);
-            if (buffer_pool_manager_ != nullptr) {
-                Page* page2 = buffer_pool_manager_->GetPage(rec.page_id);
-                if (page2 != nullptr) {
-                    std::memcpy(post_undo.data(), page2->GetData(), PAGE_SIZE);
-                    buffer_pool_manager_->UnpinPage(rec.page_id, false);
-                }
-            } else if (rec.before_image.size() == PAGE_SIZE) {
-                std::memcpy(post_undo.data(), rec.before_image.data(),
-                            PAGE_SIZE);
-            }
-            lsn_t clr_lsn = log_manager_->AppendCLR(
-                txn->GetTxnId(), rec.page_id, post_undo.data(), undo_next_lsn);
-            // 把 page.page_lsn 推到 CLR 的 LSN，让 redo 阶段幂等。
-            if (buffer_pool_manager_ != nullptr) {
-                Page* page3 = buffer_pool_manager_->GetPage(rec.page_id);
-                if (page3 != nullptr) {
-                    page3->SetPageLsn(clr_lsn);
-                    buffer_pool_manager_->UnpinPage(rec.page_id, true);
-                }
-            }
             try {
                 log_manager_->Flush();
             } catch (...) {
                 // 测试场景里 WAL 不可写时吞掉。
             }
         }
-        // 3) 测试钩子：撤销 N 步后立即 _Exit(1)。
+        // 测试钩子：撤销 N 步后立即 _Exit(1)。
         if (crash_after_undo_steps_ > 0) {
             --crash_after_undo_steps_;
             if (crash_after_undo_steps_ == 0) {
@@ -366,49 +374,18 @@ void TransactionManager::RollbackToSavepoint(const std::string& name) {
     const auto& undo_log = txn->GetUndoLog();
     const size_t total = undo_log.size();
 
-    // 1) 反向撤销 [offset, total) 区间，每步写一条 CLR。
+    // 1) 反向撤销 [offset, total) 区间，每步走单 pin 路径（UndoOnePage）。
+    //    undo_next_lsn 计算规则：i > offset 时为 undo_log[i-1].lsn（即本
+    //    savepoint 区间内下一条待撤销 entry）；i == offset 时为 INVALID_LSN
+    //    （本次 savepoint 回滚走到 savepoint 边界即停，但 CLR 的 undo_next_lsn
+    //    仍指向 INVALID_LSN，crash-mid-txn-abort 场景下 redo + undo pass 会
+    //    走标准 prev_lsn 链回溯到 savepoint 之前的 UPDATE，这是正确的）。
     for (size_t i = total; i-- > offset; ) {
         const auto& rec = undo_log[i];
-        // 1a) 把 page 恢复到 before-image。
-        if (buffer_pool_manager_ != nullptr) {
-            Page* page = buffer_pool_manager_->GetPage(rec.page_id);
-            if (page != nullptr) {
-                if (rec.before_image.size() == PAGE_SIZE) {
-                    std::memcpy(page->GetData(), rec.before_image.data(),
-                                PAGE_SIZE);
-                    page->SetDirty(true);
-                }
-                buffer_pool_manager_->UnpinPage(rec.page_id, true);
-            }
-        }
-        // 1b) 写一条 CLR：undo_next_lsn = 前一条 entry 的 LSN（与普通
-        //     Rollback 完全一致）。entry[i-1] 在 undo_log_ 中仍存在
-        //     （除非 i == offset），若 i == offset 则前一条是 entry[i-1]
-        //     ——它是 savepoint 区间之外更早的写入，不属于本次 savepoint
-        //     回滚的范围，但对 crash-mid-txn-abort 仍然有意义。
+        lsn_t undo_next_lsn =
+            (i > offset) ? undo_log[i - 1].lsn : INVALID_LSN;
+        UndoOnePage(txn->GetTxnId(), rec, undo_next_lsn);
         if (log_manager_ != nullptr) {
-            lsn_t undo_next_lsn =
-                (i > offset) ? undo_log[i - 1].lsn : INVALID_LSN;
-            std::vector<char> post_undo(PAGE_SIZE, 0);
-            if (buffer_pool_manager_ != nullptr) {
-                Page* page2 = buffer_pool_manager_->GetPage(rec.page_id);
-                if (page2 != nullptr) {
-                    std::memcpy(post_undo.data(), page2->GetData(), PAGE_SIZE);
-                    buffer_pool_manager_->UnpinPage(rec.page_id, false);
-                }
-            } else if (rec.before_image.size() == PAGE_SIZE) {
-                std::memcpy(post_undo.data(), rec.before_image.data(),
-                            PAGE_SIZE);
-            }
-            lsn_t clr_lsn = log_manager_->AppendCLR(
-                txn->GetTxnId(), rec.page_id, post_undo.data(), undo_next_lsn);
-            if (buffer_pool_manager_ != nullptr) {
-                Page* page3 = buffer_pool_manager_->GetPage(rec.page_id);
-                if (page3 != nullptr) {
-                    page3->SetPageLsn(clr_lsn);
-                    buffer_pool_manager_->UnpinPage(rec.page_id, true);
-                }
-            }
             try {
                 log_manager_->Flush();
             } catch (...) {
