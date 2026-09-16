@@ -15,7 +15,7 @@ if (-not (Test-Path $work)) { New-Item -ItemType Directory -Path $work | Out-Nul
 if (Test-Path $log) { Remove-Item $log }
 
 function Invoke-SqlFile {
-    param([string]$exe, [string]$db, [string]$sqlFile)
+    param([string]$exe, [string]$db, [string]$sqlFile, [int]$timeoutMs = 180000)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $exe
     $psi.Arguments = "`"$db`""
@@ -24,6 +24,10 @@ function Invoke-SqlFile {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $p = [System.Diagnostics.Process]::Start($psi)
+    # 必须先异步起 reader 再写 stdin：否则被测脚本输出超过管道缓冲(4KB)时会阻塞在 stdout 写，
+    # 进而停止消费 stdin，与正在写 stdin 的父进程形成经典管道死锁（表现为进程 CPU≈0 卡死）。
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $errTask = $p.StandardError.ReadToEndAsync()
     # 逐行写入 UTF-8 字节并 Flush（复刻 bat 的 < 重定向，逐字节保真）
     $reader = [System.IO.StreamReader]::new($sqlFile, [System.Text.Encoding]::UTF8)
     $utf8 = [System.Text.UTF8Encoding]::new($false)
@@ -35,12 +39,21 @@ function Invoke-SqlFile {
         }
     } finally { $reader.Dispose() }
     $p.StandardInput.Close()
-    $outTask  = $p.StandardOutput.ReadToEndAsync()
-    $errTask  = $p.StandardError.ReadToEndAsync()
-    $p.WaitForExit()
+    $timedOut = -not $p.WaitForExit($timeoutMs)
+    if ($timedOut) { $p.Kill() }
     $out = $outTask.GetAwaiter().GetResult()
     $err = $errTask.GetAwaiter().GetResult()
+    if ($timedOut) { return @{ Exit = -1; Out = ($out + $err + "`r`n<<TIMEOUT>>") } }
     return @{ Exit = $p.ExitCode; Out = ($out + $err) }
+}
+
+# Windows PowerShell 的 Set-Content -Encoding UTF8 会写入 BOM，导致被测 CLI 首条语句
+# 变成 "\ufeffCREATE ..." 报 Lexical 错误（表建不出来，后续全错）。统一用无 BOM UTF-8 落盘。
+function Write-Utf8NoBom {
+    param([string]$Path, [Parameter(ValueFromPipeline = $true)][string[]]$Lines)
+    begin { $buf = New-Object System.Collections.Generic.List[string] }
+    process { foreach ($l in $Lines) { $buf.Add($l) } }
+    end { [System.IO.File]::WriteAllLines($Path, $buf, [System.Text.UTF8Encoding]::new($false)) }
 }
 
 $passed = 0; $failed = 0; $failedList = @()
@@ -79,7 +92,7 @@ function Invoke-CrashRecovery49 {
       "BEGIN;",
       "UPDATE acct SET bal = 999 WHERE id = 1;",
       "\crash;"
-    ) | Set-Content $p1 -Encoding UTF8
+    ) | Write-Utf8NoBom -Path $p1
     $r1 = Invoke-SqlFile -exe $exec -db $db -sqlFile $p1
     @(
       "SELECT id, bal FROM acct ORDER BY id;",
@@ -88,7 +101,7 @@ function Invoke-CrashRecovery49 {
       "UPDATE acct SET bal = 777 WHERE id = 1;",
       "ROLLBACK;",
       "SELECT id, bal FROM acct ORDER BY id;"
-    ) | Set-Content $p2 -Encoding UTF8
+    ) | Write-Utf8NoBom -Path $p2
     $r2 = Invoke-SqlFile -exe $exec -db $db -sqlFile $p2
     [System.IO.File]::WriteAllText((Join-Path $work "49_acid_recovery.out"), "[phase1 exit=$($r1.Exit)]`r`n$($r1.Out)`r`n$($r2.Out)", [System.Text.Encoding]::UTF8)
     return ($r1.Exit -ne 0 -and $r2.Exit -eq 0 -and $r2.Out -match "100" -and $r2.Out -match "60")
@@ -109,9 +122,9 @@ function Invoke-CrashClr50 {
       "INSERT INTO acct VALUES (5, 500);",
       "INSERT INTO acct VALUES (6, 600);",
       "ROLLBACK;"
-    ) | Set-Content $p1 -Encoding UTF8
+    ) | Write-Utf8NoBom -Path $p1
     $r1 = Invoke-SqlFile -exe $exec -db $db -sqlFile $p1
-    @("SELECT id, bal FROM acct ORDER BY id;") | Set-Content $p2 -Encoding UTF8
+    @("SELECT id, bal FROM acct ORDER BY id;") | Write-Utf8NoBom -Path $p2
     $r2 = Invoke-SqlFile -exe $exec -db $db -sqlFile $p2
     [System.IO.File]::WriteAllText((Join-Path $work "50_undo_clr.out"), "[phase1 exit=$($r1.Exit)]`r`n$($r1.Out)`r`n$($r2.Out)", [System.Text.Encoding]::UTF8)
     return ($r1.Exit -ne 0 -and $r2.Exit -eq 0 -and $r2.Out -match "\(3 rows\)" -and $r2.Out -notmatch "4 \| 400" -and $r2.Out -notmatch "5 \| 500" -and $r2.Out -notmatch "6 \| 600")

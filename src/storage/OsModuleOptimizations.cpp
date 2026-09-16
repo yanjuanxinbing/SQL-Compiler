@@ -37,6 +37,8 @@ namespace sqlcompiler::osopt {
 
 // （线性表驱动，多项式 0xEDB88320 / IEEE 802.3，全 0 缓冲 CRC 非 0 → 可用 0 作哨兵）
 namespace {
+// 编译期构建 256 项查表：对每个字节值 i 迭代 8 次（逐位反射移位 + 条件异或多项式），
+// 循环体全为 constexpr 合法运算，故整个表在编译期求值、运行期只读，无需任何同步。
 inline constexpr std::array<uint32_t, 256> kCrcTable = [] {
     std::array<uint32_t, 256> t{};
     for (uint32_t i = 0; i < 256; ++i) {
@@ -51,6 +53,7 @@ inline constexpr std::array<uint32_t, 256> kCrcTable = [] {
 }  // namespace
 
 uint32_t Crc32(const char* data, size_t len) {
+    // 标准反射式表驱动 CRC：初值全 1，每字节用「低 8 位索引查表」更新，末尾再取反。
     uint32_t crc = 0xFFFFFFFFu;
     const unsigned char* p = reinterpret_cast<const unsigned char*>(data);
     for (size_t i = 0; i < len; ++i) {
@@ -60,12 +63,15 @@ uint32_t Crc32(const char* data, size_t len) {
 }
 
 uint32_t LegacyCrc32(const char* data, size_t len) {
+    // 基线版：把表与 init 标志放进函数内 static（进程级单例、延迟到首次调用才构建），
+    // init 标志无同步保护，多线程首次并发即为基线实现的数据竞争所在（仅用于对比）。
     struct Static {
         std::array<uint32_t, 256> t{};
         bool init = false;  // 原实现用静态 s_init 标志（未同步 → 数据竞争）
     };
     static Static s_static;
     if (!s_static.init) {
+        // 建表公式与 kCrcTable 完全一致，保证与优化版结果逐位相同。
         for (uint32_t i = 0; i < 256; ++i) {
             uint32_t c = i;
             for (int k = 0; k < 8; ++k) {
@@ -95,6 +101,8 @@ uint32_t LegacyCrc32(const char* data, size_t len) {
 // =====================================================================
 
 void LruSet::Pin(int frame_id) {
+    // 命中后先按迭代器从 list 摘除，再删哈希表项（erase(it) 复用同一次 find 的迭代器）；
+    // 未命中说明该帧本来就不是候选，直接返回即可（幂等）。
     auto it = pos.find(frame_id);
     if (it == pos.end()) return;
     list.erase(it->second);
@@ -106,10 +114,13 @@ void LruSet::Unpin(int frame_id) {
     if (it != pos.end()) return;  // 已在候选集中，幂等返回
     list.push_back(frame_id);
     // 单次哈希：emplace 直接返回插入的迭代器，避免再作 pos[id] = … 一次查找。
+    // --list.end() 即刚 push 进去的结点，恰好是队尾（淘汰优先级最低）。
     pos.emplace(frame_id, --list.end());
 }
 
 bool LruSet::Victim(int* frame_id) {
+    // 队首即最不常使用：先取帧号与出队，再删哈希表项，最后才回写输出参数——
+    // 保证失败（空集）时输出参数保持调用方原值不变。
     if (list.empty()) return false;
     int victim = list.front();
     list.pop_front();
@@ -129,6 +140,7 @@ void LruSetLegacyUnpin(LruSet& s, int frame_id) {
     auto it = s.pos.find(frame_id);
     if (it != s.pos.end()) return;
     s.list.push_back(frame_id);
+    // 基线写法：先取 end() 再自减得到尾结点迭代器，随后用 operator[] 再做一次哈希查找。
     auto inserted = s.list.end();
     --inserted;
     s.pos[frame_id] = inserted;  // 第二次哈希（operator[]）
@@ -142,7 +154,7 @@ void LruSetLegacyUnpin(LruSet& s, int frame_id) {
 //   记账写入局部化、合并相邻读，减少穿透 buffer 的冗余访问。
 // 为在不改动 PageAllocator 正确性语义的前提下量化收益，这里用探针函数对
 //   给定"交错空闲块"布局，统计一次 Allocate 需访问的块头次数，供基准对比。
-// 生产侧的同源优化在 PageAllocator.cpp 落地（见该文件 Stage3 banner）。
+// 生产侧的同源优化在 PageAllocator.cpp 落地（见该文件 Allocate / Free 的实现）。
 // =====================================================================
 namespace {
 int32_t PkI32(const char* b, int32_t o) {
@@ -151,6 +163,9 @@ int32_t PkI32(const char* b, int32_t o) {
     return v;
 }
 // 构造 occupied 个交替的空闲块（块头 8B + 固定载荷 stride）。
+// 直接按 PageAllocator 的块头格式（size_flag | free 位、next_free）手工铺一条空闲链：
+// 每个块尺寸取对齐后的 stride，并置 bit0 为 free；next 用「新块指向旧头」的方式串成
+// 单链，因此链表顺序与地址顺序相反——探针只关心遍历长度，与真实链表顺序无关。
 void BuildFragmentedLayout(char* buffer, int32_t payload_bytes, int heads) {
     constexpr int32_t kHdr = 12;   // 区域头到 free_head 的偏移
     const int32_t step = (payload_bytes / heads) & ~7;  // 对齐到 8
@@ -163,6 +178,7 @@ void BuildFragmentedLayout(char* buffer, int32_t payload_bytes, int heads) {
         std::memcpy(buffer + off + 4, &prev, 4);
         prev = off;
     }
+    // 最后一个写入的块偏移即链表头，回填到偏移 12（free_head）。
     std::memcpy(buffer + kHdr, &prev, 4);
     (void)payload_bytes;
 }
@@ -176,6 +192,7 @@ size_t Stage3ProbeLegacyAccesses(char* buffer, int32_t payload_bytes, int heads)
     int32_t cur = head;
     constexpr int32_t kBlockHdr = 8;
     // 请求超过全部空闲块总长 → 必然遍历完整个空闲链表（测最坏遍历成本）。
+    // need 取 payload_bytes + 16，恒大于单个块 step，保证 first-fit 一路走到链尾。
     const int32_t need = kBlockHdr + payload_bytes + 8;
     while (cur != 0) {
         int32_t blk = PkI32(buffer, cur) & static_cast<int32_t>(~7);  // BlockSize
@@ -201,6 +218,7 @@ size_t Stage3ProbeFastAccesses(char* buffer, int32_t payload_bytes, int heads) {
         int64_t pair;
         std::memcpy(&pair, buffer + cur, 8);  // 一次 8B 读即含 size 与 next
         accesses += 1;
+        // 小端：低 32 位是 size_flag，高 32 位是 next_free；故这里按位切分而非再访问内存。
         int32_t blk = static_cast<int32_t>(pair) & static_cast<int32_t>(~7);
         if (blk >= need) break;
         cur = static_cast<int32_t>(static_cast<uint64_t>(pair) >> 32);
@@ -219,6 +237,8 @@ size_t Stage3ProbeFastAccesses(char* buffer, int32_t payload_bytes, int heads) {
 // =====================================================================
 
 namespace {
+// 计时工具：跑 iterations 次 fn(i)，返回每次调用的平均耗时（单位：ns/op）。
+// 把下标 i 传给 fn，便于被测循环构造「按序号变化」的访问模式，避免被优化成同一操作。
 template <typename F>
 double BenchNsPer(uint64_t iterations, F fn) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -237,9 +257,13 @@ void RunBenchmarks() {
     {
         constexpr int kPages = 4096;  // 4K × 4096 = 16 MB
         std::vector<char> blob(kPages * 4096, 0);
+        // 每页写一个值为页号的字节（偏移随页号错开），使各页内容互异而非全零，
+        // 避免两端都在同一份零数据上跑出偏乐观的缓存/分支行为。
         for (int i = 0; i < kPages; ++i) {
             blob[i * 4096 + (i % 4096)] = static_cast<char>(i);
         }
+        // fast/legacy 用异或累加各自结果：既防止编译器把纯计算循环整体优化掉，
+        // 又让两版结果可在末尾直接比对（一致性检查）。
         uint32_t fast = 0, legacy = 0;
         const auto t0 = std::chrono::steady_clock::now();
         for (int p = 0; p < kPages; ++p) fast ^= Crc32(&blob[p * 4096], 4096);
@@ -263,18 +287,23 @@ void RunBenchmarks() {
 
     // ---- Stage 2：LRU 单次哈希 ----
     {
-        constexpr int kFrames = 128;
-        constexpr uint64_t kOps = 4'000'000;
+        constexpr int kFrames = 128;          // 候选帧数：全部帧入集后即达到稳定规模
+        constexpr uint64_t kOps = 4'000'000;  // 单次吞吐测量的操作次数
         LruSet fast, legacy;
         // 预热一致：全部帧入候选集。
+        // 两版从完全相同的初始状态出发，且规模取固定值，保证后续 Pin/Unpin/Victim 的
+        // 访问模式与容器容量一致，测得的差异只来自哈希次数而非数据集。
         for (int i = 0; i < kFrames; ++i) {
             fast.Unpin(i);
             LruSetLegacyUnpin(legacy, i);
         }
         uint64_t fast_sum = 0, legacy_sum = 0;
+        // 每次迭代的 id 在 [0, kFrames) 内循环，两版走完全相同的 id 序列；
+        // 偶数次做 Pin→Unpin（净效果为重新入队），奇数次做 Victim→Unpin（淘汰后再入队），
+        // 使候选集始终非空且元素流动，避免出现空集导致的提前返回差异。
         auto fn_fast = [&](uint64_t i) {
             int id = static_cast<int>(i % kFrames);
-            fast_sum += id;
+            fast_sum += id;  // 累加 id：防止循环被优化掉，并作为状态一致性校验的一部分
             if ((i & 1u) == 0) {
                 fast.Pin(id);
                 fast.Unpin(id);
@@ -296,6 +325,8 @@ void RunBenchmarks() {
         };
         double ns_fast = BenchNsPer(kOps, fn_fast);
         double ns_legacy = BenchNsPer(kOps, fn_legacy);
+        // ns/op → M ops/s（1000/ns）；加速比取两版 ns/op 之比（>1 表示优化版更快）。
+        // 一致性以「id 累加值相同 且 候选集规模相同」判定。
         std::printf(
             "[Stage2] LRU 吞吐    : 优化(%.1f M ops/s)  vs  基线(%.1f M ops/s)  加速 %.2fx\n"
             "        状态一致    : %s\n",
@@ -306,11 +337,16 @@ void RunBenchmarks() {
 
     // ---- Stage 3：页内分配 first-fit 访问次数 ----
     {
+        // kPayload 取 4096 - 20：贴近一页内可用载荷的量级（4KB 页扣掉少量头部）；
+        // kHeads 为交错空闲块数，即空闲链长度、也是遍历次数上界；两个探针各用独立
+        // 缓冲区，避免后一次布局构造覆盖前一次的统计对象。
         constexpr int kPayload = 4096 - 20;
         constexpr int kHeads = 64;
         std::vector<char> b1(kPayload), b2(kPayload);
         size_t a_legacy = Stage3ProbeLegacyAccesses(b1.data(), kPayload, kHeads);
         size_t a_fast = Stage3ProbeFastAccesses(b2.data(), kPayload, kHeads);
+        // 访问次数为整数计数，作分母前先判 0（布局异常时 a_legacy 可能为 0），
+        // 此时减少率按 0 处理而不是产生 nan/异常。
         std::printf(
             "[Stage3] 分配遍历    : 优化(%.1f 次访问/次分配)  vs  基线(%.1f 次)\n"
             "        减少        : %.1f%%\n",

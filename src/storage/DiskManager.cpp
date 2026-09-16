@@ -70,6 +70,9 @@ inline uint32_t GetU32(const char* p) {
 inline void PutU64(char* p, uint64_t v) {
     std::memcpy(p, &v, 8);
 }
+// 注意：本函数按 8 字节读入，但返回类型为 uint32_t —— 高 32 位在返回时被截断。
+// 调用点据此解析 pages / size 两个头字段（与 32 位页号域一致）；位图长度另有
+// 「头部 + size <= 文件长度」的越界校验兜底，故不会因此越界读。
 inline uint32_t GetU64(const char* p) {
     uint64_t v;
     std::memcpy(&v, p, 8);
@@ -90,7 +93,10 @@ DiskManager::DiskManager(const std::string& db_file,
       next_page_id_(0),
       file_size_(0) {
     device_ready_ = device_ && device_->IsReady();
+    // file_size_ 一次性从介质探测并缓存（后续 I/O 不再 seek 探长度）。
     file_size_ = device_ready_ ? device_->Size() : 0;
+    // 由数据文件大小反推下一个全新页号：文件是无头的纯页数组，故页数 = 大小 / PAGE_SIZE。
+    // .fpl 装载时的 pages 字段须与此值一致，否则整份位图被丢弃（见 LoadFreePageBitmap）。
     next_page_id_ = static_cast<page_id_t>(file_size_ / PAGE_SIZE);
     fpl_path_ = db_file_name_ + ".fpl";
     LoadFreePageBitmap();
@@ -268,6 +274,8 @@ void DiskManager::EnsureBitCapacity(size_t need_bytes) {
     if (fpl_ == nullptr) return;
     if (fbit_bytes_ >= need_bytes) return;
     // 扩展文件到位图区域结束位置，并用可靠的 0 覆盖（WC 未保证，故逐个扩展一次写最低字节）。
+    // 原理：在 24 + need_bytes - 1 处写 1 字节，既把文件长度撑到目标大小，又保证该最低
+    // 字节确定是 0；若只 seek 不写，延长区的实际内容在部分介质上不可预测。
     std::fseek(fpl_, static_cast<long>(kFplHeader + need_bytes - 1), SEEK_SET);
     char zero = 0;
     std::fwrite(&zero, 1, 1, fpl_);
@@ -405,6 +413,8 @@ void DiskManager::EnsureCrcFile(size_t need_count) {
     }
     if (pcrc_.size() >= need_count) return;
     // 用 0 补齐新增项（0 = 无记录），并同步扩展文件，保证后续可直接定位写。
+    // 该 fseek 偏移等价于 (need_count - 1) * 4，即「最后一个新增条目」的起始位置；
+    // 在此写 1 字节即把文件长度撑到 need_count * 4。
     size_t old = pcrc_.size();
     pcrc_.resize(need_count, 0);
     std::fseek(crc_, static_cast<long>(old * 4 + (need_count - old - 1) * 4),
@@ -421,6 +431,8 @@ void DiskManager::SetPageCrc(page_id_t page_id, const char* data) {
     if (crc_ == nullptr) return;  // 无法持久化 CRC：跳过（降级）
     uint32_t crc = osopt::Crc32(data, PAGE_SIZE);
     pcrc_[idx] = crc;
+    // 按本机字节序把 4 字节原样写入偏移 idx * 4（目标平台 x86/x64、ARM LE 均为小端，
+    // 与文件格式约定一致）。内存缓存 pcrc_ 与文件内容保持同步，读校验只信内存副本。
     std::fseek(crc_, static_cast<long>(idx * 4), SEEK_SET);
     std::fwrite(reinterpret_cast<const char*>(&crc), 4, 1, crc_);
     std::fflush(crc_);  // 仅到 OS 缓存，不逐页 fsync

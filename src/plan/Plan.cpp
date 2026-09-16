@@ -11,6 +11,11 @@ const char* JoinTypeName(JoinType t) {
         case JoinType::INNER: return "INNER";
         case JoinType::LEFT:  return "LEFT";
         case JoinType::RIGHT: return "RIGHT";
+        case JoinType::FULL_OUTER: return "FULL_OUTER";
+        case JoinType::CROSS: return "CROSS";
+        // U3-3：子查询去关联产生的半连接（EXISTS/IN/ANY）与反连接（NOT EXISTS/NOT IN）。
+        case JoinType::SEMI:  return "SEMI";
+        case JoinType::ANTI:  return "ANTI";
     }
     return "?";
 }
@@ -124,7 +129,48 @@ std::string NodeBodyToString(const PlanNode& node, int depth) {
         }
         case PlanNodeType::INDEX_SCAN: {
             auto& n = static_cast<const IndexScanNode&>(node);
-            oss << "IndexScan(" << n.table_name << " using " << n.index_name << ")";
+            oss << "IndexScan(" << n.table_name << " using " << n.index_name;
+            // Phase 5：打印区间边界（含复合索引多列前缀），供 EXPLAIN / 收敛验证。
+            const auto print_key = [&](const std::vector<Value>& key) {
+                for (size_t i = 0; i < key.size(); ++i) {
+                    if (i) oss << ",";
+                    oss << key[i].ToString();
+                }
+            };
+            if (!n.low_key.empty() || !n.high_key.empty()) {
+                oss << " [";
+                if (!n.low_key.empty()) {
+                    oss << "low=";
+                    print_key(n.low_key);
+                    if (!n.low_inclusive) oss << " excl";
+                }
+                if (!n.high_key.empty()) {
+                    if (!n.low_key.empty()) oss << " ";
+                    oss << "high=";
+                    print_key(n.high_key);
+                    if (!n.high_inclusive) oss << " excl";
+                }
+                oss << "]";
+            }
+            oss << ")";
+            break;
+        }
+        // U3-2 扫描内预聚合（继承 AggregateNode，输出形状一致）：打印 GROUP BY 与
+        // 聚合表达式，供 EXPLAIN 断言「聚合已下推到扫描层」。
+        case PlanNodeType::PRE_AGG_SCAN: {
+            auto& n = static_cast<const PreAggScanNode&>(node);
+            oss << "PreAggScan(";
+            oss << "GROUP BY [";
+            for (size_t i = 0; i < n.group_by_exprs.size(); ++i) {
+                if (i) oss << ", ";
+                oss << (n.group_by_exprs[i] ? n.group_by_exprs[i]->ToString() : "?");
+            }
+            oss << "], AGG [";
+            for (size_t i = 0; i < n.aggregate_exprs.size(); ++i) {
+                if (i) oss << ", ";
+                oss << (n.aggregate_exprs[i] ? n.aggregate_exprs[i]->ToString() : "?");
+            }
+            oss << "])";
             break;
         }
         case PlanNodeType::TRUNCATE_TABLE: {
@@ -400,6 +446,8 @@ static std::string PlanNodeTypeName(PlanNodeType t) {
         case PlanNodeType::SORT: return "Sort";
         case PlanNodeType::LIMIT: return "Limit";
         case PlanNodeType::AGGREGATE: return "Aggregate";
+        // U3-2 扫描内预聚合（继承 AggregateNode）：JSON / S-expr 序列化按原名标注。
+        case PlanNodeType::PRE_AGG_SCAN: return "PreAggScan";
         case PlanNodeType::INSERT: return "Insert";
         case PlanNodeType::UPDATE: return "Update";
         case PlanNodeType::DELETE: return "Delete";
@@ -428,6 +476,7 @@ static std::string PlanNodeTypeName(PlanNodeType t) {
         case PlanNodeType::SAVEPOINT: return "Savepoint";
         case PlanNodeType::ROLLBACK_TO_SP: return "RollbackToSp";
         case PlanNodeType::RELEASE_SP: return "ReleaseSp";
+        case PlanNodeType::SET_ISOLATION: return "SetIsolation";
         case PlanNodeType::EXPLAIN: return "Explain";
         case PlanNodeType::SHOW: return "Show";
         case PlanNodeType::CREATE_SCHEMA: return "CreateSchema";
@@ -600,6 +649,23 @@ PlanNodeType AggregateNode::GetType() const {
 }
 
 std::string AggregateNode::ToString() const {
+    return NodeBodyToString(*this, 0);
+}
+
+// ============ PreAggScanNode（U3-2 扫描内预聚合）============
+
+PreAggScanNode::PreAggScanNode(std::vector<ExprPtr> group_by_exprs,
+                               std::vector<ExprPtr> aggregate_exprs,
+                               std::vector<std::string> aliases)
+    : AggregateNode(std::move(group_by_exprs), std::move(aggregate_exprs),
+                    std::move(aliases)) {
+}
+
+PlanNodeType PreAggScanNode::GetType() const {
+    return PlanNodeType::PRE_AGG_SCAN;
+}
+
+std::string PreAggScanNode::ToString() const {
     return NodeBodyToString(*this, 0);
 }
 
@@ -1020,6 +1086,13 @@ ReleaseSavepointNode::ReleaseSavepointNode(std::string name)
 PlanNodeType ReleaseSavepointNode::GetType() const { return PlanNodeType::RELEASE_SP; }
 std::string ReleaseSavepointNode::ToString() const {
     return "ReleaseSavepoint(" + savepoint_name + ")\n";
+}
+
+// SET TRANSACTION ISOLATION LEVEL ...：只写入会话默认隔离级别，无结果集。
+SetIsolationNode::SetIsolationNode(IsolationLevel level) : isolation_level(level) {}
+PlanNodeType SetIsolationNode::GetType() const { return PlanNodeType::SET_ISOLATION; }
+std::string SetIsolationNode::ToString() const {
+    return "SetIsolation()\n";
 }
 
 // ============ 53_ddl: SCHEMA / SEQUENCE ============

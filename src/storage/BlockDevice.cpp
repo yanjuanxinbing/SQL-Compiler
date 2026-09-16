@@ -28,7 +28,6 @@ void DurableSync(std::FILE* f) {
 #endif
 }
 
-// 返回当前文件字节大小；失败返回 0
 // 64 位文件定位（Windows: _fseeki64/_ftelli64；POSIX: fseeko/ftello）。
 // 数据文件偏移 = page_id * PAGE_SIZE，DB 超 2GB（约 52 万页）后 32 位 long 会被
 // 截断回绕，读写错位；必须 64 位定位。
@@ -47,6 +46,8 @@ long long FTell64(std::FILE* f) {
 #endif
 }
 
+// 返回当前文件字节大小；失败返回 0
+// 实现：先记住当前位置，seek 到末尾取长度，再恢复原位置（避免干扰调用方的读写游标）。
 long long TellFileSize(std::FILE* f) {
     if (f == nullptr) return 0;
     long long cur = FTell64(f);
@@ -82,8 +83,11 @@ long long FileBlockDevice::Size() const {
 size_t FileBlockDevice::Read(long long offset, char* buf, size_t len) {
     if (f_ == nullptr) return 0;
     if (buf == nullptr || len == 0) return 0;
+    // 64 位定位后读；seek 越界不单独处理——随后的 fread 会读回 0 字节，自然落到
+    // 上层约定的「短读」语义（由调用方补零）。
     FSeek64(f_, offset, SEEK_SET);
     size_t got = std::fread(buf, 1, len, f_);
+    // 只有 ferror（真正的介质/系统错误）才抛；读到 EOF 造成的短读属正常返回。
     if (got < len && std::ferror(f_)) {
         std::clearerr(f_);
         throw std::runtime_error("FileBlockDevice::Read failed: " + path_);
@@ -108,6 +112,8 @@ void FileBlockDevice::EnsureCapacity(long long byte_count) {
     if (f_ == nullptr || byte_count <= 0) return;
     long long cur = TellFileSize(f_);
     if (cur >= byte_count) return;
+    // 用「写最后一个字节」而非 truncate 扩展：天然跨平台（无需 _chsize/ftruncate），
+    // 写成功后文件长度即为 byte_count；中间新扩展区域的内容未定义，由上层写入覆盖。
     FSeek64(f_, byte_count - 1, SEEK_SET);
     const char zero = 0;
     if (std::fwrite(&zero, 1, 1, f_) != 1) {
@@ -158,6 +164,7 @@ size_t FaultInjectingBlockDevice::Write(long long offset, const char* buf,
 
 void FaultInjectingBlockDevice::CorruptWritesForRange(long long from, long long len) {
     if (len == 0) {
+        // len == 0 视为「取消坏块配置」（等价于清掉 corrupt_from_ 而不动一次性标志）。
         corrupt_from_ = -1;
         corrupt_len_ = 0;
         return;

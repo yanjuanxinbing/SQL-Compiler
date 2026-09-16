@@ -4,6 +4,8 @@
 
 namespace sqlcompiler {
 
+// 构造：初始化列表先给出安全初值，随后统一走 ResetMemory() 完成数据区清零与
+// 元信息复位（两处语义一致，ResetMemory 的赋值即最终状态）。
 Page::Page() : page_id_(INVALID_PAGE_ID), is_dirty_(false), pin_count_(0) {
     ResetMemory();
 }
@@ -48,12 +50,17 @@ void Page::IncPinCount() {
     ++pin_count_;
 }
 
+// 防御性钳制：计数已为 0 时不再递减，保证 pin_count_ 恒不为负；帧「何时交回
+// 替换器候选集」由 BufferPoolManager::UnpinPage 在计数归零时判断，本函数不介入。
 void Page::DecPinCount() {
     if (pin_count_ > 0) {
         --pin_count_;
     }
 }
 
+// 帧复用入口：把上一页遗留的全部状态清零，避免新页继承旧页的脏标记、pin 计数、
+// 页 LSN 与观测计数。唯一例外是 latch_——读写闩不在本函数重置（std::shared_mutex
+// 不可重新赋值），调用方须保证此时无人持锁。
 void Page::ResetMemory() {
     std::memset(data_, 0, PAGE_SIZE);
     page_id_ = INVALID_PAGE_ID;

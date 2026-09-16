@@ -122,14 +122,16 @@ void LoopbackNetworkBlockDevice::ServerLoop(Impl* impl) {
         SockHandle c = ::accept(impl->listen_, reinterpret_cast<sockaddr*>(&caddr), &clen);
         if (c == kInvalidSock) continue;
         impl->peer_ = c;
+        // 响应帧固定 9 字节：status(1B) + 长度或值 u64 LE(8B)，其后可选跟负载。
         char resp[9];
         while (!impl->stop_.load(std::memory_order_acquire)) {
+            // 请求帧固定 17 字节：op(1B) + offset u64 LE(8B) + len u64 LE(8B)。
             char hdr[17];
             if (!RecvAll(c, hdr, sizeof(hdr))) break;  // 对端关闭/出错
             const uint8_t op = static_cast<uint8_t>(hdr[0]);
             const long long off = static_cast<long long>(GetU64(hdr + 1));
             const long long len = static_cast<long long>(GetU64(hdr + 9));
-            resp[0] = 0;
+            resp[0] = 0;  // 默认成功状态；仅「未知 opcode」分支改写为 1
             if (op == 1) {  // 读：返回可用字节（介质末尾不足）
                 std::vector<char> payload;
                 {
@@ -163,7 +165,7 @@ void LoopbackNetworkBlockDevice::ServerLoop(Impl* impl) {
                 }
                 PutU64(resp + 1, static_cast<uint64_t>(len));
                 if (!SendAll(c, resp, 9)) break;
-            } else if (op == 3) {  // EnsureCapacity
+            } else if (op == 3) {  // EnsureCapacity：复用 offset 字段承载目标字节数
                 {
                     std::lock_guard<std::mutex> lock(impl->mu_);
                     if (off > static_cast<long long>(impl->data_.size())) {
@@ -181,6 +183,7 @@ void LoopbackNetworkBlockDevice::ServerLoop(Impl* impl) {
                     std::lock_guard<std::mutex> lock(impl->mu_);
                     sz = static_cast<uint64_t>(impl->data_.size());
                 }
+                // Size 的响应额外跟 8 字节负载（Read 的响应则在固定 9 字节之后跟读到的数据）。
                 PutU64(resp + 1, 8);
                 if (!SendAll(c, resp, 9)) break;
                 char szb[8];
@@ -234,6 +237,8 @@ LoopbackNetworkBlockDevice::~LoopbackNetworkBlockDevice() {
     if (!impl_) return;
     impl_->stop_.store(true, std::memory_order_release);
     // 断开连接让服务端 RecvAll 立即返回 0 退出（select 100ms 超时兜底）。
+    // shutdown 的 how=2 在 Windows 为 SD_BOTH、POSIX 为 SHUT_RDWR：收发双向都停，
+    // 使双方正在阻塞的 recv 立刻返回，避免只靠 100ms 轮询等待。
     if (impl_->peer_ != kInvalidSock) SockShutdown(impl_->peer_, 2);
     if (impl_->conn_ != kInvalidSock) SockShutdown(impl_->conn_, 2);
     if (impl_->server_.joinable()) impl_->server_.join();
@@ -257,13 +262,13 @@ std::string LoopbackNetworkBlockDevice::Name() const {
 long long LoopbackNetworkBlockDevice::Size() const {
     if (!ready_ || impl_->conn_ == kInvalidSock) return 0;
     char hdr[17];
-    hdr[0] = 5;
+    hdr[0] = 5;  // op 5 = Size；请求帧另两个字段无意义，置 0
     PutU64(hdr + 1, 0);
     PutU64(hdr + 9, 0);
     if (!SendAll(impl_->conn_, hdr, sizeof(hdr))) return 0;
     char resp[9];
     if (!RecvAll(impl_->conn_, resp, sizeof(resp))) return 0;
-    char szb[8];
+    char szb[8];  // 固定 9 字节响应之后跟 8 字节大小值
     if (!RecvAll(impl_->conn_, szb, sizeof(szb))) return 0;
     return static_cast<long long>(GetU64(szb));
 }
@@ -273,7 +278,7 @@ size_t LoopbackNetworkBlockDevice::Read(long long offset, char* buf, size_t len)
         len == 0)
         return 0;
     char hdr[17];
-    hdr[0] = 1;
+    hdr[0] = 1;  // op 1 = Read
     PutU64(hdr + 1, static_cast<uint64_t>(offset));
     PutU64(hdr + 9, static_cast<uint64_t>(len));
     if (!SendAll(impl_->conn_, hdr, sizeof(hdr))) {
@@ -300,7 +305,7 @@ size_t LoopbackNetworkBlockDevice::Write(long long offset, const char* buf, size
         len == 0)
         return 0;
     char hdr[17];
-    hdr[0] = 2;
+    hdr[0] = 2;  // op 2 = Write（头部之后紧跟 len 字节负载）
     PutU64(hdr + 1, static_cast<uint64_t>(offset));
     PutU64(hdr + 9, static_cast<uint64_t>(len));
     if (!SendAll(impl_->conn_, hdr, sizeof(hdr)) || !SendAll(impl_->conn_, buf, len)) {
@@ -320,7 +325,7 @@ size_t LoopbackNetworkBlockDevice::Write(long long offset, const char* buf, size
 void LoopbackNetworkBlockDevice::EnsureCapacity(long long byte_count) {
     if (!ready_ || impl_->conn_ == kInvalidSock || byte_count <= 0) return;
     char hdr[17];
-    hdr[0] = 3;
+    hdr[0] = 3;  // op 3 = EnsureCapacity（offset 字段承载目标字节数）
     PutU64(hdr + 1, static_cast<uint64_t>(byte_count));
     PutU64(hdr + 9, 0);
     if (!SendAll(impl_->conn_, hdr, sizeof(hdr))) {
@@ -338,7 +343,7 @@ void LoopbackNetworkBlockDevice::EnsureCapacity(long long byte_count) {
 void LoopbackNetworkBlockDevice::Sync() {
     if (!ready_ || impl_->conn_ == kInvalidSock) return;
     char hdr[17];
-    hdr[0] = 4;
+    hdr[0] = 4;  // op 4 = Sync
     PutU64(hdr + 1, 0);
     PutU64(hdr + 9, 0);
     if (!SendAll(impl_->conn_, hdr, sizeof(hdr))) {

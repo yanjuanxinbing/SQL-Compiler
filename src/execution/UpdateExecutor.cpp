@@ -28,8 +28,12 @@
 #include "execution/TypeCoercion.h"
 #include "catalog/SystemCatalog.h"
 
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
+
+#include "txn/Transaction.h"
+#include "txn/TransactionManager.h"
 
 namespace sqlcompiler {
 
@@ -61,6 +65,24 @@ void UpdateExecutor::Init() {
     pending_returning_.clear();
     pending_pos_ = 0;
     if (table_heap_) {
+        // MVCC 快照隔离：与 SeqScanExecutor 一致，扫描/读行前把本事务快照水位与
+        // 共享 CommitTracker 挂到堆上，GetTuple 按快照过滤版本。否则更新会把同一
+        // 逻辑行的新旧版本槽位都视为独立行处理，且 RecordSnapshotRead 不会记录，
+        // first-committer-wins 退化为失败。
+        if (context_ != nullptr) {
+            Transaction* tx = context_->GetTransaction();
+            TransactionManager* mgr = context_->GetTransactionManager();
+            CommitTracker* tracker =
+                (mgr != nullptr) ? mgr->GetCommitTracker() : nullptr;
+            if (tx != nullptr && tx->IsActive() &&
+                tx->GetIsolationLevel() == IsolationLevel::kSnapshot &&
+                tracker != nullptr) {
+                table_heap_->SetSnapshot(tx->GetSnapshotCsn(), tracker);
+            } else {
+                // 非快照/自动提交：复位共享堆上遗留的快照水位，避免陈旧读泄漏。
+                table_heap_->SetSnapshot(-1, nullptr);
+            }
+        }
         iterator_ = std::make_unique<TableHeap::Iterator>(table_heap_->Begin());
     }
     // 60_view_trigger: STATEMENT 级 AFTER 触发器重置 fire 标记。
@@ -112,6 +134,11 @@ bool UpdateExecutor::Next(Tuple* tuple) {
     // 在 EvaluateSubquery 的首行 nullptr 检查退化为 NULL，进而 `= NULL` 求值为
     // UNKNOWN，所有候选行被误判为不匹配。详见 79_dml_subquery 回归用例。
     ExpressionEvaluator eval(column_index_map_, context_, nullptr);
+    // Phase A：把当前事务挂到堆上。必须在「读行取快照读基」之前就绪，否则
+    // GetTuple 的 RecordSnapshotRead（供 first-committer-wins 用）不会记录，
+    // UpdateTuple 会退化为以物理 head 为基，导致冲突检测失效。
+    Transaction* txn = context_->GetTransaction();
+    if (txn != nullptr) table_heap_->SetActiveTransaction(txn);
     for (const RID& r : rids) {
         Tuple cur;
         if (!table_heap_->GetTuple(r, &cur, column_types_)) continue;
@@ -189,27 +216,57 @@ bool UpdateExecutor::Next(Tuple* tuple) {
                                          cur.GetValues(), &r, &modified_cols);
             }
         }
+        // SERIALIZABLE 谓词写前检查（防幻读）：按更新后的主键键判冲突。
+        auto pr = context_->CheckSerializablePredicate(table_name_, new_t.GetValues());
+        if (pr == ExecutionContext::RowLockResult::kDeadlock ||
+            pr == ExecutionContext::RowLockResult::kTimeout) {
+            throw std::runtime_error(
+                pr == ExecutionContext::RowLockResult::kDeadlock
+                    ? "isolation deadlock on predicate (statement aborted)"
+                    : "isolation predicate lock wait timed out (statement aborted)");
+        }
         // 索引同步：先摘掉旧键，写堆成功后再挂上新键。
         // 顺序反过来（先插新键）会让唯一索引在「键未变」时自己撞自己。
+        // MVCC 二级索引精确可见性（t4）：键未变的更新跳过重建（旧条目仍指向
+        // 稳定 RID）；快照写者的键改写对非唯一二级索引延迟摘除旧条目，由回表
+        // 键重检精确过滤。
         const TableInfo* info = context_->GetCatalog()->GetTable(table_name_);
-        Transaction* txn = context_->GetTransaction();
+        std::vector<Value> old_vals = cur.GetValues();
         if (info != nullptr) {
-            DeleteFromIndexes(context_->GetCatalog(), *info, cur.GetValues(), r, txn);
+            std::vector<Value> new_vals = new_t.GetValues();
+            DeleteFromIndexes(context_->GetCatalog(), *info, old_vals, r, txn,
+                              &new_vals);
         }
-        // Phase A：把当前事务挂到堆上，让 UpdateTuple 抓 undo。
-        // 关键：UpdateTuple 在新行比旧 slot 大时会 DeleteTuple(old) +
+        // T2 行级写锁：写该行前取 X 锁（持有到提交，Commit/Rollback 释放）。传入
+        // 表堆首页页号参与「行级锁升级」：大批量 UPDATE 达阈值后行锁收敛为表级 X 锁。
+        auto rl = context_->AcquireRowWriteLock(r,
+            static_cast<int64_t>(table_heap_->GetFirstPageId()));
+        if (rl == ExecutionContext::RowLockResult::kDeadlock ||
+            rl == ExecutionContext::RowLockResult::kTimeout) {
+            throw std::runtime_error(
+                rl == ExecutionContext::RowLockResult::kDeadlock
+                    ? "isolation deadlock on row write (statement aborted)"
+                    : "isolation row lock wait timed out (statement aborted)");
+        }
+        // Phase A：事务已提前挂到堆上（读行时已记录快照读基），这里 UpdateTuple
+        // 直接抓 undo。关键：UpdateTuple 在新行比旧 slot 大时会 DeleteTuple(old) +
         // InsertTuple(new)，新 RID 由 out_new_rid 返回；后续 InsertIntoIndexes
         // 必须用新 RID，否则 PK 索引键会指向墓碑化 slot，下一次 UPDATE 时
         // 索引仍按旧 RID 命中旧 slot → exclude_rid 校验失败 → 抛 "duplicate key"。
-        table_heap_->SetActiveTransaction(txn);
         RID new_rid = r;
         bool ok = table_heap_->UpdateTuple(r, new_t, column_types_, &new_rid);
-        table_heap_->SetActiveTransaction(nullptr);
         if (ok) {
             ++affected;
             if (info != nullptr) {
+                // RID 未变（原位更新）时把旧行交给 InsertIntoIndexes：键未变的
+                // 索引项已在 DeleteFromIndexes 中被保留，这里跳过重复插入，避免
+                // 同 (key, rid) 出现两条条目导致查询重复出行。RID 已变（增长/迁槽
+                // 路径的 delete+insert）时必须按新 RID 写入，否则索引键指向墓碑槽。
+                const std::vector<Value>* old_row_for_skip =
+                    (new_rid == r) ? &old_vals : nullptr;
                 InsertIntoIndexes(context_->GetCatalog(), *info,
-                                  new_t.GetValues(), new_rid, txn);
+                                  new_t.GetValues(), new_rid, txn,
+                                  old_row_for_skip);
             }
             // 60_view_trigger: AFTER UPDATE 触发器（含 STATEMENT 级）。
             TriggerExecutor::FireAfter(
@@ -226,10 +283,15 @@ bool UpdateExecutor::Next(Tuple* tuple) {
                 pending_returning_.push_back(Tuple(std::move(out)));
             }
         } else if (info != nullptr) {
-            // 写堆失败：把刚摘掉的旧键放回去，避免索引凭空少一条
-            InsertIntoIndexes(context_->GetCatalog(), *info, cur.GetValues(), r, txn);
+            // 写堆失败：把「确实被摘掉」的旧键放回去，避免索引凭空少一条。
+            // 快照+非唯一索引的旧条目在 DeleteFromIndexes 中已被保留，放回会
+            // 产生同 (key,rid) 重复条目，这里只恢复被急切摘除的条目。
+            RestoreDeletedIndexEntries(context_->GetCatalog(), *info,
+                                       old_vals, r, txn);
         }
     }
+    // Phase A：语句结束前解除事务挂载，避免把快照读基记录泄漏到后续语句。
+    if (txn != nullptr) table_heap_->SetActiveTransaction(nullptr);
     if (pending_pos_ < pending_returning_.size()) {
         if (tuple) *tuple = pending_returning_[pending_pos_++];
         return true;

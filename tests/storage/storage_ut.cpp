@@ -1,12 +1,57 @@
-// 存储子系统单元测试
-// 构建：由 CMake 目标 storage_ut 编译（链接 sqlcompiler_lib）。
-// 运行：build/storage_ut(.exe)
+// =============================================================================
+// storage_ut —— 存储子系统单元测试（操作系统：页式存储与缓存管理模块）
 //
-// 覆盖点：
-//   * DiskManager 页分配/回收、写读往返、文件大小缓存
-//   * Page 复位语义
-//   * LRU / FIFO 替换顺序
-//   * BufferPoolManager 命中统计、淘汰触发 loaded_page_id、替换日志环形上限
+// 测试目标：不引入任何第三方测试框架，用 assert + main 的自撑风格端到端验证存储层
+//   各组件的行为契约与不变量，重点是「页的分配/回收/持久化/CRC 校验」「缓冲池的替换
+//   策略、淘汰统计与刷脏」「页级 latch 的读写互斥」「MVCC 版本链与真空回收」「锁管理器
+//   与谓词锁」「B+Tree 并发与删除再平衡」「块设备抽象与故障注入」「WAL 组提交与温度
+//   感知刷盘」以及 SQL 全链路（隔离级别、子查询改写、聚合下推）的可观测结果。
+//
+// 被测组件：DiskManager / Page / PageAllocator；BufferPoolManager 及替换器
+//   LRUReplacer / FIFOReplacer / LRUKReplacer / ClockReplacer；BlockDevice 家族
+//   （File / Memory / SparseFile / LoopbackNetwork / FaultInjecting）；LockManager、
+//   CommitTracker、TableHeap（MVCC）、BPlusTree、LogManager；Database（端到端 SQL）。
+//
+// 构建与运行：CMake 目标 storage_ut（见根 CMakeLists.txt，链接静态库 sqlcompiler_lib）；
+//   产物即 build/storage_ut(.exe)，直接执行、无命令行参数、无外部数据依赖——用例自行
+//   在当前工作目录创建并在结束时删除 storage_ut_* 临时文件（.bin / .wal / .crc / .fpl）。
+//
+// 断言与失败计数：CHECK(cond) 宏每次自增 g_checks；条件不成立时打印 "FAIL 文件:行
+//   [表达式]" 并自增 g_fails，但继续执行（不中断），以便一次跑完收集全部失败。
+//   main() 收尾打印 "checks: N fails: M" 与 RESULT: PASS/FAIL，退出码 0 表示全通过、
+//   1 表示存在失败断言；其后额外调用 osopt::RunBenchmarks()（仅输出指标，不做断言）。
+//
+// 用例分类概览（按被测组件分组，函数名即用例名；执行顺序见 main() 内的调用列表）：
+//   * DiskManager / 页管理：TestDiskManager、TestFreePagePersistence、TestPageCrc、
+//     TestRobustnessFixes、TestT4BlockDevices、TestT4Diagnostics
+//   * Page / 页内分配器：TestPage、TestPageAllocator、TestPageRWLock
+//   * 缓冲池与替换策略：TestBufferPool、TestBufferPoolClock、TestBufferPoolMemory、
+//     TestReplacementLogCap、TestIOStats、TestBackgroundFlush、TestT4Observability、
+//     TestLRU、TestFIFO、TestClock、TestLRUK、TestTemperatureAwareFlush、
+//     TestAdaptiveTemperatureThreshold、TestBlockDeviceFaultInjection
+//   * 并发会话与锁：TestBufferPoolConcurrency、TestConcurrentSessions、TestLockManager、
+//     TestLockWaitObservation、TestLockManagerShardThroughput、TestRowLockEncoding、
+//     TestRowLockTier、TestRowLockEscalation、TestAdaptiveLockEscalation、
+//     TestIsolationLevels、TestSetIsolationStatement、TestRowLevelConcurrency
+//   * 谓词锁 / 可串行化：TestPredicateLockMerge、TestPredicateIntervalTree、
+//     TestPredicateIncrementalInsert、TestSerializablePredicatePhantom、
+//     TestSerializablePredicateNonPkPhantom、TestCompositeIndexRangeConvergence、
+//     TestCompositeIndexPageConvergence
+//   * MVCC 快照 / 真空：TestSnapshotIsolation、TestSnapshotDeleteFcw、TestSnapshotUpsertFcw、
+//     TestSnapshotIndexScan、TestBackgroundVacuumThread、TestVacuumReclaimsOldVersions、
+//     TestLowWaterMarkO1、TestInlineVacuum、TestVersionIndexCache、TestTombstoneSlotReuse、
+//     TestVacuumChainUnlink、TestIndexTombstoneReclaim、TestIndexVacuumLongChain
+//   * B+Tree：TestBPlusTreeConcurrency、TestOptimisticSplitConcurrency、TestBPlusTreeRebalance、
+//     TestBPlusTreeRebalanceConcurrency、TestBPlusTreeMerge、TestBPlusTreeCollapseRoot、
+//     TestBPlusTreeMergeConcurrency、TestBPlusTreeReliableReclaim、
+//     TestBPlusTreeReliableReclaimConcurrent、TestBPlusTreeOptimisticRestartOpt
+//   * WAL / 组提交：TestGroupCommit、TestGroupCommitTimeWindow
+//   * SQL 规划与优化：TestJoinReorder、TestPreAggPushDown、TestSubqueryDecorrelation、
+//     TestSubqueryMaterialization、TestRecursiveCteCacheInvalidation、TestOptimizations
+//
+// 约定：断言中的期望值属于测试契约，修改前须确认被测行为确实变更；跨线程用例尽量用
+//   原子量/轮询而非固定长睡眠来同步（少数用例用 sleep 制造锁等待窗口，就近有注释说明）。
+// =============================================================================
 
 #include <atomic>
 #include <chrono>
@@ -55,12 +100,19 @@ static int g_fails = 0;
         }                                                                      \
     } while (0)
 
+// 删除指定路径的临时文件（文件不存在时静默忽略），用于每个用例开头清场与收尾清理。
+// @param path 待删除的文件路径（各用例自建的 storage_ut_* 临时文件，含 .wal/.crc/.fpl 旁路）。
 static void RemoveFile(const std::string& path) {
     std::remove(path.c_str());
 }
 
 // 打开一个全新 DiskManager 并尝试读取某页；返回是否存在 CRC 不匹配等异常。
-// 每次调用都独立重新装载 <db>.crc，用于验证页在跨会话后的持久化校验行为。
+// @param path 数据文件路径（<db>.bin）。
+// @param pid  要读取的页号（合法值 >= 0）。
+// @return true  —— 读取过程中抛出异常（典型为页级 CRC 不匹配，也可能是 I/O 错误）；
+//         false —— 读取正常返回。
+// @note 每次调用都独立重新装载 <db>.crc，因此读到的校验记录来自磁盘而非上一次会话的
+//       内存状态——这样才真正验证「跨会话/跨进程重开文件后」页的持久化校验行为。
 static bool ReadPageThrows(const std::string& path, page_id_t pid) {
     try {
         DiskManager dm(path);
@@ -73,6 +125,13 @@ static bool ReadPageThrows(const std::string& path, page_id_t pid) {
 }
 
 // 把数据文件中某页从 byte_off 起连续 count 个字节各翻转（异或 0xFF），模拟位损坏。
+// @param path     数据文件路径。
+// @param pid      目标页号（函数内部按 pid*PAGE_SIZE 换算文件偏移）。
+// @param byte_off 页内起始字节偏移。
+// @param count    连续翻转的字节数（1 用于单字节损坏，PAGE_SIZE 用于整页损坏）。
+// @return 无（文件不存在或读写失败时静默返回，由调用方的后续断言暴露问题）。
+// @note 以 "r+b" 就地改写物理文件，完全绕过 DiskManager 的写入路径，因此 <db>.crc 中
+//       的记录不会同步刷新——这正是构造「读回时应被 CRC 校验拦截」的场景所需。
 static void FlipPageBytes(const std::string& path, page_id_t pid,
                           size_t byte_off, size_t count) {
     std::FILE* f = std::fopen(path.c_str(), "r+b");
@@ -93,6 +152,9 @@ static void FlipPageBytes(const std::string& path, page_id_t pid,
 }
 
 // 判断某文件是否存在（供惰性创建/文件增长断言语义）。
+// @param path 目标文件路径。
+// @return true  —— 文件存在且可打开读取；
+//         false —— 文件不存在或不可读。
 static bool FileExists(const std::string& path) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (f == nullptr) return false;
@@ -100,7 +162,9 @@ static bool FileExists(const std::string& path) {
     return true;
 }
 
-// 返回某文件字节大小；不存在返回 0。
+// 返回某文件字节大小（用于断言 .crc 按页 4 字节增长等文件尺寸契约）。
+// @param path 目标文件路径。
+// @return 文件的字节大小；文件不存在或不可读时返回 0。
 static long FileSize(const std::string& path) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (f == nullptr) return 0;
@@ -113,6 +177,12 @@ static long FileSize(const std::string& path) {
 // ---------------------------------------------------------------------------
 // 1. DiskManager：页分配/回收 + 写读往返 + 文件大小缓存
 // ---------------------------------------------------------------------------
+// TestDiskManager —— DiskManager 基础页管理闭环（无缓冲池，直连磁盘）。
+// 覆盖：AllocatePage 自 0 起分配、WritePage/ReadPage 全页往返逐字节一致、DeallocatePage
+// 后页号被立即复用、读取未分配页返回全零（不越界）、GetNumPages 反映已分配页数。
+// 场景：单进程内开一个临时库文件，依次分配→写读→回收→再分配，全部在同一次会话内完成，
+// 故不涉及持久化（跨会话路径由 TestFreePagePersistence / TestPageCrc 覆盖）。
+// 边界：页号 999 远超当前文件范围，读路径必须按零页返回而非崩溃；收尾删除临时文件。
 static void TestDiskManager() {
     const std::string path = "storage_ut_disk.bin";
     RemoveFile(path);
@@ -520,6 +590,11 @@ static void TestBufferPoolConcurrency() {
 // ---------------------------------------------------------------------------
 // 2. Page：复位语义
 // ---------------------------------------------------------------------------
+// TestPage —— Page 复位语义（ResetMemory 的清场契约）。
+// 场景：先把页置为非默认状态（页号 7、脏标记、pin 计数 1、page_lsn 42），再调用
+// ResetMemory，逐项断言状态回到默认（INVALID_PAGE_ID / 非脏 / pin=0 / lsn=0）。
+// 关键不变量：复位必须彻底——帧被复用时若残留任何一项元数据，就会把上一页的页号或
+// LSN 带给新页，因此四项都断言，而不是只抽查其中一项。
 static void TestPage() {
     Page pg;
     pg.SetPageId(7);
@@ -536,6 +611,12 @@ static void TestPage() {
 // ---------------------------------------------------------------------------
 // 3. LRU 替换顺序
 // ---------------------------------------------------------------------------
+// TestLRU —— LRUReplacer 的淘汰顺序（最久未用优先）。
+// 场景：依次 Unpin 1/2/3 后断言 Victim 先 1 后 2；再 Unpin(4)，然后 Pin(3)+Unpin(3)
+// 把帧 3 提升为「最近使用」，断言接下来的淘汰顺序变为 4 → 3。
+// 关键不变量：重复访问会重排候选次序——被 Pin 过再归还的帧不会立刻被淘汰；因此本用例
+// 的期望顺序是 1,2,4,3 而非 1,2,3,4。
+// 边界：候选集取空后 Victim 返回 false 且 Size()==0（可安全复用同一 victim 变量）。
 static void TestLRU() {
     LRUReplacer r(4);
     r.Unpin(1);
@@ -557,6 +638,11 @@ static void TestLRU() {
 // ---------------------------------------------------------------------------
 // 4. FIFO 替换顺序
 // ---------------------------------------------------------------------------
+// TestFIFO —— FIFOReplacer 的淘汰顺序（先进先出，访问历史不改变次序）。
+// 场景：Unpin 1/2 → Pin(2) 再从候选集移除 → Unpin(2) 重新入队 → Unpin(3)。
+// 断言 Victim 顺序恰为 1 → 2 → 3：与 LRU 相反，中间的 Pin/Unpin 只做「出队再入队」，
+// 并不把 2 提到队尾，所以 1 始终排在最前。
+// 边界：全部取空后 Victim 返回 false（候选集为空时不得给出无效页号）。
 static void TestFIFO() {
     FIFOReplacer r(4);
     r.Unpin(1);
@@ -574,6 +660,12 @@ static void TestFIFO() {
 // ---------------------------------------------------------------------------
 // 4.5 Clock 替换顺序（含其中"二次机会"语义验证）
 // ---------------------------------------------------------------------------
+// TestClock —— ClockReplacer 的「二次机会」语义（按引用位轮转扫描，扫描指针不回退）。
+// 场景分三段：空候选集（Victim 失败、Size 0）；同一帧重复 Unpin 不重复计数、Pin 移出
+// 候选；两帧均 ref=1 时首轮扫描把引用位清零，其中先被扫到的一帧在第二轮才被逐出。
+// 关键不变量：刚归还（ref=1）的帧获得第二次机会，而已经空闲（ref=0）的帧优先被逐；
+// 逐出后该帧从候选集移除，Size 相应递减。
+// 边界：候选集为空时 Victim 必须返回 false，且逐空后 Size 归零。
 static void TestClock() {
     // 空候选集：Victim 失败、Size 为 0
     {
@@ -626,6 +718,12 @@ static void TestClock() {
 // ---------------------------------------------------------------------------
 // 4.6 BufferPoolManager 以 CLOCK 策略工作：替换仍记录 loaded 日志
 // ---------------------------------------------------------------------------
+// TestBufferPoolClock —— BufferPoolManager 切到 CLOCK 策略后，淘汰与替换日志仍自洽。
+// 场景：2 帧缓冲池（ReplacementPolicy::CLOCK）先 NewPage 占满两帧并归还占用，再读一个
+// 不在池中的页（a+100）触发一次淘汰。
+// 断言：replacement_count 恰为 1、替换日志非空且末条 loaded_page_id 已填入真实页号——
+// 证明非 LRU 策略共用同一条可观测的替换记录路径，不会漏记或记成 INVALID_PAGE_ID。
+// 边界：数据文件中并不存在的页（a+100）按零页读入，取页必须成功而非失败。
 static void TestBufferPoolClock() {
     const std::string path = "storage_ut_bpm_clock.bin";
     RemoveFile(path);
@@ -651,6 +749,12 @@ static void TestBufferPoolClock() {
 // ---------------------------------------------------------------------------
 // 4.7 页内内存分配器（PageAllocator）：分配/释放/合并/碎片/可重放
 // ---------------------------------------------------------------------------
+// TestPageAllocator —— 页内空闲空间分配器的记账与布局不变量（纯内存，无 I/O）。
+// 覆盖五段：空堆统计（容量/空闲块数/最大空闲块/可用空闲，外部碎片为 0）；分配后可写入
+// 读回且记账为「载荷 + 8B 块头」；释放相邻块合并回单一空闲块；释放中间块留下中孔（外部
+// 碎片 > 0）但尾部大块仍能承载 3000B 分配；负例防御——分配 0 字节、分配 1MB 超页、
+// 二次释放同一偏移、释放非法偏移 0 全部被拒。
+// 最后以相同操作序列跑两个独立缓冲区，断言四个载荷偏移完全一致（布局可重放/确定性）。
 static void TestPageAllocator() {
     // 空堆统计
     {
@@ -744,6 +848,12 @@ static void TestPageAllocator() {
 // ---------------------------------------------------------------------------
 // 5. BufferPoolManager：命中统计、淘汰日志 loaded、历史截断
 // ---------------------------------------------------------------------------
+// TestBufferPool —— 缓冲池命中/缺失统计与淘汰日志（默认 LRU、2 帧）。
+// 场景：NewPage 两页（各记 1 次 miss）并归还占用，使池满且两帧均可淘汰；再 GetPage 命中
+// 已在池中的页（hit 递增）；最后读一个池外的新页触发淘汰。
+// 断言：miss_count==2、淘汰计数==1、替换日志末条 loaded_page_id 非 INVALID_PAGE_ID；
+// 另外 FlushAllDirtyPages/FlushPage 在未注入 LogManager 的兼容路径下不抛异常。
+// 边界：新分配、从未写盘的页也要能被取回（零页语义），不能因文件里没有而失败。
 static void TestBufferPool() {
     const std::string path = "storage_ut_bpm.bin";
     RemoveFile(path);
@@ -788,6 +898,11 @@ static void TestBufferPool() {
 // ---------------------------------------------------------------------------
 // 6. 替换日志环形上限：超过 kMaxReplacementLog 后被截断
 // ---------------------------------------------------------------------------
+// TestReplacementLogCap —— 替换日志是有界环形缓冲，不能被长跑场景无限撑大。
+// 场景：单帧缓冲池（每次 NewPage 必然淘汰上一帧）循环 NewPage 1100 次，超过 1024 上限。
+// 断言：淘汰计数如实等于 1100（统计不受日志截断影响），而替换日志条目数被夹在 1024——
+// 即「计数与明细分离」：明细只为最近 1024 次淘汰保留，避免内存随运行时长增长。
+// 边界：恰好落在上限的临界处，故断言用 size()<=1024 且 >=1024 两个方向夹住。
 static void TestReplacementLogCap() {
     const std::string path = "storage_ut_bpm_cap.bin";
     RemoveFile(path);
@@ -815,6 +930,12 @@ static void TestReplacementLogCap() {
 // ---------------------------------------------------------------------------
 // 6b. IO 统计与脏页写回计数：\stats 的「disk reads/writes」「dirty writebacks」
 // ---------------------------------------------------------------------------
+// TestIOStats —— 磁盘 I/O 计数与脏页写回计数的对账（\stats 指标的底层数据源）。
+// 场景（单帧池便于触发淘汰）：NewPage 与干净命中都不应触盘；写脏后显式 FlushPage 应记
+// 1 次磁盘写 + 1 次脏页写回；再弄脏后 NewPage 淘汰换出，两计数各再 +1；最后取回已被换出
+// 的页应记一次磁盘读。
+// 关键不变量：计数只在真正读写盘时递增——缓冲池命中不得虚增读计数，不脏的换出不得虚增
+// 写计数，否则 \stats 会失真。边界：被换出的页需重新读盘，读计数用 >=1 容纳实现细节。
 static void TestIOStats() {
     const std::string path = "storage_ut_io_stats.bin";
     RemoveFile(path);
@@ -868,6 +989,13 @@ static void TestIOStats() {
 // ---------------------------------------------------------------------------
 // 6c. 后台异步刷脏线程（E5）：周期刷脏、启用/停用、幂等收尾
 // ---------------------------------------------------------------------------
+// TestBackgroundFlush —— 后台周期刷脏线程的启停与推进（4 帧池，未注入 LogManager）。
+// 场景：先把 p0 弄脏且不清洗，确认未启用时 IsBackgroundFlushEnabled 为 false；再以 20ms
+// 周期启动后台线程；等待采用「轮询 + 2s 上限」而不是固定长睡眠，避免机器负载抖动把用例
+// 变成偶发失败。
+// 断言：启用后 writeback_count/IOWriteCount/BackgroundFlushTicks 被后台线程推进（全程不做
+// 显式 Flush）；StopBackgroundFlush 后线程 join 干净收尾、tick 不再增长，且重复 Stop 无副作用。
+// 边界：停用后必须彻底静止（等待 80ms 后 tick 不变），否则会留下悬空线程污染后续用例。
 static void TestBackgroundFlush() {
     const std::string path = "storage_ut_bg_flush.bin";
     RemoveFile(path);
@@ -924,6 +1052,14 @@ static void TestBackgroundFlush() {
 // 6d. 块设备抽象层（E7）：FileBlockDevice 透传 + FaultInjectingBlockDevice
 //     坏块注入（I/O 错误通道 + 页 CRC 拦截静默损坏）
 // ---------------------------------------------------------------------------
+// TestBlockDeviceFaultInjection —— 块设备装饰器的透传语义与三类故障注入点。
+// 场景：FileBlockDevice 外套 FaultInjectingBlockDevice，并把设备 std::move 交给 DiskManager
+// 接管所有权；提前取出裸指针 faulty 作为注入句柄（装饰器注入点是「装饰器层」，而不是文件层）。
+// 断言四段：(a) 未注入时写读往返一致且 I/O 计数正常；(b) FailNextWrite / (c) FailNextRead
+// 让下一次写/读上抛统一 I/O 错误，且失败的写不计入成功写回计数；(d) CorruptWritesForRange
+// 使指定区间落盘时被 0xFF 覆写（静默损坏），读回被页级 CRC 校验拦截并抛含 "CRC mismatch"
+// 的异常——这是 D5 页校验与 E7 故障注入的联动验证。
+// 边界：注入的是一次性故障（FailNext*），故 (a) 之后的调用仍可正常落盘。
 static void TestBlockDeviceFaultInjection() {
     const std::string path = "storage_ut_bdev.bin";
     RemoveFile(path);
@@ -988,6 +1124,13 @@ static void TestBlockDeviceFaultInjection() {
 // ---------------------------------------------------------------------------
 // 7. LRU-K 替换策略（E8）
 // ---------------------------------------------------------------------------
+// TestLRUK —— LRU-K 替换策略：用「访问次数是否达到 K」区分热页与一次性页。
+// (a) 直接策略测试（K=2）：帧 0 被访问两次进 historic（受保护），帧 1 只访问一次留在
+//     recent，Victim 先给出 1；recent 空后才轮到 historic 的 0。
+// (b) 缓冲池级对照：同一访问足迹 A→A→B→C→A 分别跑 LRU 与 LRU-K（均 2 帧、K=2）——
+//     第 4 步淘汰时 LRU-K 保留热页 A 而 LRU 淘汰 A，于是第 5 步读 A 时 LRU-K 命中、LRU 缺失。
+// 关键不变量：淘汰次序由访问历史深度决定，而非单纯的最近访问时刻；本用例用命中/缺失
+// 计数的确定值（2/3 与 1/4）把这一差异钉死。
 static void TestLRUK() {
     // (a) 直接策略测试（K=2）：被访问 ≥2 次的「相关」热页受保护，
     //     优先淘汰只访问 1 次（未满 K）的近期帧 —— 与普通 LRU 相反。
@@ -1144,6 +1287,12 @@ static void TestPageRWLock() {
 
 // E6：缓冲池内存上限可配置与统计。
 //   验证字节<->帧数换算、配置上限(cap)与当前占用(usage)统计的自洽性。
+//
+// TestBufferPoolMemory —— 缓冲池内存上限换算与占用统计（纯计算 + 池内状态查询）。
+// (a) FramesForBytes：字节到帧数向上取整，且 0 字节也保证至少 1 帧，避免出现零容量缓存。
+// (b) 缓冲池级：cap 恒为「帧数 × 页大小」且不随分配变化（固定池）；usage 随占用帧数线性
+// 变化、恒不超过 cap；DeletePage 把帧放回空闲池后占用随之减一。
+// 关键不变量：cap 与 usage 两个口径互不干扰——前者是池上限，后者只统计当前被占用的帧。
 static void TestBufferPoolMemory() {
     // (a) 字节 -> 帧数换算：不足一页按一页，保证缓存非空。
     CHECK(BufferPoolManager::FramesForBytes(0) == 1);
@@ -1391,6 +1540,13 @@ static void TestConcurrentSessions() {
 }
 
 // T2：事务级 S/X 锁管理器 + 等待图死锁检测 + 超时。
+//
+// TestLockManager —— LockManager 的相容矩阵、死锁检测、超时与跨线程唤醒。
+// (1) 同资源多把 S 锁可叠加、S 与 X 互斥；(2) X 互斥，释放后后继请求可获授；
+// (3) 两个事务互相等待成环时，由后发起等待的一方作为 victim 得到 kDeadlock（等待图检测）；
+// (4) 阻塞等待超过 wait_ms 返回 kTimeout，并断言实际耗时下界（证明真的等了，而非立即返回）；
+// (5) 跨线程阻塞式获授：A 释放后 B 被唤醒并最终持有锁。
+// 场景为纯内存锁表，无 I/O；边界覆盖「非阻塞探针返回 kWouldBlock」与「释放后重新获授」。
 static void TestLockManager() {
     LockManager lm;
 
@@ -1527,6 +1683,12 @@ static void TestIsolationLevels() {
 
 // SET TRANSACTION ISOLATION LEVEL ...：从 SQL 层设置会话默认隔离级别，
 // 下一次 BEGIN 采样进新事务；非法级别报语法错误。
+//
+// TestSetIsolationStatement —— SET TRANSACTION ISOLATION LEVEL 的 SQL 层语义。
+// 覆盖：设置成功后立即反映到会话默认级别；下一次 BEGIN 把该级别采样进新事务
+// （txn->GetIsolationLevel 与会话一致）；未 BEGIN 时也可反复重设并再次采样。
+// 场景：单会话、单数据库文件，纯 SQL 驱动，无并发。
+// 边界/负例：非法级别名 "X" 必须返回失败（语法错误），且不得静默忽略或回退为默认值。
 static void TestSetIsolationStatement() {
     const std::string path = "storage_ut_setiso.bin";
     RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
@@ -1562,6 +1724,12 @@ static void TestSetIsolationStatement() {
 }
 
 // 行级锁资源 id 编码：符号位标记行锁，保证与表锁（非负首页页号）数值不相交。
+//
+// TestRowLockEncoding —— RowResourceId 的编码不变量（无需创建锁，只验编码函数）。
+// 断言：同一 (页, 槽) 编码确定；不同页号或不同槽位编码互异；结果恒为负数。
+// 关键不变量：行锁 id 与表锁 id 的取值域不相交——(页0,槽7) 不等于表 7、(页0,槽0) 不等于
+// 表 0，否则行锁与表锁会在锁管理器里被当成同一资源而误冲突。
+// 边界：两个边界组合（页 0 与槽 0）单独列出，专防「编码退化为原值」的实现错误。
 static void TestRowLockEncoding() {
     CHECK(RowResourceId(5, 7) < 0);                                  // 行锁恒为负
     CHECK(RowResourceId(5, 7) == RowResourceId(5, 7));               // 确定性
@@ -1573,6 +1741,13 @@ static void TestRowLockEncoding() {
 
 // 行锁层：用 RID 编码的负 id 走同一套 LockManager，验证 S-S 兼容 / X 冲突 /
 // 跨行独立 / IsLockHeld / Unlock 与 UnlockAll。
+//
+// TestRowLockTier —— 行级锁复用 LockManager：以 RID 编码的负 id 表达「一行」。
+// 覆盖：同一行两个事务的 S 锁相容、X 与已有 S 冲突；不同行（r2）互不影响；释放 r2 后
+// 该行的 S 请求可获授；释放一把 S 后 X 仍被余下的 S 挡住，全部释放后才授予 X；UnlockAll
+// 后 IsLockHeld 变为 false。
+// 关键不变量：锁冲突严格局限在同一 RID 上——跨行不互相阻塞，这正是行级粒度成立的前提。
+// 场景为纯内存锁表；边界覆盖「部分释放后仍冲突」这一最易写错的相容判定。
 static void TestRowLockTier() {
     LockManager lm;
     const int64_t r1 = RowResourceId(1, 0);  // 行(页1, 槽0)
@@ -2013,6 +2188,11 @@ static void TestOptimisticSplitConcurrency() {
 
 // 全面行级并发：两个 READ COMMITTED 事务同表不同行并发写【不互斥】（行级并发，
 // 非表级）；同表同行使行锁阻塞至持有者提交。验证取消表锁后行锁真正承担并发隔离。
+// 场景：会话 A 对 id=1 持行写锁且不提交，工作线程 B 先改 id=2、再改 id=1；用原子
+//   标志配合 200ms 等待窗口判断 B 是否被阻塞（超过窗口未结束即视为互斥）。
+// 关键不变量：不同行更新不得因表级锁互斥而卡住（b_row2_done 必须已置位）；同行更新
+//   必须被 A 的行 X 锁拦住（b_row1_done 在 A 提交前保持 0），A 提交后立即放行。
+// 边界：B 的阻塞只是等待而非失败——放行后 r1.success 为真且最终 v 取后写者（12/21）。
 static void TestRowLevelConcurrency() {
     const std::string path = "storage_ut_rowlevel.bin";
     RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
@@ -2083,6 +2263,11 @@ static void TestRowLevelConcurrency() {
 
 // SERIALIZABLE 谓词锁防幻读：A 全表扫描注册覆盖全范围的读谓词后不提交；B 向
 // 该范围插入新键被 A 的谓词挡住，直到 A 提交才放行。
+// 场景：会话 A 置 kSerializable 并 SELECT 全表（注册全范围读谓词，持锁到提交），
+//   工作线程 B 并发 INSERT 新键 5；A 的谓词锁应把 B 挡在写前的谓词冲突检查处。
+// 关键不变量：B 在 A 提交前不得完成（b_done 在 200ms 窗口内保持 0）——否则 A 重扫
+//   会看到新键 5 形成幻读；A 提交后 B 立即可写入且 rb.success 为真（阻塞非失败）。
+// 边界：本用例只涉及主键键值，非主键列/复合索引区间的谓词收敛见后续 NonPk 用例。
 static void TestSerializablePredicatePhantom() {
     const std::string path = "storage_ut_phantom.bin";
     RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
@@ -2576,6 +2761,8 @@ static void TestGroupCommitTimeWindow() {
     const int kPerThread = 4;
     const int kCommits = kThreads * kPerThread;
 
+    // 单次提交的观测结果：target 为本条 COMMIT 的 LSN，durable 为 GroupCommit 返回时
+    // 已确认持久化的 LSN。用例据此断言 durable >= target，即「提交返回即已落盘」。
     struct Res {
         lsn_t target;
         lsn_t durable;
@@ -2929,6 +3116,12 @@ static void TestSnapshotIsolation() {
 
 // 快照 DELETE 的 first-committer-wins：B 基于 E 快照读到的旧值删行，而该行在
 // B 的 E 快照之后已被 A 提交改写——B 的 DELETE 应被 FCW 中止（行保留，A 的值落盘）。
+//
+// TestSnapshotDeleteFcw —— 快照隔离下 DELETE 的提交期冲突判定（FCW）。
+// 场景：A 先改写 id=3 并持行 X 锁不提交；B 在同一行的快照 DELETE 被该 X 锁阻塞，等 A 提交
+// 后 DELETE 语句本身得以完成，但 COMMIT 时按「B 的快照早于 A 的提交」判定 B 为输家而中止。
+// 断言：B 的删除整体回滚——表仍有 3 行，且 id=3 保持 A 提交的值 300（不是被删，也不是旧值）。
+// 边界：本用例专门钉住「语句成功 ≠ 事务生效」——若只断言语句返回值就会漏掉该缺陷。
 static void TestSnapshotDeleteFcw() {
     const std::string path = "storage_ut_snapshot_del.bin";
     RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
@@ -2966,7 +3159,7 @@ static void TestSnapshotDeleteFcw() {
             if (rd.success) db.ExecuteSQL("COMMIT", sB.get());
             b_done = 1;
         });
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));  // 给 B 线程进入锁等待的时间窗
         CHECK(!b_done.load());  // B 被 A 的行 X 锁挡住
         CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
         wb.join();
@@ -2990,6 +3183,13 @@ static void TestSnapshotDeleteFcw() {
 
 // 快照 UPSERT（冲突改写路径复用 UpdateTuple）的 first-committer-wins：
 // B 的主键冲突改写基于 E 快照旧值，而该行在 B 的快照后已被 A 提交改写——B 应被中止。
+//
+// TestSnapshotUpsertFcw —— 快照隔离下 UPSERT 改写分支的 FCW 判定。
+// 场景：A 先改写 id=1（v=100）并持行 X 锁不提交；B 执行
+// INSERT ... ON DUPLICATE KEY UPDATE v=999 命中主键冲突改写路径，被该 X 锁阻塞；A 提交后
+// B 的语句成功，但 COMMIT 时 FCW 判定其基于陈旧快照而中止。
+// 断言：B 的改写不落盘，id=1 的最终值为 A 提交的 100。
+// 边界：UPSERT 走的是「冲突改写复用 UpdateTuple」的路径，必须同样被 FCW 覆盖，不能漏检。
 static void TestSnapshotUpsertFcw() {
     const std::string path = "storage_ut_snapshot_upsert.bin";
     RemoveFile(path); RemoveFile(path + ".wal"); RemoveFile(path + ".crc");
@@ -3027,7 +3227,7 @@ static void TestSnapshotUpsertFcw() {
             if (ru.success) db.ExecuteSQL("COMMIT", sB.get());
             b_done = 1;
         });
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));  // 给 B 线程进入锁等待的时间窗
         CHECK(!b_done.load());  // B 被 A 的行 X 锁挡住
         CHECK(db.ExecuteSQL("COMMIT", sA.get()).success);
         wb.join();
@@ -4036,9 +4236,13 @@ static void TestIndexVacuumLongChain() {
             });
         };
 
-        // 插入 (100,·) 后连续 66 次键改写 (101..166)：链共 67 版本全部同页，
-        //   head(166)@c66 → v65(165)@c65 → ... → v1(101)@c1 → v0(100)@c0
-        // （67×60B = 4020B ≤ 页空间，RID 稳定不 relocate）。
+        // 插入 (100,·) 后连续 65 次键改写 (101..165)：链共 66 版本全部同页，
+        //   head(165)@c65 → v64(164)@c64 → ... → v1(101)@c1 → v0(100)@c0
+        // （66×61B = 4026B ≤ 页空间，RID 稳定不 relocate）。
+        // 注：Tuple 序列化含 NULL bitmap（main 侧 BUG-5 修复：NULL 信息外置到
+        //     bitmap，避免 in-band marker 与合法值碰撞），单版本记录 53B
+        //     （48B MVCC 头 + 1B bitmap + 4B INT），加 8B 槽项共 61B/版本，
+        //     单页上限 66 版本（67 版本需 4087B > 4080B 可用空间，会触发 relocate）。
         RID rid;
         std::vector<int64_t> csn;  // csn[i] = v_i 的 begin_csn（第 i 次提交）
         run_txn([&] {
@@ -4046,7 +4250,7 @@ static void TestIndexVacuumLongChain() {
             CHECK(tree->Insert(IndexKey({Value::MakeInt(100)}), rid));
         });
         csn.push_back(tracker.CurrentCSN());  // c0
-        for (int k = 1; k <= 66; ++k) {
+        for (int k = 1; k <= 65; ++k) {
             run_txn([&] {
                 CHECK(heap->UpdateTuple(rid, Tuple({Value::MakeInt(100 + k)}), schema));
                 CHECK(tree->Insert(IndexKey({Value::MakeInt(100 + k)}), rid));
@@ -4054,29 +4258,30 @@ static void TestIndexVacuumLongChain() {
             csn.push_back(tracker.CurrentCSN());  // ck
         }
         CHECK(rid.slot_num == 0);  // 链完整累积，RID 稳定
-        CHECK(csn.size() == 67);
-        CHECK(count_key(100) == 1 && count_key(166) == 1);
+        CHECK(csn.size() == 66);
+        CHECK(count_key(100) == 1 && count_key(165) == 1);
 
-        // 快照 {c1}：oldest=c1 < head.begin=c66，精确化走链 65 步（v65..v1）> 64。
-        //   旧条目 (100,rid)：链上无「键==100 且区间含 c1」的版本 → kRemove。
-        //   （旧实现 64 步超限一律 kKeep 漏回收；新实现访问集防环 + 完整走链正确回收。）
-        CHECK(decide(rid, 100, {csn[1]}) == TableHeap::IndexVacuumDecision::kRemove);
-        //   安全边界：快照 {c0} 尚需旧键（S=c0 的可见版本 = v0(100)）→ kKeep。
+        // 快照 {c0}：最老快照的可见版本 = 链尾 v0(100)，精确化走链 65 步（v64..v0）> 64。
+        //   （旧实现 64 步超限一律 kKeep 漏回收；新实现访问集防环 + 完整走链正确判定。）
+        //   条目 (100,rid)：链上可见版本键 == 100 → kKeep。
         CHECK(decide(rid, 100, {csn[0]}) == TableHeap::IndexVacuumDecision::kKeep);
-        //   可见版本键命中：S=c1 的可见版本 = v1(101) → 条目 (101,rid) kKeep。
-        CHECK(decide(rid, 101, {csn[1]}) == TableHeap::IndexVacuumDecision::kKeep);
-        //   紧邻下界：v2(102) 的可见区间 [c2, c3) 不含 c1 → 条目 (102,rid) kRemove。
-        CHECK(decide(rid, 102, {csn[1]}) == TableHeap::IndexVacuumDecision::kRemove);
+        //   条目 (101,rid)：v1(101) 的可见区间 [c1, c2) 不含 c0 → 65 步走链后 kRemove。
+        CHECK(decide(rid, 101, {csn[0]}) == TableHeap::IndexVacuumDecision::kRemove);
+        //   紧邻下界：v2(102) 的可见区间 [c2, c3) 不含 c0 → 65 步走链后 kRemove。
+        CHECK(decide(rid, 102, {csn[0]}) == TableHeap::IndexVacuumDecision::kRemove);
         //   多快照并存 {c0, c1}：最老快照 c0 需要旧键 → kKeep。
         CHECK(decide(rid, 100, {csn[0], csn[1]}) == TableHeap::IndexVacuumDecision::kKeep);
         //   活跃条目（head 键 == 条目键）无条件 kKeep。
-        CHECK(decide(rid, 166, {csn[1]}) == TableHeap::IndexVacuumDecision::kKeep);
+        CHECK(decide(rid, 165, {csn[0]}) == TableHeap::IndexVacuumDecision::kKeep);
+        //   快照 {c1}：可见版本 = v1(101) → 条目 (101,rid) kKeep、(100,rid) kRemove。
+        CHECK(decide(rid, 101, {csn[1]}) == TableHeap::IndexVacuumDecision::kKeep);
+        CHECK(decide(rid, 100, {csn[1]}) == TableHeap::IndexVacuumDecision::kRemove);
 
-        // 整树真空（快照 {c1}）：仅保留可见版本键 101 与 head 键 166，
-        // 移除其余 65 条旧键条目（100、102..165）。
-        CHECK(vacuum_with({csn[1]}) == 65);
-        CHECK(count_key(101) == 1 && count_key(166) == 1);
-        CHECK(count_key(100) == 0 && count_key(102) == 0 && count_key(165) == 0);
+        // 整树真空（快照 {c0}）：仅保留可见版本键 100 与 head 键 165，
+        // 移除其余 64 条旧键条目（101..164）。
+        CHECK(vacuum_with({csn[0]}) == 64);
+        CHECK(count_key(100) == 1 && count_key(165) == 1);
+        CHECK(count_key(101) == 0 && count_key(102) == 0 && count_key(164) == 0);
 
         tracker.UnregisterSnapshot(0);  // 解除保护性快照
         delete heap;
@@ -4263,6 +4468,13 @@ static void TestLockManagerShardThroughput() {
 // ---------------------------------------------------------------------------
 // T4a. 介质扩展：Memory / SparseFile / LoopbackNetwork 三种可交换块设备
 // ---------------------------------------------------------------------------
+// TestT4BlockDevices —— T4 介质扩展：三种可互换块设备 + 以依赖注入换介质。
+// (a) MemoryBlockDevice：读写往返、Size 随写入增长、未写区恒为 0、越介质末尾读返回不足量。
+// (b) SparseFileBlockDevice：写越 EOF 成洞（洞读 0）、逻辑大小与物理分配字节分离、补齐洞后
+//     分配区间数由 2 合并为 1、Sync 落盘不抛异常。
+// (c) LoopbackNetworkBlockDevice：TCP 回环读写往返、请求计数递增、EnsureCapacity 扩容生效。
+// (d)(e) 给 DiskManager 注入内存/稀疏设备：零业务改动换介质，读写往返与 GetDeviceName 正确。
+// 边界：三者都在同一用例内自建自清临时文件，验证「介质可替换」这一抽象不泄漏到上层。
 static void TestT4BlockDevices() {
     // (a) 内存块设备：读写往返、EnsureCapacity 扩容、未写区为 0、越界读不足
     {
@@ -4386,6 +4598,14 @@ static void TestT4BlockDevices() {
 // ---------------------------------------------------------------------------
 // T4b. 可观测性：命中构成 / 脏页年龄 / 后台刷脏直方图 / 页映射 / IO 队列
 // ---------------------------------------------------------------------------
+// TestT4Observability —— T4 新增观测指标与真实池内状态的对照（16 帧池、固定热阈值 4）。
+// (a) 命中按温度分档：随同一页被反复命中，命中从 cold 递进到 warm 再到 hot，且三档之和
+//     精确等于总命中次数（5 次），证明分档不重不漏。
+// (b) 脏页年龄分布：刚变脏落入 [0,1) 桶，脏页未写回时五个年龄桶合计不为 0。
+// (c) 页映射观测：GetPageMapSnapshot / GetFrameOfPage / IsPageDirtyInPool 对在池页给出一致
+//     结果（帧号相同、脏标记为真），对不在池的页（9999）给出 -1/false。
+// (d) 后台刷脏直方图：启动后台线程后用轮询 + 2s 上限等待至少一次刷脏记账（避免时序抖动），
+//     停止后直方图合计 >=1 且 p0 已不再是脏页。
 static void TestT4Observability() {
     const std::string path = "storage_ut_t4_obs.bin";
     RemoveFile(path);
@@ -4477,6 +4697,13 @@ static void TestT4Observability() {
 // ---------------------------------------------------------------------------
 // T4c. 诊断：CRC 校验累计计数 + \analyze / \stats 扩展输出
 // ---------------------------------------------------------------------------
+// TestT4Diagnostics —— 诊断指标的计数语义与 \analyze/\stats 的文本契约。
+// (a) 正常读写时 GetCrcErrorCount 恒为 0；注入坏块（CorruptWritesForRange）使落盘数据被
+//     0xFF 覆写后，读回触发 CRC mismatch——断言异常上抛「且」累计计数恰好 +1，两者都要成立。
+// (b) 建库并插入数据后，GetStorageStats 输出须含 hit composition / dirty age dist /
+//     bg flush histogram / io queue；GetStorageAnalysis 须含 device / crc errors / page map；
+//     另有 \analyze 命令可执行且其消息含 page map。
+// 边界：这些断言钉住的是用户可见的输出文本契约，改动指标输出措辞即会让用例失败。
 static void TestT4Diagnostics() {
     // (a) CRC 校验失败累计计数：坏块注入 → 读回 mismatch → 计数 +1 并上抛
     const std::string path = "storage_ut_t4_diag.bin";
@@ -5422,7 +5649,11 @@ static void TestSubqueryDecorrelation() {
         CHECK(e2.success && !e2.rows.empty());
         std::string t2 = e2.rows[0].GetValue(0).ToString();
         CHECK(t2.find("Join(ANTI") != std::string::npos);
-        CHECK(t2.find("Filter((o.amount > 100))") != std::string::npos);
+        // 内层非相关子句（o.amount > 100）不得丢失：main 侧 PushDownPredicates 会把它
+        // 吸收进 SeqScan 谓词列表（`SeqScan(orders, [(o.amount > 100)])`），未下推时
+        // 仍是独立 Filter（存储线形态）。两种等价形态都接受。
+        CHECK(t2.find("Filter((o.amount > 100))") != std::string::npos ||
+              t2.find("[(o.amount > 100)]") != std::string::npos);
         auto r2 = db.ExecuteSQL(
             "SELECT name FROM customers c WHERE NOT EXISTS "
             "(SELECT 1 FROM orders o WHERE o.cust_id = c.id AND o.amount > 100) ORDER BY id",
@@ -5468,7 +5699,9 @@ static void TestSubqueryDecorrelation() {
         CHECK(e5.success && !e5.rows.empty());
         std::string t5 = e5.rows[0].GetValue(0).ToString();
         CHECK(t5.find("Join(SEMI") != std::string::npos);
-        CHECK(t5.find("Filter((city = 'BJ'))") != std::string::npos);
+        // 同 (2)：city = 'BJ' 可能已被下推为 `SeqScan(customers, [(city = 'BJ')])`。
+        CHECK(t5.find("Filter((city = 'BJ'))") != std::string::npos ||
+              t5.find("[(city = 'BJ')]") != std::string::npos);
         auto r5 = db.ExecuteSQL(
             "SELECT name FROM customers WHERE city = 'BJ' AND EXISTS "
             "(SELECT 1 FROM orders o WHERE o.cust_id = customers.id) ORDER BY id", s.get());
@@ -5662,6 +5895,11 @@ static void TestRecursiveCteCacheInvalidation() {
     RemoveFile(path + ".fpl");
 }
 
+// 测试入口：按固定顺序调用上面全部用例（顺序即本函数内的调用列表），逐个跑完后统一汇总。
+// @return 0 —— 全部 CHECK 通过（g_fails == 0）；1 —— 存在失败断言（退出码即 CI 判定依据）。
+// @note 用例之间无共享状态：各自创建并删除自己的 storage_ut_* 临时文件，互不依赖前序用例的
+//       产物；g_checks / g_fails 为全局累计量，因此调换调用顺序不会改变通过与否的结论。
+// @note 收尾的 osopt::RunBenchmarks() 只打印优化前后指标、不含断言，不影响退出码。
 int main() {
     TestDiskManager();
     TestFreePagePersistence();

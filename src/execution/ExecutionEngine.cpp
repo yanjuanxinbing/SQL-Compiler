@@ -21,6 +21,7 @@
 #include "execution/MaterializedViewExecutor.h"  // 60_view_trigger
 #include "execution/MergeExecutor.h"  // 54_dml: MERGE
 #include "execution/NoOpExecutor.h"
+#include "execution/PreAggScanExecutor.h"  // U3-2: 扫描内预聚合（PRE_AGG_SCAN）
 #include "execution/ProjectExecutor.h"
 #include "execution/SeqScanExecutor.h"
 #include "execution/ShowExecutor.h"
@@ -35,14 +36,98 @@
 #include "execution/UpdateExecutor.h"
 #include "execution/UpsertExecutor.h"
 #include "execution/WindowExecutor.h"
+#include "catalog/IndexInfo.h"
+#include "plan/Plan.h"
+#include "storage/LockManager.h"
+#include "txn/Transaction.h"
 #include "txn/TransactionManager.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <functional>
+#include <unordered_set>
 #include <utility>
 
 namespace sqlcompiler {
 
 namespace {
+
+// T2 隔离级别：锁等待超时（毫秒）。超时仍未获锁则返回 kTimeout 并中止本语句。
+// 选一个「远超单条 SQL 正常执行时间」但仍能在死锁时及时回收的折中值。
+constexpr int kIsolationLockWaitMs = 5000;
+
+// T2：语句结束后处理 READ COMMITTED 的语句级行读锁。
+// 规则：仅当「活动显式事务 + 注入 LockManager + 隔离级别为 READ COMMITTED」时，
+// 本语句取得的行 S 锁需要在此释放；SERIALIZABLE 的行读锁与所有行写锁持有到提交，
+// 由 Commit/Rollback 的 UnlockAll 回收，这里只清空登记（避免残留）。成功与异常
+// 路径都调用本函数，确保不泄漏。
+void ReleaseRowReadLocks(ExecutionContext* ctx) {
+    if (ctx == nullptr) return;
+    Transaction* txn = ctx->GetTransaction();
+    TransactionManager* mgr = ctx->GetTransactionManager();
+    if (txn == nullptr || mgr == nullptr) {
+        ctx->ClearRowReadLocks();
+        return;
+    }
+    LockManager* lm = mgr->GetLockManager();
+    if (lm == nullptr || !txn->IsActive() ||
+        txn->GetIsolationLevel() != IsolationLevel::kReadCommitted) {
+        ctx->ClearRowReadLocks();
+        return;
+    }
+    // 释放时按登记的表提示路由分片（与获取时一致，G6 分片锁）。
+    for (const auto& [r, th] : ctx->GetRowReadLocks()) lm->Unlock(txn->GetTxnId(), r, th);
+    ctx->ClearRowReadLocks();
+}
+
+// 是否为结构变更（DDL）语句：这些指令在语句边界保留表级独占锁。DML 与只读
+// 语句已下放到行级并发，不在此列。
+bool IsDdlStmt(const PlanNodePtr& node) {
+    if (!node) return false;
+    switch (node->GetType()) {
+        case PlanNodeType::TRUNCATE_TABLE:
+        case PlanNodeType::ALTER_TABLE:
+        case PlanNodeType::DROP_TABLE:
+        case PlanNodeType::CREATE_INDEX:
+        case PlanNodeType::DROP_INDEX:
+        case PlanNodeType::CREATE_TABLE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// DDL 语句锁定的目标表名；返回空串表示无需加表锁（如 CREATE TABLE 建新表）。
+std::string DdlTableNameOf(SystemCatalog* catalog, const PlanNodePtr& node) {
+    if (!node) return "";
+    switch (node->GetType()) {
+        case PlanNodeType::TRUNCATE_TABLE:
+            return std::static_pointer_cast<TruncateTableNode>(node)->table_name;
+        case PlanNodeType::ALTER_TABLE:
+            return std::static_pointer_cast<AlterTableNode>(node)->table_name;
+        case PlanNodeType::DROP_TABLE:
+            return std::static_pointer_cast<DropTableNode>(node)->table_name;
+        case PlanNodeType::CREATE_INDEX:
+            return std::static_pointer_cast<CreateIndexNode>(node)->table_name;
+        case PlanNodeType::DROP_INDEX: {
+            const IndexInfo* ii = (catalog != nullptr)
+                ? catalog->GetIndex(std::static_pointer_cast<DropIndexNode>(node)->index_name)
+                : nullptr;
+            return (ii != nullptr) ? ii->table_name : "";
+        }
+        default:
+            return "";
+    }
+}
+
+// 表名 -> 锁资源 id：用表堆首页页号作为稳定、跨会话一致的资源键。
+// 表不存在（如派生表占位 / CTE 别名）返回 -1，调用方据此跳过加锁。
+int64_t TableResourceId(SystemCatalog* catalog, const std::string& name) {
+    if (catalog == nullptr || name.empty()) return -1;
+    TableHeap* heap = catalog->GetTableHeap(name);
+    if (heap == nullptr) return -1;
+    return static_cast<int64_t>(heap->GetFirstPageId());
+}
 
 std::string FindScanTableName(const PlanNodePtr& node) {
     if (!node) return "";
@@ -123,6 +208,329 @@ std::vector<std::pair<std::string, std::string>> CollectScanTableNames(
         names.insert(names.end(), sub.begin(), sub.end());
     }
     return names;
+}
+
+// SERIALIZABLE 读谓词信息：某真实表上的列谓词。
+//   column >= 0 → 该列（表模式下标）上的闭区间 [lo, hi]（lo/hi 为空 = 开边界，
+//     -inf/+inf），谓词持有到提交；
+//   column < 0 && is_full → 表级全表谓词（覆盖整表任意写入）。
+// Phase 5（周期 1）：谓词从「主键区间」泛化为「(表, 列, 区间)」——非主键列、
+// 二级索引列与 Filter 谓词中的任意等值/范围列都可注册；写侧
+// CheckWritePredicateRow 按受影响行逐列匹配冲突。
+struct ScanPredicateInfo {
+    std::string table;
+    int32_t column = -1;
+    bool is_full = false;
+    IndexKey lo;
+    IndexKey hi;
+};
+
+// 拆合取谓词为 AND 连接子句（与优化器同一套拆分逻辑）。
+void SplitConjuncts(const ExprPtr& expr, std::vector<ExprPtr>* out) {
+    if (!expr) return;
+    if (expr->GetType() == NodeType::BINARY_EXPR) {
+        const auto* bin = static_cast<const BinaryExpr*>(expr.get());
+        if (bin->op == BinaryOperator::AND) {
+            SplitConjuncts(bin->left, out);
+            SplitConjuncts(bin->right, out);
+            return;
+        }
+    }
+    out->push_back(expr);
+}
+
+struct ColCompare {
+    std::string column;
+    BinaryOperator op;
+    ExprPtr literal;
+};
+
+BinaryOperator FlipOp(BinaryOperator op) {
+    switch (op) {
+        case BinaryOperator::LESS: return BinaryOperator::GREATER;
+        case BinaryOperator::LESS_EQUAL: return BinaryOperator::GREATER_EQUAL;
+        case BinaryOperator::GREATER: return BinaryOperator::LESS;
+        case BinaryOperator::GREATER_EQUAL: return BinaryOperator::LESS_EQUAL;
+        default: return op;
+    }
+}
+
+bool IsLiteralExpr(const ExprPtr& e) {
+    return e && e->GetType() == NodeType::LITERAL_EXPR;
+}
+
+// 匹配 <列> <比较> <字面量>（支持字面量在左；限定到扫描表/别名的列才接受）。
+bool MatchColumnCompare(const ExprPtr& expr, const std::string& table,
+                        const std::string& alias, ColCompare* out) {
+    if (!expr || expr->GetType() != NodeType::BINARY_EXPR) return false;
+    const auto* bin = static_cast<const BinaryExpr*>(expr.get());
+    switch (bin->op) {
+        case BinaryOperator::EQUAL:
+        case BinaryOperator::LESS:
+        case BinaryOperator::LESS_EQUAL:
+        case BinaryOperator::GREATER:
+        case BinaryOperator::GREATER_EQUAL:
+            break;
+        default:
+            return false;
+    }
+    auto column_of = [&](const ExprPtr& e, std::string* name) {
+        if (!e || e->GetType() != NodeType::COLUMN_REF_EXPR) return false;
+        const auto* col = static_cast<const ColumnRefExpr*>(e.get());
+        if (!col->table_name.empty() && col->table_name != table &&
+            col->table_name != alias) {
+            return false;
+        }
+        *name = col->column_name;
+        return true;
+    };
+    std::string name;
+    if (column_of(bin->left, &name) && IsLiteralExpr(bin->right)) {
+        out->column = name;
+        out->op = bin->op;
+        out->literal = bin->right;
+        return true;
+    }
+    if (column_of(bin->right, &name) && IsLiteralExpr(bin->left)) {
+        out->column = name;
+        out->op = FlipOp(bin->op);
+        out->literal = bin->left;
+        return true;
+    }
+    return false;
+}
+
+// 字面量转 Value，按目标列类型归一化（与优化器一致：类型必须与列声明一致，
+// 否则 Value::Compare 的结果没有意义）。
+bool LiteralToValue(const ExprPtr& e, ValueType target, Value* out) {
+    if (!IsLiteralExpr(e) || out == nullptr) return false;
+    const auto* lit = static_cast<const LiteralExpr*>(e.get());
+    switch (lit->literal_type) {
+        case LiteralType::INTEGER:
+            if (target == ValueType::INTEGER) {
+                *out = Value::MakeInt(static_cast<int32_t>(std::atoi(lit->value.c_str())));
+                return true;
+            }
+            if (target == ValueType::FLOAT) {
+                *out = Value::MakeFloat(std::atof(lit->value.c_str()));
+                return true;
+            }
+            return false;
+        case LiteralType::FLOAT:
+            if (target != ValueType::FLOAT) return false;
+            *out = Value::MakeFloat(std::atof(lit->value.c_str()));
+            return true;
+        case LiteralType::STRING:
+            if (target != ValueType::VARCHAR) return false;
+            *out = Value::MakeVarchar(lit->value);
+            return true;
+        default:
+            return false;
+    }
+}
+
+// 单列约束：等值/范围收紧（与优化器同规则：等值最紧；同向范围取更紧）。
+struct ColConstraint {
+    bool has_eq = false;
+    Value eq;
+    bool has_lo = false;
+    Value lo;
+    bool has_hi = false;
+    Value hi;
+};
+
+void ApplyCompare(ColConstraint& c, BinaryOperator op, const Value& v) {
+    const auto tighten_lo = [&]() {
+        if (!c.has_lo || Value::Compare(v, c.lo) > 0) {
+            c.lo = v;
+            c.has_lo = true;
+        }
+    };
+    const auto tighten_hi = [&]() {
+        if (!c.has_hi || Value::Compare(v, c.hi) < 0) {
+            c.hi = v;
+            c.has_hi = true;
+        }
+    };
+    switch (op) {
+        case BinaryOperator::EQUAL:
+            c.has_eq = true;
+            c.eq = v;
+            c.has_lo = c.has_hi = false;  // 等值替代任何范围
+            break;
+        case BinaryOperator::GREATER:
+        case BinaryOperator::GREATER_EQUAL:
+            if (!c.has_eq) tighten_lo();
+            break;
+        case BinaryOperator::LESS:
+        case BinaryOperator::LESS_EQUAL:
+            if (!c.has_eq) tighten_hi();
+            break;
+        default:
+            break;
+    }
+}
+
+// 把谓词表达式中的列比较提取为按列约束 → 列谓词（跳过无法解析/非本表列）。
+void AddPredicateColumns(SystemCatalog* catalog, const std::string& table,
+                         const std::string& alias, const ExprPtr& predicate,
+                         std::vector<ScanPredicateInfo>* out) {
+    if (catalog == nullptr || !predicate || out == nullptr) return;
+    const TableInfo* info = catalog->GetTable(table);
+    if (info == nullptr) return;
+    std::vector<ExprPtr> conjuncts;
+    SplitConjuncts(predicate, &conjuncts);
+    std::vector<ColConstraint> cons(info->columns.size());
+    for (const auto& c : conjuncts) {
+        ColCompare cc;
+        if (!MatchColumnCompare(c, table, alias, &cc)) continue;
+        size_t idx = info->columns.size();
+        for (size_t i = 0; i < info->columns.size(); ++i) {
+            if (info->columns[i].name == cc.column) { idx = i; break; }
+        }
+        if (idx == info->columns.size()) continue;  // 非本表列（JOIN 对端/外层引用）
+        // 列类型由表定义投影（ColumnInfo 只持 data_type 字符串，运行时类型用
+        // BuildIndexKeyTypes 推导，避免重复的类型名 → ValueType 映射）。
+        std::vector<ValueType> t2;
+        if (!BuildIndexKeyTypes(*info, std::vector<std::string>{cc.column}, &t2) ||
+            t2.size() != 1) {
+            continue;
+        }
+        Value v;
+        if (!LiteralToValue(cc.literal, t2[0], &v)) continue;
+        ApplyCompare(cons[idx], cc.op, v);
+    }
+    for (size_t i = 0; i < cons.size(); ++i) {
+        const ColConstraint& c = cons[i];
+        ScanPredicateInfo p;
+        p.table = table;
+        p.column = static_cast<int32_t>(i);
+        if (c.has_eq) {
+            p.lo = IndexKey(std::vector<Value>{c.eq});
+            p.hi = IndexKey(std::vector<Value>{c.eq});
+        } else {
+            if (c.has_lo) p.lo = IndexKey(std::vector<Value>{c.lo});
+            if (c.has_hi) p.hi = IndexKey(std::vector<Value>{c.hi});
+        }
+        if (p.lo.values.empty() && p.hi.values.empty()) continue;
+        out->push_back(std::move(p));
+    }
+}
+
+// 把索引扫描边界（low_key/high_key + 前缀列数）转换为覆盖列的列谓词：
+//   共同前缀中值相等的列 → 点谓词 [v, v]；首个范围列 → 区间 [lo, hi]
+//   （某侧缺失即开放）。索引键列必须解析到表列下标（索引可能建在非前导列上）。
+void AddIndexBoundPredicates(SystemCatalog* catalog,
+                             const std::shared_ptr<IndexScanNode>& s,
+                             std::vector<ScanPredicateInfo>* out) {
+    if (catalog == nullptr || out == nullptr) return;
+    const size_t low_cols = s->low_bound_cols, high_cols = s->high_bound_cols;
+    if (low_cols == 0 && high_cols == 0) return;
+    const IndexInfo* info = catalog->GetIndex(s->index_name);
+    if (info == nullptr) return;
+    // 索引键列位置 j -> 表列下标（索引键顺序 ≠ 表列顺序）。
+    auto col_of = [&](size_t j) -> int32_t {
+        if (info->key_columns.size() <= j) return -1;
+        const TableInfo* tinfo = catalog->GetTable(s->table_name);
+        if (tinfo == nullptr) return -1;
+        for (size_t i = 0; i < tinfo->columns.size(); ++i) {
+            if (tinfo->columns[i].name == info->key_columns[j]) {
+                return static_cast<int32_t>(i);
+            }
+        }
+        return -1;
+    };
+    // 共同前缀中值相等的列 → 点谓词。
+    const size_t common = std::min(low_cols, high_cols);
+    size_t eq_cols = 0;
+    for (size_t j = 0; j < common; ++j) {
+        if (Value::Compare(s->low_key[j], s->high_key[j]) != 0) break;
+        ++eq_cols;
+    }
+    for (size_t j = 0; j < eq_cols; ++j) {
+        const int32_t cidx = col_of(j);
+        if (cidx < 0) continue;
+        ScanPredicateInfo p;
+        p.table = s->table_name;
+        p.column = cidx;
+        p.lo = IndexKey(std::vector<Value>{s->low_key[j]});
+        p.hi = p.lo;
+        out->push_back(std::move(p));
+    }
+    // 首个范围列（某侧仍覆盖到该列时）。
+    const size_t range_col = eq_cols;
+    if (range_col >= low_cols && range_col >= high_cols) return;
+    const int32_t cidx = col_of(range_col);
+    if (cidx < 0) return;
+    ScanPredicateInfo p;
+    p.table = s->table_name;
+    p.column = cidx;
+    if (range_col < low_cols) p.lo = IndexKey(std::vector<Value>{s->low_key[range_col]});
+    if (range_col < high_cols) p.hi = IndexKey(std::vector<Value>{s->high_key[range_col]});
+    out->push_back(std::move(p));
+}
+
+bool HasPredicateFor(const std::vector<ScanPredicateInfo>& out, const std::string& t) {
+    for (const auto& p : out) {
+        if (p.table == t) return true;
+    }
+    return false;
+}
+
+// 遍历计划收集被扫描真实表的读谓词（SERIALIZABLE 闭合幻读窗口）：
+//   * INDEX_SCAN：索引边界覆盖列 → 点/区间谓词；residual_predicate 中的列比较
+//     另行提取；两者都提取不到 → 全表谓词。
+//   * Filter 直接覆盖 SeqScan：提取 Filter 谓词中的列比较；提取不到 → 全表谓词。
+//   * 其余扫描形态（纯 SEQ_SCAN / JOIN 下的扫描 / 派生表）：全表谓词。
+// 同一表任一扫描为全表 → 整体升级为全表谓词（注册时的全表化收敛会清理同事务的
+// 列级谓词）。
+std::vector<ScanPredicateInfo> CollectScanPredicates(SystemCatalog* catalog,
+                                                    const PlanNodePtr& node) {
+    std::vector<ScanPredicateInfo> out;
+    std::unordered_set<std::string> full;  // 需全表覆盖的表
+    std::function<void(const PlanNodePtr&)> walk = [&](const PlanNodePtr& n) {
+        if (!n) return;
+        if (n->GetType() == PlanNodeType::INDEX_SCAN) {
+            auto s = std::static_pointer_cast<IndexScanNode>(n);
+            if (!s->table_name.empty() && full.count(s->table_name) == 0) {
+                AddIndexBoundPredicates(catalog, s, &out);
+                if (s->residual_predicate) {
+                    AddPredicateColumns(catalog, s->table_name, s->table_alias,
+                                        s->residual_predicate, &out);
+                }
+                if (!HasPredicateFor(out, s->table_name)) {
+                    full.insert(s->table_name);
+                }
+            }
+        } else if (n->GetType() == PlanNodeType::FILTER &&
+                   n->children.size() == 1 &&
+                   n->children[0]->GetType() == PlanNodeType::SEQ_SCAN) {
+            auto s = std::static_pointer_cast<SeqScanNode>(n->children[0]);
+            auto f = std::static_pointer_cast<FilterNode>(n);
+            if (!s->table_name.empty() && full.count(s->table_name) == 0) {
+                AddPredicateColumns(catalog, s->table_name, s->table_alias,
+                                    f->predicate, &out);
+                if (!HasPredicateFor(out, s->table_name)) {
+                    full.insert(s->table_name);
+                }
+            }
+            // 派生表（table_name == alias 且 children 非空）的内层子计划仍需下探。
+            for (auto& cc : n->children[0]->children) walk(cc);
+            return;
+        } else if (n->GetType() == PlanNodeType::SEQ_SCAN) {
+            auto s = std::static_pointer_cast<SeqScanNode>(n);
+            if (!s->table_name.empty()) full.insert(s->table_name);
+        }
+        for (auto& c : n->children) walk(c);
+    };
+    walk(node);
+    for (const std::string& t : full) {
+        ScanPredicateInfo info;
+        info.table = t;
+        info.is_full = true;
+        out.push_back(std::move(info));
+    }
+    return out;
 }
 
 // 将 vector<string> 形式 (仅有表名) 适配到新签名；用作纯单表路径的兼容入口。
@@ -237,7 +645,8 @@ std::vector<std::string> DeriveTerminalColumns(SystemCatalog* catalog,
         }
         return cols;
     }
-    if (p->GetType() == PlanNodeType::AGGREGATE) {
+    if (p->GetType() == PlanNodeType::AGGREGATE ||
+        p->GetType() == PlanNodeType::PRE_AGG_SCAN) {
         auto agg = std::static_pointer_cast<AggregateNode>(p);
         cols.reserve(agg->aggregate_exprs.size());
         for (size_t i = 0; i < agg->aggregate_exprs.size(); ++i) {
@@ -423,12 +832,13 @@ std::unordered_map<std::string, size_t> BuildCombinedColumnIndexMapWithDerived(
 
 }  // namespace
 
-ExecutionEngine::ExecutionEngine(SystemCatalog* catalog, TransactionManager* txn_manager)
-    : catalog_(catalog), txn_manager_(txn_manager) {
+ExecutionEngine::ExecutionEngine(SystemCatalog* catalog, TransactionManager* txn_manager,
+                                 SubqueryCacheStats* subquery_stats)
+    : catalog_(catalog), txn_manager_(txn_manager), subquery_stats_(subquery_stats) {
 }
 
 ExecutionResult ExecutionEngine::Execute(const PlanNodePtr& plan) {
-    ExecutionContext ctx(catalog_, txn_manager_);
+    ExecutionContext ctx(catalog_, txn_manager_, subquery_stats_);
     // Phase A：让新 ctx 自动挂上当前事务，使 DML 算子的写路径抓到正确的 undo。
     // BEGIN/COMMIT/ROLLBACK/SAVEPOINT 等事务控制语句本身也通过此 ctx
     // 看到当前 txn。
@@ -446,15 +856,71 @@ ExecutionResult ExecutionEngine::Execute(const PlanNodePtr& plan) {
     if (session_vars_ != nullptr) {
         ctx.SetSessionVars(session_vars_);
     }
-    return ExecuteSubplan(plan, &ctx);
+    // T2：READ COMMITTED 的语句级行读锁在语句结束（含异常）后统一释放。
+    try {
+        ExecutionResult result = ExecuteSubplan(plan, &ctx);
+        ReleaseRowReadLocks(&ctx);
+        return result;
+    } catch (...) {
+        ReleaseRowReadLocks(&ctx);
+        throw;
+    }
 }
 
 ExecutionResult ExecutionEngine::ExecuteSubplan(const PlanNodePtr& plan, ExecutionContext* ctx) {
     ExecutionResult result;
     if (!plan || !ctx) return result;
+    // ---- 隔离级别：语句边界只保留 DDL 的表级独占锁 ----
+    // 仅当存在「活动显式事务」且注入了共享 LockManager 时启用；自动提交
+    // （无事务）与未注入锁管理器（单连接旧行为）路径完全不加锁，保持兼容。
+    Transaction* txn = ctx->GetTransaction();
+    TransactionManager* mgr = ctx->GetTransactionManager();
+    LockManager* lm = (mgr != nullptr) ? mgr->GetLockManager() : nullptr;
+    const bool lock_enabled = (txn != nullptr && txn->IsActive() && lm != nullptr);
+    const IsolationLevel iso =
+        (txn != nullptr) ? txn->GetIsolationLevel() : IsolationLevel::kSerializable;
+    // DML（INSERT/UPSERT/UPDATE/DELETE）与只读语句不再对整表取锁：并发访问
+    // 下放到行级 S/X 锁（逻辑隔离）+ B+Tree 树锁 / TableHeap write_mutex_ /
+    // BufferPool 页锁（物理安全）+ SERIALIZABLE 谓词锁（防幻读）。
+    // 仅 DDL（结构变更）保留表级 X 锁，持有到提交。
+    int64_t ddl_lock_res = -1;
+    bool ddl_lock_held = false;
+    if (lock_enabled && IsDdlStmt(plan)) {
+        ddl_lock_res = TableResourceId(ctx->GetCatalog(), DdlTableNameOf(ctx->GetCatalog(), plan));
+        if (ddl_lock_res >= 0) {
+            LockResult lr = lm->LockExclusive(txn->GetTxnId(), ddl_lock_res,
+                                              kIsolationLockWaitMs);
+            if (lr == LockResult::kDeadlock || lr == LockResult::kTimeout) {
+                result.success = false;
+                result.message =
+                    std::string("isolation ") +
+                    (lr == LockResult::kDeadlock
+                         ? "deadlock detected (statement aborted)"
+                         : "lock wait timeout (statement aborted)");
+                return result;
+            }
+            ddl_lock_held = true;
+        }
+    }
+
+    // SERIALIZABLE：在读前为被扫描的真实表注册列读谓词，闭合幻读窗口
+    //（其他事务向该范围插入/删除命中键时会与我们冲突）。Phase 5：谓词按
+    // (表, 列, 区间) 注册——任意列（含二级索引列）的等值/范围谓词都参与写前冲突
+    // 判定。读谓词持有到提交，由 Commit/Rollback 的 UnlockAll 一并释放。
+    if (lock_enabled && iso == IsolationLevel::kSerializable) {
+        for (const auto& p : CollectScanPredicates(ctx->GetCatalog(), plan)) {
+            int64_t r = TableResourceId(ctx->GetCatalog(), p.table);
+            if (r < 0) continue;  // 派生表/CTE 别名，非真实表
+            lm->AcquireReadPredicate(txn->GetTxnId(), r, p.column, p.is_full,
+                                     p.lo, p.hi);
+        }
+    }
+
     try {
         auto root = BuildExecutor(plan, ctx);
         if (!root) {
+            // 构建失败：释放本语句已获取的 DDL 表锁。
+            if (ddl_lock_held && lm != nullptr) lm->Unlock(txn->GetTxnId(), ddl_lock_res);
             result.success = false;
             result.message = "failed to build executor";
             return result;
@@ -470,6 +936,7 @@ ExecutionResult ExecutionEngine::ExecuteSubplan(const PlanNodePtr& plan, Executi
                          plan->GetType() == PlanNodeType::SORT ||
                          plan->GetType() == PlanNodeType::LIMIT ||
                          plan->GetType() == PlanNodeType::AGGREGATE ||
+                         plan->GetType() == PlanNodeType::PRE_AGG_SCAN ||
                          plan->GetType() == PlanNodeType::SUBQUERY ||
                          plan->GetType() == PlanNodeType::CTE_BIND ||
                          plan->GetType() == PlanNodeType::CTE_DEFINE ||
@@ -560,10 +1027,19 @@ ExecutionResult ExecutionEngine::ExecuteSubplan(const PlanNodePtr& plan, Executi
         if (!is_query) {
             result.message = "OK";
         }
+        // 语句成功：释放 READ COMMITTED 的语句级行读锁。此处在 ExecuteSubplan
+        // 内（而非仅 Execute）执行，因为会话路径也直接调用本函数，若只在
+        // Execute 释放，跨会话的 READ COMMITTED 读锁会漏放并阻塞其他会话的
+        // 行 X 锁。
+        ReleaseRowReadLocks(ctx);
     } catch (const CompilerException& e) {
+        ReleaseRowReadLocks(ctx);
+        if (ddl_lock_held && lm != nullptr) lm->Unlock(txn->GetTxnId(), ddl_lock_res);
         result.success = false;
         result.message = FormatError(e);
     } catch (const std::exception& e) {
+        ReleaseRowReadLocks(ctx);
+        if (ddl_lock_held && lm != nullptr) lm->Unlock(txn->GetTxnId(), ddl_lock_res);
         result.success = false;
         result.message = std::string("error: ") + e.what();
     }
@@ -652,7 +1128,8 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             // in the output tuple. We map aggregate function calls to positions.
             std::unordered_map<std::string, size_t> cmap;
             if (!plan_node->children.empty() &&
-                plan_node->children[0]->GetType() == PlanNodeType::AGGREGATE) {
+                (plan_node->children[0]->GetType() == PlanNodeType::AGGREGATE ||
+                 plan_node->children[0]->GetType() == PlanNodeType::PRE_AGG_SCAN)) {
                 auto agg = std::static_pointer_cast<AggregateNode>(plan_node->children[0]);
                 for (size_t i = 0; i < agg->aggregate_exprs.size(); ++i) {
                     const auto& e = agg->aggregate_exprs[i];
@@ -671,7 +1148,8 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             }
             // HAVING / 上层 Filter 引用 SELECT 别名时，把别名映射到对应位置。
             if (!plan_node->children.empty() &&
-                plan_node->children[0]->GetType() == PlanNodeType::AGGREGATE) {
+                (plan_node->children[0]->GetType() == PlanNodeType::AGGREGATE ||
+                 plan_node->children[0]->GetType() == PlanNodeType::PRE_AGG_SCAN)) {
                 auto agg = std::static_pointer_cast<AggregateNode>(plan_node->children[0]);
                 for (size_t i = 0; i < agg->aggregate_exprs.size(); ++i) {
                     if (i < agg->aliases.size() && !agg->aliases[i].empty()) {
@@ -707,7 +1185,8 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             if (!child) return nullptr;
             // If child is an Aggregate, the aggregate already produced tuples
             // matching the SELECT list; pass through unchanged.
-            if (plan_node->children[0]->GetType() == PlanNodeType::AGGREGATE) {
+            if (plan_node->children[0]->GetType() == PlanNodeType::AGGREGATE ||
+                plan_node->children[0]->GetType() == PlanNodeType::PRE_AGG_SCAN) {
                 // 新路径：AggregateNode.aggregate_exprs 可能比 SELECT list 长（容纳
                 // HAVING/ORDER BY 独占的聚合调用），但本路径仍直接透传：HAVING 的
                 // FilterNode 和 ORDER BY 的 SortNode 都基于 extended 长度构造 cmap
@@ -727,7 +1206,8 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             // through unchanged.
             if (plan_node->children[0]->GetType() == PlanNodeType::FILTER &&
                 plan_node->children[0]->children.size() > 0 &&
-                plan_node->children[0]->children[0]->GetType() == PlanNodeType::AGGREGATE) {
+                (plan_node->children[0]->children[0]->GetType() == PlanNodeType::AGGREGATE ||
+                 plan_node->children[0]->children[0]->GetType() == PlanNodeType::PRE_AGG_SCAN)) {
                 if (n->is_distinct) {
                     return wrap(std::make_unique<DistinctExecutor>(context, std::move(child),
                                                                    n->columns.size()));
@@ -910,6 +1390,18 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             if (!child) return nullptr;
             auto cmap = BuildCombinedColumnIndexMapWithDerived(catalog_, plan_node, CollectScanTableNames(plan_node));
             return wrap(std::make_unique<AggregateExecutor>(context, std::move(child),
+                                                             n->group_by_exprs, n->aggregate_exprs,
+                                                             cmap));
+        }
+        case PlanNodeType::PRE_AGG_SCAN: {
+            // U3-2：扫描内预聚合。与 AGGREGATE 同构（PreAggScanNode 继承 AggregateNode），
+            // 仅执行器不同：PreAggScanExecutor 在扫描循环内直接累计 COUNT/SUM 状态并以
+            // 哈希分组，替代 AggregateExecutor 的线性扫描分组。cmap 面向子扫描的列序构建。
+            auto n = std::static_pointer_cast<PreAggScanNode>(plan_node);
+            auto child = BuildExecutor(plan_node->children.empty() ? nullptr : plan_node->children[0], context, wrap_timing);
+            if (!child) return nullptr;
+            auto cmap = BuildCombinedColumnIndexMapWithDerived(catalog_, plan_node, CollectScanTableNames(plan_node));
+            return wrap(std::make_unique<PreAggScanExecutor>(context, std::move(child),
                                                              n->group_by_exprs, n->aggregate_exprs,
                                                              cmap));
         }
@@ -1244,6 +1736,10 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
         case PlanNodeType::RELEASE_SP: {
             auto n = std::static_pointer_cast<ReleaseSavepointNode>(plan_node);
             return wrap(std::make_unique<ReleaseSavepointExecutor>(context, n->savepoint_name));
+        }
+        case PlanNodeType::SET_ISOLATION: {
+            auto n = std::static_pointer_cast<SetIsolationNode>(plan_node);
+            return wrap(std::make_unique<SetIsolationExecutor>(context, n->isolation_level));
         }
         case PlanNodeType::CREATE_VIEW:
             return wrap(std::make_unique<NoOpExecutor>(context));

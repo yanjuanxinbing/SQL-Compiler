@@ -1685,7 +1685,26 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
         ctx_->SetInnerTables(use_inner);
     }
 
-    auto rows = RunPlanToCompletion(ctx_, plan);
+    // U3-3：非相关子查询物化——结果与当前外层行无关，首次求值执行一次并缓存，
+    // 后续外层行直接复用（每条语句每个子查询只跑一次子计划）；相关子查询保持
+    // 逐行求值（结果依赖当前外层绑定，不可缓存）。
+    // 缓存键用 AST 上稳定的 subquery_plan 指针（Planner 在语句规划阶段写入）；
+    // 按需 plan 出来的临时计划不参与缓存（局部 shared_ptr 生命周期不足以做键）。
+    const bool correlated = expr.subquery && IsSubqueryCorrelated(*expr.subquery);
+    const void* cache_key = expr.subquery_plan
+                                ? static_cast<const void*>(expr.subquery_plan.get())
+                                : nullptr;
+    std::vector<Tuple> rows;
+    const std::vector<Tuple>* cached =
+        (!correlated && cache_key != nullptr) ? ctx_->GetCachedSubqueryRows(cache_key) : nullptr;
+    if (cached) {
+        rows = *cached;
+    } else {
+        rows = RunPlanToCompletion(ctx_, plan);
+        if (!correlated && cache_key != nullptr) {
+            ctx_->CacheSubqueryRows(cache_key, rows);
+        }
+    }
     if (use_bind) ctx_->SetOuterBind(saved_bind);
     if (use_inner) ctx_->SetInnerTables(saved_inner);
 
