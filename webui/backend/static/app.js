@@ -42,18 +42,10 @@
   const dbModalBack     = $("#db-modal-backdrop");
   const dbModalClose    = $("#db-modal-close");
   const dbBrowseServerBtn = $("#db-browse-server-btn");
-  const dbPathDetails   = $("#db-path-details");
-  const dbPathInput     = $("#db-path-input");
-  const dbScanBtn       = $("#db-scan-btn");
-  const dbPathFeedback  = $("#db-path-feedback");
-  const dbOpenBtn       = $("#db-open-btn");
   const dbCancelBtn     = $("#db-cancel-btn");
   const dbRecentSection = $("#db-recent-section");
   const dbRecentList    = $("#db-recent-list");
   const dbClearRecent   = $("#db-clear-recent");
-  const dbFolderSection = $("#db-folder-section");
-  const dbFolderList    = $("#db-folder-list");
-  const dbFolderMeta    = $("#db-folder-meta");
   const dbError         = $("#db-error");
 
   // Browse modal
@@ -70,7 +62,6 @@
   const browseSelected    = $("#browse-selected");
   const browseSelectedPath= $("#browse-selected-path");
   const browseOpenBtn     = $("#browse-open-btn");
-  const browseNewHereBtn  = $("#browse-new-here-btn");
 
   // ── App state ──────────────────────────────────────────────────────────
   const app = {
@@ -166,7 +157,6 @@
   // ── DB modal (recently opened) ─────────────────────────────────────────
   const RECENTS_KEY = "sqlui.recents.v1";
   const RECENTS_MAX = 8;
-  let folderScanToken = 0;
 
   function loadRecents() {
     try {
@@ -192,18 +182,10 @@
     saveRecents();
   }
 
-  function defaultDbPath() {
-    return "playground.db";
-  }
-
   function openDbModal() {
     dbError.hidden = true;
     dbModal.classList.remove("hidden");
-    if (app.dbPath) dbPathInput.value = app.dbPath;
-    else if (app.recents.length) dbPathInput.value = app.recents[0];
-    else dbPathInput.value = defaultDbPath();
     renderRecents();
-    scanCurrentPath();
     setTimeout(() => dbBrowseServerBtn.focus(), 50);
   }
   function closeDbModal() { dbModal.classList.add("hidden"); }
@@ -241,99 +223,9 @@
     });
   }
 
-  async function scanCurrentPath() {
-    const value = (dbPathInput.value || "").trim();
-    dbFolderSection.hidden = true;
-    dbFolderList.innerHTML = "";
-    dbFolderMeta.textContent = "";
-    if (!value) {
-      dbPathFeedback.innerHTML = `开始输入路径，或使用上方的「浏览…」按钮。`;
-      dbPathInput.classList.remove("is-valid", "is-invalid");
-      return;
-    }
-    const myToken = ++folderScanToken;
-    dbPathFeedback.textContent = `正在检查 ${value} …`;
-    let probe;
-    try {
-      probe = await api("/api/db/validate", { method: "POST", body: { path: value } });
-    } catch (e) {
-      if (myToken !== folderScanToken) return;
-      dbPathInput.classList.add("is-invalid");
-      dbPathInput.classList.remove("is-valid");
-      dbPathFeedback.innerHTML = `<span style="color: var(--error)">${escapeHtml(e.message || String(e))}</span>`;
-      return;
-    }
-    if (myToken !== folderScanToken) return;
-    dbPathInput.classList.remove("is-invalid");
-    dbPathInput.classList.add("is-valid");
-    let dirToScan = null;
-    let extraFeedback = "";
-    switch (probe.status) {
-      case "parent_missing":
-        dbPathInput.classList.remove("is-valid");
-        dbPathInput.classList.add("is-invalid");
-        dbPathFeedback.innerHTML = `<span style="color: var(--error)">父目录不存在：</span> <code>${escapeHtml(probe.parent)}</code>`;
-        return;
-      case "wrong_type":
-        dbPathInput.classList.remove("is-valid");
-        dbPathInput.classList.add("is-invalid");
-        dbPathFeedback.innerHTML = `<span style="color: var(--amber)">${escapeHtml(probe.message)}</span>`;
-        return;
-      case "directory":
-        dirToScan = value;
-        extraFeedback = `这是一个目录。请在下面选择一个 <code>.db</code> 文件，或改为新文件名。`;
-        break;
-      case "existing_file":
-        dirToScan = probe.parent;
-        extraFeedback = `<span style="color: var(--success)">${escapeHtml(probe.message)}</span> 点「打开」绑定该数据库。`;
-        break;
-      case "new_file":
-        dirToScan = probe.parent;
-        extraFeedback = `<span style="color: var(--accent)">${escapeHtml(probe.message)}</span>`;
-        break;
-    }
-    if (!dirToScan) {
-      dbPathFeedback.innerHTML = extraFeedback;
-      return;
-    }
-    try {
-      const data = await api(`/api/db/ls?directory=${encodeURIComponent(dirToScan)}`);
-      if (myToken !== folderScanToken) return;
-      const items = data.items || [];
-      if (items.length === 0) {
-        dbPathFeedback.innerHTML = `${extraFeedback} <span class="muted">目录中暂无 <code>.db</code> 文件。</span>`;
-        return;
-      }
-      dbFolderSection.hidden = false;
-      dbFolderMeta.textContent = `${items.length} 个文件 · ${dirToScan}`;
-      dbFolderList.innerHTML = items.map((it) => {
-        const name = pathBasename(it.path);
-        const isCurrent = it.path === value;
-        return `
-          <li class="recent-item ${isCurrent ? "is-active" : ""}" data-path="${escapeHtml(it.path)}">
-            <span class="recent-item-icon">${escapeHtml((name[0] || "?").toUpperCase())}</span>
-            <span class="recent-item-body">
-              <span class="recent-item-name">${escapeHtml(name)}${isCurrent ? ' <span class="muted">(当前)</span>' : ""}</span>
-              <span class="recent-item-path">${escapeHtml(it.path)}</span>
-            </span>
-            <span class="recent-item-meta">${formatBytes(it.size_bytes)}</span>
-          </li>`;
-      }).join("");
-      $$(".recent-item", dbFolderList).forEach((el) => {
-        el.addEventListener("click", () => openPathAndClose(el.dataset.path));
-      });
-      dbPathFeedback.innerHTML = `${extraFeedback} <span class="muted">共 ${items.length} 个 .db 文件。</span>`;
-    } catch (e) {
-      if (myToken !== folderScanToken) return;
-      dbPathFeedback.innerHTML = `<span style="color: var(--error)">${escapeHtml(e.message || String(e))}</span>`;
-    }
-  }
-
   async function openPathAndClose(p) {
     if (!p) return;
     dbError.hidden = true;
-    dbOpenBtn.disabled = true;
-    dbOpenBtn.textContent = "打开中…";
     try {
       const res = await api("/api/db/open", { body: { db_path: p } });
       app.dbPath = res.db_path;
@@ -367,20 +259,7 @@
     } catch (e) {
       dbError.textContent = e.message || String(e);
       dbError.hidden = false;
-    } finally {
-      dbOpenBtn.disabled = false;
-      dbOpenBtn.textContent = "打开";
     }
-  }
-
-  async function openDatabaseFromInput() {
-    const p = (dbPathInput.value || "").trim();
-    if (!p) {
-      dbError.textContent = '请输入数据库文件路径，或使用「浏览…」按钮。';
-      dbError.hidden = false;
-      return;
-    }
-    await openPathAndClose(p);
   }
 
   // Reset the current database: delete the underlying .db + WAL, then
@@ -467,23 +346,53 @@
     browseBody.innerHTML = `<div class="browse-empty">加载中…</div>`;
     browseSelected.hidden = true;
     browseState.selected = null;
+    // Remember what the user actually asked for — when the backend
+    // auto-recovers a `.db` file path to its parent directory, the
+    // response's `path` is the parent, not the typed string.  We use
+    // `requested` to decide whether overwriting the path input makes
+    // sense (Bug B fix).
+    const requested = targetPath;
     try {
       const data = await api("/api/db/browse", { method: "POST", body: { path: targetPath } });
       if (myToken !== browseState.lastFetchToken) return;
       if (data.error) {
         browseBody.innerHTML = `<div class="browse-error">${escapeHtml(data.error)}</div>`;
+        // Restore the user's input so they can edit it instead of
+        // seeing the error path silently replaced.
+        if (requested !== undefined) browsePathInput.value = requested;
         return;
       }
       browseState.currentPath = data.path;
       browseState.parent = data.parent || "";
       browseState.roots = data.roots || [];
-      browsePathInput.value = data.path;
+      // Bug A fix: the listing was always empty because we never
+      // copied `data.entries` into the shared state.
+      browseState.entries = Array.isArray(data.entries) ? data.entries : [];
+      // Only update the input when the navigation succeeded and the
+      // resolved path matches what the user asked for.  When the user
+      // typed a `.db` file and the backend auto-recovered to its
+      // parent, leave their typed text alone so they can see / edit
+      // it (Bug B fix).
+      if (requested === undefined || requested === data.path) {
+        browsePathInput.value = data.path;
+      }
       renderBrowseCrumbs();
       renderBrowseListing();
+      updateBrowseUpBtn();
     } catch (e) {
       if (myToken !== browseState.lastFetchToken) return;
       browseBody.innerHTML = `<div class="browse-error">${escapeHtml(e.message || String(e))}</div>`;
+      if (requested !== undefined) browsePathInput.value = requested;
     }
+  }
+
+  function updateBrowseUpBtn() {
+    // At a filesystem root browseState.parent is empty (or equals
+    // currentPath when we're at the root itself).  Disable the up-
+    // button so it visually communicates "no parent to navigate to"
+    // (Bug C fix).
+    const canGoUp = !!browseState.parent && browseState.parent !== browseState.currentPath;
+    browseUpBtn.disabled = !canGoUp;
   }
 
   function renderBrowseCrumbs() {
@@ -518,7 +427,7 @@
     const dirs = browseState.entries.filter((e) => e.kind === "dir");
     const dbs  = browseState.entries.filter((e) => e.kind === "db");
     if (dirs.length === 0 && dbs.length === 0) {
-      browseBody.innerHTML = `<div class="browse-empty">该文件夹为空。可用「新建于此」创建一个 .db 文件。</div>`;
+      browseBody.innerHTML = `<div class="browse-empty">该文件夹为空。请选择上层目录浏览其他位置。</div>`;
       return;
     }
     let html = "";
@@ -568,20 +477,6 @@
     if (!p) return;
     closeBrowseModal();
     openPathAndClose(p);
-  }
-
-  function openBrowseNewHere() {
-    const dir = browseState.currentPath || "";
-    if (!dir) {
-      browseBody.innerHTML = `<div class="browse-error">未选择目录。</div>`;
-      return;
-    }
-    const sep = dir.includes("\\") ? "\\" : "/";
-    const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
-    const candidate = `${dir}${sep}sqldb_${stamp}.db`;
-    browsePathInput.value = candidate;
-    browsePathInput.focus();
-    browsePathInput.select();
   }
 
   // ── Catalog (sidebar) ──────────────────────────────────────────────────
@@ -1198,7 +1093,6 @@
   dbModalClose.addEventListener("click", closeDbModal);
   dbModalBack.addEventListener("click", closeDbModal);
   dbCancelBtn.addEventListener("click", closeDbModal);
-  dbOpenBtn.addEventListener("click", openDatabaseFromInput);
 
   dbBrowseServerBtn.addEventListener("click", () => openBrowseModal());
   browseModalClose.addEventListener("click", closeBrowseModal);
@@ -1218,19 +1112,6 @@
     if (e.key === "Escape") { e.preventDefault(); closeBrowseModal(); }
   });
   browseOpenBtn.addEventListener("click", openBrowseSelection);
-  browseNewHereBtn.addEventListener("click", openBrowseNewHere);
-
-  let pathDebounce = null;
-  dbPathInput.addEventListener("input", () => {
-    clearTimeout(pathDebounce);
-    pathDebounce = setTimeout(scanCurrentPath, 220);
-  });
-  dbPathInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); openDatabaseFromInput(); }
-    if (e.key === "Escape") { e.preventDefault(); closeDbModal(); }
-  });
-  dbScanBtn.addEventListener("click", () => { dbPathDetails.open = true; scanCurrentPath(); });
-  dbPathInput.addEventListener("focus", () => { dbPathDetails.open = true; });
 
   dbClearRecent.addEventListener("click", () => {
     if (!app.recents.length) return;

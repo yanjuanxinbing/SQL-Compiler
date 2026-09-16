@@ -235,15 +235,6 @@
         </div>
       </div>
 
-      <details class="path-details" id="db-path-details">
-        <summary>或者输入路径 / 新建文件</summary>
-        <div class="path-row">
-          <input type="text" id="db-path-input" placeholder="例如 C:\path\to\mydb.db （不存在则会创建）" spellcheck="false">
-          <button class="btn btn-secondary" id="db-scan-btn" type="button" title="扫描该目录下的 .db 文件">↻ 扫描</button>
-        </div>
-        <p class="hint" id="db-path-feedback">输入路径。若父目录存在，将列出其中的 <code>.db</code> 文件。</p>
-      </details>
-
       <p class="hint db-error" id="db-error" hidden></p>
 
       <div class="recent-section" id="db-recent-section" hidden>
@@ -253,18 +244,9 @@
         </div>
         <ul class="recent-list" id="db-recent-list"></ul>
       </div>
-
-      <div class="recent-section" id="db-folder-section" hidden>
-        <div class="recent-section-head">
-          <h3>该文件夹中的文件</h3>
-          <span class="recent-section-meta" id="db-folder-meta"></span>
-        </div>
-        <ul class="recent-list" id="db-folder-list"></ul>
-      </div>
     </div>
     <div class="modal-foot">
       <button class="btn btn-secondary" id="db-cancel-btn" type="button">取消</button>
-      <button class="btn btn-primary" id="db-open-btn" type="button">打开</button>
     </div>
   </div>
 </div>
@@ -296,7 +278,6 @@
       <span class="browse-selected-label">已选择：</span>
       <code class="browse-selected-path mono" id="browse-selected-path"></code>
       <div class="browse-selected-actions">
-        <button class="btn btn-secondary" id="browse-new-here-btn" type="button" title="在该目录新建 .db 文件">新建于此</button>
         <button class="btn btn-primary" id="browse-open-btn" type="button">打开</button>
       </div>
     </div>
