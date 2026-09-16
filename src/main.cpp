@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <vector>
 #include <cctype>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 
@@ -131,6 +132,171 @@ void PrintPlan(const sqlcompiler::PlanNode* plan) {
         return;
     }
     PrintIndentedBlock("plan-optimized", plan->ToString(), "");
+}
+
+// ============ 调试输出模式（Phase 1.5 + WebUI 可视化）============
+//
+// WebUI 的 `/api/query/debug` 端点用 `--debug-output` 调用引擎，并把
+// `[DEBUG_JSON_START]…[DEBUG_JSON_END]` 信封解析成可视化数据
+// （tokens / AST / plan / 存储统计 / 替换日志）。Python 端已经在
+// `engine._assemble_multistatement_debug` 等位置按以下 JSON 契约
+// 解析（见 webui/backend/schemas.py 的 DebugData / StorageStats /
+// ReplacementEntry）：
+//
+//   {
+//     "tokens":          [{"type":"…","lexeme":"…","line":N,"col":N}, …],
+//     "ast_text":        "<ast::Node::ToString() 的多行文本>",
+//     "plan_before_opt": "<优化前 PlanNode::ToString() 的多行文本>",
+//     "plan_json":       "<优化后 PlanNode::ToString() 的多行文本>",
+//     "storage_stats":   {"hit_count":N,"miss_count":N,
+//                         "replacement_count":N,"hit_rate":0.0..1.0,
+//                         "total_pages":N},
+//     "replacement_log": [{"evicted":N,"loaded":N,"dirty":bool}, …]
+//   }
+//
+// 信封必须落在**一行**内（Python 端 regex 在 `[DEBUG_JSON_START]` 与
+// `[DEBUG_JSON_END]` 之间截取），因此所有字符串值都通过 JsonEscape 把
+// 真正的换行转成 `\n`，信封之间只用单个 `\n` 分隔。引擎的
+// `Database::ExecuteSQL` 在每次成功后已经把上面要拿的数据（LastTokens /
+// LastAst / LastPlan / LastPlanBeforeOptText）缓存好；我们只需要
+// 在这里统一格式化输出。
+//
+// 复用现有 API（不要重新发明）：
+//   - Database::LastTokens / LastAst / LastPlan / LastPlanBeforeOptText
+//   - BufferPoolManager::GetStats() → BufferPoolStats + HitRate()
+//   - BufferPoolManager::GetReplacementLog() → vector<ReplacementLogEntry>
+//   - DiskManager::GetNumPages()
+
+// 把任意字符串按 JSON 字符串字面量的规则转义。我们手写而不引入
+// nlohmann/json 是因为项目目前零第三方依赖；这里只覆盖会出现在
+// tokens / AST / plan 文本里的字符（控制字符、"、\、换行）。
+std::string JsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (unsigned char uc : s) {
+        switch (uc) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            default:
+                if (uc < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", uc);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(uc);
+                }
+                break;
+        }
+    }
+    return out;
+}
+
+// 把数字格式化成有限精度的字符串。hit_rate 等浮点数在落 JSON 前
+// 用此函数序列化，避免 ostringstream 默认格式带来的本地化 / 精度
+// 不一致问题。
+std::string JsonNumber(double d) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.6f", d);
+    // 去掉无意义的尾随 0（保持紧凑，例如 0.5 而不是 0.500000）。
+    std::string s(buf);
+    auto dot = s.find('.');
+    if (dot != std::string::npos) {
+        auto last_nonzero = s.find_last_not_of('0');
+        if (last_nonzero != std::string::npos && last_nonzero > dot) {
+            s.erase(last_nonzero + 1);
+        } else {
+            // 全是 0（例如 1.000000）→ 保留一个小数点便于前端解析
+            s.erase(dot + 2);
+        }
+    }
+    return s;
+}
+
+// 把 page_id_t（int32_t）以 JSON 数字字面量写入。INVALID_PAGE_ID
+// (-1) 在我们的语义里表示 "无页 / 自由帧"，直接序列化为 -1
+// 比用 null 更便于前端做聚合统计。
+void EmitJsonNumber(std::ostringstream& os, long n) {
+    os << n;
+}
+
+// 在 stdout 上输出一个调试信封。调用方负责控制 `debug_output` 开关
+// 与调用时机（仅在 --debug-output 模式下、且最近一条 ExecuteSQL
+// 编译成功后调用）。
+//
+// 即使 LastAst / LastPlan 为空（典型场景：词法成功但语义失败、或
+// 纯 DDL/DML 但优化器没改写），仍要发出 envelope —— 前端把
+// "空 plan_json" 解读为 "该语句没有可优化计划"，且 storage_stats
+// 仍然有价值。
+void EmitDebugEnvelope(sqlcompiler::Database* db) {
+    using namespace sqlcompiler;
+    std::ostringstream os;
+
+    os << "{";
+
+    // --- tokens ---
+    os << "\"tokens\":[";
+    const auto& toks = db->LastTokens();
+    for (size_t i = 0; i < toks.size(); ++i) {
+        const auto& t = toks[i];
+        if (i) os << ",";
+        os << "{\"type\":\"" << JsonEscape(TokenTypeToString(t.type))
+           << "\",\"lexeme\":\"" << JsonEscape(t.lexeme)
+           << "\",\"line\":" << t.line
+           << ",\"col\":" << t.column << "}";
+    }
+    os << "],";
+
+    // --- ast_text ---
+    const Statement* ast = db->LastAst();
+    os << "\"ast_text\":\""
+       << JsonEscape(ast ? ast->ToString() : std::string()) << "\",";
+
+    // --- plan_before_opt（优化前的快照文本；Database 已缓存） ---
+    os << "\"plan_before_opt\":\""
+       << JsonEscape(db->LastPlanBeforeOptText()) << "\",";
+
+    // --- plan_json（优化后的计划 = EXPLAIN 真正跑的那一份） ---
+    const PlanNode* opt = db->LastPlan();
+    os << "\"plan_json\":\""
+       << JsonEscape(opt ? opt->ToString() : std::string()) << "\",";
+
+    // --- storage_stats ---
+    auto* bpm = db->GetBufferPoolManager();
+    auto* dm  = db->GetDiskManager();
+    const auto& st = bpm->GetStats();
+    long total_pages = dm ? static_cast<long>(dm->GetNumPages()) : 0;
+    os << "\"storage_stats\":{"
+       << "\"hit_count\":"         << st.hit_count        << ","
+       << "\"miss_count\":"        << st.miss_count       << ","
+       << "\"replacement_count\":" << st.replacement_count<< ","
+       << "\"hit_rate\":"          << JsonNumber(st.HitRate()) << ","
+       << "\"total_pages\":"       << total_pages
+       << "},";
+
+    // --- replacement_log ---
+    os << "\"replacement_log\":[";
+    const auto& log = bpm->GetReplacementLog();
+    for (size_t i = 0; i < log.size(); ++i) {
+        const auto& e = log[i];
+        if (i) os << ",";
+        os << "{\"evicted\":" << static_cast<long>(e.evicted_page_id)
+           << ",\"loaded\":"  << static_cast<long>(e.loaded_page_id)
+           << ",\"dirty\":"   << (e.evicted_was_dirty ? "true" : "false")
+           << "}";
+    }
+    os << "]";
+
+    os << "}";
+
+    // 单行输出：Python 端 regex 截取 [START]…[END]，要求信封内不含
+    // 真换行。JsonEscape 已经把字符串值里的换行转成 \n，这里只写
+    // 一个 `\n` 作为信封的结束符。
+    std::cout << "[DEBUG_JSON_START]" << os.str() << "[DEBUG_JSON_END]\n";
 }
 
 // 判断文本是否仅由空白与 SQL 行注释（-- ...）组成。
@@ -335,7 +501,14 @@ void PrintResult(const sqlcompiler::ExecutionResult& result) {
 //
 // 复杂度：ReplLineParser::FeedLine 单行 O(line.length())，buffer append 预
 // reserve 后单次摊销 O(1)；整体 O(L)（L = 总字符数）。
-bool RunScriptFile(sqlcompiler::Database* database, const std::string& path) {
+//
+// debug_output：true 时每条 ExecuteSQL 成功执行后，在 stdout 输出一个
+// [DEBUG_JSON_START]…[DEBUG_JSON_END] 信封供 WebUI 解析（见 EmitDebugEnvelope
+// 注释）。失败语句不输出信封 —— Python 端在 _assemble_multistatement_debug
+// 里把它当作"空 plan_json"处理，前端的可视化面板对该 block 只渲染 Storage
+// 这一块就够了。
+bool RunScriptFile(sqlcompiler::Database* database, const std::string& path,
+                   bool debug_output = false) {
     std::ifstream in(path);
     if (!in) {
         std::cerr << "Error: cannot open script file '" << path << "'" << std::endl;
@@ -353,6 +526,12 @@ bool RunScriptFile(sqlcompiler::Database* database, const std::string& path) {
         if (trimmed.empty() || IsOnlyCommentsOrWhitespace(trimmed)) return false;
         auto result = database->ExecuteSQL(trimmed);
         PrintResult(result);
+        // 仅在编译/执行成功时输出信封。失败留给 stderr 的 "Error:" 提示，
+        // 前端在 _split_blocks 里已经把空 stdout + stderr "Error:" 配对到
+        // 正确的 block。
+        if (debug_output && result.success) {
+            EmitDebugEnvelope(database);
+        }
         return true;
     };
 
@@ -421,6 +600,7 @@ int main(int argc, char** argv) {
     //   3) 都没有就用默认 "sqlcompiler.db"。
     std::string db_file = "sqlcompiler.db";
     std::vector<std::string> script_files;  // 多个 -f 依次执行
+    bool debug_output = false;              // --debug-output：每条语句后输出调试信封
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto take_next = [&](const std::string& flag) -> std::string {
@@ -435,6 +615,10 @@ int main(int argc, char** argv) {
             script_files.push_back(take_next(a));
         } else if (a.rfind("-f=", 0) == 0) {
             script_files.push_back(a.substr(3));
+        } else if (a == "--debug-output") {
+            // WebUI 的可视化端点（POST /api/query/debug）依赖此 flag；
+            // 见 EmitDebugEnvelope 注释了解信封格式。
+            debug_output = true;
         } else if (a == "-h" || a == "--help") {
             std::cout << "Usage: sqlcompiler [db_file] [-f script.sql ...]\n"
                       << "  db_file         Path to the database file "
@@ -442,6 +626,8 @@ int main(int argc, char** argv) {
                       << "  -f <file>       Run <file> as a SQL script, then "
                       << "exit (repeatable)\n"
                       << "  --file, --source   Aliases for -f\n"
+                      << "  --debug-output  Emit a JSON envelope per "
+                      << "statement (WebUI visualization)\n"
                       << "Inside the REPL you can also run: .source <file> "
                       << "(or .read <file>)\n";
             return 0;
@@ -470,7 +656,7 @@ int main(int argc, char** argv) {
     if (!script_files.empty()) {
         int rc = 0;
         for (const auto& f : script_files) {
-            if (!RunScriptFile(database, f)) rc = 1;
+            if (!RunScriptFile(database, f, debug_output)) rc = 1;
         }
         database->Shutdown();
         delete database;
@@ -557,7 +743,7 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 std::string path = rest.substr(ra, rb - ra + 1);
-                RunScriptFile(database, path);
+                RunScriptFile(database, path, debug_output);
                 std::cout << "sqlcompiler> " << std::flush;
                 return true;
             };
