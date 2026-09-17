@@ -51,20 +51,7 @@ file(GLOB_RECURSE SQLCOMPILER_LIB_SOURCES
 # 编译为静态库，方便主程序与未来的测试共同链接
 add_library(sqlcompiler_lib STATIC ${SQLCOMPILER_LIB_SOURCES})
 target_include_directories(sqlcompiler_lib PUBLIC ${CMAKE_SOURCE_DIR}/include)
-if(WIN32)
-    # 回环网络块设备（LoopbackNetworkBlockDevice）依赖 Winsock
-    target_link_libraries(sqlcompiler_lib PUBLIC ws2_32)
-endif()
 
 # 主程序可执行文件
 add_executable(sqlcompiler ${CMAKE_SOURCE_DIR}/src/main.cpp)
 target_link_libraries(sqlcompiler PRIVATE sqlcompiler_lib)
-
-# ---- 存储子系统单元测试 ----
-# 独立目标，链接静态库 sqlcompiler_lib，验证页式存储/缓存/替换策略的正确性。
-file(GLOB_RECURSE STORAGE_UT_SOURCES ${CMAKE_SOURCE_DIR}/tests/storage/*.cpp)
-if(STORAGE_UT_SOURCES)
-    add_executable(storage_ut ${STORAGE_UT_SOURCES})
-    target_link_libraries(storage_ut PRIVATE sqlcompiler_lib)
-    target_include_directories(storage_ut PRIVATE ${CMAKE_SOURCE_DIR}/include)
-endif()

@@ -5,7 +5,6 @@
 #include "common/CaseInsensitive.h"
 #include "common/DateTime.h"
 #include "common/Error.h"
-#include "txn/Transaction.h"
 
 #include <cstdlib>
 #include <unordered_map>
@@ -368,7 +367,6 @@ StatementPtr Parser::ParseStatement() {
         case TokenType::KEYWORD_ROLLBACK: return ParseRollbackStatement();
         case TokenType::KEYWORD_SAVEPOINT:return ParseSavepointStatement();
         case TokenType::KEYWORD_RELEASE:  return ParseReleaseSavepointStatement();
-        case TokenType::KEYWORD_SET:      return ParseSetIsolationStatement();
         case TokenType::KEYWORD_VIEW:     return ParseCreateViewStatement();
         case TokenType::KEYWORD_TRIGGER:  return ParseCreateTriggerStatement();
         case TokenType::KEYWORD_FUNCTION: return ParseCreateFunctionStatement();
@@ -3305,42 +3303,6 @@ StatementPtr Parser::ParseReleaseSavepointStatement() {
     Expect(TokenType::KEYWORD_SAVEPOINT, "expected SAVEPOINT after RELEASE");
     Token t = Expect(TokenType::IDENTIFIER, "expected savepoint name");
     return std::make_shared<ReleaseSavepointStatement>(t.lexeme);
-}
-
-// SET TRANSACTION ISOLATION LEVEL
-//   READ COMMITTED | READ UNCOMMITTED | SERIALIZABLE | SNAPSHOT
-StatementPtr Parser::ParseSetIsolationStatement() {
-    Expect(TokenType::KEYWORD_SET, "expected SET");
-    Expect(TokenType::KEYWORD_TRANSACTION, "expected TRANSACTION after SET");
-    Expect(TokenType::KEYWORD_ISOLATION, "expected ISOLATION after TRANSACTION");
-    Expect(TokenType::KEYWORD_LEVEL, "expected LEVEL after ISOLATION");
-    auto stmt = std::make_shared<SetIsolationStatement>();
-    const Token& lv = CurrentToken();
-    if (lv.type == TokenType::KEYWORD_READ) {
-        Advance();
-        if (Check(TokenType::KEYWORD_COMMITTED)) {
-            Advance();
-            stmt->isolation_level = static_cast<int>(IsolationLevel::kReadCommitted);
-        } else if (Check(TokenType::KEYWORD_UNCOMMITTED)) {
-            Advance();
-            stmt->isolation_level = static_cast<int>(IsolationLevel::kReadUncommitted);
-        } else {
-            throw CompilerException(ErrorStage::SYNTAX,
-                "expected COMMITTED or UNCOMMITTED after READ", lv.line, lv.column);
-        }
-    } else if (lv.type == TokenType::KEYWORD_SERIALIZABLE) {
-        Advance();
-        stmt->isolation_level = static_cast<int>(IsolationLevel::kSerializable);
-    } else if (lv.type == TokenType::KEYWORD_SNAPSHOT) {
-        Advance();
-        stmt->isolation_level = static_cast<int>(IsolationLevel::kSnapshot);
-    } else {
-        throw CompilerException(ErrorStage::SYNTAX,
-            "expected isolation level: READ COMMITTED | READ UNCOMMITTED | SERIALIZABLE | SNAPSHOT (got '" +
-                lv.lexeme + "')",
-            lv.line, lv.column);
-    }
-    return stmt;
 }
 
 // CREATE VIEW name AS <select>

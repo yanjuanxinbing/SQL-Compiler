@@ -55,7 +55,6 @@ private:
     StatementPtr ParseRollbackStatement();
     StatementPtr ParseSavepointStatement();
     StatementPtr ParseReleaseSavepointStatement();
-    StatementPtr ParseSetIsolationStatement();
     StatementPtr ParseCreateViewStatement();
     StatementPtr ParseDropViewStatement();
     // 60_view_trigger (Category 9): MATERIALIZED VIEW 解析入口

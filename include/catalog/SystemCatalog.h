@@ -82,12 +82,6 @@ public:
     // 获取某张表对应的数据存储堆，供执行引擎读写记录；表不存在返回nullptr
     TableHeap* GetTableHeap(const std::string& table_name);
 
-    // MVCC 快照隔离：对全部表的堆做惰性真空回收（回收 begin_csn < 最老活动快照
-    // 的非 head 旧版本槽位），随后对该表全部二级索引做索引墓碑回收。以活动快照
-    // 列表为界防误删仍可能被读取的版本：堆真空用最老水位（= list.front()），索引
-    // 判定用完整升序列表（精确化判据 (ii) 需逐快照检查可见版本键）。
-    void VacuumAll(const std::vector<int64_t>& active_snapshots);
-
     // 提供内存态元数据视图，供语义分析/计划生成阶段复用（避免与编译器模块重复实现）
     SymbolTable& GetSymbolTable();
 
@@ -111,18 +105,6 @@ public:
     // 覆盖指定主键列组的唯一索引；没有则返回 nullptr（此时约束校验回退到全表扫描）
     BPlusTree* GetPrimaryKeyIndexTree(const std::string& table_name,
                                       const std::vector<std::string>& pk_columns);
-
-    // ---- U1 索引健康观测（供 \stats 与监控）----
-    struct IndexStat {
-        std::string name;
-        int height = 0;          // 树高（单叶=1）
-        double min_ratio = 0.0;  // 全树最小页利用率（已用字节/页）
-        double avg_ratio = 0.0;  // 全树平均页利用率
-        uint64_t leaf_pages = 0;
-        uint64_t internal_pages = 0;
-    };
-    // 汇总全部索引树的树高与利用率（只读；按索引名排序）。
-    std::vector<IndexStat> CollectIndexStats() const;
 
     // ---- 40_txn_view_udf：视图 / UDF / 触发器注册表 ----
     //
@@ -343,12 +325,6 @@ private:
     BufferPoolManager* buffer_pool_manager_;
     LogManager* log_manager_ = nullptr;  // Phase B：可选 WAL 写出器
     SymbolTable symbol_table_;  // 内存态元数据缓存
-
-    // 当前挂到 catalog 写路径上的事务。SetActiveTransaction 记录一份，供
-    // 惰性创建的 __sys_indexes__ 堆 / 索引树在创建后立刻继承——否则这些后建
-    // 实例在 WAL 记录里 txn_id=0，恢复期 undo pass 会把它当活动事务撤销，
-    // 跨重启后索引元数据被抹掉（只有 page 3 记录被撤、page 0 幸存，链不完整）。
-    Transaction* active_txn_ = nullptr;
 
     page_id_t sys_tables_first_page_id_;  // 系统目录自身存储表的首页
     // 索引目录堆的首页。旧版本数据库没有这张堆，此时为 INVALID_PAGE_ID，

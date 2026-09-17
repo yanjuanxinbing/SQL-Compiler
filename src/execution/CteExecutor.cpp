@@ -306,9 +306,6 @@ void CteDefineExecutor::Init() {
 
     for (int iter = 0; iter < kRecursiveDepthLimit; ++iter) {
         if (delta.empty()) break;
-        // U3-3：递归 CTE 每轮迭代的工作集变化，非相关子查询若引用 CTE 结果，
-        // 上一轮物化的缓存已陈旧——迭代边界失效缓存。
-        context_->ClearSubqueryCache();
         // 把 delta 推到 override：让递归 SELECT 看到本轮的 delta。
         context_->PushCteOverride(node_->cte_name, delta);
         std::vector<Tuple> new_rows;

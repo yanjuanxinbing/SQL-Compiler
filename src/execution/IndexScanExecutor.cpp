@@ -2,31 +2,8 @@
 
 #include "execution/ConstraintChecker.h"
 #include "execution/ExpressionEvaluator.h"
-#include "txn/Transaction.h"
-#include "txn/TransactionManager.h"
-
-#include <algorithm>
-#include <stdexcept>
 
 namespace sqlcompiler {
-
-namespace {
-
-// 前缀比较：仅比较 key 的前 prefix_cols 列与 bound（bound 恰好含 prefix_cols 个值）。
-// 前缀完全相等即视为相等（忽略 key 的剩余列）——复合索引上界按最左前缀收窄，
-// 剩余列在字典序下没有独立边界；否则返回首个不同列的符号。
-// 单列索引 / 旧计划未标注前缀列数（bound_cols==0）时，调用方传入 bound 的全列数，
-// 退化为完整键比较（与原 CompareKeyOnly 行为一致）。
-int CompareKeyPrefix(const IndexKey& key, size_t prefix_cols, const IndexKey& bound) {
-    const size_t n = std::min({prefix_cols, key.values.size(), bound.values.size()});
-    for (size_t i = 0; i < n; ++i) {
-        int c = Value::Compare(key.values[i], bound.values[i]);
-        if (c != 0) return c;
-    }
-    return 0;
-}
-
-}  // namespace
 
 IndexScanExecutor::IndexScanExecutor(
     ExecutionContext* context, std::shared_ptr<IndexScanNode> node,
@@ -41,33 +18,7 @@ void IndexScanExecutor::Init() {
     tree_ = catalog->GetIndexTree(node_->index_name);
     const TableInfo* info = catalog->GetTable(node_->table_name);
     if (info != nullptr) column_types_ = BuildColumnTypes(*info);
-    // MVCC 快照隔离：kSnapshot 下把本事务快照水位与共享 CommitTracker 挂到堆上，
-    // 回表 GetTuple 按快照过滤版本（免读锁）。
-    if (table_heap_ != nullptr) {
-        Transaction* txn = context_->GetTransaction();
-        TransactionManager* mgr = context_->GetTransactionManager();
-        if (txn != nullptr && txn->IsActive() &&
-            txn->GetIsolationLevel() == IsolationLevel::kSnapshot &&
-            mgr != nullptr && mgr->GetCommitTracker() != nullptr) {
-            table_heap_->SetSnapshot(txn->GetSnapshotCsn(), mgr->GetCommitTracker());
-        } else {
-            // 非快照/自动提交读：复位共享堆上遗留的快照水位，避免陈旧读泄漏。
-            table_heap_->SetSnapshot(-1, nullptr);
-        }
-    }
     if (tree_ == nullptr) return;
-
-    // MVCC 精确可见性（t4）：解析被扫描索引的键列，供回表后做键重检（过滤
-    // 快照写者延迟保留的陈旧条目）。目录里找不到索引元数据时该过滤整体停用。
-    if (catalog != nullptr) {
-        for (const IndexInfo* idx : catalog->GetIndexesForTable(node_->table_name)) {
-            if (idx != nullptr && idx->index_name == node_->index_name) {
-                index_key_columns_ = idx->key_columns;
-                break;
-            }
-        }
-    }
-    seen_rids_.clear();
 
     if (node_->low_key.empty()) {
         cursor_ = tree_->Begin();
@@ -79,32 +30,8 @@ void IndexScanExecutor::Init() {
 bool IndexScanExecutor::BeyondUpperBound(const IndexKey& key) const {
     if (node_->high_key.empty()) return false;
     const IndexKey high(node_->high_key);
-    // 复合索引：只比较上界覆盖的前缀列；未标注（bound_cols==0）按完整键比较。
-    const size_t cols = node_->high_bound_cols > 0 ? node_->high_bound_cols
-                                                   : high.values.size();
-    const int c = CompareKeyPrefix(key, cols, high);
+    const int c = CompareKeyOnly(key, high);
     return node_->high_inclusive ? (c > 0) : (c >= 0);
-}
-
-// MVCC 精确可见性（t4）：键重检——回表得到的「本快照可见版本」必须真的落在
-// 扫描区间内。索引里延迟保留的陈旧条目（快照写者键改写/逻辑删除）指向的行，
-// 其可见版本键可能与条目键不同，据此过滤。
-bool IndexScanExecutor::InScanBounds(const IndexKey& key) const {
-    if (!node_->low_key.empty()) {
-        const IndexKey low(node_->low_key);
-        const size_t lcols = node_->low_bound_cols > 0 ? node_->low_bound_cols
-                                                       : low.values.size();
-        const int c = CompareKeyPrefix(key, lcols, low);
-        if (node_->low_inclusive ? (c < 0) : (c <= 0)) return false;
-    }
-    if (!node_->high_key.empty()) {
-        const IndexKey high(node_->high_key);
-        const size_t hcols = node_->high_bound_cols > 0 ? node_->high_bound_cols
-                                                        : high.values.size();
-        const int c = CompareKeyPrefix(key, hcols, high);
-        if (node_->high_inclusive ? (c > 0) : (c >= 0)) return false;
-    }
-    return true;
 }
 
 bool IndexScanExecutor::Next(Tuple* tuple) {
@@ -114,13 +41,9 @@ bool IndexScanExecutor::Next(Tuple* tuple) {
     IndexKey key;
     RID rid;
     while (cursor_->Next(&key, &rid)) {
-        // 下界是开区间时，LowerBound 会把等于下界的项也带出来，这里跳过。
-        // 复合索引前缀下界：前缀相等即视为等于下界（key 的剩余列无独立边界）。
+        // 下界是开区间时，LowerBound 会把等于下界的项也带出来，这里跳过
         if (!node_->low_key.empty() && !node_->low_inclusive) {
-            const IndexKey low(node_->low_key);
-            const size_t lcols = node_->low_bound_cols > 0 ? node_->low_bound_cols
-                                                           : low.values.size();
-            if (CompareKeyPrefix(key, lcols, low) == 0) continue;
+            if (CompareKeyOnly(key, IndexKey(node_->low_key)) == 0) continue;
         }
         if (BeyondUpperBound(key)) return false;
 
@@ -130,41 +53,11 @@ bool IndexScanExecutor::Next(Tuple* tuple) {
         // 让整条查询失败。
         if (!table_heap_->GetTuple(rid, &t, column_types_)) continue;
 
-        // MVCC 精确可见性（t4）：按 RID 去重 + 可见版本键重检。快照写者的键改写/
-        // 逻辑删除在非唯一二级索引中延迟保留旧条目：同一稳定 RID 可能命中新旧多
-        // 条目（范围扫描会重复返回同一行），且旧条目的可见版本键与扫描区间不符。
-        if (!index_key_columns_.empty()) {
-            if (!seen_rids_.insert(rid).second) continue;  // 已返回过该逻辑行
-            IndexKey tuple_key;
-            bool key_ok = true;
-            for (const auto& col : index_key_columns_) {
-                auto it = column_index_map_.find(col);
-                if (it == column_index_map_.end() ||
-                    it->second >= t.ColumnCount()) {
-                    key_ok = false;
-                    break;
-                }
-                tuple_key.values.push_back(t.GetValue(it->second));
-            }
-            if (key_ok && !InScanBounds(tuple_key)) continue;
-        }
-
         if (node_->residual_predicate) {
             Value v = eval.Evaluate(node_->residual_predicate, t);
             if (v.IsNull() || v.AsInt() == 0) continue;
         }
         if (tuple != nullptr) *tuple = std::move(t);
-        // T2 行级读锁：显式事务内逐行取 S 锁（READ COMMITTED 登记、语句末释放）。
-        // 传入表堆首页页号作表提示：行读锁与所属表锁同分片（G6 分片锁）。
-        auto rl = context_->AcquireRowReadLock(t.GetRid(),
-            static_cast<int64_t>(table_heap_->GetFirstPageId()));
-        if (rl == ExecutionContext::RowLockResult::kDeadlock ||
-            rl == ExecutionContext::RowLockResult::kTimeout) {
-            throw std::runtime_error(
-                rl == ExecutionContext::RowLockResult::kDeadlock
-                    ? "isolation deadlock on row read (statement aborted)"
-                    : "isolation row lock wait timed out (statement aborted)");
-        }
         return true;
     }
     return false;

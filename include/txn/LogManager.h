@@ -1,9 +1,7 @@
 #pragma once
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -61,33 +59,10 @@ public:
     // 强制把缓冲区刷到磁盘（fdatasync / FlushFileBuffers）。
     // 同时把 fdatasync 后的 LSN 记录到 durable_lsn_，之后 durable_lsn()
     // 会返回这个值，供 BufferPoolManager 决定能否 FlushPage。
-    // 同步语义：本调用返回即保证「本线程之前追加的全部记录」已落盘。
-    // 供 CLR 逐条刷（Rollback/Savepoint）、恢复期与 WAL-before-data 等
-    // 必须立刻持久化的路径使用；常规 COMMIT 请用 GroupCommit 享受组提交。
     void Flush();
 
-    // Phase 4（创新特性 F）：组提交——把 durable 推进到 >= target。
-    // 多事务并发提交时，把 COMMIT 记录交给 WAL 后调用本方法：先到者成为
-    // 「领导者」，一次性 SyncOs 覆盖当前已追加的全部记录（含跟随者），随后
-    // 跟随者仅需等待 durable_lsn_ 覆盖自己的 target 即返回——批内所有提交
-    // 共享一次 fsync。返回时保证 durable_lsn_ >= target。
-    // 领导者 SyncOs 失败时抛出（跟随者会看到 durable 未推进并自行领跑重试）。
-    lsn_t GroupCommit(lsn_t target);
-
-    // Phase 5（周期 2）：组提交时间窗聚合。ms > 0 时，领导者成为后先在窗口内
-    // 等待更多提交到达（到达者成为跟随者），窗口结束再统一快照并一次 SyncOs，
-    // 覆盖窗口内全部提交——高频小事务场景 fsync 次数在「纯跟随者聚合」基础上
-    // 进一步下降。默认 0（关闭，保持领导者-跟随者被动聚合）。
-    // 启动时由环境变量 SQLCOMPILER_GROUPCOMMIT_WINDOW_MS（毫秒）配置；UT/基准
-    // 可直设。
-    void SetGroupCommitWindowMs(long ms);
-
-    // 当前「已被持久化」的最大 LSN（Phase 4 起持锁读取，与 GroupCommit 并发安全）。
-    lsn_t durable_lsn() const;
-
-    // 累计执行 SyncOs（真正 fsync）的次数。组提交下并发 N 次提交的 fsync 次数
-    // 远小于 N；供单元测试与吞吐基准观测。
-    size_t GetSyncCount() const;
+    // 当前「已被持久化」的最大 LSN。
+    lsn_t durable_lsn() const { return durable_lsn_; }
 
     // 扫描整个 WAL 文件，逐条反序列化返回。仅 RecoveryManager 在启动期使用，
     // 不与 AppendRecord 并发。返回的 LogRecord 已经把 lsn_/prev_lsn_ 字段填好。
@@ -100,11 +75,7 @@ private:
     int posix_fd_ = -1;            // POSIX: -1 表示未打开
 
     std::string wal_file_;
-    mutable std::mutex mutex_;       // 保护以下字段（Phase 4：GroupCommit 并发安全）
-    std::condition_variable gc_cv_;  // 组提交跟随者等待 durable 推进
-    bool gc_leader_ = false;         // 是否有线程正在执行 SyncOs（领导者）
-    std::atomic<size_t> sync_count_{0};  // 累计 SyncOs 次数（观测，原子：领导者在解锁后同步）
-    long group_commit_window_ms_ = 0;    // 周期 2：组提交时间窗（毫秒；0 = 关闭）
+    std::mutex mutex_;
     lsn_t next_lsn_ = 1;       // 下一个待分配的 LSN
     lsn_t durable_lsn_ = 0;     // 已持久化的最大 LSN
     // 每个事务最近一次 AppendRecord 的 LSN；AppendRecord 时用此值填 prev_lsn_。

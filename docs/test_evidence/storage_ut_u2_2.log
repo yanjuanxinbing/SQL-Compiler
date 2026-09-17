@@ -1,3 +1,0 @@
-﻿checks: 292486   fails: 0
-[U2-2] lock waits: ep=2(s=1,x=1) us~96ms timeout=1 deadlock=0 wouldblock=1 cur=0 pred=0 (单元计数对账: 阻塞获授计1事件+时长+当前等待者, 超时入timeout且并入事件, 探针计wouldblock不算事件, wait_episodes==S+X)
-SQL回归: 55/55  \stats 已渲染锁等待段; build 0告警0错误

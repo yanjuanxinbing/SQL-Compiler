@@ -22,12 +22,11 @@
 
 #include "txn/LogManager.h"
 
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
 
-#if defined(_MSC_VER)
+#if defined(_WIN32)
 // _open / _read / _write are flagged C4996 by MSVC; we deliberately use the
 // low-level POSIX-style API to talk to FlushFileBuffers directly. Silence the
 // "use _sopen_s" hint that doesn't apply here.
@@ -63,11 +62,6 @@ inline uint32_t ReadU32(const char* src) {
 }  // namespace
 
 LogManager::LogManager(const std::string& wal_file) : wal_file_(wal_file) {
-    // 周期 2：组提交时间窗默认关闭（0 = 纯跟随者聚合）；由环境变量配置毫秒数。
-    if (const char* w = std::getenv("SQLCOMPILER_GROUPCOMMIT_WINDOW_MS")) {
-        const long ms = std::atol(w);
-        if (ms > 0) group_commit_window_ms_ = ms;
-    }
     if (!OpenForAppend()) {
         throw std::runtime_error("LogManager: cannot open WAL file: " + wal_file_);
     }
@@ -205,7 +199,6 @@ bool LogManager::WriteBytes(const char* data, size_t length) {
 }
 
 bool LogManager::SyncOs() {
-    ++sync_count_;  // 观测：累计真实 fsync 次数（原子，领导者解锁期间同步也安全）
 #if defined(_WIN32)
     if (file_handle_ == nullptr || file_handle_ == INVALID_HANDLE_VALUE) return false;
     return FlushFileBuffers(static_cast<HANDLE>(file_handle_)) != 0;
@@ -299,69 +292,6 @@ void LogManager::Flush() {
     }
     // Flush 成功：把「next_lsn_-1」标为已持久化（next_lsn_ 是下一个待分配 LSN）。
     durable_lsn_ = next_lsn_ > 0 ? next_lsn_ - 1 : 0;
-    gc_cv_.notify_all();  // 唤醒可能的组提交跟随者（其 target 已被覆盖）
-}
-
-// Phase 4：组提交。把 durable 推进到 >= target，批内所有提交共享一次 fsync。
-// 算法（领导者-跟随者）：
-//   1) 若 durable 已覆盖 target → 立即返回（无 fsync）；
-//   2) 无领导者 → 本线程成为领导者：在锁内捕获 flush_to = next_lsn_ - 1
-//      （快照「本次同步将覆盖到的 LSN」，含之后到达的跟随者记录），解锁执行
-//      SyncOs，回锁后把 durable 推进到 flush_to（只升不降——同步期间新追加的
-//      记录 LSN > flush_to，不在本次覆盖范围内，留给下一轮）；
-//   3) 有领导者 → 作为跟随者在 gc_cv_ 上等待，durable 推进后重查循环。
-//   4) 领导者 SyncOs 失败：不清空 leader 标记即抛异常；跟随者被唤醒后看到
-//      durable 未推进，将自行成为新领导者重试同步，保证跟随者提交不丢失。
-lsn_t LogManager::GroupCommit(lsn_t target) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    for (;;) {
-        if (durable_lsn_ >= target) return durable_lsn_;
-        if (gc_leader_) {
-            // 跟随者：等领导者（或失败后的下一轮领导者）把 durable 推进到 target。
-            gc_cv_.wait(lock);
-            continue;
-        }
-        // 成为领导者。
-        gc_leader_ = true;
-        // 周期 2：时间窗聚合——领导者先等待窗口结束，让窗口内到达的提交成为
-        // 跟随者并入本批；wait_for 释放锁，跟随者因此能进来登记并等待。
-        if (group_commit_window_ms_ > 0) {
-            gc_cv_.wait_for(lock,
-                            std::chrono::milliseconds(group_commit_window_ms_));
-        }
-        // 窗口结束重新快照 flush_to：窗口内新追加的记录（含跟随者提交）一并覆盖，
-        // 一次 SyncOs 持久化整批。随后 durable 只升不降。
-        const lsn_t flush_to = next_lsn_ > 0 ? next_lsn_ - 1 : 0;
-        lock.unlock();
-        const bool ok = SyncOs();
-        lock.lock();
-        gc_leader_ = false;
-        if (ok && flush_to > durable_lsn_) durable_lsn_ = flush_to;
-        gc_cv_.notify_all();  // 唤醒跟随者重查 durable
-        if (!ok) {
-            // durable 未推进：跟随者会接管重试；本线程向上抛（调用方按既有
-            // COMMIT 路径语义吞掉）。
-            throw std::runtime_error("LogManager: WAL group flush failed for " +
-                                     wal_file_);
-        }
-        if (durable_lsn_ >= target) return durable_lsn_;
-        // 同步期间又有新追加（flush_to < 更新后的目标）：继续领跑下一轮。
-    }
-}
-
-lsn_t LogManager::durable_lsn() const {
-    std::lock_guard<std::mutex> lk(mutex_);
-    return durable_lsn_;
-}
-
-void LogManager::SetGroupCommitWindowMs(long ms) {
-    std::lock_guard<std::mutex> lk(mutex_);
-    group_commit_window_ms_ = ms > 0 ? ms : 0;
-    if (ms > 0) gc_cv_.notify_all();  // 若已有领导者等待，提前结束窗口按新值重走
-}
-
-size_t LogManager::GetSyncCount() const {
-    return sync_count_.load();
 }
 
 void LogManager::ScanFile(std::vector<char>* out) {
@@ -423,7 +353,7 @@ std::vector<LogRecord> LogManager::ReadAll() {
     return records;
 }
 
-#if defined(_MSC_VER)
+#if defined(_WIN32)
 #pragma warning(pop)
 #endif
 

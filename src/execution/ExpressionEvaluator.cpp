@@ -1874,33 +1874,193 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
         if (use_inner_aliases_for_nest) ctx_->SetInnerAliases(saved_inner_aliases_for_nest);
     };
 
-    std::vector<Tuple> rows;
     if (!correlated) {
-        // U3-3（合并后接线）：非相关子查询结果与当前外层行无关 → 首次求值执行一次
-        // 并缓存，后续外层行直接复用。缓存路由到 ExecutionContext::subquery_cache_
-        // —— 注入 SubqueryCacheStats 供 \stats 观测（materialize=N hits=M），且
-        // CteDefineExecutor 每轮迭代 ClearSubqueryCache 清除，避免递归体内陈旧
-        // 结果（替代 remote 的静态 thread_local 缓存：它永不清除、也不更新统计，
-        // 会破坏递归 CTE 边界与可观测性）。缓存键取 AST 上稳定的 subquery_plan
-        // 指针；按需 plan 出来的临时计划不参与缓存。
-        const void* cache_key = expr.subquery_plan
-                                    ? static_cast<const void*>(expr.subquery_plan.get())
-                                    : nullptr;
-        const std::vector<Tuple>* cached =
-            (cache_key != nullptr) ? ctx_->GetCachedSubqueryRows(cache_key) : nullptr;
-        if (cached) {
-            rows = *cached;
-        } else {
-            auto r = RunPlanToCompletion(ctx_, plan);
-            if (cache_key != nullptr) ctx_->CacheSubqueryRows(cache_key, r);
-            rows = std::move(r);
+        struct SubqCache {
+            std::vector<Tuple> rows;
+            std::unordered_set<std::string> in_set;
+            bool have_in_set = false;
+            bool have_rows = false;
+        };
+        static thread_local std::unordered_map<const SubqueryExprNode*, SubqCache>
+            cache;
+        auto it_cache = cache.find(&expr);
+        if (it_cache != cache.end() && it_cache->second.have_rows) {
+            const auto& rows = it_cache->second.rows;
+            switch (expr.kind) {
+                case SubqueryType::SCALAR: {
+                    if (rows.empty()) return Value::MakeNull();
+                    const auto& t = rows[0];
+                    if (t.ColumnCount() == 0) return Value::MakeNull();
+                    return t.GetValue(0);
+                }
+                case SubqueryType::EXISTS:
+                    return rows.empty() ? Value::MakeInt(0) : Value::MakeInt(1);
+                case SubqueryType::IN: {
+                    if (!expr.outer_expr) return Value::MakeInt(0);
+                    Value outer = Evaluate(expr.outer_expr, tuple);
+                    if (outer.IsNull()) return Value::MakeNull();
+                    if (!it_cache->second.have_in_set) {
+                        // 构造 in_set 缓存
+                        SubqCache& mut = it_cache->second;
+                        mut.in_set.reserve(rows.size());
+                        bool saw_null = false;
+                        for (const auto& r : rows) {
+                            if (r.ColumnCount() == 0) continue;
+                            const Value& v = r.GetValue(0);
+                            if (v.IsNull()) { saw_null = true; continue; }
+                            mut.in_set.insert(v.ToString());
+                        }
+                        // 若原 rows 里有 NULL，必须保留 saw_null 以实现 UNKNOWN
+                        mut.in_set.insert("__had_null__");
+                        mut.have_in_set = true;
+                        (void)saw_null;
+                    }
+                    if (it_cache->second.in_set.find(outer.ToString()) !=
+                        it_cache->second.in_set.end()) {
+                        return Value::MakeInt(1);
+                    }
+                    // 检测 rows 里有 NULL：当时 in_set 多塞了一个 sentinel；
+                    // 上面用 sentinel 的方式不区分命中 vs NULL——更稳妥的做法
+                    // 是单独记录 has_null_flag。简单处理：当 sentinel 未命中但
+                    // 我们曾把 sentinel 塞进去时，返回 UNKNOWN 表明存在 NULL。
+                    // （如果 original rows 没有 NULL，sentinel 不会被插入，逻辑
+                    // 也不会触发此分支）。
+                    if (it_cache->second.in_set.size() > 0 &&
+                        it_cache->second.in_set.count("__had_null__") > 0) {
+                        return Value::MakeNull();
+                    }
+                    return Value::MakeInt(0);
+                }
+                case SubqueryType::ANY:
+                case SubqueryType::SOME: {
+                    // SOME 与 ANY 完全等价（SQL 标准同义关键字）。
+                    // 存在性量化：expr op SOME/ANY (SELECT ...)。
+                    // 行值至少有一个匹配比较 → TRUE；空集/全不匹配 → FALSE；
+                    // 含 NULL 且未命中 → UNKNOWN（NULL）。
+                    if (!expr.outer_expr) return Value::MakeInt(0);
+                    Value outer = Evaluate(expr.outer_expr, tuple);
+                    if (outer.IsNull()) return Value::MakeNull();
+                    const std::string& op = expr.comparison_op;
+                    bool saw_null = false;
+                    for (const auto& r : rows) {
+                        if (r.ColumnCount() == 0) continue;
+                        const Value& v = r.GetValue(0);
+                        if (v.IsNull()) { saw_null = true; continue; }
+                        if (SqlCompare(outer, op, v)) return Value::MakeInt(1);
+                    }
+                    if (saw_null) return Value::MakeNull();
+                    return Value::MakeInt(0);
+                }
+                case SubqueryType::ALL: {
+                    // 全称量化：expr op ALL (SELECT ...)。
+                    //   - 空集合 → TRUE（vacuous truth，SQL 标准规定）。
+                    //   - outer 为 NULL → NULL（三值逻辑）。
+                    //   - 任一行不满足 op → FALSE。
+                    //   - 所有非 NULL 行都满足且出现过 NULL → NULL（UNKNOWN）。
+                    //   - 所有非 NULL 行都满足且无 NULL → TRUE。
+                    if (!expr.outer_expr) return Value::MakeInt(0);
+                    Value outer = Evaluate(expr.outer_expr, tuple);
+                    if (outer.IsNull()) return Value::MakeNull();
+                    if (rows.empty()) return Value::MakeInt(1);  // vacuous TRUE
+                    const std::string& op = expr.comparison_op;
+                    bool saw_null = false;
+                    for (const auto& r : rows) {
+                        if (r.ColumnCount() == 0) continue;
+                        const Value& v = r.GetValue(0);
+                        if (v.IsNull()) { saw_null = true; continue; }
+                        if (!SqlCompare(outer, op, v)) return Value::MakeInt(0);
+                    }
+                    // 全部满足（无 FALSE）；若含 NULL → UNKNOWN，否则 TRUE。
+                    if (saw_null) return Value::MakeNull();
+                    return Value::MakeInt(1);
+                }
+            }
+            return Value::MakeNull();
         }
+        // 缓存 miss：跑一次，把结果存进缓存。
+        // bind / inner 表集合已在函数顶部统一挂上，直接跑计划即可。
+        auto rows = RunPlanToCompletion(ctx_, plan);
+        SubqCache entry;
+        entry.rows = rows;
+        entry.have_rows = true;
+        cache[&expr] = std::move(entry);
         restore_nest();
-    } else {
-        // 相关子查询：nested_bind 已预挂「父 bind + 当前行」；这里在它之上叠加
-        //子查询 AST 中相关列引用精确匹配的条目（优先级最高，用户写了 `o.col = t.col`
-        // 时希望绑到外层 t.col，即使 nested_bind 里同名键已有当前行 / 父 bind 兜底）。
-        // 其余 bind / inner 表集合已由上方统一设置，无需重做。
+        switch (expr.kind) {
+            case SubqueryType::SCALAR: {
+                if (rows.empty()) return Value::MakeNull();
+                const auto& t = rows[0];
+                if (t.ColumnCount() == 0) return Value::MakeNull();
+                return t.GetValue(0);
+            }
+            case SubqueryType::EXISTS:
+                return rows.empty() ? Value::MakeInt(0) : Value::MakeInt(1);
+            case SubqueryType::IN: {
+                if (!expr.outer_expr) return Value::MakeInt(0);
+                Value outer = Evaluate(expr.outer_expr, tuple);
+                if (outer.IsNull()) return Value::MakeNull();
+                SubqCache& mut = cache[&expr];
+                mut.in_set.reserve(rows.size());
+                bool saw_null = false;
+                for (const auto& r : rows) {
+                    if (r.ColumnCount() == 0) continue;
+                    const Value& v = r.GetValue(0);
+                    if (v.IsNull()) { saw_null = true; continue; }
+                    mut.in_set.insert(v.ToString());
+                }
+                if (saw_null) mut.in_set.insert("__had_null__");
+                mut.have_in_set = true;
+                if (mut.in_set.find(outer.ToString()) != mut.in_set.end()) {
+                    return Value::MakeInt(1);
+                }
+                if (mut.in_set.count("__had_null__") > 0) return Value::MakeNull();
+                return Value::MakeInt(0);
+            }
+            case SubqueryType::ANY:
+            case SubqueryType::SOME: {
+                // SOME 与 ANY 等价；见上方 cache hit 路径的注释。
+                if (!expr.outer_expr) return Value::MakeInt(0);
+                Value outer = Evaluate(expr.outer_expr, tuple);
+                if (outer.IsNull()) return Value::MakeNull();
+                const std::string& op = expr.comparison_op;
+                bool saw_null = false;
+                for (const auto& r : rows) {
+                    if (r.ColumnCount() == 0) continue;
+                    const Value& v = r.GetValue(0);
+                    if (v.IsNull()) { saw_null = true; continue; }
+                    if (SqlCompare(outer, op, v)) return Value::MakeInt(1);
+                }
+                if (saw_null) return Value::MakeNull();
+                return Value::MakeInt(0);
+            }
+            case SubqueryType::ALL: {
+                // 全称量化；详见 cache hit 路径。
+                if (!expr.outer_expr) return Value::MakeInt(0);
+                Value outer = Evaluate(expr.outer_expr, tuple);
+                if (outer.IsNull()) return Value::MakeNull();
+                if (rows.empty()) return Value::MakeInt(1);
+                const std::string& op = expr.comparison_op;
+                bool saw_null = false;
+                for (const auto& r : rows) {
+                    if (r.ColumnCount() == 0) continue;
+                    const Value& v = r.GetValue(0);
+                    if (v.IsNull()) { saw_null = true; continue; }
+                    if (!SqlCompare(outer, op, v)) return Value::MakeInt(0);
+                }
+                if (saw_null) return Value::MakeNull();
+                return Value::MakeInt(1);
+            }
+        }
+        return Value::MakeNull();
+    }
+
+    // === 相关子查询：把当前外层行的列值推到 ExecutionContext，再跑子计划 ===
+    // 跑完后恢复旧的 outer_bind，避免影响同语句后续无关的 evaluator。
+    // 60_query：嵌套子查询相关时已经在上方 nested_bind 中预挂了「父 bind + 当前行」，
+    // 本分支只在它之上叠加「子查询 AST 中相关列引用精确匹配的额外条目」——
+    // 这些条目优先级最高（用户写了 `o.col = t.col` 时希望绑到外层 t.col，即使
+    // nested_bind 里同名键已有当前行 / 父 bind 的兜底值）。其余 bind / inner
+    // 表集合已由上方统一设置，无需重做。
+    if (correlated) {
         std::vector<ExprPtr> rels;
         for (auto& e : expr.subquery->select_list) rels.push_back(e);
         if (expr.subquery->where_clause) rels.push_back(expr.subquery->where_clause);
@@ -1914,9 +2074,10 @@ Value ExpressionEvaluator::EvaluateSubquery(const SubqueryExprNode& expr,
                 nested_bind[kv.first] = kv.second;
             }
         }
-        rows = RunPlanToCompletion(ctx_, plan);
-        restore_nest();
     }
+
+    auto rows = RunPlanToCompletion(ctx_, plan);
+    restore_nest();
 
     switch (expr.kind) {
         case SubqueryType::SCALAR: {

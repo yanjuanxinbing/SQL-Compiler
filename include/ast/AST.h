@@ -53,7 +53,6 @@ enum class NodeType {
     ROLLBACK_TO_STMT,       // 48_acid_undo: ROLLBACK TO name
     SAVEPOINT_STMT,
     RELEASE_SAVEPOINT_STMT,
-    SET_ISOLATION_STMT,     // SET TRANSACTION ISOLATION LEVEL ...
     CREATE_VIEW_STMT,
     DROP_VIEW_STMT,
     CREATE_TRIGGER_STMT,
@@ -315,10 +314,7 @@ struct ColumnDefinition {
 };
 
 // JOIN 类型
-// SEMI/ANTI 由 U3-3 子查询去关联改写产生（EXISTS/IN → SEMI，NOT EXISTS → ANTI），
-// 不来自 SQL 语法：SEMI 每个左行在右子树存在匹配时输出一次左行（半连接，
-// 精确等价 EXISTS/IN 的 WHERE 语义）；ANTI 在右子树无匹配时输出左行（NOT EXISTS）。
-enum class JoinType { INNER, LEFT, RIGHT, FULL_OUTER, CROSS, SEMI, ANTI };
+enum class JoinType { INNER, LEFT, RIGHT, FULL_OUTER, CROSS };
 
 // JOIN 子句
 struct JoinClause {
@@ -1004,21 +1000,6 @@ public:
     std::string ToString() const override;
 
     std::string savepoint_name;
-};
-
-// SET TRANSACTION ISOLATION LEVEL
-//   READ COMMITTED | READ UNCOMMITTED | SERIALIZABLE
-// isolation_level 存 IsolationLevel 枚举的整值
-//   （kSerializable=0 / kReadCommitted=1 / kReadUncommitted=2）。
-// 用 int 而非直接引入 txn/Transaction.h，避免 AST.h 的传递依赖变重。
-class SetIsolationStatement : public Statement {
-public:
-    SetIsolationStatement();
-
-    NodeType GetType() const override;
-    std::string ToString() const override;
-
-    int isolation_level = 0;  // IsolationLevel 的整值
 };
 
 // CREATE VIEW name AS <select> —— 视图定义保存在 catalog 中。

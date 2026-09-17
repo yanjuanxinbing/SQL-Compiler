@@ -69,7 +69,6 @@ bool SemanticAnalyzer::AnalyzeInternal(const StatementPtr& statement, bool& ok) 
         case NodeType::ROLLBACK_TO_STMT:
         case NodeType::SAVEPOINT_STMT:
         case NodeType::RELEASE_SAVEPOINT_STMT:
-        case NodeType::SET_ISOLATION_STMT:
         case NodeType::CREATE_VIEW_STMT:
         case NodeType::DROP_VIEW_STMT:
         // 60_view_trigger: 物化视图 / 物化视图 ALTER 走 no-op 语义校验。

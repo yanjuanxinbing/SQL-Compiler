@@ -1,12 +1,9 @@
 #pragma once
 
 #include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -15,10 +12,8 @@
 #include "execution/ExecutionEngine.h"
 #include "lexer/Token.h"
 #include "plan/Plan.h"
-#include "session/Session.h"
 #include "storage/BufferPoolManager.h"
 #include "storage/DiskManager.h"
-#include "storage/LockManager.h"
 #include "storage/StorageAccess.h"
 #include "storage_engine/Value.h"  // 71_proc_out_params: SessionVars uses Value
 #include "txn/TransactionManager.h"
@@ -28,7 +23,6 @@ namespace sqlcompiler {
 // 前向声明：避免 Database.h 引入 LogManager 的全头（与 TransactionManager 形成环）。
 class LogManager;
 class RecoveryManager;
-class CommitTracker;
 
 // 数据库总入口（门面/Facade）：
 // 串联 编译器模块（Lexer -> Parser -> SemanticAnalyzer -> Planner -> Optimizer）
@@ -37,10 +31,7 @@ class CommitTracker;
 class Database {
 public:
     // db_file: 数据文件路径（不存在则创建新库）；buffer_pool_size: 缓冲池可容纳的页数
-    // bg_flush_ms: 后台异步刷脏线程的唤醒间隔（毫秒，0 = 关闭，默认）。
-    // bg_vacuum_ms: MVCC 后台多版本真空线程的唤醒间隔（毫秒，0 = 关闭，默认）。
-    explicit Database(const std::string& db_file, size_t buffer_pool_size = 64,
-                      int bg_flush_ms = 0, int bg_vacuum_ms = 0);
+    explicit Database(const std::string& db_file, size_t buffer_pool_size = 64);
     ~Database();
 
     // 执行一条SQL语句，内部完成 词法->语法->语义->计划->优化->执行 全流程，
@@ -54,18 +45,7 @@ public:
     // 将缓冲池中所有脏页写回磁盘，通常在CLI退出前调用
     void Shutdown();
 
-    // ---- T2 多连接并发事务：会话感知执行 ----
-    // 在指定会话（拥有独立事务状态）上执行一条 SQL。多线程对同一 Database 各持
-    // 一个 CreateSession() 返回的会话并发调用即可实现「各自独立事务/自动提交」。
-    // 传 nullptr 等价于默认会话（单连接旧行为）。
-    ExecutionResult ExecuteSQL(const std::string& sql, Session* session);
-
-    // 新建一个会话：拥有独立的 TransactionManager（独立当前事务与嵌套深度），
-    // 但共享缓冲池/WAL/系统目录，并共享全局 txn_id 序列器（保证 id 唯一）。
-    // 返回的 Session 交由 Database 持有所有权；调用方可持 shared_ptr 副本使用。
-    std::shared_ptr<Session> CreateSession();
-
-    // 获取默认会话的事务管理器（兼容旧 API）。
+    // ---- Phase A：事务管理入口 ----
     TransactionManager* GetTransactionManager() const { return txn_manager_.get(); }
 
     // ---- 统一的存储访问门面 ----
@@ -128,72 +108,22 @@ public:
         return last_plan_before_opt_text_;
     }
 
-    // 生成存储子系统诊断信息字符串（由 \stats 命令触发）。
-    // 输出缓冲池命中/缺失/替换统计、命中率、磁盘页数与近期页替换日志，
-    // 满足指导书「页级读写、缓存命中统计、页替换日志输出」的要求。
-    std::string GetStorageStats() const;
-
-    // ---- T4 诊断：\analyze 命令 ----
-    // 生成页映射 / 介质 / CRC 校验的诊断信息字符串（由 \analyze 命令触发）：
-    //   * 页映射：缓冲池中每个逻辑页 → 帧号、是否脏、访问温度；
-    //   * 介质：当前块设备名（memory / sparse / 网络回环 / 文件）；
-    //   * CRC 累计校验失败计数与磁盘 IO 计数（介质损坏观测）。
-    std::string GetStorageAnalysis() const;
-
-    // 诊断：磁盘物理读/写页累计计数（转发 DiskManager）。供量化测试（如
-    // 复合索引多列前缀收敛带来的扫描页数下降）与 \stats 扩展使用；只读无副作用。
-    long long GetDiskIOReadCount() const;
-    long long GetDiskIOWriteCount() const;
-
-    // ---- MVCC 低频后台真空线程（可观测性/控制）----
-    // 线程生命周期由构造参数 bg_vacuum_ms 驱动；以下访问器供诊断与测试使用。
-    bool IsBackgroundVacuumEnabled() const;
-    long GetBackgroundVacuumTicks() const;  // 被唤醒并执行真空的次数（可观测）
-
-    // ---- U3-3：非相关子查询物化缓存观测（跨语句累计）----
-    // 每条语句的 ExecutionContext 通过 ExecutionEngine 把物化/命中计数汇入此 sink，
-    // 供 \stats 展示与白盒单元测试断言（多会话并发时原子累计）。
-    const SubqueryCacheStats& GetSubqueryCacheStats() const {
-        return subquery_cache_stats_;
-    }
-
 private:
     // storage_ 必须声明在 disk_manager_ / buffer_pool_manager_ 之前：成员按
-    // 声明逆序析构，因此 storage_ 最后销毁，其持有的非所有权裸指针在 BPM / DM
+    // 声明逆序析构，因此 storage_ 最先销毁，其持有的非所有权裸指针在 BPM / DM
     // 析构前已经失效但不被访问，安全。
     std::unique_ptr<StorageAccess> storage_;
     std::unique_ptr<DiskManager> disk_manager_;
-    // Phase B：LogManager 必须声明在 BufferPoolManager 之前——成员逆序析构时
-    // BufferPoolManager 的析构仍会 FlushAllPages → FlushPageUnlocked 访问
-    // log_manager_->durable_lsn()/Flush()，若 LogManager 先被销毁则构成
-    // use-after-free（Phase 4 起 durable_lsn 持锁读取后必现崩溃）。
-    std::unique_ptr<LogManager> log_manager_;        // Phase B：WAL 写出器
     std::unique_ptr<BufferPoolManager> buffer_pool_manager_;
     std::unique_ptr<SystemCatalog> catalog_;
     std::unique_ptr<ExecutionEngine> execution_engine_;
     std::unique_ptr<TransactionManager> txn_manager_;
-    // U3-3：非相关子查询物化缓存观测 sink（Engine 构造时注入，见 Database.cpp）。
-    SubqueryCacheStats subquery_cache_stats_;
+    std::unique_ptr<LogManager> log_manager_;        // Phase B：WAL 写出器
     std::unique_ptr<RecoveryManager> recovery_;      // Phase B：启动期 ARIES 恢复
-    // T2：跨会话共享的事务级锁管理器（隔离级别 + 死锁回收）。
-    std::unique_ptr<LockManager> lock_manager_;
-    // MVCC 快照隔离：跨会话共享的提交跟踪器（CSN 注入 + 版本可见性判定）。
-    std::unique_ptr<CommitTracker> commit_tracker_;
-
-    // ---- U2 基准：\bench 命令 ----
-    // 进程内多会话并发读写混合负载吞吐/延迟基准（由 \bench <threads> <ops> 触发）。
-    ExecutionResult RunBenchCommand(const std::string& sql, TransactionManager* txn_mgr);
-
-    // T2 并发会话：全局 txn_id 序列器 + 会话所有权容器 + 会话执行器私有辅助。
-    TxnIdSequencer txn_seq_;
-    std::vector<std::shared_ptr<Session>> sessions_;
-    ExecutionResult ExecuteSQLImpl(const std::string& sql, TransactionManager* txn_mgr);
 
     std::string db_file_path_;       // 规范化后的绝对路径
     std::string wal_file_path_;      // <db_file>.wal
     bool is_new_database_;           // 用于判断启动时是Bootstrap()还是LoadFromDisk()
-    // MVCC 快照隔离：低频惰性真空触发器（每执行 N 条成功后租一次全表 Vacuum）。
-    int vacuum_statement_counter_ = 0;
 
     // ---- Phase 1.5: 调试输出模式缓存 ----
     // ExecuteSQL 在词法/语法/计划成功后写入；阶段失败时不写入，保留上一次成功的值。
@@ -220,23 +150,6 @@ private:
     // 的 @var 读写都直接打到这张表。ExecuteSQL 结束不需要拷贝 —— 上下文只是
     // 引用了 Database 的成员。线程模型：项目当前为单线程 REPL / 脚本驱动。
     std::unordered_map<std::string, Value> session_vars_;
-
-    // ---- MVCC 低频后台真空线程 ----
-    // 与 E5 后台刷脏线程同一模式：仅当构造参数 bg_vacuum_ms > 0 时启动，默认关闭
-    // （行为与旧版完全一致）。线程每隔 interval 以「最老活动快照」为界对全部表做
-    // 一次惰性多版本真空（TableHeap::Vacuum），回收已提交且不再被任何活动快照
-    // 可见的旧版本槽位。生命周期：构造末尾启动，Shutdown 时先停再刷盘/同步。
-    void StartBackgroundVacuum(std::chrono::milliseconds interval);
-    void StopBackgroundVacuum();  // 幂等：未运行时 no-op
-    void BackgroundVacuumLoop();
-
-    std::thread bg_vacuum_thread_;          // 后台真空线程；未运行时为空
-    mutable std::mutex bg_vacuum_mutex_;    // 保护 bg_vacuum_running_ / stop_ / interval_
-    std::condition_variable bg_vacuum_cv_;
-    bool bg_vacuum_running_ = false;
-    bool bg_vacuum_stop_ = false;
-    std::chrono::milliseconds bg_vacuum_interval_{0};
-    std::atomic<long> bg_vacuum_ticks_{0};
 
     // 在 ExecuteSQL 内部、autocommit commit 之后调一次。若还有崩溃名额则扣减，
     // 归零后立即 _Exit(1)。

@@ -1,7 +1,5 @@
 #include "ast/AST.h"
 
-#include "txn/Transaction.h"
-
 #include <sstream>
 
 namespace sqlcompiler {
@@ -29,6 +27,7 @@ const char* LiteralTypeToString(LiteralType t) {
     }
     return "?";
 }
+
 const char* BinaryOpToString(BinaryOperator op) {
     switch (op) {
         case BinaryOperator::ADD:            return "+";
@@ -58,6 +57,14 @@ const char* BinaryOpToString(BinaryOperator op) {
         case BinaryOperator::IS_NOT_FALSE:   return "IS NOT FALSE";
         case BinaryOperator::INTERVAL_ADD:   return "+";
         case BinaryOperator::INTERVAL_SUB:   return "-";
+    }
+    return "?";
+}
+
+const char* UnaryOpToString(UnaryOperator op) {
+    switch (op) {
+        case UnaryOperator::NOT:    return "NOT";
+        case UnaryOperator::NEGATE: return "-";
     }
     return "?";
 }
@@ -821,18 +828,6 @@ ReleaseSavepointStatement::ReleaseSavepointStatement(std::string name)
 NodeType ReleaseSavepointStatement::GetType() const { return NodeType::RELEASE_SAVEPOINT_STMT; }
 std::string ReleaseSavepointStatement::ToString() const {
     return "RELEASE SAVEPOINT " + savepoint_name;
-}
-
-SetIsolationStatement::SetIsolationStatement() {
-}
-NodeType SetIsolationStatement::GetType() const { return NodeType::SET_ISOLATION_STMT; }
-std::string SetIsolationStatement::ToString() const {
-    const char* name = (isolation_level == static_cast<int>(IsolationLevel::kReadCommitted))
-                           ? "READ COMMITTED"
-                           : (isolation_level == static_cast<int>(IsolationLevel::kReadUncommitted))
-                                 ? "READ UNCOMMITTED"
-                                 : "SERIALIZABLE";
-    return "SET TRANSACTION ISOLATION LEVEL " + std::string(name);
 }
 
 CreateViewStatement::CreateViewStatement() {

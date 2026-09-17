@@ -675,16 +675,6 @@ int main(int argc, char** argv) {
               << "load and execute SQL script" << std::endl;
     std::cout << "sqlcompiler> " << std::flush;
     while (std::getline(std::cin, line)) {
-        // 去除行首 UTF-8 BOM（EF BB BF）：Windows 上 PowerShell/.NET 以管道向
-        // 子进程写入首批输入时会在最前面附加 BOM 前导，若不清除，首条语句会被
-        // 词法器判为非法字符。真实场景（如用户重定向 Notepad 保存的带 BOM 脚本）
-        // 同样受益。
-        if (line.size() >= 3 &&
-            static_cast<unsigned char>(line[0]) == 0xEF &&
-            static_cast<unsigned char>(line[1]) == 0xBB &&
-            static_cast<unsigned char>(line[2]) == 0xBF) {
-            line.erase(0, 3);
-        }
         // ---- Phase 1.5: 元命令就地处理 ----
         // 调试元命令不写库、不需要 ';'，也不需要拼到 sql 累加器里。
         // 当 sql 累加器为空（即上一条语句已完整消化）且本行就是元命令时，

@@ -175,7 +175,7 @@ bool JoinExecutor::Next(Tuple* tuple) {
         return false;
     }
 
-// Item #4 (perf)：hash join 路径仅用于 INNER + 简单等值。
+    // Item #4 (perf)：hash join 路径仅用于 INNER + 简单等值。
     if (use_hash_join_) {
         const auto& probe_buf = hj_probe_is_left_ ? left_buffer_ : right_buffer_;
         const auto& build_buf = hj_probe_is_left_ ? right_buffer_ : left_buffer_;
@@ -194,46 +194,15 @@ bool JoinExecutor::Next(Tuple* tuple) {
             while (hj_cur_bucket_pos_ < hj_cur_bucket_.size()) {
                 size_t build_idx = hj_cur_bucket_[hj_cur_bucket_pos_++];
                 const Tuple& bt = build_buf[build_idx];
-                if (tuple) {
-                    *tuple = hj_probe_is_left_ ? Concat(pt, bt) : Concat(bt, pt);
+                if (hj_probe_is_left_) {
+                    if (tuple) *tuple = Concat(pt, bt);
+                } else {
+                    if (tuple) *tuple = Concat(bt, pt);
                 }
                 return true;
             }
             ++hj_probe_idx_;
             hj_cur_bucket_pos_ = 0;
-        }
-        return false;
-    }
-
-    // SEMI / ANTI（U3-3 子查询去关联产生，不来自 SQL 语法）：
-    //   SEMI —— 每个左行在右子树存在「条件为 TRUE」的匹配时输出一次左行；
-    //   ANTI —— 每个左行在右子树「无任何条件为 TRUE」的匹配时输出左行。
-    // 输出只含左行（与改写前的 Filter 输出形状一致：外层列位置不变），
-    // 条件在拼接元组（左+右）上求值，NULL 条件按 SQL 三值逻辑视为不匹配
-    // （与 EXISTS/IN/NOT EXISTS 在 WHERE 上下文的 UNKNOWN→过滤语义精确等价）。
-    if (join_type_ == JoinType::SEMI || join_type_ == JoinType::ANTI) {
-        ExpressionEvaluator eval(column_index_map_, context_, nullptr);
-        while (li_ < left_buffer_.size()) {
-            const Tuple& lt = left_buffer_[li_];
-            bool found = false;
-            for (size_t i = 0; i < right_buffer_.size(); ++i) {
-                Tuple joined = Concat(lt, right_buffer_[i]);
-                bool match = true;
-                if (condition_) {
-                    Value v = eval.Evaluate(condition_, joined);
-                    match = !v.IsNull() && v.AsInt() != 0;
-                }
-                if (match) {
-                    found = true;
-                    break;
-                }
-            }
-            ++li_;
-            const bool emit = (join_type_ == JoinType::SEMI) ? found : !found;
-            if (emit) {
-                if (tuple) *tuple = lt;
-                return true;
-            }
         }
         return false;
     }

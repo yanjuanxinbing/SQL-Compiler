@@ -45,5 +45,5 @@ apple
 aXbXc
 (3 rows)
 sqlcompiler> sqlcompiler> sqlcompiler> 
-Error: invalid regex pattern: Unexpected character within '[...]' in regular expression
+Error: invalid regex pattern: regex_error(error_brack): The expression contained mismatched [ and ].
 sqlcompiler> sqlcompiler> 
