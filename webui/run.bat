@@ -20,11 +20,13 @@ popd >nul
 set "WEBUI=%ROOT%\webui"
 set "BUILD=%ROOT%\build"
 set "PORT=8765"
-REM Accept BOTH a single-config layout (build\sqlcompiler.exe, produced by
-REM Ninja / NMake / Unix Makefiles) and a multi-config layout
-REM (build\Debug\sqlcompiler.exe, produced by Visual Studio generators).
+REM Accept all three build layouts:
+REM   build\sqlcompiler.exe        - single-config (Ninja / NMake / Unix Makefiles)
+REM   build\Debug\sqlcompiler.exe  - multi-config (Visual Studio, Debug)
+REM   build\Release\sqlcompiler.exe- multi-config (Visual Studio, Release)
 set "BIN=%BUILD%\sqlcompiler.exe"
 set "BIN_DEBUG=%BUILD%\Debug\sqlcompiler.exe"
+set "BIN_RELEASE=%BUILD%\Release\sqlcompiler.exe"
 
 echo.
 echo ============================================================
@@ -38,6 +40,8 @@ echo.
 REM ── 1) ensure the engine binary exists; build if missing ─────────────────
 if exist "%BIN%" goto :engine_ok
 if exist "%BIN_DEBUG%" set "BIN=%BIN_DEBUG%"
+if exist "%BIN%" goto :engine_ok
+if exist "%BIN_RELEASE%" set "BIN=%BIN_RELEASE%"
 if exist "%BIN%" goto :engine_ok
 
 echo [INFO] Engine binary not found. Building C++ project...
@@ -85,8 +89,12 @@ if exist "%BIN_DEBUG%" (
     set "BIN=%BIN_DEBUG%"
     goto :engine_ok
 )
+if exist "%BIN_RELEASE%" (
+    set "BIN=%BIN_RELEASE%"
+    goto :engine_ok
+)
 echo [ERROR] Build finished but sqlcompiler.exe was not produced under
-echo         build\ or build\Debug\.  Inspect the build log above.
+echo         build\, build\Debug\ or build\Release\.  Inspect the build log above.
 goto :fail
 
 :engine_ok

@@ -32,3 +32,4 @@ _e2e_test_*.db.wal
 /test.sql
 /webui.zip
 /可视化文件.md
+/webui/backend/__pycache__

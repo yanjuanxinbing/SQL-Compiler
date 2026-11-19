@@ -92,6 +92,7 @@
   const browseModalClose  = $("#browse-modal-close");
   const browseCrumbs      = $("#browse-crumbs");
   const browseUpBtn       = $("#browse-up-btn");
+  const browseRootsBtn    = $("#browse-roots-btn");
   const browseHomeBtn     = $("#browse-home-btn");
   const browseRefreshBtn  = $("#browse-refresh-btn");
   const browsePathInput   = $("#browse-path-input");
@@ -497,23 +498,90 @@
     browseBody.innerHTML = `<div class="browse-empty">加载中…</div>`;
     browseSelected.hidden = true;
     browseState.selected = null;
+    // Remember what the user actually asked for — when the backend
+    // auto-recovers a `.db` file path to its parent directory, the
+    // response's `path` is the parent, not the typed string.  We use
+    // `requested` to decide whether overwriting the path input makes
+    // sense (Bug B fix).
+    const requested = targetPath;
     try {
       const data = await api("/api/db/browse", { method: "POST", body: { path: targetPath } });
       if (myToken !== browseState.lastFetchToken) return;
       if (data.error) {
         browseBody.innerHTML = `<div class="browse-error">${escapeHtml(data.error)}</div>`;
+        // Restore the user's input so they can edit it instead of
+        // seeing the error path silently replaced.
+        if (requested !== undefined) browsePathInput.value = requested;
         return;
       }
       browseState.currentPath = data.path;
       browseState.parent = data.parent || "";
       browseState.roots = data.roots || [];
-      browsePathInput.value = data.path;
+      // Bug A fix: the listing was always empty because we never
+      // copied `data.entries` into the shared state.
+      browseState.entries = Array.isArray(data.entries) ? data.entries : [];
+      // Only update the input when the navigation succeeded and the
+      // resolved path matches what the user asked for.  When the user
+      // typed a `.db` file and the backend auto-recovered to its
+      // parent, leave their typed text alone so they can see / edit
+      // it (Bug B fix).
+      if (requested === undefined || requested === data.path) {
+        browsePathInput.value = data.path;
+      }
       renderBrowseCrumbs();
       renderBrowseListing();
+      updateBrowseUpBtn();
     } catch (e) {
       if (myToken !== browseState.lastFetchToken) return;
       browseBody.innerHTML = `<div class="browse-error">${escapeHtml(e.message || String(e))}</div>`;
+      if (requested !== undefined) browsePathInput.value = requested;
     }
+  }
+
+  function updateBrowseUpBtn() {
+    // At a drive root browseState.parent is empty. The up button then
+    // surfaces the roots view (我的电脑) instead of being a dead click
+    // — the title attribute communicates the dual role so the user
+    // sees the affordance change at the root.
+    const atRoot = !browseState.parent || browseState.parent === browseState.currentPath;
+    browseUpBtn.disabled = false;
+    browseUpBtn.title = atRoot ? "磁盘（我的电脑）" : "上级目录";
+  }
+
+  // Render the "我的电脑 / This PC" view: every drive root from
+  // browseState.roots as a clickable row. The drive the user is
+  // currently on (if any) is highlighted.
+  function showRootsView() {
+    const roots = browseState.roots;
+    if (!roots || roots.length === 0) {
+      // Roots not populated yet — fire a home navigation to fetch
+      // them, then re-enter the view on completion.
+      browseNavigate("").then(() => {
+        if (browseState.roots.length) showRootsView();
+        else {
+          browseBody.innerHTML = `<div class="browse-empty">未发现任何磁盘根目录。</div>`;
+        }
+      });
+      return;
+    }
+    browseBody.innerHTML = "";
+    const head = document.createElement("div");
+    head.className = "browse-section-head";
+    head.textContent = `磁盘 (${roots.length})`;
+    browseBody.appendChild(head);
+    const currentUpper = (browseState.currentPath || "").toUpperCase();
+    roots.forEach((rootPath) => {
+      const isCurrent = currentUpper.startsWith(rootPath.toUpperCase());
+      const item = document.createElement("div");
+      item.className = "browse-item kind-root" + (isCurrent ? " is-selected" : "");
+      item.dataset.path = rootPath;
+      item.innerHTML = `
+        <span class="browse-item-icon">💽</span>
+        <span class="browse-item-name" title="${escapeHtml(rootPath)}">${escapeHtml(rootPath)}</span>
+        <span class="browse-item-action">${isCurrent ? "当前" : "打开"}</span>`;
+      item.addEventListener("click", () => browseNavigate(rootPath));
+      browseBody.appendChild(item);
+    });
   }
 
   function renderBrowseCrumbs() {
@@ -1236,8 +1304,14 @@
   browseUpBtn.addEventListener("click", () => {
     if (browseState.parent && browseState.parent !== browseState.currentPath) {
       browseNavigate(browseState.parent);
+    } else {
+      // At a drive root: show the "我的电脑" view (all available
+      // drives) instead of a dead no-op.  The user can then click any
+      // drive to jump there.
+      showRootsView();
     }
   });
+  browseRootsBtn.addEventListener("click", showRootsView);
   browseHomeBtn.addEventListener("click", () => browseNavigate(""));
   browseRefreshBtn.addEventListener("click", () => {
     if (browseState.currentPath !== null) browseNavigate(browseState.currentPath);
