@@ -103,7 +103,11 @@ void RecoveryManager::AnalysisPass(const std::vector<LogRecord>& records) {
 }
 
 void RecoveryManager::RedoPass(const std::vector<LogRecord>& records) {
-    // 找 dirty_page_table_ 中最小的 rec_lsn 作为扫描起点。
+    // item #9: LogManager::AppendRecord 单调分配 LSN，因此 records 本身按
+    // lsn 升序。我们用 std::lower_bound 找到 start_lsn 对应的下标，
+    // 直接从该位置开始 O(records_above_start_lsn) 扫一遍即可，
+    // 不再走「min_element + 全 records 顺序扫描 + rec.lsn_ < start_lsn
+    // 跳过」的 O(D + N · skip) 路径。
     lsn_t start_lsn = 1;
     if (!dirty_page_table_.empty()) {
         start_lsn = std::min_element(dirty_page_table_.begin(),
@@ -112,8 +116,11 @@ void RecoveryManager::RedoPass(const std::vector<LogRecord>& records) {
                                           return a.second < b.second;
                                       })->second;
     }
-    for (const auto& rec : records) {
-        if (rec.lsn_ < start_lsn) continue;
+    auto start_it = std::lower_bound(
+        records.begin(), records.end(), start_lsn,
+        [](const LogRecord& rec, lsn_t lsn) { return rec.lsn_ < lsn; });
+    for (auto rec_it = start_it; rec_it != records.end(); ++rec_it) {
+        const LogRecord& rec = *rec_it;
         if (rec.type_ != LogRecordType::UPDATE &&
             rec.type_ != LogRecordType::CLR) continue;
         Page* page = buffer_pool_manager_->GetPage(rec.page_id_);

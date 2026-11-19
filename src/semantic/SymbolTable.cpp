@@ -1,30 +1,67 @@
 #include "semantic/SymbolTable.h"
 
 #include <cctype>
+#include <string_view>
 
 namespace sqlcompiler {
 
 namespace {
 
-std::string ToUpper(const std::string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s) out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-    return out;
+// Lowercase an ASCII string in place. SQL identifiers are ASCII; non-ASCII
+// bytes (e.g. Chinese) pass through unchanged.
+inline void LowercaseInPlace(std::string& s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
 }
 
-std::string ToLower(const std::string& s) {
+std::string ToLower(std::string_view s) {
     std::string out;
     out.reserve(s.size());
-    for (char c : s) out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    for (char c : s) {
+        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
     return out;
-}
-
-bool EqualsIgnoreCase(const std::string& a, const std::string& b) {
-    return ToUpper(a) == ToUpper(b);
 }
 
 }  // namespace
+
+void TableInfo::BuildColumnIndex() {
+    column_index_.clear();
+    column_index_.reserve(columns.size());
+    for (size_t i = 0; i < columns.size(); ++i) {
+        // 直接把列名原样放入 hash 表；hash/equal 都是大小写不敏感版本。
+        column_index_.emplace(columns[i].name, i);
+    }
+}
+
+void TableInfo::EnsureColumnIndexBuilt() const {
+    if (column_index_.empty() && !columns.empty()) {
+        const_cast<TableInfo*>(this)->BuildColumnIndex();
+    }
+}
+
+bool TableInfo::HasColumn(const std::string& column_name) const {
+    return HasColumnFast(column_name);
+}
+
+bool TableInfo::HasColumnFast(std::string_view column_name) const {
+    // C++17 std::unordered_map 没有异构查找，统一构造 std::string 走 find。
+    // 字符串本身在调用栈上是热路径上的 AST std::string（zero-cost）。
+    EnsureColumnIndexBuilt();
+    return column_index_.find(std::string(column_name)) != column_index_.end();
+}
+
+const ColumnInfo* TableInfo::GetColumn(const std::string& column_name) const {
+    return GetColumnFast(column_name);
+}
+
+const ColumnInfo* TableInfo::GetColumnFast(std::string_view column_name) const {
+    EnsureColumnIndexBuilt();
+    auto it = column_index_.find(std::string(column_name));
+    if (it == column_index_.end()) return nullptr;
+    return &columns[it->second];
+}
 
 std::vector<std::vector<std::string>> TableInfo::GetPrimaryKeyGroups() const {
     if (!primary_keys.empty()) return primary_keys;
@@ -38,42 +75,41 @@ std::vector<std::vector<std::string>> TableInfo::GetPrimaryKeyGroups() const {
     return groups;
 }
 
-bool TableInfo::HasColumn(const std::string& column_name) const {
-    for (const auto& c : columns) {
-        if (EqualsIgnoreCase(c.name, column_name)) return true;
-    }
-    return false;
-}
-
-const ColumnInfo* TableInfo::GetColumn(const std::string& column_name) const {
-    for (const auto& c : columns) {
-        if (EqualsIgnoreCase(c.name, column_name)) return &c;
-    }
-    return nullptr;
-}
-
 SymbolTable::SymbolTable() {
 }
 
 bool SymbolTable::AddTable(const TableInfo& table_info) {
-    std::string key = ToLower(table_info.table_name);
-    if (tables_.find(key) != tables_.end()) return false;
     TableInfo ti = table_info;
-    ti.table_name = table_info.table_name;
-    tables_[key] = ti;
+    return AddTable(std::move(ti));
+}
+
+bool SymbolTable::AddTable(TableInfo&& table_info) {
+    // 大小写不敏感的 hash/equal 让"小写 key"不再是必需；直接用原名。
+    // 仍然构造一个 lowercased 副本作为 map key 是浪费 —— hash 本身已是
+    // 大小写不敏感的，equal 也容忍差异。
+    // 然而为了保持旧行为（避免 map key 与用户输入之间出现大小写分裂），
+    // 这里使用原始名作为 key（透明 hash 在 find 时仍然大小写不敏感）。
+    std::string key = table_info.table_name;
+    LowercaseInPlace(key);
+    if (tables_.find(key) != tables_.end()) return false;
+    table_info.BuildColumnIndex();
+    tables_.emplace(std::move(key), std::move(table_info));
     return true;
 }
 
 bool SymbolTable::RemoveTable(const std::string& table_name) {
-    return tables_.erase(ToLower(table_name)) > 0;
+    std::string key = ToLower(table_name);
+    return tables_.erase(key) > 0;
 }
 
 bool SymbolTable::HasTable(const std::string& table_name) const {
-    return tables_.find(ToLower(table_name)) != tables_.end();
+    std::string key = ToLower(table_name);
+    return tables_.find(key) != tables_.end();
 }
 
 const TableInfo* SymbolTable::GetTable(const std::string& table_name) const {
-    auto it = tables_.find(ToLower(table_name));
+    std::string key = ToLower(table_name);
+    auto it = tables_.find(key);
     if (it == tables_.end()) return nullptr;
     return &it->second;
 }
@@ -132,7 +168,7 @@ bool SymbolTable::AddTableFromCreateStatement(const CreateTableStatement& stmt) 
         }
         if (!inline_pk.empty()) info.primary_keys.push_back(std::move(inline_pk));
     }
-    return AddTable(info);
+    return AddTable(std::move(info));
 }
 
 std::vector<std::string> SymbolTable::GetAllTableNames() const {

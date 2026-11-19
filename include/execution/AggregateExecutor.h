@@ -70,10 +70,24 @@ private:
         std::vector<Value> key_values;
         std::vector<AggregateState> agg_states;   // 与 aggregate_exprs 等长
         Tuple  sample_tuple;                       // 用于求值非聚合子表达式
+        std::string key_str;                       // Item #5 (perf): 缓存 key_str
     };
 
     std::vector<Group> groups_;
+    // Item #5 (perf): key_str → group 下标 O(1) 查找。在 Init() 中每新建一个
+    // 分组就 push_back 进 groups_by_key_；每次来了新行直接查表，避免线性扫描。
+    std::unordered_map<std::string, size_t> groups_by_key_;
     size_t cursor_;
+
+    // Item #6 (perf): 提前在 Init() 一次性算出每个 aggregate_expr 的
+    // (contains_agg, agg_call) 对，避免 per-row 重走表达式树。
+    std::vector<bool>   contains_agg_;
+    std::vector<ExprPtr> agg_call_;
+public:
+    // Item #3 (perf)：ApplyExecutor 探测相关性时读取 group_by_/aggregate_。
+    const std::vector<ExprPtr>& group_by_for_scan() const { return group_by_exprs_; }
+    const std::vector<ExprPtr>& aggregate_for_scan() const { return aggregate_exprs_; }
+private:
 
     // 评估 aggregate_exprs[i]，将其中聚合函数调用替换为已计算的状态值
     Value EvalAggregateExpr(const ExprPtr& expr, const Tuple& sample,

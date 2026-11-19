@@ -121,6 +121,10 @@ private:
     std::vector<UndoRecord> undo_log_;
     // 保存点栈。栈顶即当前（最近）的保存点。
     std::vector<Savepoint> savepoints_;
+    // item #8: name → 该 name 在 savepoints_ 中所有 entry 的 undo_log_offset，
+    // 按 PushSavepoint 顺序追加，Pop / RollbackTo 时同步 pop_back。
+    // HasSavepoint(name) 与 GetSavepointOffset(name) 通过该 map 拿到 O(1) 答案。
+    std::unordered_map<std::string, std::vector<size_t>> name_to_offsets_;
 };
 
 }  // namespace sqlcompiler

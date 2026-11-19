@@ -63,4 +63,26 @@ SELECT id, name,
        END AS tier
 FROM emp;
 
+-- GROUP BY 引用 SELECT-list 别名：SQL 标准允许 GROUP BY/HAVING/ORDER BY 引用同 SELECT
+-- 块内已定义的别名（与 PostgreSQL / MySQL 一致）。
+-- 修复前：GROUP BY tier 报「column not found: tier」；修复后 AggregateExecutor 按
+-- 替换后的 CASE 表达式对每条输入行求 val，把 salary 落到对应 tier 桶里。
+SELECT CASE
+           WHEN salary >= 8000 THEN 'high'
+           WHEN salary >= 6000 THEN 'mid'
+           ELSE 'low'
+       END AS tier,
+       COUNT(*) AS n
+FROM emp
+GROUP BY tier
+ORDER BY tier;
+
+-- 复合别名：GROUP BY 同时使用列别名与 CASE 表达式
+SELECT dept,
+       CASE WHEN salary >= 8000 THEN 'S' ELSE 'J' END AS seniority,
+       COUNT(*) AS cnt
+FROM emp
+GROUP BY dept, seniority
+ORDER BY dept, seniority;
+
 exit;

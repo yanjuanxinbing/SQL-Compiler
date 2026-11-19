@@ -36,6 +36,15 @@ private:
     std::vector<SortedEntry> materialized_;
     std::vector<size_t> sorted_indices_;
     size_t cursor_;
+    // Item #13 (perf): 在 Init() 中把每条 SortedEntry 的 ascending[i] 提
+    // 取为成员字段（O(K)），比较器仅直接读 this->materialized_[a].ascending[i]，
+    // 省掉 std::vector<bool>::operator[] 的间接访问。
+    std::vector<bool> ascending_;  // per-key 升序标志；多个 order_items 共享。
+
+public:
+    // Item #3 (perf)：ApplyExecutor 探测相关性时读取 order_items。
+    const std::vector<OrderByItem>& order_items_for_scan() const { return order_items_; }
+
 };
 
 }  // namespace sqlcompiler

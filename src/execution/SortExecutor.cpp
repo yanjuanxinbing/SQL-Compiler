@@ -18,6 +18,13 @@ void SortExecutor::Init() {
     if (!child_) return;
     child_->Init();
 
+    // Item #13 (perf): 预提取每个 order_item 的 ascending 标志，构造一次，
+    // 比较器读 this->ascending_[i]，避免多次 std::vector<bool> deref 与
+    // materialized_ 数组间接访问。
+    ascending_.clear();
+    ascending_.reserve(order_items_.size());
+    for (const auto& ob : order_items_) ascending_.push_back(ob.ascending);
+
     ExpressionEvaluator eval(column_index_map_, context_, nullptr);
     Tuple t;
     while (child_->Next(&t)) {
@@ -53,7 +60,9 @@ void SortExecutor::Init() {
               [this](size_t a, size_t b) {
                   const auto& ka = materialized_[a].keys;
                   const auto& kb = materialized_[b].keys;
-                  for (size_t i = 0; i < ka.size() && i < kb.size(); ++i) {
+                  const size_t nkeys = ascending_.size();
+                  for (size_t i = 0; i < nkeys; ++i) {
+                      if (i >= ka.size() || i >= kb.size()) break;
                       bool a_null = ka[i].IsNull();
                       bool b_null = kb[i].IsNull();
                       // MySQL-style: NULL is always greater than any non-NULL value,
@@ -64,9 +73,8 @@ void SortExecutor::Init() {
                       if (a_null) return false;   // a is NULL → must come after b
                       if (b_null) return true;    // b is NULL → a must come first
                       int cmp = Value::Compare(ka[i], kb[i]);
-                      bool ascending = materialized_[a].ascending[i];
                       if (cmp != 0) {
-                          return ascending ? cmp < 0 : cmp > 0;
+                          return ascending_[i] ? cmp < 0 : cmp > 0;
                       }
                   }
                   return a < b;

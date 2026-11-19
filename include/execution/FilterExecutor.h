@@ -23,6 +23,9 @@ private:
     ExecutorPtr child_;
     ExprPtr predicate_;
     std::unordered_map<std::string, size_t> column_index_map_;
+public:
+    // Item #3 (perf)：ApplyExecutor 探测右子计划相关性时读取 predicate。
+    const ExprPtr& predicate_for_scan() const { return predicate_; }
 };
 
 }  // namespace sqlcompiler

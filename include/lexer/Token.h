@@ -100,6 +100,7 @@ enum class TokenType {
     KEYWORD_EXCEPT,
     KEYWORD_ANY,
     KEYWORD_ALL,
+    KEYWORD_SOME,        // SOME — SQL 标准量化比较关键字，与 ANY 完全等价
     KEYWORD_EXISTS,
     KEYWORD_UPPER,
     KEYWORD_LOWER,

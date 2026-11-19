@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "ast/AST.h"
+#include "common/CaseInsensitive.h"
 
 namespace sqlcompiler {
 
@@ -13,7 +14,7 @@ namespace sqlcompiler {
 struct ColumnInfo {
     std::string name;
     std::string data_type;
-    // VARCHAR(N) / CHAR(N) 中的 N；未声明为 -1（不限长）
+    // VARCHAR(N) / CHAR(T) 中的 N；未声明为 -1（不限长）
     int32_t char_length = -1;
     bool is_primary_key = false;
     bool is_not_null = false;
@@ -55,12 +56,28 @@ struct TableInfo {
     };
     std::vector<TableCheck> table_checks;
 
+    // 性能优化：列名 → 索引（大小写不敏感），使 HasColumn / GetColumn 由 O(C) 降为 O(1)。
+    // 私有以保持公共接口不变；构造时一次性填充（AddTable 会主动调用）。
+    void BuildColumnIndex();
+
     bool HasColumn(const std::string& column_name) const;
     const ColumnInfo* GetColumn(const std::string& column_name) const;
+    // O(1) 列查询：传入 string_view（避免 std::string 拷贝）。
+    bool HasColumnFast(std::string_view column_name) const;
+    const ColumnInfo* GetColumnFast(std::string_view column_name) const;
 
     // 返回用于唯一性校验的主键组。若 primary_keys 为空（例如从旧格式元数据
     // 读出），退化为「所有被标记 is_primary_key 的列构成一个复合组」。
     std::vector<std::vector<std::string>> GetPrimaryKeyGroups() const;
+
+private:
+    // 大小写不敏感的列名 → 列下标 hash。
+    std::unordered_map<std::string, size_t,
+                       CaseInsensitiveHash, CaseInsensitiveEq> column_index_;
+    // 惰性索引：column_index_ 空但 columns 非空时，HasColumn/GetColumn 第一次
+    // 被调用会 BuildColumnIndex。CreateTableExecutor 在调用 ValidateForeignKeys
+    // 之前不会主动 BuildColumnIndex，因此惰性路径是必要的兼容性兜底。
+    void EnsureColumnIndexBuilt() const;
 };
 
 // 符号表（数据库元数据目录，Catalog）
@@ -71,6 +88,7 @@ public:
 
     // ---- 表管理 ----
     bool AddTable(const TableInfo& table_info);
+    bool AddTable(TableInfo&& table_info);
     bool RemoveTable(const std::string& table_name);
     bool HasTable(const std::string& table_name) const;
     const TableInfo* GetTable(const std::string& table_name) const;
@@ -82,7 +100,9 @@ public:
     std::vector<std::string> GetAllTableNames() const;
 
 private:
-    std::unordered_map<std::string, TableInfo> tables_;
+    // 大小写不敏感的表名 hash，使 HasTable / GetTable / RemoveTable 走 O(1) 路径。
+    std::unordered_map<std::string, TableInfo,
+                       CaseInsensitiveHash, CaseInsensitiveEq> tables_;
 };
 
 }  // namespace sqlcompiler

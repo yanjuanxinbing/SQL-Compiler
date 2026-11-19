@@ -3,6 +3,7 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "storage/Page.h"
@@ -19,7 +20,9 @@ public:
     // 分配一个新页，返回其page_id（优先复用已回收的空闲页号）
     page_id_t AllocatePage();
 
-    // 释放一个页，将其归还到空闲页列表，供后续AllocatePage()复用
+    // 释放一个页，将其归还到空闲页列表，供后续AllocatePage()复用。
+    // 重复释放同一个 page_id 是 no-op（free_set_ 去重）：避免同一 page_id
+    // 出现在 free_pages_ 里两次、导致后续 AllocatePage 返回重复 id。
     void DeallocatePage(page_id_t page_id);
 
     // 从磁盘文件中读取page_id对应的页内容到data（大小需为PAGE_SIZE）
@@ -45,6 +48,10 @@ private:
 
     page_id_t next_page_id_;
     std::vector<page_id_t> free_pages_;
+    // 与 free_pages_ 并行维护的 set：DeallocatePage 查重 (O(1))，
+    // AllocatePage 同步弹出。避免重复 free 同一 page_id 让回收池里
+    // 出现重复的 id，污染后续 AllocatePage 的输出。
+    std::unordered_set<page_id_t> free_set_;
 
     // 确保底层文件大小足以容纳page_id对应的页，不足则扩展文件
     void EnsureFileCapacity(page_id_t page_id);

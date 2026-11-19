@@ -66,6 +66,13 @@ private:
 
     bool executed_ = false;
     int affected_rows_ = 0;
+
+    // Item #2 (perf)：on_condition 等值谓词形态下，把 target 表按等值列
+    // 哈希到内存；每条 source 行只做 O(1) 探测，避免 O(S·T) SeqScan。
+    bool use_target_hash_ = false;
+    std::string eq_target_col_;
+    std::string eq_source_col_;
+    std::unordered_map<std::string, std::vector<Tuple>> target_hash_;
 };
 
 }  // namespace sqlcompiler

@@ -113,6 +113,11 @@ private:
     // 拿到 frame 再调 DiskManager::AllocatePage 的旧路径）。无副作用时
     // （日志为空）安全 no-op。
     void PatchLastReplacementLog(page_id_t loaded_page_id);
+
+    // FlushPage 的"已知 frame"内部实现：被 FlushPage / FlushAllDirtyPages /
+    // FlushAllPages 共享。包含 WAL-before-data 的 LSN 检查和真实写盘。
+    // 不再做 page_table_.find；调用方需自行保证 frame_id 合法且 pid 一致。
+    void FlushPageImpl(int frame_id, page_id_t pid);
 };
 
 }  // namespace sqlcompiler
