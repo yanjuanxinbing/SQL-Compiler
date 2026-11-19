@@ -275,19 +275,212 @@ bool MayOverflow(const char* d, size_t reserve) {
     return MayOverflowGeneric(d, reserve, t);
 }
 
-// 在内部节点中选出 (key, rid) 应当进入的孩子。
-// 分隔键语义 sep[i] <= 右子树所有项，因此取最后一个满足 (key,rid) >= sep[i] 的孩子。
-page_id_t ChooseChild(const char* d, const std::vector<InternalEntry>& entries,
-                      const IndexKey& key, const RID& rid) {
-    page_id_t child = GetFirstChild(d);
-    for (const auto& e : entries) {
-        if (CompareKeyThenRid(key, rid, e.key, e.rid) >= 0) {
-            child = e.child;
+// ============================================================================
+// Slot-directory helpers
+//
+// 物化整个 page 是 O(M) 的字符串拷贝 + VARCHAR 字符串分配。我们只需要在
+// 下降时定位「应当进入的孩子」或「>= key 的第一个条目」——典型的二分查找，
+// 不必把 M 条记录全部解出。这里提供按 slot 索引读取 key_off/key_len/rid 的
+// 快速路径，以及基于列级 raw byte compare 的二分搜索，复杂度 O(log M)
+// 次探测、每次 O(1)~O(col_bytes) 的字节读，无需分配临时 vector<Value>。
+// ============================================================================
+
+inline void ReadLeafSlotKeyLoc(const char* d, int slot_index,
+                               uint32_t* out_off, uint16_t* out_len) {
+    const size_t so = kLeafHeaderBytes +
+                      static_cast<size_t>(slot_index) * kLeafSlotBytes;
+    *out_off = ReadU32(d, so);
+    *out_len = ReadU16(d, so + 4);
+}
+
+inline void ReadInternalSlotKeyLoc(const char* d, int slot_index,
+                                   uint32_t* out_off, uint16_t* out_len) {
+    const size_t so = kInternalHeaderBytes +
+                      static_cast<size_t>(slot_index) * kInternalSlotBytes;
+    *out_off = ReadU32(d, so);
+    *out_len = ReadU16(d, so + 4);
+}
+
+inline RID ReadLeafSlotRid(const char* d, int slot_index) {
+    const size_t so = kLeafHeaderBytes +
+                      static_cast<size_t>(slot_index) * kLeafSlotBytes;
+    RID r;
+    r.page_id = ReadI32(d, so + 8);
+    r.slot_num = ReadI32(d, so + 12);
+    return r;
+}
+
+inline RID ReadInternalSlotRid(const char* d, int slot_index) {
+    const size_t so = kInternalHeaderBytes +
+                      static_cast<size_t>(slot_index) * kInternalSlotBytes;
+    RID r;
+    r.page_id = ReadI32(d, so + 12);
+    r.slot_num = ReadI32(d, so + 16);
+    return r;
+}
+
+inline page_id_t ReadInternalSlotChild(const char* d, int slot_index) {
+    const size_t so = kInternalHeaderBytes +
+                      static_cast<size_t>(slot_index) * kInternalSlotBytes;
+    return ReadI32(d, so + 8);
+}
+
+// 列级 raw byte 比较。INT 直接 memcmp 4 字节；FLOAT 与 VARCHAR 解码后与
+// target Value 比，与 Value::Compare 保持一致语义（包括 NULL → 0）。
+// 之所以走 raw byte 而非全 Value 反序列化：二分查找每次探测都新建一个
+// IndexKey + 多个 std::string 会显著拖慢热路径；固定长度列的字节模式与
+// Compare 语义 1:1 对应（机器端序两端一致），可以零成本短路。
+static inline int CmpSerializedValueAt(const char* bytes, ValueType vt,
+                                      const Value& target) {
+    if (vt == ValueType::NULL_TYPE) return 0;
+    if (target.IsNull()) return 0;
+    switch (vt) {
+        case ValueType::INTEGER: {
+            int32_t v;
+            std::memcpy(&v, bytes, 4);
+            int32_t tv = target.AsInt();
+            if (v < tv) return -1;
+            if (v > tv) return 1;
+            return 0;
+        }
+        case ValueType::FLOAT: {
+            double v;
+            std::memcpy(&v, bytes, 8);
+            double tv = target.AsFloat();
+            // 与 Value::Compare 一致：NaN 视为相等（双方都不触发 < / >）。
+            if (v < tv) return -1;
+            if (v > tv) return 1;
+            return 0;
+        }
+        case ValueType::VARCHAR: {
+            int32_t slen;
+            std::memcpy(&slen, bytes, 4);
+            if (slen < 0) slen = 0;
+            const std::string& ts = target.AsVarchar();
+            const size_t common = std::min<size_t>(static_cast<size_t>(slen),
+                                                    ts.size());
+            int r = std::memcmp(bytes + 4, ts.data(), common);
+            if (r != 0) return r < 0 ? -1 : 1;
+            if (static_cast<size_t>(slen) < ts.size()) return -1;
+            if (static_cast<size_t>(slen) > ts.size()) return 1;
+            return 0;
+        }
+        default: return 0;
+    }
+}
+
+// 把记录区内一段 key 字节与 target IndexKey 按列做字典序比较，返回 -1/0/+1。
+// 完全不构造 IndexKey 对象；对固定长度列直接走 raw byte，对 VARCHAR 仅比对
+// 共同前缀段。
+int CompareKeyBytesToIndexKey(const char* bytes, size_t len,
+                              const IndexKey& target,
+                              const std::vector<ValueType>& schema) {
+    size_t off = 0;
+    const size_t n = std::min(target.values.size(), schema.size());
+    for (size_t i = 0; i < n; ++i) {
+        ValueType vt = schema[i];
+        size_t col_bytes;
+        switch (vt) {
+            case ValueType::INTEGER:
+                col_bytes = 4;
+                break;
+            case ValueType::FLOAT:
+                col_bytes = 8;
+                break;
+            case ValueType::VARCHAR: {
+                if (off + 4 > len) return 0;
+                int32_t slen;
+                std::memcpy(&slen, bytes + off, 4);
+                if (slen < 0) slen = 0;
+                col_bytes = 4 + static_cast<size_t>(slen);
+                break;
+            }
+            default:
+                return 0;  // NULL_TYPE 列按 Value::Compare 视为相等
+        }
+        if (off + col_bytes > len) return 0;
+        int c = CmpSerializedValueAt(bytes + off, vt, target.values[i]);
+        if (c != 0) return c;
+        off += col_bytes;
+    }
+    // 前缀全相等时按列数决胜负（与 CompareKeyOnly 一致）。
+    if (target.values.size() < schema.size()) return -1;
+    if (target.values.size() > schema.size()) return 1;
+    return 0;
+}
+
+// 在叶子 slot 目录上做 lower_bound（CompareKeyOnly）。返回第一个 slot[i] >=
+// key 的索引；若全部 < key 则返回 n。
+int LowerBoundLeafSlot(const char* d, const IndexKey& key,
+                       const std::vector<ValueType>& schema) {
+    const int n = GetKeyCount(d);
+    int lo = 0;
+    int hi = n;
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        uint32_t key_off;
+        uint16_t key_len;
+        ReadLeafSlotKeyLoc(d, mid, &key_off, &key_len);
+        const int c = CompareKeyBytesToIndexKey(d + key_off, key_len, key, schema);
+        if (c < 0) {
+            lo = mid + 1;
         } else {
-            break;
+            hi = mid;
         }
     }
-    return child;
+    return lo;
+}
+
+// 在内部 slot 目录上做 upper_bound（CompareKeyThenRid）。返回满足
+// sep[i] <= target 的条目数 k ∈ [0, n]；对应的子节点 child = (k == 0)
+// ? first_child : entries[k-1].child。
+int UpperBoundInternalSlot(const char* d, const IndexKey& key, const RID& rid,
+                           const std::vector<ValueType>& schema) {
+    const int n = GetKeyCount(d);
+    int lo = 0;
+    int hi = n;
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        uint32_t key_off;
+        uint16_t key_len;
+        ReadInternalSlotKeyLoc(d, mid, &key_off, &key_len);
+        int c = CompareKeyBytesToIndexKey(d + key_off, key_len, key, schema);
+        if (c == 0) {
+            const RID srid = ReadInternalSlotRid(d, mid);
+            if (srid.page_id < rid.page_id) c = -1;
+            else if (srid.page_id > rid.page_id) c = 1;
+            else if (srid.slot_num < rid.slot_num) c = -1;
+            else if (srid.slot_num > rid.slot_num) c = 1;
+        }
+        // upper_bound: c <= 0 时往右。
+        if (c <= 0) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+// 给定 UpperBoundInternalSlot 的返回值 k，返回应当下降的 child page id。
+inline page_id_t InternalChildAtK(const char* d, int k) {
+    if (k == 0) return GetFirstChild(d);
+    return ReadInternalSlotChild(d, k - 1);
+}
+
+struct ChooseChildResult {
+    page_id_t child_pid;
+    size_t separator_index;  // k ∈ [0, n]
+};
+
+// 在内部节点中选出 (key, rid) 应当进入的孩子。
+// 走 slot 目录二分（O(log M)），不再物化所有 entries。
+ChooseChildResult ChooseChild(const char* d, const IndexKey& key,
+                              const RID& rid,
+                              const std::vector<ValueType>& schema) {
+    const int k = UpperBoundInternalSlot(d, key, rid, schema);
+    return ChooseChildResult{InternalChildAtK(d, k),
+                             static_cast<size_t>(k)};
 }
 
 // ============================================================================
@@ -377,9 +570,7 @@ page_id_t BPlusTree::FindLeafPage(const IndexKey& key, const RID& rid) const {
         if (!g.Valid()) return INVALID_PAGE_ID;
         const char* d = g.Data();
         if (GetPageType(d) == PageType::kLeaf) return pid;
-        std::vector<InternalEntry> entries;
-        if (!ReadInternalEntries(d, key_schema_, &entries)) return INVALID_PAGE_ID;
-        pid = ChooseChild(d, entries, key, rid);
+        pid = ChooseChild(d, key, rid, key_schema_).child_pid;
     }
     return INVALID_PAGE_ID;
 }
@@ -412,7 +603,6 @@ page_id_t BPlusTree::LeftmostLeafPage() const {
 bool BPlusTree::Insert(const IndexKey& key, const RID& rid) {
     std::vector<char> key_bytes = SerializeKey(key, key_schema_);
     if (key_bytes.size() > kMaxKeyBytes) return false;
-    if (is_unique_ && FindFirst(key).IsValid()) return false;
 
     // 预留量按「本次要插入的键」计算，而不是按最大可能键长，
     // 这样定长小键（如 INT 主键）仍能接近填满页面。
@@ -444,13 +634,11 @@ bool BPlusTree::Insert(const IndexKey& key, const RID& rid) {
         const char* d = node.Data();
         if (GetPageType(d) == PageType::kLeaf) break;
 
-        std::vector<InternalEntry> entries;
-        if (!ReadInternalEntries(d, key_schema_, &entries)) return false;
-        const page_id_t child_pid = ChooseChild(d, entries, key, rid);
+        const ChooseChildResult cc = ChooseChild(d, key, rid, key_schema_);
         node.Release();
-        if (child_pid < 0) return false;
+        if (cc.child_pid < 0) return false;
 
-        PageGuard child = PageGuard::Fetch(bpm_, child_pid);
+        PageGuard child = PageGuard::Fetch(bpm_, cc.child_pid);
         if (!child.Valid()) return false;
         char* cd = child.Data();
         if (GetPageType(cd) == PageType::kUninitialized) {
@@ -462,10 +650,10 @@ bool BPlusTree::Insert(const IndexKey& key, const RID& rid) {
 
         if (overflow) {
             // 父节点此刻一定装得下分隔键（进入本层前已保证），分裂后重选孩子
-            if (!SplitChild(pid, child_pid, reserve)) return false;
+            if (!SplitChild(pid, cc.child_pid, reserve)) return false;
             continue;
         }
-        pid = child_pid;
+        pid = cc.child_pid;
     }
 
     // ---- 3) 叶子插入。由不变式保证一定装得下 ----
@@ -485,12 +673,44 @@ bool BPlusTree::Insert(const IndexKey& key, const RID& rid) {
     if (log_manager_ != nullptr) {
         leaf_before.assign(d, d + PAGE_SIZE);
     }
+
+    // 唯一索引：检查「二分查到的 slot[lower]」或下一页是否有相同 key。
+    // O(log M) 二分 + 至多 1 次下一页检查，避免旧版「整树下落两次」。
+    if (is_unique_) {
+        const char* ld = d;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            const int lower = LowerBoundLeafSlot(ld, key, key_schema_);
+            const int cnt = GetKeyCount(ld);
+            if (lower < cnt) {
+                uint32_t koff;
+                uint16_t klen;
+                ReadLeafSlotKeyLoc(ld, lower, &koff, &klen);
+                const int c = CompareKeyBytesToIndexKey(ld + koff, klen, key,
+                                                        key_schema_);
+                if (c == 0) return false;  // 同 key 已存在
+                // c > 0：slot[lower] > 目标键；后续叶子只会更大，命中失败。
+                // c < 0：不可能（lower_bound 保证 slot[lower] >= key）。
+                break;
+            }
+            // lower == cnt：本页所有键 < 目标，下一页的左首可能 == 目标。
+            const page_id_t nxt = GetNextLeaf(ld);
+            if (nxt < 0) break;
+            PageGuard ng = PageGuard::Fetch(bpm_, nxt);
+            if (!ng.Valid()) break;
+            ld = ng.Data();
+        }
+    }
+
     std::vector<LeafEntry> entries;
     if (!ReadLeafEntries(d, key_schema_, &entries)) return false;
 
+    // 二分查找返回的 lower 与上面 LowerBoundLeafSlot 在 entries 上的等价位置
+    // 一致：slot[i] 是 CompareKeyThenRid 排序后的第 i 条记录，二者同序。
+    // 把 IndexKey 从 const& 参数直接 move 到 ne.key：此前唯一性检查与 Slot
+    // 比较都已经走 raw byte compare 完成，不再依赖 key 这个 const ref。
     LeafEntry ne;
     ne.key_bytes = std::move(key_bytes);
-    ne.key = key;
+    ne.key = std::move(key);
     ne.rid = rid;
     auto pos = std::lower_bound(
         entries.begin(), entries.end(), ne,
@@ -547,8 +767,12 @@ bool BPlusTree::SplitChild(page_id_t parent_pid, page_id_t child_pid,
         if (!ReadLeafEntries(cd, key_schema_, &entries)) return false;
         if (entries.size() < 2) return false;
         const size_t mid = entries.size() / 2;
-        std::vector<LeafEntry> left(entries.begin(), entries.begin() + mid);
-        std::vector<LeafEntry> right(entries.begin() + mid, entries.end());
+        // 移动而非拷贝：把 entries 的存储直接搬到 left / right，原 entries
+        // 进入 moved-from 状态；本函数末尾 entries 析构即可。
+        std::vector<LeafEntry> left(std::make_move_iterator(entries.begin()),
+                                    std::make_move_iterator(entries.begin() + mid));
+        std::vector<LeafEntry> right(std::make_move_iterator(entries.begin() + mid),
+                                     std::make_move_iterator(entries.end()));
 
         const page_id_t old_next = GetNextLeaf(cd);
         const page_id_t old_prev = GetPrevLeaf(cd);
@@ -563,29 +787,35 @@ bool BPlusTree::SplitChild(page_id_t parent_pid, page_id_t child_pid,
                 nxt.MarkDirty();
             }
         }
-        // 分隔键取右页第一条的完整 (key, rid)
-        sep.key = right.front().key;
+        // 分隔键取右页第一条的完整 (key, rid)，从 right.front() 移动得到；
+        // right 接下来被析构，无需清空 moved-from 元素。
+        sep.key = std::move(right.front().key);
         sep.rid = right.front().rid;
-        sep.key_bytes = right.front().key_bytes;
+        sep.key_bytes = std::move(right.front().key_bytes);
+        right.front().key = IndexKey{};
+        right.front().key_bytes.clear();
     } else {
         std::vector<InternalEntry> entries;
         if (!ReadInternalEntries(cd, key_schema_, &entries)) return false;
         if (entries.size() < 2) return false;
         const page_id_t first_child = GetFirstChild(cd);
         const size_t mid = entries.size() / 2;
-        // 内部节点分裂：中间键上推到父节点，不在两个孩子里保留
-        InternalEntry up = entries[mid];
-        std::vector<InternalEntry> left(entries.begin(), entries.begin() + mid);
-        std::vector<InternalEntry> right(entries.begin() + mid + 1, entries.end());
+        // 内部节点分裂：中间键上推到父节点，不在两个孩子里保留。
+        // 直接从 entries[mid] 移动得到 up，避免一次冗余拷贝。
+        InternalEntry up = std::move(entries[mid]);
+        std::vector<InternalEntry> left(std::make_move_iterator(entries.begin()),
+                                       std::make_move_iterator(entries.begin() + mid));
+        std::vector<InternalEntry> right(std::make_move_iterator(entries.begin() + mid + 1),
+                                        std::make_move_iterator(entries.end()));
 
         if (!WriteInternalEntries(sib.Data(), up.child, right)) return false;
         sib.MarkDirty();
         if (!WriteInternalEntries(cd, first_child, left)) return false;
         child.MarkDirty();
 
-        sep.key = up.key;
-        sep.rid = up.rid;
-        sep.key_bytes = up.key_bytes;
+        sep.key = std::move(up.key);
+        sep.rid = std::move(up.rid);
+        sep.key_bytes = std::move(up.key_bytes);
     }
 
     // Phase B：先写 child 和 sib 的 UPDATE 记录（两者是新增或修改页面，
@@ -663,8 +893,10 @@ bool BPlusTree::SplitRoot() {
         // 调用方会继续尝试插入，若确实放不下则返回失败而不是无限分裂。
         if (entries.size() < 2) return false;
         const size_t mid = entries.size() / 2;
-        std::vector<LeafEntry> left(entries.begin(), entries.begin() + mid);
-        std::vector<LeafEntry> right(entries.begin() + mid, entries.end());
+        std::vector<LeafEntry> left(std::make_move_iterator(entries.begin()),
+                                    std::make_move_iterator(entries.begin() + mid));
+        std::vector<LeafEntry> right(std::make_move_iterator(entries.begin() + mid),
+                                     std::make_move_iterator(entries.end()));
         const page_id_t old_next = GetNextLeaf(moved.Data());
 
         if (!WriteLeafEntries(sib.Data(), right, old_next, moved_pid)) return false;
@@ -678,26 +910,30 @@ bool BPlusTree::SplitRoot() {
                 nxt.MarkDirty();
             }
         }
-        sep.key = right.front().key;
+        sep.key = std::move(right.front().key);
         sep.rid = right.front().rid;
-        sep.key_bytes = right.front().key_bytes;
+        sep.key_bytes = std::move(right.front().key_bytes);
+        right.front().key = IndexKey{};
+        right.front().key_bytes.clear();
     } else {
         std::vector<InternalEntry> entries;
         if (!ReadInternalEntries(moved.Data(), key_schema_, &entries)) return false;
         if (entries.size() < 2) return false;
         const page_id_t first_child = GetFirstChild(moved.Data());
         const size_t mid = entries.size() / 2;
-        InternalEntry up = entries[mid];
-        std::vector<InternalEntry> left(entries.begin(), entries.begin() + mid);
-        std::vector<InternalEntry> right(entries.begin() + mid + 1, entries.end());
+        InternalEntry up = std::move(entries[mid]);
+        std::vector<InternalEntry> left(std::make_move_iterator(entries.begin()),
+                                       std::make_move_iterator(entries.begin() + mid));
+        std::vector<InternalEntry> right(std::make_move_iterator(entries.begin() + mid + 1),
+                                        std::make_move_iterator(entries.end()));
 
         if (!WriteInternalEntries(sib.Data(), up.child, right)) return false;
         sib.MarkDirty();
         if (!WriteInternalEntries(moved.Data(), first_child, left)) return false;
         moved.MarkDirty();
-        sep.key = up.key;
-        sep.rid = up.rid;
-        sep.key_bytes = up.key_bytes;
+        sep.key = std::move(up.key);
+        sep.rid = std::move(up.rid);
+        sep.key_bytes = std::move(up.key_bytes);
     }
 
     // Phase B：写 moved 与 sib 的 UPDATE 记录。
@@ -739,27 +975,26 @@ RID BPlusTree::FindFirst(const IndexKey& key) const {
     page_id_t leaf_pid = FindLeafPage(key, min_rid);
     if (leaf_pid < 0) return RID();
 
-    PageGuard g = PageGuard::Fetch(bpm_, leaf_pid);
-    if (!g.Valid()) return RID();
-    std::vector<LeafEntry> entries;
-    if (!ReadLeafEntries(g.Data(), key_schema_, &entries)) return RID();
-    for (const auto& e : entries) {
-        int c = CompareKeyOnly(e.key, key);
-        if (c == 0) return e.rid;
-        if (c > 0) break;
-    }
-    // 边界情形：目标键恰好全部落在后继叶子上
-    const page_id_t next = GetNextLeaf(g.Data());
-    if (next < 0) return RID();
-    g.Release();
-    PageGuard g2 = PageGuard::Fetch(bpm_, next);
-    if (!g2.Valid()) return RID();
-    std::vector<LeafEntry> next_entries;
-    if (!ReadLeafEntries(g2.Data(), key_schema_, &next_entries)) return RID();
-    for (const auto& e : next_entries) {
-        int c = CompareKeyOnly(e.key, key);
-        if (c == 0) return e.rid;
-        if (c > 0) break;
+    // 最多看两片叶子：跨页重复键的退化情形。slot 二分替代逐条 CompareKeyOnly。
+    page_id_t cur = leaf_pid;
+    for (int attempt = 0; attempt < 2 && cur >= 0; ++attempt) {
+        PageGuard g = PageGuard::Fetch(bpm_, cur);
+        if (!g.Valid()) return RID();
+        const char* d = g.Data();
+        const int n = GetKeyCount(d);
+        const int lower = LowerBoundLeafSlot(d, key, key_schema_);
+        if (lower < n) {
+            uint32_t key_off;
+            uint16_t key_len;
+            ReadLeafSlotKeyLoc(d, lower, &key_off, &key_len);
+            const int c = CompareKeyBytesToIndexKey(d + key_off, key_len, key,
+                                                    key_schema_);
+            if (c == 0) return ReadLeafSlotRid(d, lower);
+            // c > 0：slot[lower].key > 目标键；后续叶子只会更大，命中失败。
+            return RID();
+        }
+        // lower == n：本页所有键都 < 目标；最多再看一页。
+        cur = GetNextLeaf(d);
     }
     return RID();
 }
@@ -792,22 +1027,10 @@ bool BPlusTree::Delete(const IndexKey& key, const RID& rid) {
             break;
         }
         if (type != PageType::kInternal) return false;
-        std::vector<InternalEntry> entries;
-        if (!ReadInternalEntries(d, key_schema_, &entries)) return false;
-        // 找到要去的 child 索引：0 = first_child，i+1 = entries[i].child
-        size_t idx = 0;
-        page_id_t child_pid = GetFirstChild(d);
-        for (size_t i = 0; i < entries.size(); ++i) {
-            if (CompareKeyThenRid(key, rid, entries[i].key, entries[i].rid) >= 0) {
-                ++idx;
-                child_pid = entries[i].child;
-            } else {
-                break;
-            }
-        }
-        path.push_back(Frame{pid, idx});
+        const ChooseChildResult cc = ChooseChild(d, key, rid, key_schema_);
+        path.push_back(Frame{pid, cc.separator_index});
         node.Release();
-        pid = child_pid;
+        pid = cc.child_pid;
     }
 
     // =====================================================================
@@ -824,38 +1047,47 @@ bool BPlusTree::Delete(const IndexKey& key, const RID& rid) {
             char* d = g.Data();
             std::vector<LeafEntry> entries;
             if (!ReadLeafEntries(d, key_schema_, &entries)) return false;
-            for (size_t i = 0; i < entries.size(); ++i) {
-                if (CompareKeyOnly(entries[i].key, key) == 0 &&
-                    entries[i].rid == rid) {
-                    // Phase A：写之前抓叶子整页 before-image。
-                    if (active_txn_ != nullptr && active_txn_->IsActive()) {
-                        active_txn_->AppendUndo(leaf_pid, d, PAGE_SIZE,
-                                                "BPlusTree::Delete(leaf)");
-                    }
-                    // Phase B：抓叶子 before-image 给 WAL。
-                    std::vector<char> leaf_before;
-                    if (log_manager_ != nullptr) {
-                        leaf_before.assign(d, d + PAGE_SIZE);
-                    }
-                    entries.erase(entries.begin() + static_cast<long>(i));
-                    if (!WriteLeafEntries(d, entries, GetNextLeaf(d), GetPrevLeaf(d))) {
-                        return false;
-                    }
-                    g.MarkDirty();
-                    after_count = entries.size();
-                    erased_leaf = leaf_pid;
-                    // Phase B：写 UPDATE 记录。
-                    if (log_manager_ != nullptr) {
-                        lsn_t lsn = EmitPageImageRecord(log_manager_, leaf_pid,
-                                                       leaf_before.data(), d,
-                                                       active_txn_);
-                        g.SetPageLsn(lsn);
-                    }
-                    deleted = true;
-                    break;
-                }
+            // 二分定位「CompareKeyOnly >= key」的首条，然后只在前向 dup_count
+            // 区间内比对 rid，避免 O(M) 线性扫描。
+            const int lower = LowerBoundLeafSlot(d, key, key_schema_);
+            const int n = GetKeyCount(d);
+            int match_idx = -1;
+            for (int i = lower; i < n; ++i) {
+                uint32_t koff;
+                uint16_t klen;
+                ReadLeafSlotKeyLoc(d, i, &koff, &klen);
+                if (CompareKeyBytesToIndexKey(d + koff, klen, key,
+                                              key_schema_) != 0) break;
+                if (ReadLeafSlotRid(d, i) == rid) { match_idx = i; break; }
             }
-            if (deleted) break;
+            if (match_idx >= 0) {
+                // Phase A：写之前抓叶子整页 before-image。
+                if (active_txn_ != nullptr && active_txn_->IsActive()) {
+                    active_txn_->AppendUndo(leaf_pid, d, PAGE_SIZE,
+                                            "BPlusTree::Delete(leaf)");
+                }
+                // Phase B：抓叶子 before-image 给 WAL。
+                std::vector<char> leaf_before;
+                if (log_manager_ != nullptr) {
+                    leaf_before.assign(d, d + PAGE_SIZE);
+                }
+                entries.erase(entries.begin() + match_idx);
+                if (!WriteLeafEntries(d, entries, GetNextLeaf(d), GetPrevLeaf(d))) {
+                    return false;
+                }
+                g.MarkDirty();
+                after_count = entries.size();
+                erased_leaf = leaf_pid;
+                // Phase B：写 UPDATE 记录。
+                if (log_manager_ != nullptr) {
+                    lsn_t lsn = EmitPageImageRecord(log_manager_, leaf_pid,
+                                                   leaf_before.data(), d,
+                                                   active_txn_);
+                    g.SetPageLsn(lsn);
+                }
+                deleted = true;
+                break;
+            }
             leaf_pid = GetNextLeaf(d);
         }
     }
@@ -1165,7 +1397,11 @@ bool BPlusTree::MergeNodes(page_id_t left_pid, page_id_t right_pid,
         std::vector<LeafEntry> le, re;
         if (!ReadLeafEntries(ld, key_schema_, &le)) return false;
         if (!ReadLeafEntries(rd, key_schema_, &re)) return false;
-        le.insert(le.end(), re.begin(), re.end());
+        // 与内部节点 merge 一致：移动而非拷贝（re 整个序列的 (key, rid,
+        // key_bytes) 直接转移到 le 末尾）。
+        le.insert(le.end(),
+                  std::make_move_iterator(re.begin()),
+                  std::make_move_iterator(re.end()));
         if (le.size() > static_cast<size_t>(kMaxLeafSlots)) return false;
         // 合并后 left 的 next = right.next，prev = left.prev（left 占据原位）
         if (!WriteLeafEntries(ld, le, GetNextLeaf(rd), GetPrevLeaf(ld))) return false;
@@ -1401,7 +1637,7 @@ bool BPlusTree::RedistributeInternal(page_id_t deficient_internal, page_id_t sib
     //
     // ——写时按「先记旧值再覆盖」的顺序避免丢数据。
     if (sibling_is_left) {
-        const InternalEntry old_parent_sep = pe[sep_in_parent];
+        InternalEntry old_parent_sep = pe[sep_in_parent];
         InternalEntry moved = std::move(se.back());
         se.pop_back();
         const page_id_t promoted_child = moved.child;
@@ -1413,11 +1649,15 @@ bool BPlusTree::RedistributeInternal(page_id_t deficient_internal, page_id_t sib
         pe[sep_in_parent].child = promoted_child;
 
         // 新 deficient.head = (parent_sep.key/rid, child = d_first_old)
+        // old_parent_sep 是局部变量，仅借用其内容：直接 move 转移 key_bytes，
+        // 避免「先 copy 再 copy」两次 vector<char> 分配。
         InternalEntry de_head;
-        de_head.key = old_parent_sep.key;
+        de_head.key = std::move(old_parent_sep.key);
         de_head.rid = old_parent_sep.rid;
-        de_head.key_bytes = old_parent_sep.key_bytes;
+        de_head.key_bytes = std::move(old_parent_sep.key_bytes);
         de_head.child = d_first_old;
+        old_parent_sep.key = IndexKey{};
+        old_parent_sep.key_bytes.clear();
         de.insert(de.begin(), std::move(de_head));
 
         // 写回：deficient 用 promoted_child 作为新 first_child
@@ -1425,7 +1665,7 @@ bool BPlusTree::RedistributeInternal(page_id_t deficient_internal, page_id_t sib
         if (!WriteInternalEntries(sd, s_first, se)) return false;
         if (!WriteInternalEntries(pd, p_first, pe)) return false;
     } else {
-        const InternalEntry old_parent_sep = pe[sep_in_parent];
+        InternalEntry old_parent_sep = pe[sep_in_parent];
         InternalEntry moved = std::move(se.front());
         se.erase(se.begin());
         // moved.child 是 sibling 失去的子节点，但 promoted_child 仍归 sibling 所有
@@ -1438,16 +1678,16 @@ bool BPlusTree::RedistributeInternal(page_id_t deficient_internal, page_id_t sib
         pe[sep_in_parent].key_bytes = std::move(moved.key_bytes);
         pe[sep_in_parent].child = d_first_old;
 
-        // 新 deficient.tail = (parent_sep.key/rid, child = d_first_old)
-        // ——等等，这里 child = d_first_old 就和 parent sep.child 重复。
-        // 正确语义：新 deficient.tail 的 child = promoted_child
-        // （即从 sibling 搬过来的那个 child，它在 deficient 末尾）。deficient
-        // 的 first_child 保持 d_first_old 不变。
+        // 新 deficient.tail 的 child = promoted_child（即从 sibling 搬过来的那个
+        // child，它在 deficient 末尾）。deficient 的 first_child 保持 d_first_old
+        // 不变。
         InternalEntry de_tail;
-        de_tail.key = old_parent_sep.key;
+        de_tail.key = std::move(old_parent_sep.key);
         de_tail.rid = old_parent_sep.rid;
-        de_tail.key_bytes = old_parent_sep.key_bytes;
+        de_tail.key_bytes = std::move(old_parent_sep.key_bytes);
         de_tail.child = promoted_child;
+        old_parent_sep.key = IndexKey{};
+        old_parent_sep.key_bytes.clear();
         de.push_back(std::move(de_tail));
 
         // 写回：deficient 用 d_first_old（不变）作为 first_child
@@ -1598,12 +1838,9 @@ std::unique_ptr<BPlusTree::Cursor> BPlusTree::LowerBound(const IndexKey& key) co
 
     PageGuard g = PageGuard::Fetch(bpm_, leaf_pid);
     if (!g.Valid()) return nullptr;
-    std::vector<LeafEntry> entries;
-    if (!ReadLeafEntries(g.Data(), key_schema_, &entries)) return nullptr;
-    size_t idx = 0;
-    while (idx < entries.size() && CompareKeyOnly(entries[idx].key, key) < 0) {
-        ++idx;
-    }
+    const char* d = g.Data();
+    // slot 二分直接得到 >= key 的首条；不再物化整个 leaf。
+    const size_t idx = static_cast<size_t>(LowerBoundLeafSlot(d, key, key_schema_));
     // 若本页所有键都小于目标，游标停在页尾，Next() 会自动跨到下一页
     return std::make_unique<Cursor>(this, leaf_pid, idx);
 }

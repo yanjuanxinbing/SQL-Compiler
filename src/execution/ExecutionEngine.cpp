@@ -338,7 +338,21 @@ std::unordered_map<std::string, size_t> BuildCombinedColumnIndexMapWithDerived(
     SystemCatalog* catalog,
     const PlanNodePtr& plan_node,
     const std::vector<std::pair<std::string, std::string>>& table_info) {
-    auto m = BuildCombinedColumnIndexMap(catalog, table_info);
+    // Bug 13 修复：原实现先调用 BuildCombinedColumnIndexMap(catalog, table_info)
+    // 把 table_info 中的真实表列以 offset=0 起登记，再 walk 计划树追加派生列。
+    // 当 FROM 是派生表（JoinNode.children[0] = 占位 SeqScanNode，
+    // 占位再挂 sub_plan）时，CollectScanTableNames 会跳过占位（line 113），
+    // 于是 table_info 只含右侧真实表，导致该表的列被登记到 offset=0；
+    // 但 JoinExecutor 拼接 (left || right) 元组时，真实表列实际排在
+    // 子查询输出列之后，所以 column_index_map 与真实列序错位，
+    // `t1.name` 误命中派生表的 info 列。
+    //
+    // 新实现：完全以计划树为准做 DFS 前序遍历，按"实际拼接顺序"登记所有列
+    // —— 普通 SeqScanNode 用 catalog 的列顺序，派生表占位 SeqScanNode 用
+    // DeriveTerminalColumns 提取的子计划输出列。table_info 仍然接住参数，
+    // 但只用于触发走该函数（旧调用方依赖此入口）；列登记全部由 walk 完成。
+    (void)table_info;  // 已废弃：避免重复登记导致 offset 错位。
+    std::unordered_map<std::string, size_t> m;
     if (!plan_node) return m;
     std::function<void(const PlanNodePtr&, size_t&)> walk =
         [&](const PlanNodePtr& n, size_t& offset) {
@@ -348,26 +362,119 @@ std::unordered_map<std::string, size_t> BuildCombinedColumnIndexMapWithDerived(
             // 派生表：table_name == alias 且 children[0] 非空
             if (!s->table_alias.empty() && s->table_alias == s->table_name &&
                 !n->children.empty()) {
-                auto cols = DeriveTerminalColumns(catalog, n->children[0]);
-                for (size_t i = 0; i < cols.size(); ++i) {
-                    const std::string& cname = cols[i];
+                // ProjectExecutor 的输出元组 = [select_values ++ underlying_tuple]，
+                // 所以 placeholder 占位的实际元组长度 = 项目列数 + 内层元组长度。
+                // 子计划若以 ProjectNode 收尾，需要把两半都登记到 cmap，外层 JOIN
+                // / SELECT 引用 `sub.col` 时落在任何一半都能命中（同名同值）。
+                // 若子计划没有 ProjectNode 收尾（例如 VALUES 或直接 SeqScan），
+                // 则只输出一次，按 DeriveTerminalColumns 的列数登记即可。
+                PlanNodePtr p = n->children[0];
+                while (p && (p->GetType() == PlanNodeType::SORT ||
+                             p->GetType() == PlanNodeType::LIMIT ||
+                             p->GetType() == PlanNodeType::SET_OP ||
+                             p->GetType() == PlanNodeType::CTE_DEFINE ||
+                             p->GetType() == PlanNodeType::CTE_BIND)) {
+                    if (p->children.empty()) { p = nullptr; break; }
+                    p = p->children[0];
+                }
+                bool has_project = (p && p->GetType() == PlanNodeType::PROJECT &&
+                                    !p->children.empty());
+                std::vector<std::string> proj_cols;
+                std::vector<std::string> under_cols;
+                if (has_project) {
+                    auto proj = std::static_pointer_cast<ProjectNode>(p);
+                    proj_cols.reserve(proj->columns.size());
+                    for (size_t i = 0; i < proj->columns.size(); ++i) {
+                        std::string cname;
+                        if (i < proj->aliases.size() && !proj->aliases[i].empty()) {
+                            cname = proj->aliases[i];
+                        } else if (proj->columns[i] &&
+                                   proj->columns[i]->GetType() == NodeType::COLUMN_REF_EXPR) {
+                            cname = std::static_pointer_cast<ColumnRefExpr>(
+                                proj->columns[i])->column_name;
+                        } else {
+                            cname = "col" + std::to_string(i);
+                        }
+                        proj_cols.push_back(std::move(cname));
+                    }
+                    // 内层元组列：project 通常盖在 SeqScanNode 上，按 catalog 的列序登记；
+                    // DeriveTerminalColumns 对 SEQ_SCAN 返回空 vector（无 alias 标识），
+                    // 这里手动从 catalog 取出列名以匹配实际元组形状。
+                    PlanNodePtr inner = p->children[0];
+                    while (inner && (inner->GetType() == PlanNodeType::SORT ||
+                                     inner->GetType() == PlanNodeType::LIMIT ||
+                                     inner->GetType() == PlanNodeType::SET_OP ||
+                                     inner->GetType() == PlanNodeType::FILTER)) {
+                        if (inner->children.empty()) { inner = nullptr; break; }
+                        inner = inner->children[0];
+                    }
+                    if (inner && inner->GetType() == PlanNodeType::SEQ_SCAN) {
+                        auto inner_scan = std::static_pointer_cast<SeqScanNode>(inner);
+                        const TableInfo* tinfo = catalog->GetTable(inner_scan->table_name);
+                        if (tinfo) {
+                            under_cols.reserve(tinfo->columns.size());
+                            for (const auto& c : tinfo->columns) {
+                                under_cols.push_back(c.name);
+                            }
+                        }
+                    }
+                } else {
+                    proj_cols = DeriveTerminalColumns(catalog, n->children[0]);
+                }
+                // First half: project columns.
+                for (size_t i = 0; i < proj_cols.size(); ++i) {
+                    const std::string& cname = proj_cols[i];
                     m[s->table_alias + "." + cname] = offset + i;
                     if (m.find(cname) == m.end()) {
                         m[cname] = offset + i;
                     }
                 }
-                offset += cols.size();
+                offset += proj_cols.size();
+                // Second half: underlying tuple (only if Project wraps something).
+                for (size_t i = 0; i < under_cols.size(); ++i) {
+                    const std::string& cname = under_cols[i];
+                    m[s->table_alias + "." + cname] = offset + i;
+                    if (m.find(cname) == m.end()) {
+                        m[cname] = offset + i;
+                    }
+                }
+                offset += under_cols.size();
                 return;
             }
-            // 普通表：catalog 已有对应列，下标已在 m 中；只需推进 offset
+            // 普通表：按 catalog 列顺序登记；同时推进 offset。
             const TableInfo* info = catalog->GetTable(s->table_name);
-            if (info) offset += info->columns.size();
+            if (info) {
+                for (size_t i = 0; i < info->columns.size(); ++i) {
+                    const auto& c = info->columns[i];
+                    // Qualified: real_table.col → offset+i（覆盖式赋值，
+                    // 让同一表多次出现时以最后一次的位置为准，避免左侧
+                    // 派生表 sub.id 与右侧 t1.id 同名时 alias 区分失效）。
+                    m[s->table_name + "." + c.name] = offset + i;
+                    if (!s->table_alias.empty() && s->table_alias != s->table_name) {
+                        m[s->table_alias + "." + c.name] = offset + i;
+                    }
+                    // Unqualified: first-table-wins。
+                    if (m.find(c.name) == m.end()) {
+                        m[c.name] = offset + i;
+                    }
+                }
+                offset += info->columns.size();
+            }
             return;
         }
         if (n->GetType() == PlanNodeType::INDEX_SCAN) {
             auto s = std::static_pointer_cast<IndexScanNode>(n);
             const TableInfo* info = catalog->GetTable(s->table_name);
-            if (info) offset += info->columns.size();
+            if (info) {
+                for (size_t i = 0; i < info->columns.size(); ++i) {
+                    const auto& c = info->columns[i];
+                    m[s->table_name + "." + c.name] = offset + i;
+                    if (m.find(c.name) == m.end()) {
+                        m[c.name] = offset + i;
+                    }
+                }
+                offset += info->columns.size();
+            }
             return;
         }
         // 55_query: LATERAL ApplyNode ——右子查询的输出列按「派生表」语义
@@ -909,6 +1016,28 @@ ExecutorPtr ExecutionEngine::BuildExecutor(const PlanNodePtr& plan_node,
             auto child = BuildExecutor(plan_node->children.empty() ? nullptr : plan_node->children[0], context, wrap_timing);
             if (!child) return nullptr;
             auto cmap = BuildCombinedColumnIndexMapWithDerived(catalog_, plan_node, CollectScanTableNames(plan_node));
+            // 60_query：相关子查询在聚合表达式内引用外层别名（典型：
+            //   SELECT category AS cat, ... GROUP BY cat
+            //   含 (SELECT ... WHERE t.col = cat) —— 外层 Project 的 alias
+            // `cat` 只活在聚合输出位置，不在 cmap 中；BuildOuterBind 拿 outer_cmap
+            // 找 `cat` 找不到，inner evaluator 又拿不到 `cat` 值。把每个 aggregate
+            // alias 映射到底层 ColumnRef 在 cmap 中的位置（仅对 ColumnRefExpr
+            // 形式的 aggregate_expr 适用；聚合函数 / 子查询类不映射）。
+            for (size_t i = 0;
+                 i < n->aggregate_exprs.size() && i < n->aliases.size(); ++i) {
+                const std::string& alias = n->aliases[i];
+                if (alias.empty()) continue;
+                const auto& expr = n->aggregate_exprs[i];
+                if (!expr || expr->GetType() != NodeType::COLUMN_REF_EXPR) continue;
+                auto cr = std::static_pointer_cast<ColumnRefExpr>(expr);
+                std::string key = cr->table_name.empty()
+                                      ? cr->column_name
+                                      : (cr->table_name + "." + cr->column_name);
+                auto it = cmap.find(key);
+                if (it != cmap.end()) {
+                    cmap[alias] = it->second;
+                }
+            }
             return wrap(std::make_unique<AggregateExecutor>(context, std::move(child),
                                                              n->group_by_exprs, n->aggregate_exprs,
                                                              cmap));

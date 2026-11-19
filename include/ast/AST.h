@@ -339,6 +339,14 @@ struct JoinClause {
     // 内层 SELECT（或 VALUES）。Planner 在该字段非空时把它编译为子计划挂到
     // ApplyNode.children[1] 上。
     SelectStatementPtr lateral_subquery;
+    // 派生表 JOIN 右操作数：JOIN (SELECT ...) [AS] alias
+    // 携带 (SELECT ...) / (SELECT ... UNION/INTERSECT/EXCEPT SELECT ...) 作为
+    // JOIN 右侧的派生表。Planner 把它编译为 SeqScanNode(alias, alias) 占位 +
+    // children[0] = 子计划；ExecutionEngine 在 SEQ_SCAN 路径已识别该占位形式
+    // （见 ExecutionEngine.cpp 中 table_name==table_alias 且 children[0] 非空
+    // 时直接递归执行子计划的分支）。derived_subquery 与 derived_set_op 互斥。
+    SelectStatementPtr derived_subquery;
+    SetOperationStatementPtr derived_set_op;
 };
 
 // ORDER BY 单项
@@ -749,8 +757,17 @@ public:
     bool ignore_nulls = false;
 };
 
-// 子查询表达式：标量 / IN / EXISTS / ANY
-enum class SubqueryType { SCALAR, EXISTS, IN, ANY };
+// 子查询表达式：标量 / IN / EXISTS / 量化比较（ANY/SOME/ALL）
+//   - SCALAR：裸 (SELECT ...)，用于 SELECT 列表 / WHERE 比较右侧；
+//   - EXISTS：EXISTS (SELECT ...)，仅判断子查询是否返回至少一行；
+//   - IN   ：<expr> [NOT] IN (SELECT ...)，等价于 =ANY（NOT IN 在执行期用
+//            UnaryExpr(NOT) 包裹，仍走 IN 分支）；
+//   - ANY  ：<expr> <op> ANY (SELECT ...)，存在性量化；
+//   - SOME ：<expr> <op> SOME (SELECT ...)；SQL 标准与 ANY 完全等价；
+//   - ALL  ：<expr> <op> ALL (SELECT ...)，全称量化；空集 → TRUE。
+// 后三种（ANY/SOME/ALL）共享 comparison_op 字段（">"/"<"/"="/...) 与 outer_expr，
+// 由 ExpressionEvaluator 按 kind 分支计算。
+enum class SubqueryType { SCALAR, EXISTS, IN, ANY, SOME, ALL };
 class SubqueryExprNode : public Expr {
 public:
     SubqueryExprNode(SubqueryType kind, SelectStatementPtr subquery,
@@ -762,9 +779,9 @@ public:
 
     SubqueryType kind;
     SelectStatementPtr subquery;
-    // 仅 ANY/IN 有效：比较运算符（如 ">"、"<"），用于 expr op ANY (SELECT ...)
+    // 仅 ANY/SOME/ALL/IN 有效：比较运算符（如 ">"、"<"），用于 expr op ANY (SELECT ...)
     std::string comparison_op;
-    // 仅 ANY/IN 有效：与子查询比较的外部表达式
+    // 仅 ANY/SOME/ALL/IN 有效：与子查询比较的外部表达式
     ExprPtr outer_expr;
     // Planner 在递归下降阶段填充：把 subquery 转成的内部计划。
     // 求值期 ExpressionEvaluator 看到 subquery_plan 非空时用它直接驱动子查询，
