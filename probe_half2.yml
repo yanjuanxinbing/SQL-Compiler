@@ -1,0 +1,44 @@
+          # Windows：默认生成器是 Visual Studio 17 2022（多配置），
+          # --config Release 对应 build/Release/sqlcompiler.exe
+          - os: windows-latest
+            bin: build/Release/sqlcompiler.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # 固定版本，避免 runner 镜像升级导致结果漂移
+          python-version: '3.12'
+
+      - name: Configure CMake
+        run: |
+          cmake --version
+          # 单配置生成器（Linux）用 CMAKE_BUILD_TYPE；
+          # 多配置生成器（Windows）忽略它，靠下面 --config Release 选配置。
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build engine
+        run: cmake --build build --config Release
+
+      - name: SQL regression suite
+        # 84+ 个用例，逐字节比对 stdout 与 tests/expected/*.out。
+        # --bin 显式指定路径，不依赖各平台的默认查找规则。
+        run: python tests/verify_outputs.py --bin "${{ matrix.bin }}"
+
+      - name: Install webui dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r webui/requirements.txt
+
+      - name: WebUI test suite
+        working-directory: webui
+        env:
+          # 让测试直接找到刚编出来的引擎：engine.py 的查找顺序是
+          # SQLCOMPILER_BIN → build/{Debug,Release,}/ → PATH
+          SQLCOMPILER_BIN: ${{ github.workspace }}/${{ matrix.bin }}
+        # -s backend/tests 扫测试目录，-t . 把顶层包目录设为 webui/，
+        # 这样测试里的 `from backend.engine import ...` 才能解析到。
+        run: python -m unittest discover -s backend/tests -t . -v
