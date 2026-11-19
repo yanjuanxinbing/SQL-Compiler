@@ -539,15 +539,13 @@ static void JsonWriteString(std::ostream& oss, const std::string& s) {
 // Expr 输出由我们控制：不会产生 \" \\ \n 等需要转义的字符，但仍走
 // JsonWriteString 走一遍 escape 兜底，保证健壮性。
 static void WriteJsonExprValue(std::ostream& oss, const Expr* e) {
-    // JsonWriteString 自己会包一对引号；这里不能再额外加引号，否则会产出
-    // ""value"" 这种非法 JSON（前端 renderPlan() 的 JSON.parse 会直接失败）。
-    if (e == nullptr) {
-        JsonWriteString(oss, std::string());
-        return;
+    oss << '"';
+    if (e != nullptr) {
+        std::ostringstream inner;
+        WriteExpr(inner, e);
+        JsonWriteString(oss, inner.str());
     }
-    std::ostringstream inner;
-    WriteExpr(inner, e);
-    JsonWriteString(oss, inner.str());
+    oss << '"';
 }
 
 // item #2：直接把节点 fields 写到 oss，不再构造中间
@@ -830,7 +828,7 @@ static std::string SerializeNodeToJson(const PlanNode& node, int depth) {
     oss << indent << "{\n";
     oss << indent << "  \"type\": ";
     JsonWriteString(oss, PlanNodeTypeName(node.GetType()));
-    bool first = false;  // type 字段已写，fields 从 "," 开始（first=false → 每个字段都补逗号）
+    bool first = true;  // type 字段已写，fields 从 "," 开始
     WriteJsonNodeFields(oss, indent, node, first);
     if (!node.children.empty()) {
         oss << ",\n" << indent << "  \"children\": [";
