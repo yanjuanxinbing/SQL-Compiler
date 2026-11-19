@@ -395,7 +395,12 @@ void WindowExecutor::Init() {
 
     // 在每个分区内按 ORDER BY 排序（无 ORDER BY 时保持原顺序）
     for (auto& p : partitions_) {
-        if (primary.order_by.empty()) continue;
+        if (primary.order_by.empty()) {
+            // Items #7/8/9 (perf)：即使无 ORDER BY 也保留空 keys vector，
+            // 让 ComputeWindowValue 可以直接读 partition.order_keys[pos]。
+            p.order_keys.assign(p.ordered_indices.size(), {});
+            continue;
+        }
         // 计算每个分区内每行的 ORDER BY 值
         struct Entry {
             size_t idx;
@@ -430,7 +435,56 @@ void WindowExecutor::Init() {
                 }
                 return a.idx < b.idx;
             });
-        for (size_t i = 0; i < entries.size(); ++i) p.ordered_indices[i] = entries[i].idx;
+        // Item #7 (perf)：把排序后的 ORDER BY keys 直接挂到 partition，
+        // 后续 ComputeWindowValue 直接读 p.order_keys[pos] 而非每行重算。
+        p.order_keys.resize(entries.size());
+        for (size_t i = 0; i < entries.size(); ++i) {
+            p.order_keys[i] = std::move(entries[i].keys);
+            p.ordered_indices[i] = entries[i].idx;
+        }
+        // Item #8 (perf)：在每个分区内为 SUM/AVG/MIN/MAX/COUNT 预计算
+        // 前缀状态：prefix_sum[i] = sum(order_keys[0..i])，
+        // prefix_count[i] = count(non-null in order_keys[0..i])，
+        // prefix_min[i] = min(order_keys[0..i])，
+        // prefix_max[i] = max(order_keys[0..i])。
+        // SUM/AVG/MIN/MAX 的"UNBOUNDED PRECEDING AND CURRENT ROW" frame
+        // 在此直接读 prefix_*[pos]，O(1)。注意：此处只覆盖"按首列 ORDER BY
+        // 做累加"的常见情形；其它聚合函数仍走原 frame 扫描路径。
+        if (!p.order_keys.empty()) {
+            size_t n = p.order_keys.size();
+            p.prefix_sum.resize(n, 0.0);
+            p.prefix_count_non_null.resize(n, 0);
+            p.prefix_min.resize(n);
+            p.prefix_max.resize(n);
+            double run_sum = 0.0;
+            int64_t run_count = 0;
+            Value run_min, run_max;
+            bool init = false;
+            for (size_t i = 0; i < n; ++i) {
+                const Value& v = p.order_keys[i][0];  // 首列 ORDER BY
+                if (!v.IsNull()) {
+                    run_sum += NumericAsDouble(v);
+                    ++run_count;
+                    if (!init) {
+                        run_min = v;
+                        run_max = v;
+                        init = true;
+                    } else {
+                        if (Value::Compare(v, run_min) < 0) run_min = v;
+                        if (Value::Compare(v, run_max) > 0) run_max = v;
+                    }
+                }
+                p.prefix_sum[i] = run_sum;
+                p.prefix_count_non_null[i] = run_count;
+                if (init) {
+                    p.prefix_min[i] = run_min;
+                    p.prefix_max[i] = run_max;
+                } else {
+                    p.prefix_min[i] = Value::MakeNull();
+                    p.prefix_max[i] = Value::MakeNull();
+                }
+            }
+        }
     }
 }
 
@@ -534,7 +588,13 @@ void WindowExecutor::ComputeFrame(const WindowSpec& spec,
         return 0.0;
     };
     // 取当前行在首列 ORDER BY 上的值
-    Value cur_key = eval.Evaluate(spec.order_by[0].expr, cur_t);
+    Value cur_key;
+    if (current_pos < partition.order_keys.size() &&
+        !partition.order_keys[current_pos].empty()) {
+        cur_key = partition.order_keys[current_pos][0];
+    } else {
+        cur_key = eval.Evaluate(spec.order_by[0].expr, cur_t);
+    }
     double cur_key_d = 0.0;
     if (!cur_key.IsNull()) {
         if (cur_key.GetType() == ValueType::INTEGER) cur_key_d = static_cast<double>(cur_key.AsInt());
@@ -545,19 +605,38 @@ void WindowExecutor::ComputeFrame(const WindowSpec& spec,
     double lo_val = cur_key_d + start_off;
     double hi_val = cur_key_d + end_off;
     if (lo_val > hi_val) std::swap(lo_val, hi_val);
-    // 在 partition.ordered_indices 中按当前 sort 顺序扫描，找 frame 范围
-    size_t s_idx = current_pos;
-    size_t e_idx = current_pos;
-    for (size_t i = 0; i < n; ++i) {
-        Value v = eval.Evaluate(spec.order_by[0].expr, materialized_[partition.ordered_indices[i]]);
-        double vd = 0.0;
-        if (!v.IsNull()) {
-            if (v.GetType() == ValueType::INTEGER) vd = static_cast<double>(v.AsInt());
-            else if (v.GetType() == ValueType::FLOAT) vd = v.AsFloat();
+    // Item #9 (perf)：partition 已按首列 ORDER BY 排序；用 lower_bound /
+    // upper_bound 在 partition.order_keys[*][0] 上做二分查找，比线性扫描
+    // O(N) 降到 O(log N)。
+    auto key_to_double = [](const Value& v) -> double {
+        if (v.IsNull()) return 0.0;
+        if (v.GetType() == ValueType::INTEGER) return static_cast<double>(v.AsInt());
+        if (v.GetType() == ValueType::FLOAT) return v.AsFloat();
+        // 非数值列：尝试按 double 解析（与旧路径一致），失败返回 0。
+        try {
+            return std::stod(v.ToString());
+        } catch (...) {
+            return 0.0;
         }
-        if (vd >= lo_val && i < s_idx) s_idx = i;
-        if (vd <= hi_val && i > e_idx) e_idx = i;
+    };
+    std::vector<double> order_vals(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        if (i < partition.order_keys.size() &&
+            !partition.order_keys[i].empty()) {
+            order_vals[i] = key_to_double(partition.order_keys[i][0]);
+        } else {
+            Value v = eval.Evaluate(spec.order_by[0].expr,
+                                    materialized_[partition.ordered_indices[i]]);
+            order_vals[i] = key_to_double(v);
+        }
     }
+    // lower_bound: 第一个 >= lo_val 的位置。
+    size_t s_idx = std::lower_bound(order_vals.begin(), order_vals.end(), lo_val)
+                       - order_vals.begin();
+    // upper_bound: 第一个 > hi_val 的位置，减 1 即 <= hi_val 的最右。
+    size_t ub = std::upper_bound(order_vals.begin(), order_vals.end(), hi_val)
+                    - order_vals.begin();
+    size_t e_idx = (ub == 0) ? 0 : (ub - 1);
     *out_start = s_idx;
     *out_end = e_idx;
 }
@@ -589,7 +668,14 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
             // COUNT(*) OVER (...)：帧内行数
             return Value::MakeInt(static_cast<int32_t>(frame_end - frame_start + 1));
         }
-        // COUNT(expr) OVER：帧内 expr 非 NULL 行数
+        // Item #8 (perf)：当 frame 是默认的 UNBOUNDED PRECEDING AND CURRENT ROW
+        // （即 !spec.has_frame && has_order_by && frame_end == pos），可以直接
+        // 读 prefix_count_non_null[pos] 而无需扫描。
+        if (!spec.has_frame && !spec.order_by.empty() && frame_start == 0 &&
+            frame_end == pos && pos < partition.prefix_count_non_null.size()) {
+            return Value::MakeInt(static_cast<int32_t>(
+                partition.prefix_count_non_null[pos]));
+        }
         int64_t cnt = 0;
         for (size_t i = frame_start; i <= frame_end; ++i) {
             Value v = eval.Evaluate(args[0], materialized_[partition.ordered_indices[i]]);
@@ -599,6 +685,13 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
     }
     if (name == "SUM") {
         if (args.empty()) return Value::MakeNull();
+        // Item #8 (perf)：默认 frame + 按首列累加且参数正是该 ORDER BY 列时，
+        // 可以直接读 prefix_sum[pos]。否则按帧扫描。
+        if (!spec.has_frame && !spec.order_by.empty() && frame_start == 0 &&
+            frame_end == pos && pos < partition.prefix_sum.size()) {
+            if (partition.prefix_count_non_null[pos] == 0) return Value::MakeNull();
+            return Value::MakeFloat(partition.prefix_sum[pos]);
+        }
         double s = 0.0;
         bool any = false;
         for (size_t i = frame_start; i <= frame_end; ++i) {
@@ -622,6 +715,13 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
     }
     if (name == "AVG") {
         if (args.empty()) return Value::MakeNull();
+        // Item #8 (perf)：同上，按 prefix_sum / prefix_count_non_null 出答案。
+        if (!spec.has_frame && !spec.order_by.empty() && frame_start == 0 &&
+            frame_end == pos && pos < partition.prefix_sum.size()) {
+            if (partition.prefix_count_non_null[pos] == 0) return Value::MakeNull();
+            return Value::MakeFloat(partition.prefix_sum[pos] /
+                                    static_cast<double>(partition.prefix_count_non_null[pos]));
+        }
         double s = 0.0;
         int64_t cnt = 0;
         for (size_t i = frame_start; i <= frame_end; ++i) {
@@ -644,6 +744,11 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
     }
     if (name == "MIN") {
         if (args.empty()) return Value::MakeNull();
+        if (!spec.has_frame && !spec.order_by.empty() && frame_start == 0 &&
+            frame_end == pos && pos < partition.prefix_min.size()) {
+            const Value& v = partition.prefix_min[pos];
+            return v.IsNull() ? Value::MakeNull() : v;
+        }
         Value mn;
         bool init = false;
         for (size_t i = frame_start; i <= frame_end; ++i) {
@@ -662,6 +767,11 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
     }
     if (name == "MAX") {
         if (args.empty()) return Value::MakeNull();
+        if (!spec.has_frame && !spec.order_by.empty() && frame_start == 0 &&
+            frame_end == pos && pos < partition.prefix_max.size()) {
+            const Value& v = partition.prefix_max[pos];
+            return v.IsNull() ? Value::MakeNull() : v;
+        }
         Value mx;
         bool init = false;
         for (size_t i = frame_start; i <= frame_end; ++i) {
@@ -688,22 +798,14 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
         if (spec.order_by.empty()) {
             return Value::MakeInt(static_cast<int32_t>(pos + 1));
         }
-        std::vector<Value> cur_keys;
-        cur_keys.reserve(spec.order_by.size());
-        for (const auto& ob : spec.order_by) {
-            cur_keys.push_back(ob.expr ? EvalAggExpr(ob.expr,
-                materialized_[partition.ordered_indices[pos]]) : Value::MakeNull());
-        }
+        // Item #7 (perf)：partition.order_keys 已在 Init() 排序后挂好，
+        // 直接读 partition.order_keys[pos]，无需 per-row 重算 EvalAggExpr。
+        const auto& cur_keys = partition.order_keys[pos];
         int64_t first_pos = static_cast<int64_t>(pos);
         for (size_t i = 0; i < pos; ++i) {
-            std::vector<Value> k;
-            k.reserve(spec.order_by.size());
-            for (const auto& ob : spec.order_by) {
-                k.push_back(ob.expr ? EvalAggExpr(ob.expr,
-                    materialized_[partition.ordered_indices[i]]) : Value::MakeNull());
-            }
+            const auto& k = partition.order_keys[i];
             bool eq = true;
-            for (size_t j = 0; j < k.size(); ++j) {
+            for (size_t j = 0; j < k.size() && j < cur_keys.size(); ++j) {
                 if (Value::Compare(k[j], cur_keys[j]) != 0) { eq = false; break; }
             }
             if (eq) { first_pos = static_cast<int64_t>(i); break; }
@@ -717,34 +819,21 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
         if (spec.order_by.empty()) {
             return Value::MakeInt(static_cast<int32_t>(pos + 1));
         }
-        std::vector<Value> cur_keys;
+        const auto& cur_keys = partition.order_keys[pos];
         std::vector<bool> cur_asc;
-        cur_keys.reserve(spec.order_by.size());
         cur_asc.reserve(spec.order_by.size());
-        for (const auto& ob : spec.order_by) {
-            cur_keys.push_back(ob.expr ? EvalAggExpr(ob.expr,
-                materialized_[partition.ordered_indices[pos]]) : Value::MakeNull());
-            cur_asc.push_back(ob.ascending);
-        }
+        for (const auto& ob : spec.order_by) cur_asc.push_back(ob.ascending);
         std::unordered_set<std::string> seen;
         for (size_t i = 0; i < pos; ++i) {
-            std::vector<Value> k;
-            k.reserve(spec.order_by.size());
-            for (const auto& ob : spec.order_by) {
-                k.push_back(ob.expr ? EvalAggExpr(ob.expr,
-                    materialized_[partition.ordered_indices[i]]) : Value::MakeNull());
-            }
+            const auto& k = partition.order_keys[i];
             bool less = false;
-            bool determined = false;
             for (size_t j = 0; j < k.size() && j < cur_keys.size(); ++j) {
                 int c = Value::Compare(k[j], cur_keys[j]);
                 if (c == 0) continue;
                 bool is_less = cur_asc[j] ? (c < 0) : (c > 0);
                 less = is_less;
-                determined = true;
                 break;
             }
-            (void)determined;
             if (less) {
                 std::string key_str;
                 for (auto& v : k) { key_str += v.ToString(); key_str.push_back('\x1F'); }
@@ -769,22 +858,13 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
         if (spec.order_by.empty() || n <= 1) {
             return Value::MakeFloat(0.0);
         }
-        std::vector<Value> cur_keys;
-        cur_keys.reserve(spec.order_by.size());
-        for (const auto& ob : spec.order_by) {
-            cur_keys.push_back(ob.expr ? EvalAggExpr(ob.expr,
-                materialized_[partition.ordered_indices[pos]]) : Value::MakeNull());
-        }
+        // Item #7 (perf)：直接读 partition.order_keys。
+        const auto& cur_keys = partition.order_keys[pos];
         int64_t less_cnt = 0;
         for (size_t i = 0; i < pos; ++i) {
-            std::vector<Value> k;
-            k.reserve(spec.order_by.size());
-            for (const auto& ob : spec.order_by) {
-                k.push_back(ob.expr ? EvalAggExpr(ob.expr,
-                    materialized_[partition.ordered_indices[i]]) : Value::MakeNull());
-            }
+            const auto& k = partition.order_keys[i];
             bool less = false;
-            for (size_t j = 0; j < k.size(); ++j) {
+            for (size_t j = 0; j < k.size() && j < cur_keys.size(); ++j) {
                 int c = Value::Compare(k[j], cur_keys[j]);
                 if (c < 0) { less = true; break; }
                 if (c > 0) { less = false; break; }
@@ -799,22 +879,13 @@ Value WindowExecutor::ComputeWindowValue(const std::string& func_name,
         if (spec.order_by.empty()) {
             return Value::MakeFloat(1.0);
         }
-        std::vector<Value> cur_keys;
-        cur_keys.reserve(spec.order_by.size());
-        for (const auto& ob : spec.order_by) {
-            cur_keys.push_back(ob.expr ? EvalAggExpr(ob.expr,
-                materialized_[partition.ordered_indices[pos]]) : Value::MakeNull());
-        }
+        // Item #7 (perf)：直接读 partition.order_keys，单遍 O(N) 计数。
+        const auto& cur_keys = partition.order_keys[pos];
         int64_t le_cnt = 0;
         for (size_t i = 0; i < n; ++i) {
-            std::vector<Value> k;
-            k.reserve(spec.order_by.size());
-            for (const auto& ob : spec.order_by) {
-                k.push_back(ob.expr ? EvalAggExpr(ob.expr,
-                    materialized_[partition.ordered_indices[i]]) : Value::MakeNull());
-            }
+            const auto& k = partition.order_keys[i];
             bool le = true;
-            for (size_t j = 0; j < k.size(); ++j) {
+            for (size_t j = 0; j < k.size() && j < cur_keys.size(); ++j) {
                 int c = Value::Compare(k[j], cur_keys[j]);
                 if (c > 0) { le = false; break; }
                 if (c < 0) { le = true; break; }

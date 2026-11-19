@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <sstream>
 #include <string>
+#include <string_view>
 
 namespace sqlcompiler {
 
@@ -293,18 +294,23 @@ namespace {
 // 跨类型 VARCHAR ↔ INT/FLOAT 时，把 VARCHAR 按十进制文本解析为 double。
 // 用于 DECIMAL/NUMERIC 等按文本持久化的数值列与数值字面量比较。
 // 失败时返回 false（空串 / 非数字字符 / 浮点溢出均视为不可解析）。
+//
+// 零拷贝：直接拿 v.AsVarchar() 的 (data, size) 构造 std::string_view，不复制
+// 字符串。std::strtod 需要可写 null-terminated 视图——std::string 自 C++11 起
+// 保证 data()[size()] == '\0'，因此 string_view.data() 落在合法范围之外最多
+// 一字节也是合法的（恰好是 null 终止符），strtod 不会越界读取。
 bool ParseVarcharAsDouble(const Value& v, double* out) {
-    try {
-        size_t pos = 0;
-        std::string s = v.AsVarchar();
-        while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
-        if (pos >= s.size()) return false;
-        double d = std::stod(s, &pos);
-        *out = d;
-        return true;
-    } catch (...) {
-        return false;
-    }
+    const std::string& s_full = v.AsVarchar();
+    std::string_view s{s_full.data(), s_full.size()};
+    size_t pos = 0;
+    while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+    if (pos >= s.size()) return false;
+    const char* begin = s.data() + pos;
+    char* end = nullptr;
+    double d = std::strtod(begin, &end);
+    if (end == begin) return false;  // 没消耗任何字符：不是合法数字
+    *out = d;
+    return true;
 }
 
 }  // namespace
@@ -356,10 +362,12 @@ int Value::Compare(const Value& a, const Value& b) {
             if (a.float_val_ < b.float_val_) return -1;
             if (a.float_val_ > b.float_val_) return 1;
             return 0;
-        case ValueType::VARCHAR:
-            if (a.str_val_ < b.str_val_) return -1;
-            if (a.str_val_ > b.str_val_) return 1;
-            return 0;
+        case ValueType::VARCHAR: {
+            // Item #6: 单次 compare 即可得到三态结果，避免双次 < / > 比较
+            // （O(2·min(L1,L2)) 最坏情况降到 O(min(L1,L2))）。
+            int c = a.str_val_.compare(b.str_val_);
+            return (c > 0) - (c < 0);
+        }
         case ValueType::NULL_TYPE:
             return 0;
     }

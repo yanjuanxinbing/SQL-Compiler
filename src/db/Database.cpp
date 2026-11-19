@@ -11,10 +11,12 @@
 #include "txn/RecoveryManager.h"
 
 #include <atomic>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <string_view>
 #include <system_error>
 
 namespace sqlcompiler {
@@ -335,32 +337,47 @@ ExecutionResult Database::ExecuteSQL(const std::string& sql) {
 }
 
 std::vector<ExecutionResult> Database::ExecuteScript(const std::string& sql_script) {
+    // item #7: 跟踪 stmt_first/stmt_last (在 sql_script 上的字节区间) + string_view
+    // 切片，避免原实现的 buf.push_back 反复 realloc 与每条 stmt 末尾的
+    // find_first/last_not_of 重复扫描。每字符摊销 O(1)，整体 O(S)。
     std::vector<ExecutionResult> results;
-    std::string buf;
+    auto run_view = [&](std::string_view sv) {
+        size_t a = sv.find_first_not_of(" \t\r\n");
+        size_t b = sv.find_last_not_of(" \t\r\n");
+        if (a == std::string_view::npos) return;
+        std::string_view trimmed = sv.substr(a, b - a + 1);
+        if (trimmed.empty()) return;
+        results.push_back(ExecuteSQL(std::string(trimmed)));
+    };
+    size_t stmt_first = std::string::npos;
+    size_t stmt_last = std::string::npos;
     bool in_string = false;
     for (size_t i = 0; i < sql_script.size(); ++i) {
         char c = sql_script[i];
         if (c == '\'' && (i == 0 || sql_script[i - 1] != '\\')) {
             in_string = !in_string;
+            if (stmt_first == std::string::npos) stmt_first = i;
+            stmt_last = i;
+            continue;
         }
         if (c == ';' && !in_string) {
-            std::string stmt = buf;
-            buf.clear();
-            size_t a = stmt.find_first_not_of(" \t\r\n");
-            size_t b = stmt.find_last_not_of(" \t\r\n");
-            if (a == std::string::npos) continue;
-            stmt = stmt.substr(a, b - a + 1);
-            if (stmt.empty()) continue;
-            results.push_back(ExecuteSQL(stmt));
-        } else {
-            buf.push_back(c);
+            if (stmt_first != std::string::npos &&
+                stmt_first <= stmt_last) {
+                run_view(std::string_view(sql_script.data() + stmt_first,
+                                          stmt_last - stmt_first + 1));
+            }
+            stmt_first = std::string::npos;
+            stmt_last = std::string::npos;
+            continue;
+        }
+        if (!std::isspace(static_cast<unsigned char>(c))) {
+            if (stmt_first == std::string::npos) stmt_first = i;
+            stmt_last = i;
         }
     }
-    size_t a = buf.find_first_not_of(" \t\r\n");
-    size_t b = buf.find_last_not_of(" \t\r\n");
-    if (a != std::string::npos) {
-        std::string stmt = buf.substr(a, b - a + 1);
-        if (!stmt.empty()) results.push_back(ExecuteSQL(stmt));
+    if (stmt_first != std::string::npos && stmt_first <= stmt_last) {
+        run_view(std::string_view(sql_script.data() + stmt_first,
+                                  stmt_last - stmt_first + 1));
     }
     return results;
 }

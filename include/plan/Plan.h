@@ -188,6 +188,13 @@ public:
 
     JoinType join_type;
     ExprPtr condition;
+    // ---- 1.6 列裁剪 / 谓词下推的 JOIN 表集合缓存 ----
+    // 由 Optimizer::PushDownPredicates / PruneNode 在首次访问时填充，
+    // 避免 N 次递归子表扫描（O(N²) → O(N)）。empty 表示"未填充"。
+    // mutable：方便在 const 递归路径里 lazy-init；语义上对 plan 结构
+    // 透明，只读端看到 cached 状态不影响正确性。
+    mutable std::vector<std::string> left_tables;
+    mutable std::vector<std::string> right_tables;
 };
 
 // 排序节点

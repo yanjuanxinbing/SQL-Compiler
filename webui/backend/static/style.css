@@ -200,7 +200,7 @@ kbd{font-family:var(--font-mono);font-size:10px;background:var(--bg-active);padd
 .viz-status{
   flex-shrink:0;padding:8px 12px;font-size:12px;border-bottom:1px solid var(--border);
 }
-.viz-status.is-success{color:var(--success);background:var(--green)}
+.viz-status.is-success{color:var(--bg-primary);background:var(--green)}
 .viz-status.is-error{color:#fff;background:var(--error)}
 .viz-status.is-info{color:var(--blue);background:var(--accent-dim)}
 .viz-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;min-height:160px;color:var(--text-muted);text-align:center;gap:8px;padding:20px}
@@ -451,6 +451,10 @@ text.ast-collapse-glyph{
 .link-btn:hover{text-decoration:underline}
 .icon-btn{width:26px;height:26px;display:inline-flex;align-items:center;justify-content:center;border-radius:4px;color:var(--text-secondary);background:var(--bg-tertiary);border:1px solid var(--border-light)}
 .icon-btn:hover{background:var(--bg-hover);color:var(--text-primary)}
+.icon-btn:disabled,
+.icon-btn[disabled]{opacity:.4;cursor:not-allowed}
+.icon-btn:disabled:hover,
+.icon-btn[disabled]:hover{background:var(--bg-tertiary);color:var(--text-secondary)}
 
 /* ===== 底部状态栏 ===== */
 .statusbar{

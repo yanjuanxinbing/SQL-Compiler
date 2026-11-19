@@ -327,6 +327,11 @@ void ValidateRowConstraints(SystemCatalog* catalog, const TableInfo& table_info,
     //
     //   本函数合并列级 is_unique 和表级 unique_constraints 为统一列表
     //   （与 CreateTableExecutor 使用的合并规则一致），逐组扫描。
+    //
+    //   Item #3 (perf)：原实现对每组 UNIQUE 都做全表扫描，N 条 INSERT
+    //   → O(N²)。改为：每组优先用对应的 unique B+Tree 索引做 FindFirst
+    //   （O(log N)），仅对那些没有匹配 unique 索引的组退回 SeqScan。
+    //   catalog->GetIndexesForTable 在 Item #9 之后已经是 O(K)。
     if (heap == nullptr) return;
     std::vector<std::vector<std::string>> uniq_groups = table_info.unique_constraints;
     for (const auto& c : table_info.columns) {
@@ -342,20 +347,88 @@ void ValidateRowConstraints(SystemCatalog* catalog, const TableInfo& table_info,
     std::unordered_map<std::string, size_t> col_idx;
     for (size_t i = 0; i < cols.size(); ++i) col_idx[cols[i].name] = i;
 
-    // 把每组列名映射到下标；任一列缺失或值含 NULL（SQL 语义下 NULL 不参与
-    // 唯一性比较）就跳过本组的检查。
-    std::vector<std::vector<size_t>> uniq_indexes;
+    // 把每组列名映射到下标；任一列缺失就跳过本组的检查（含 NULL：NULL 不参与
+    // 唯一性比较）。
+    struct GroupPlan {
+        std::vector<size_t> indexes;
+        std::vector<std::string> names;
+        // 优先用索引路径：catalog 已登记的 unique B+Tree，且 key_columns 与
+        // 本组列名按序完全一致。索引路径失败（含 NULL）或未匹配时退化为
+        // 全表扫描本组。
+        const IndexInfo* unique_index = nullptr;
+        // IndexMaintenance 已经为 PRIMARY KEY / 列级 UNIQUE / 表级 UNIQUE
+        // 注册了 unique 索引。理论上每组 UNIQUE 都应有匹配索引；找不到
+        // 索引的常见原因是该组包含 VARCHAR(无长度) 列，建索引时被拒，
+        // 仍然需要走兜底扫描。
+    };
+    std::vector<GroupPlan> plans;
+    plans.reserve(uniq_groups.size());
     for (const auto& g : uniq_groups) {
-        std::vector<size_t> idxs;
+        GroupPlan plan;
+        plan.names = g;
         bool ok = true;
         for (const auto& name : g) {
             auto it = col_idx.find(name);
             if (it == col_idx.end()) { ok = false; break; }
-            idxs.push_back(it->second);
+            plan.indexes.push_back(it->second);
         }
-        if (ok && !idxs.empty()) uniq_indexes.push_back(std::move(idxs));
+        if (!ok || plan.indexes.empty()) continue;
+        // 查找匹配的 unique 索引（顺序敏感：key_columns == g）。
+        if (catalog != nullptr) {
+            for (const IndexInfo* info : catalog->GetIndexesForTable(
+                     table_info.table_name)) {
+                if (info == nullptr) continue;
+                if (!info->is_unique) continue;
+                if (info->key_columns != g) continue;
+                plan.unique_index = info;
+                break;
+            }
+        }
+        plans.push_back(std::move(plan));
     }
-    if (uniq_indexes.empty()) return;
+    if (plans.empty()) return;
+
+    // Item #3: 优先走索引路径的组：直接 FindFirst，O(log N)。
+    for (const auto& plan : plans) {
+        if (plan.unique_index == nullptr) continue;
+        // SQL 语义：含 NULL 则跳过本组（NULL 不参与唯一性比较）。
+        bool any_null = false;
+        for (size_t idx : plan.indexes) {
+            if (idx >= row.size() || row[idx].IsNull()) { any_null = true; break; }
+        }
+        if (any_null) continue;
+        IndexKey ukey;
+        ukey.values.reserve(plan.indexes.size());
+        for (size_t idx : plan.indexes) ukey.values.push_back(row[idx]);
+        BPlusTree* tree = catalog->GetIndexTree(plan.unique_index->index_name);
+        if (tree == nullptr) continue;
+        RID existing = tree->FindFirst(ukey);
+        if (!existing.IsValid()) continue;
+        if (exclude_rid != nullptr && existing == *exclude_rid) continue;
+        // 命中：报告 UNIQUE 冲突。
+        std::string col_desc;
+        if (plan.indexes.size() == 1) {
+            col_desc = cols[plan.indexes[0]].name;
+        } else {
+            col_desc = "(";
+            for (size_t i = 0; i < plan.indexes.size(); ++i) {
+                if (i) col_desc += ", ";
+                col_desc += cols[plan.indexes[i]].name;
+            }
+            col_desc += ")";
+        }
+        throw CompilerException(
+            ErrorStage::SEMANTIC,
+            "UNIQUE constraint violation: " + table_info.table_name +
+                "." + col_desc);
+    }
+
+    // 没有索引的组（rare 路径）：合并到一次 SeqScan 里检查所有无索引组。
+    std::vector<size_t> unindexed_plans;
+    for (size_t i = 0; i < plans.size(); ++i) {
+        if (plans[i].unique_index == nullptr) unindexed_plans.push_back(i);
+    }
+    if (unindexed_plans.empty()) return;
 
     const std::vector<ValueType> uniq_schema = BuildColumnTypes(table_info);
     auto uniq_iter = heap->Begin();
@@ -367,15 +440,14 @@ void ValidateRowConstraints(SystemCatalog* catalog, const TableInfo& table_info,
             existing.GetRid().slot_num == exclude_rid->slot_num) {
             continue;
         }
-        for (const auto& idxs : uniq_indexes) {
+        for (size_t pi : unindexed_plans) {
+            const GroupPlan& plan = plans[pi];
             bool all_equal = true;
-            bool any_null = false;
-            for (size_t idx : idxs) {
+            for (size_t idx : plan.indexes) {
                 const Value& a = row[idx];
                 const Value& b = existing.GetValue(idx);
                 if (a.IsNull() || b.IsNull()) {
-                    // SQL 语义：NULL 不参与唯一性比较，跳过本组判定
-                    any_null = true;
+                    // SQL 语义：NULL 不参与唯一性比较
                     all_equal = false;
                     break;
                 }
@@ -385,16 +457,14 @@ void ValidateRowConstraints(SystemCatalog* catalog, const TableInfo& table_info,
                 }
             }
             if (all_equal) {
-                // 单列 UNIQUE 报告形式：uq.email
-                // 多列 UNIQUE 报告形式：uq2.(a, b)
                 std::string col_desc;
-                if (idxs.size() == 1) {
-                    col_desc = cols[idxs[0]].name;
+                if (plan.indexes.size() == 1) {
+                    col_desc = cols[plan.indexes[0]].name;
                 } else {
                     col_desc = "(";
-                    for (size_t i = 0; i < idxs.size(); ++i) {
+                    for (size_t i = 0; i < plan.indexes.size(); ++i) {
                         if (i) col_desc += ", ";
-                        col_desc += cols[idxs[i]].name;
+                        col_desc += cols[plan.indexes[i]].name;
                     }
                     col_desc += ")";
                 }
@@ -403,7 +473,6 @@ void ValidateRowConstraints(SystemCatalog* catalog, const TableInfo& table_info,
                     "UNIQUE constraint violation: " + table_info.table_name +
                         "." + col_desc);
             }
-            (void)any_null;
         }
     }
 }  // end of ValidateRowConstraints
@@ -474,6 +543,12 @@ IndexKey BuildIndexKeyFromRow(const TableInfo& info,
 
 // 全表扫描 parent_table，验证是否存在一行满足 parent_cols == 目标 key。
 // 仅当 (parent_cols) 全部等于 key 时返回 true。表为空时返回 false。
+//
+// Item #4 (perf)：原实现优先走 PK 索引，但当 FK.parent_cols 不是 PK 列时
+// 退回 O(parent_rows) SeqScan，对每条 child INSERT 都要全扫。改为：
+// 先尝试 PK 索引；不命中再遍历 GetIndexesForTable 找任意 unique 索引
+// key_columns == parent_cols 的；用 FindFirst 做 O(log N) 点查。
+// 仅在没有任何 unique 索引匹配时才退化到 SeqScan。
 bool ParentRowExists(SystemCatalog* catalog, const std::string& parent_table,
                      const std::vector<std::string>& parent_cols,
                      const IndexKey& key) {
@@ -481,13 +556,26 @@ bool ParentRowExists(SystemCatalog* catalog, const std::string& parent_table,
     if (pt == nullptr) return false;
     TableHeap* heap = catalog->GetTableHeap(parent_table);
     if (heap == nullptr) return false;
-    // 优先走 PK 索引点查：只有当 (parent_cols) 与某 PK 组完全一致时。
+    if (key.values.size() != parent_cols.size()) return false;
+    // 路径 1：PK 索引精确匹配。GetPrimaryKeyIndexTree 内部已比较列名。
     BPlusTree* tree = catalog->GetPrimaryKeyIndexTree(parent_table, parent_cols);
-    if (tree != nullptr && key.values.size() == parent_cols.size()) {
+    if (tree != nullptr) {
         RID r = tree->FindFirst(key);
         return r.IsValid();
     }
-    // 兜底：全表扫描。
+    // 路径 2：任何 unique 索引 key_columns == parent_cols 即可复用。
+    for (const IndexInfo* info : catalog->GetIndexesForTable(parent_table)) {
+        if (info == nullptr) continue;
+        if (!info->is_unique) continue;
+        if (info->key_columns != parent_cols) continue;
+        BPlusTree* t = catalog->GetIndexTree(info->index_name);
+        if (t == nullptr) continue;
+        RID r = t->FindFirst(key);
+        if (r.IsValid()) return true;
+        // 同一组列只取第一个匹配；继续找别的组是浪费。
+        return false;
+    }
+    // 路径 3：兜底 SeqScan。
     auto idxs = ResolveColumns(*pt, parent_cols);
     if (idxs.empty() || idxs.size() != key.values.size()) return false;
     std::vector<ValueType> schema;
@@ -517,6 +605,12 @@ struct ChildMatch {
     RID rid;
     std::vector<Value> row;
 };
+//
+// Item #5 (perf)：原实现对每条被影响的 parent UPDATE/DELETE 都对 child 堆做
+// 一次 O(N) SeqScan。改为：先在 child 表的索引里找 key_columns == child_cols
+// 的索引，命中后用 LowerBound 走到第一条匹配，沿叶子链 walk 收齐所有匹配。
+// 总复杂度从 O(M·N) 降到 O(M·log N + matched)。多匹配索引存在时优先 unique
+// 保证确定性。
 std::vector<ChildMatch> FindChildMatches(SystemCatalog* catalog,
                                          const std::string& child_table,
                                          const std::vector<std::string>& child_cols,
@@ -526,8 +620,53 @@ std::vector<ChildMatch> FindChildMatches(SystemCatalog* catalog,
     if (ct == nullptr) return out;
     TableHeap* heap = catalog->GetTableHeap(child_table);
     if (heap == nullptr) return out;
+    if (key.values.size() != child_cols.size()) return out;
     auto idxs = ResolveColumns(*ct, child_cols);
     if (idxs.empty()) return out;
+    // 任意 NULL 在 key 中：CASCADE/SET NULL 路径下不会到这里（EnforceParent
+    // 已经 FkRowHasNull 过滤）；理论上 key.values 都非 NULL，但仍保险。
+    for (const auto& v : key.values) {
+        if (v.IsNull()) return out;
+    }
+
+    // 找最佳匹配索引（unique 优先；都非 unique 取首个）。
+    const IndexInfo* chosen = nullptr;
+    if (catalog != nullptr) {
+        for (const IndexInfo* info : catalog->GetIndexesForTable(child_table)) {
+            if (info == nullptr) continue;
+            if (info->key_columns != child_cols) continue;
+            if (info->is_unique) { chosen = info; break; }
+            if (chosen == nullptr) chosen = info;
+        }
+    }
+    if (chosen != nullptr) {
+        BPlusTree* tree = catalog->GetIndexTree(chosen->index_name);
+        if (tree != nullptr) {
+            std::unique_ptr<BPlusTree::Cursor> cur = tree->LowerBound(key);
+            if (cur != nullptr) {
+                IndexKey cur_key;
+                RID cur_rid;
+                while (cur->Next(&cur_key, &cur_rid)) {
+                    if (cur_key.values.size() != key.values.size()) break;
+                    if (CompareKeyOnly(cur_key, key) != 0) break;  // 已越过匹配段
+                    if (!cur_rid.IsValid()) continue;
+                    Tuple t;
+                    if (!heap->GetTuple(cur_rid, &t,
+                                        BuildColumnTypes(*ct))) continue;
+                    ChildMatch m;
+                    m.rid = cur_rid;
+                    m.row.reserve(t.ColumnCount());
+                    for (size_t i = 0; i < t.ColumnCount(); ++i) {
+                        m.row.push_back(t.GetValue(i));
+                    }
+                    out.push_back(std::move(m));
+                }
+                return out;
+            }
+        }
+    }
+
+    // 兜底：全表扫描。
     std::vector<ValueType> schema;
     schema.reserve(ct->columns.size());
     for (const auto& c : ct->columns) schema.push_back(ValueTypeFromString(c.data_type));
