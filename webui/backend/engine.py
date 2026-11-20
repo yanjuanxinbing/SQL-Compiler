@@ -343,6 +343,58 @@ def _split_blocks(stdout: str, statements: list[str], stderr: str = "") -> list[
 # ── Engine executor ────────────────────────────────────────────────────────
 
 
+def _segment_by_envelopes(stdout: str, count: int) -> tuple[list[str], list[dict | None]]:
+    """Split `--debug-output` stdout into per-statement segments + payloads.
+
+    With `--debug-output` the engine emits, for every statement it runs,
+    the statement's stdout lines followed by exactly one
+    `[DEBUG_JSON_START]…[DEBUG_JSON_END]` envelope — verified
+    experimentally for successful, DDL/DML, failing (semantic AND syntax)
+    and BEGIN/COMMIT statements.  The envelopes are therefore hard
+    per-statement delimiters: statement *i*'s plain output is the text
+    between envelope i-1's end and envelope i's start.  Everything after
+    the last envelope (the `[script]` trailer, trailing newlines) is
+    discarded.
+
+    This replaces the old per-`-f`-file split.  Segmentation on envelopes
+    lets a whole batch travel as ONE `-f` file, which keeps the command
+    line short — the one-`-f`-per-statement form grew ~54 chars per
+    statement and blew past the Windows 32767-char CreateProcess limit at
+    ~600 statements (WinError 206).
+
+    Returns `(segments, debug_dicts)`, both padded/trimmed to `count` so
+    they align 1:1 with the input statements.  A failing statement's
+    segment is empty (its diagnostic went to stderr); its envelope still
+    parses (the engine emits one even for failures).
+    """
+    import json as _json
+
+    env_re = re.compile(
+        r"\[DEBUG_JSON_START\]\s*(.*?)\s*\[DEBUG_JSON_END\]", re.DOTALL
+    )
+    matches = list(env_re.finditer(stdout))
+    debug_dicts: list[dict | None] = []
+    for m in matches:
+        try:
+            debug_dicts.append(_json.loads(m.group(1)))
+        except _json.JSONDecodeError:
+            debug_dicts.append(None)
+
+    segments: list[str] = []
+    prev_end = 0
+    for m in matches:
+        segments.append(stdout[prev_end:m.start()])
+        prev_end = m.end()
+
+    if len(segments) > count:
+        segments = segments[:count]
+        debug_dicts = debug_dicts[:count]
+    elif len(segments) < count:
+        segments += [""] * (count - len(segments))
+        debug_dicts += [None] * (count - len(debug_dicts))
+    return segments, debug_dicts
+
+
 @dataclass
 class EngineRunResult:
     success: bool
@@ -502,10 +554,15 @@ class SqlEngine:
         if transaction and not user_txn:
             # implicit all-or-nothing wrapper
             return await asyncio.to_thread(self._run_transaction_batch_sync, stmts)
-        if len(stmts) == 1 or user_txn:
-            # single statement, or an explicit user-led transaction that
-            # must stay in one engine process
+        if len(stmts) == 1:
             return await self.run_script(s)
+        if user_txn:
+            # An explicit user-led transaction must stay in ONE engine
+            # process (the engine only tracks txn state in-process).  We
+            # still give each statement its own `-f` file so a failing
+            # statement — which prints no stdout — cannot shift the next
+            # statement's output onto it the way a merged script does.
+            return await asyncio.to_thread(self._run_multi_f_sync, stmts)
 
         # multi-statement autocommit → precise per-statement isolation
         return await self._run_each_statement(stmts, on_error)
@@ -557,24 +614,110 @@ class SqlEngine:
         )
 
     # ── implicit (automatic) transaction wrapper ──────────────────────────
-    def _run_transaction_batch_sync(self, stmts: list[str]) -> EngineRunResult:
-        """Run `BEGIN; …; COMMIT;` in a single process for atomic commit."""
-        script_text = (
-            "BEGIN;\n" + "".join(_norm_statement(s) + "\n" for s in stmts) + "COMMIT;\n"
-        )
-        # Align output against BEGIN + user stmts + COMMIT, then drop the
-        # two synthetic boundary blocks so `blocks` mirrors the user's
-        # statements only.
-        full = ["BEGIN"] + list(stmts) + ["COMMIT"]
-        run = self._invoke_engine(script_text, full)
-        blocks = run.blocks[1:-1] if len(run.blocks) >= 2 else []
+    def _run_multi_f_sync(self, full: list[str]) -> EngineRunResult:
+        """Run a whole batch as ONE script in ONE engine subprocess.
+
+        The engine keeps a single session for the duration of one
+        invocation (a BEGIN in the first statement is still open when the
+        last COMMIT runs, and an uncommitted txn auto-rolls back on exit),
+        which is exactly what a transaction needs.  To attribute results
+        per statement we run with `--debug-output` purely for its
+        `[DEBUG_JSON_START]…[DEBUG_JSON_END]` envelope markers: they are
+        emitted once per statement (even failures) and give hard
+        boundaries, so a failing statement's segment is simply empty
+        instead of stealing the next statement's output.  The envelope
+        payloads themselves are discarded here — this is the non-debug
+        execute path.
+
+        (The previous implementation wrote one `-f` file per statement,
+        but that grew the command line ~54 chars/statement and hit the
+        Windows 32767-char CreateProcess limit at ~600 statements.)
+
+        Returns one block per entry in `full`, with stderr "Error:" lines
+        attributed in order to the empty segments.
+        """
+        script_text = "".join(_norm_statement(s) + "\n" for s in full)
+        t0 = time.monotonic()
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".sql", delete=False,
+            encoding="utf-8", dir=tempfile.gettempdir(),
+        ) as f:
+            f.write(script_text)
+            tmp_path = f.name
+        try:
+            try:
+                proc = subprocess.run(
+                    [str(self.binary), str(self.db_path), "-f", tmp_path, "--debug-output"],
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=120,
+                )
+            except subprocess.TimeoutExpired as e:
+                return EngineRunResult(
+                    success=False, blocks=[],
+                    stderr=f"engine timeout after {e.timeout}s",
+                    elapsed_ms=int((time.monotonic() - t0) * 1000),
+                    returncode=-1,
+                )
+            except FileNotFoundError as e:
+                raise EngineError(f"engine binary not found: {e}") from e
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        stderr_clean = proc.stderr or ""
+        segs, _debug = _segment_by_envelopes(proc.stdout or "", len(full))
+        blocks: list[ParsedBlock] = []
+        err_lines = [
+            ln.strip()
+            for ln in stderr_clean.splitlines()
+            if ln.lstrip().startswith("Error:") or ln.lstrip().startswith("error:")
+        ]
+        err_idx = 0
+        for idx, stmt in enumerate(full):
+            seg = segs[idx]
+            blk = _parse_one_block(stmt, seg, "" if seg.strip() == "" else stderr_clean)
+            blk.statement = stmt
+            # An empty segment in the presence of a pending stderr error
+            # means THIS statement failed and printed nothing.
+            if (
+                blk.success
+                and seg.strip() == ""
+                and err_idx < len(err_lines)
+            ):
+                blk.success = False
+                blk.message = err_lines[err_idx]
+                blk.kind = "error"
+                err_idx += 1
+            blocks.append(blk)
         return EngineRunResult(
-            success=run.success and all(b.success for b in blocks),
+            success=(proc.returncode == 0) and err_idx == 0,
             blocks=blocks,
-            stderr=run.stderr,
-            elapsed_ms=run.elapsed_ms,
-            returncode=run.returncode,
+            stderr=stderr_clean,
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+            returncode=proc.returncode,
         )
+
+    def _run_transaction_batch_sync(self, stmts: list[str]) -> EngineRunResult:
+        """Run `BEGIN; …; COMMIT;` as one engine process for atomic commit.
+
+        The engine has no abort-on-error: after a failing statement it
+        still executes COMMIT, which then commits the *preceding
+        successful* statements.  We therefore surface the failure honestly
+        (block marked error + `run.success == False`) — full
+        all-or-nothing rollback for mid-batch failures is an engine-side
+        limitation, not something this wrapper can fix.
+
+        BEGIN/COMMIT are execution scaffolding, not user statements, so
+        their blocks are dropped from the returned list; `blocks` mirrors
+        `stmts` one-to-one.
+        """
+        full = ["BEGIN"] + list(stmts) + ["COMMIT"]
+        run = self._run_multi_f_sync(full)
+        # Drop the synthetic BEGIN/COMMIT boundary blocks.
+        run.blocks = run.blocks[1:-1] if len(run.blocks) >= 2 else []
+        return run
 
     # ── debug: execute + return JSON visualization data ───────────────────
     async def execute_debug(self, statement: str) -> tuple[EngineRunResult, dict | None]:
@@ -624,45 +767,50 @@ class SqlEngine:
         ]
         if not stmts:
             return EngineRunResult(success=True, blocks=[]), None
-        if len(stmts) == 1 or any(self._is_txn_control(x) for x in stmts):
+        if len(stmts) == 1:
             return await self._execute_debug_single(s)
 
-        # multi-statement autocommit → one -f per statement, single subprocess
+        # multi-statement (autocommit OR an explicit user BEGIN…COMMIT) →
+        # one -f per statement, single subprocess.  The engine keeps the
+        # transaction open across the `-f` files of one invocation, so an
+        # explicit user txn still runs atomically in-process; per-file
+        # layout is what stops a failing statement (which prints no stdout)
+        # from shifting the next statement's output onto it and swallowing
+        # the error the way a merged script does.
         return await asyncio.to_thread(self._execute_debug_multistatement_sync, stmts)
 
     def _execute_debug_multistatement_sync(
         self, stmts: list[str]
     ) -> tuple[EngineRunResult, dict | None]:
-        """Run N statements via N `-f` files in one subprocess and parse all.
+        """Run N statements as ONE `-f` script in one subprocess, with debug.
 
-        Each -f file contains exactly one statement.  The engine writes
-        each file's stdout and debug envelope back-to-back; we capture
-        them in order and zip with the input statements.
+        Historically we wrote one temp file per statement and passed N
+        `-f` flags, because a failing statement (which prints no stdout)
+        would otherwise shift the next statement's output onto it.  That
+        works, but the command line grows ~54 chars per statement, so a
+        600+ statement script overflows the Windows 32767-char
+        CreateProcess limit (WinError 206).  `--debug-output` gives us a
+        far better delimiter: the engine emits exactly one
+        `[DEBUG_JSON_START]…[DEBUG_JSON_END]` envelope per statement —
+        verified experimentally for successful, DDL/DML, failing
+        (semantic AND syntax) and BEGIN/COMMIT statements — so we can
+        segment stdout on the envelope boundaries instead of on `-f`
+        files.  One file, one short command line, transaction state
+        naturally preserved (it is a single process).
         """
-        tmp_paths: list[str] = []
+        script_text = "".join(_norm_statement(s) + "\n" for s in stmts)
         t0 = time.monotonic()
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".sql", delete=False,
+            encoding="utf-8", dir=tempfile.gettempdir(),
+        ) as f:
+            f.write(script_text)
+            tmp_path = f.name
         try:
-            for stmt in stmts:
-                # Each statement gets its own temp file so the engine's
-                # line-buffered parser sees clean, isolated input.  We
-                # re-emit the comment-only block-leading content by
-                # writing `stmt` verbatim (it may include leading
-                # comment text the splitter preserved).  The C++ lexer
-                # happily skips `-- …` and `/* … */` lines.
-                norm = _norm_statement(stmt) + "\n"
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".sql", delete=False,
-                    encoding="utf-8", dir=tempfile.gettempdir(),
-                ) as f:
-                    f.write(norm)
-                    tmp_paths.append(f.name)
-            cmd = [str(self.binary), str(self.db_path)]
-            for p in tmp_paths:
-                cmd.extend(["-f", p])
-            cmd.append("--debug-output")
             try:
                 proc = subprocess.run(
-                    cmd, capture_output=True, text=True,
+                    [str(self.binary), str(self.db_path), "-f", tmp_path, "--debug-output"],
+                    capture_output=True, text=True,
                     encoding="utf-8", errors="replace", timeout=120,
                 )
             except subprocess.TimeoutExpired:
@@ -676,11 +824,10 @@ class SqlEngine:
             except FileNotFoundError as e:
                 raise EngineError(f"engine binary not found: {e}") from e
         finally:
-            for p in tmp_paths:
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
         raw = proc.stdout or ""
         stderr_clean = proc.stderr or ""
@@ -696,91 +843,21 @@ class SqlEngine:
     ) -> tuple[EngineRunResult, dict | None]:
         """Parse per-statement stdout + per-statement debug envelopes.
 
-        The engine layout for N files is: for each file, the file's
-        stdout lines, then its `[DEBUG_JSON_START]…[DEBUG_JSON_END]`
-        envelope, then optionally a `[script] file: ran N statement(s)`
-        trailer.  We split on the envelopes, then for each segment
-        strip its own envelope and hand the remainder to
-        `_split_blocks([stmt], raw, stderr)`.
-
-        When a file's statement fails (e.g. `SELECT * FROM missing_table`)
-        the engine still emits its envelope but the file's stdout is
-        empty (the error went to stderr).  We then fabricate a
-        failure block carrying the engine's error message.
+        Segmentation is delegated to `_segment_by_envelopes` (see its
+        docstring): the engine emits exactly one envelope per statement,
+        so envelope boundaries isolate each statement's stdout — including
+        failures, whose segment is empty and whose diagnostic is dequeued
+        from stderr in order below.
         """
-        import json as _json
-
-        # 1. collect every envelope (in order) and strip them out of `raw`.
-        # `finditer` on the start marker gives us positions to slice; we
-        # then locate the matching END on each segment.
-        starts = [m.start() for m in re.finditer(r"\[DEBUG_JSON_START\]", raw)]
-        ends = [m.end() for m in re.finditer(r"\[DEBUG_JSON_END\]", raw)]
-        debug_dicts: list[dict | None] = []
-        prev_end = 0
-        new_raw_parts: list[str] = []
-        for i, s_pos in enumerate(starts):
-            e_pos = ends[i] if i < len(ends) else len(raw)
-            envelope = raw[s_pos:e_pos]
-            new_raw_parts.append(raw[prev_end:s_pos])
-            prev_end = e_pos
-            m = re.search(r"\[DEBUG_JSON_START\]\s*(.*?)\s*\[DEBUG_JSON_END\]", envelope, re.DOTALL)
-            if m:
-                try:
-                    debug_dicts.append(_json.loads(m.group(1)))
-                except _json.JSONDecodeError:
-                    debug_dicts.append(None)
-            else:
-                debug_dicts.append(None)
-        new_raw_parts.append(raw[prev_end:])
-        raw_no_envelope = "".join(new_raw_parts)
-
-        # 2. split the remaining stdout by file-trailer boundaries so
-        # each file's stdout is isolated.  The trailer is a line
-        # `[script] <path>: ran N statement(s)` that the engine appends
-        # after each -f file's content.
-        file_segments = re.split(r"^\[script\][^\n]*\n?", raw_no_envelope, flags=re.MULTILINE)
-
-        # 3. zip statements with file segments and debug envelopes.
-        #
-        # CRITICAL: every empty slot in `file_segments` corresponds to a
-        # statement whose `-f` produced no stdout (CREATE / DDL / failed
-        # statements fall here).  We must NOT drop those slots — they
-        # carry the per-statement "fingerprint" that block ordering
-        # depends on.  Previously this routine popped all leading and
-        # trailing empty entries, which silently collapsed all failing
-        # statements' empty slots into one and associated the FIRST
-        # non-empty stdout (a successful SELECT) with the FIRST
-        # statement (a failed CREATE).  The fix is to strip ONLY the
-        # trailing empty after the last `[script]` trailer (the engine
-        # always emits an extra empty segment after the final file),
-        # then pad / trim to exactly len(stmts).
-        cleaned_segments = list(file_segments)
-        # Strip trailing empties that exist after the last `[script]`
-        # line — those are post-script artifacts that don't correspond
-        # to any input statement.  We POP all consecutive trailing
-        # empties (there's typically just one, but engine edge cases
-        # can produce several) and never touch leading empties, because
-        # a leading empty IS the first statement's stdout slot.
-        while cleaned_segments and cleaned_segments[-1].strip() == "":
-            cleaned_segments.pop()
-        # Defensive: align with statement count.  If fewer segments
-        # than statements, pad with empty strings (engine emitted fewer
-        # `[script]` trailers than we expect — fall back to a "no stdout"
-        # attribution for the missing ones).  If more, trim (very rare;
-        # usually means an unexpected blank inside stdout that survived
-        # the `[script]` split).
-        if len(cleaned_segments) > len(stmts):
-            cleaned_segments = cleaned_segments[: len(stmts)]
-        elif len(cleaned_segments) < len(stmts):
-            while len(cleaned_segments) < len(stmts):
-                cleaned_segments.append("")
+        # 1-3. segment stdout on envelope boundaries; align to len(stmts).
+        cleaned_segments, debug_dicts = _segment_by_envelopes(raw, len(stmts))
 
         # 4. Pair up stderr errors with empty-stdout blocks IN ORDER.
-        # The C++ engine writes one stderr line per failed `-f` file (in
+        # The C++ engine writes one stderr line per failed statement (in
         # the same order as the inputs), so we dequeue one error per
-        # empty-stdout block.  This is the only reliable way to
-        # attribute errors to the right statement when stdout and
-        # stderr are interleaved across `-f` invocations.
+        # empty-stdout block.  This is the reliable way to attribute
+        # errors to the right statement when a failing statement prints
+        # no stdout of its own.
         err_lines = [
             ln.strip()
             for ln in stderr_clean.splitlines()
@@ -797,7 +874,7 @@ class SqlEngine:
             # Pass `stderr_clean` only to `_split_blocks` for blocks with
             # actual stdout — that path catches errors written into the
             # output stream.  For empty-stdout blocks we attribute
-            # errors ourselves below (one stderr line per failing `-f`)
+            # errors ourselves below (one stderr line per failure)
             # because `_split_blocks`'s pad branch would otherwise
             # over-attribute the shared stderr to every empty block.
             blk_list = _split_blocks(seg, [stmt], "" if seg.strip() == "" else stderr_clean)
@@ -808,7 +885,7 @@ class SqlEngine:
                 blk = ParsedBlock(success=True, statement=stmt)
             blk.debug = dbg
             # Failed-statement attribution: a successful-looking block
-            # whose `-f` produced no stdout is almost certainly the
+            # whose statement produced no stdout is almost certainly the
             # statement the engine just failed on.  Dequeue the next
             # stderr error to surface the real diagnostic.  Statements
             # that already reported failure via their own stdout
@@ -974,7 +1051,7 @@ class SqlEngine:
 
     @staticmethod
     def _is_repl_meta(s: str) -> bool:
-        """True if `s` is a C++ REPL meta-command, not SQL.
+        r"""True if `s` is a C++ REPL meta-command, not SQL.
 
         The CLI accepts a handful of dot/back-slash commands at the
         prompt (the engine banner says: `\.tokens`, `\.ast`, `\.plan`,
@@ -1045,6 +1122,13 @@ class SqlEngine:
         - `--` line comments;
         - `/* … */` block comments (a `;` inside any of these is NOT a
           statement terminator).
+        - `CREATE FUNCTION/PROCEDURE … BEGIN … END` bodies: a `;` inside
+          the body does NOT terminate the statement.  This mirrors the
+          engine's own `HasCompleteStatement` (src/main.cpp) — without it
+          our per-statement `-f` dispatch chops procedure bodies into
+          fragments (`CREATE PROC … BEGIN DECLARE…`, `END`, `CALL …`)
+          that each fail to parse, turning one valid procedure into a
+          dozen bogus errors.
 
         Only a top-level `;` terminates a statement.  Comments are
         preserved verbatim into the following statement (the C++ engine
@@ -1055,8 +1139,24 @@ class SqlEngine:
         in_string = False
         in_line_comment = False
         in_block_comment = False
+        # Per-statement CREATE FUNCTION/PROCEDURE BEGIN…END tracking,
+        # reset whenever a statement is emitted — matching the engine,
+        # which re-runs HasCompleteStatement on a freshly emptied buffer
+        # for every statement.
+        create_fn_seen = False
+        begin_depth = 0
         i = 0
         n = len(sql)
+
+        def word_at(pos: int) -> tuple[str, int]:
+            """Upper-cased identifier word at `pos`; returns (word, end)."""
+            while pos < n and sql[pos].isspace():
+                pos += 1
+            j = pos
+            while j < n and (sql[j].isalpha() or sql[j] == "_"):
+                j += 1
+            return sql[pos:j].upper(), j
+
         while i < n:
             c = sql[i]
             nxt = sql[i + 1] if i + 1 < n else ""
@@ -1100,11 +1200,44 @@ class SqlEngine:
                 buf.append(c)
                 i += 1
                 continue
+            if c.isalpha() or c == "_":
+                # Identifier: mirror the engine's CREATE FUNCTION/PROCEDURE
+                # + BEGIN/END depth scan so routine bodies stay intact.
+                j = i
+                while j < n and (sql[j].isalpha() or sql[j] == "_"):
+                    j += 1
+                w = sql[i:j].upper()
+                if w == "CREATE" and not create_fn_seen:
+                    nxt_w, _ = word_at(j)
+                    if nxt_w in ("FUNCTION", "PROCEDURE"):
+                        create_fn_seen = True
+                elif create_fn_seen and w == "BEGIN":
+                    begin_depth += 1
+                elif create_fn_seen and w == "END":
+                    # END IF / WHILE / LOOP / REPEAT / CASE close a
+                    # sub-block, not the routine body — skip the pair
+                    # (same rule as HasCompleteStatement).
+                    nxt_w, nxt_end = word_at(j)
+                    if nxt_w in ("IF", "WHILE", "LOOP", "REPEAT", "CASE"):
+                        buf.append(sql[i:nxt_end])
+                        i = nxt_end
+                        continue
+                    if begin_depth > 0:
+                        begin_depth -= 1
+                buf.append(sql[i:j])
+                i = j
+                continue
             if c == ";":
-                stmt = "".join(buf).strip()
-                if stmt:
-                    out.append(stmt)
-                buf = []
+                if begin_depth == 0:
+                    stmt = "".join(buf).strip()
+                    if stmt:
+                        out.append(stmt)
+                    buf = []
+                    create_fn_seen = False
+                    begin_depth = 0
+                else:
+                    # semicolon inside a routine body: keep it verbatim
+                    buf.append(c)
                 i += 1
                 continue
             buf.append(c)

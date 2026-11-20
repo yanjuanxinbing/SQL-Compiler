@@ -10,7 +10,7 @@ Design notes:
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -148,6 +148,27 @@ class BrowseResponse(BaseModel):
     # system roots for the "Home" / quick-jump button (e.g. C:\ on Windows)
     roots: list[str] = Field(default_factory=list)
     error: str = ""
+
+
+# ── Client-side telemetry ──────────────────────────────────────────────────
+
+
+class ClientLogRequest(BaseModel):
+    """Browser-side error report posted by the frontend's
+    `window.error` / `unhandledrejection` handlers.  The server treats
+    these as untrusted input and only forwards them to the application
+    log; nothing else reads them."""
+
+    level: str = "error"
+    message: str = ""
+    url: str = ""
+    ua: str = ""
+    stack: Optional[str] = None
+    time: str = ""
+
+
+class ClientLogResponse(BaseModel):
+    received: bool = True
 
 
 # ── Schema introspection ────────────────────────────────────────────────────

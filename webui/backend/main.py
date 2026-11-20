@@ -20,7 +20,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from backend.api import SESSION, router as api_router
@@ -28,6 +28,15 @@ from backend.engine import find_engine_binary
 
 STATIC_DIR = Path(__file__).parent / "static"
 INDEX_FILE = STATIC_DIR / "index.html"
+
+# 1x1 transparent GIF.  Returned for any /favicon.ico request so that
+# legacy browsers / link-previewers that ignore the <link rel="icon">
+# declaration don't pollute the access log with 404s.
+_FAVICON_GIF = (
+    b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00"
+    b"!\xf9\x04\x00\x00\x00\x00\x00,\2\x00\x00\x00\x01\x00\x01\x00"
+    b"\x00\x02\x02D\x01\x00;"
+)
 
 
 def create_app() -> FastAPI:
@@ -55,6 +64,14 @@ def create_app() -> FastAPI:
     # Serve static assets at /static/* and the index page at /.
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon() -> Response:
+        return Response(
+            content=_FAVICON_GIF,
+            media_type="image/gif",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     @app.get("/", include_in_schema=False)
     async def root() -> FileResponse:

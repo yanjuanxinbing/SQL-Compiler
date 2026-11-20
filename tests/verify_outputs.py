@@ -32,6 +32,7 @@ import argparse
 import concurrent.futures as cf
 import fnmatch
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -89,14 +90,27 @@ def find_binary(explicit: str | None) -> Path:
 # Output normalization & comparison
 # ---------------------------------------------------------------------------
 
+# std::regex 的报错文案由标准库实现决定，不是我们自己拼的字符串：
+#   libstdc++（Linux/GCC）→ "Unexpected character within '[...]' in regular expression"
+#   MSVC（Windows）      → "The expression contained mismatched [ and ]."
+# 语义完全一样，但字面不同，同一份 expected/*.out 不可能在两个平台上都对。
+# 这里把整句归一化成占位符，让回归套件可以跨平台跑。
+# 注意：normalize() 对「实际输出」和「期望输出」两边都调用，所以两边归一化
+# 之后仍然可比。
+_REGEX_ERROR_RE = re.compile(rb"(invalid regex pattern: )[^\n]*")
+
+
 def normalize(data: bytes) -> bytes:
-    """Normalize line endings (CRLF → LF) and strip trailing newlines.
+    """Normalize line endings (CRLF → LF), canonicalize platform-specific
+    error text, and strip trailing newlines.
 
     Trailing newline stripping matches the previous implementation so that
     the very last line of expected files (which may or may not end with \n)
     compares equal to whatever the binary produced before EOF.
     """
-    return data.replace(b"\r\n", b"\n").rstrip(b"\n")
+    data = data.replace(b"\r\n", b"\n")
+    data = _REGEX_ERROR_RE.sub(rb"\1<regex error>", data)
+    return data.rstrip(b"\n")
 
 
 # ---------------------------------------------------------------------------

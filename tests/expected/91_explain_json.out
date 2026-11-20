@@ -1,0 +1,19 @@
+sqlcompiler> Meta-commands: \.tokens, \.ast, \.plan, \.optimized  (show last statement's debug info)
+Meta-commands: .source <file>  (or .read <file>) - load and execute SQL script
+sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> sqlcompiler> OK
+sqlcompiler> plan                                                                                                                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+{
+  "type": "Project",
+  "col_0": "t.a AS a",
+  "col_1": "t.b AS b",
+  "children": [
+  {
+    "type": "SeqScan",
+    "table": "t",
+    "predicate": "(a > 0)"
+  }
+  ]
+}
+(1 row)
+sqlcompiler> 

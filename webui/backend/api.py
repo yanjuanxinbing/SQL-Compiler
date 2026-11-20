@@ -43,6 +43,8 @@ from backend.schemas import (
     BrowseRequest,
     BrowseResponse,
     CloseDatabaseResponse,
+    ClientLogRequest,
+    ClientLogResponse,
     ColumnInfo,
     DatabaseFileInfo,
     DebugData,
@@ -172,6 +174,33 @@ async def health() -> HealthResponse:
         engine_exists=binary is not None,
         db_path=SESSION.db_path,
     )
+
+
+@router.post("/api/client/log", response_model=ClientLogResponse)
+async def client_log(req: ClientLogRequest) -> ClientLogResponse:
+    """Receive a browser-side error report and append it to the server log.
+
+    This endpoint is intentionally permissive (no auth, accepts free-form
+    text) because the only thing it does is record a one-line summary into
+    the application log — same surface area as `print()`, just routed
+    through FastAPI so the request appears in the access log too.  We
+    truncate aggressively to avoid log-flood attacks.
+    """
+    import logging
+
+    msg = (req.message or "").strip()
+    if not msg:
+        msg = "(empty client report)"
+    msg = msg.replace("\n", " ")[:300]
+    url = (req.url or "")[:120]
+    level = (req.level or "error").lower()
+    logger = logging.getLogger("client")
+    log_fn = {"warn": "warning"}.get(level, None)
+    extra = {"client_url": url} if url else {}
+    getattr(logger, log_fn or level, logger.info)(
+        "[browser %s] %s", level.upper(), msg, extra=extra,
+    )
+    return ClientLogResponse(received=True)
 
 
 # ── Database binding ───────────────────────────────────────────────────────
